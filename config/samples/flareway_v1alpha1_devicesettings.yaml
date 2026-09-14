@@ -1,0 +1,14 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: DeviceSettings
+metadata:
+  name: default
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: runbear
+  gatewayProxyEnabled: true
+  gatewayUdpProxyEnabled: true
+  rootCertificateInstallationEnabled: true
+  useZtVirtualIp: true
+  managementPolicy: ObserveOnly
+  deletionPolicy: Orphan

@@ -1,0 +1,240 @@
+# Complete cc-lb migration example. Replace the example IDs, token, and hostnames
+# before applying it. The shared Access objects remain Terraform-owned.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cc-lb-example
+  labels:
+    kubernetes.io/metadata.name: cc-lb-example
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cc-lb-example-cloudflare-token
+  namespace: flareway-system
+type: Opaque
+stringData:
+  token: replace-with-a-scoped-cloudflare-api-token
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareAccount
+metadata:
+  name: cc-lb-example
+spec:
+  accountId: "00000000000000000000000000000000"
+  credentials:
+    apiTokenSecretRef:
+      name: cc-lb-example-cloudflare-token
+      namespace: flareway-system
+      key: token
+  grants:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: cc-lb-example
+    hostnames:
+    - cc-lb.example.com
+    - cc-lb-proxy.example.com
+    zones:
+    - example.com
+    exposures:
+    - Public
+    unprotectedHostnames:
+    - cc-lb-proxy.example.com
+    accessPolicyRefs: Allowed
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Denied
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: cc-lb
+  namespace: cc-lb-example
+spec:
+  accountRef:
+    name: cc-lb-example
+  tunnel:
+    name: flareway-example-cc-lb
+  managementPolicy: Managed
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: flareway example; replace before production
+  listeners:
+  - name: admin
+    exposure: Public
+  - name: proxy
+    exposure: Public
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cc-lb
+  namespace: cc-lb-example
+spec:
+  selector:
+    app.kubernetes.io/name: cc-lb
+  ports:
+  - name: admin
+    port: 9090
+    targetPort: 9090
+  - name: proxy
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: cc-lb
+  namespace: cc-lb-example
+spec:
+  gatewayClassName: flareway
+  infrastructure:
+    parametersRef:
+      group: flareway.bhyoo.com
+      kind: CloudflareTunnel
+      name: cc-lb
+  listeners:
+  - name: admin
+    hostname: cc-lb.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+  - name: proxy
+    hostname: cc-lb-proxy.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cc-lb-admin
+  namespace: cc-lb-example
+spec:
+  parentRefs:
+  - name: cc-lb
+    sectionName: admin
+  hostnames:
+  - cc-lb.example.com
+  rules:
+  - name: admin
+    backendRefs:
+    - name: cc-lb
+      port: 9090
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cc-lb-proxy
+  namespace: cc-lb-example
+spec:
+  parentRefs:
+  - name: cc-lb
+    sectionName: proxy
+  hostnames:
+  - cc-lb-proxy.example.com
+  rules:
+  - name: v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cc-lb
+      port: 8080
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: IdentityProvider
+metadata:
+  name: google
+  namespace: cc-lb-example
+spec:
+  accountRef:
+    name: cc-lb-example
+  type: google
+  name: Google
+  managementPolicy: ObserveOnly
+  externalRef:
+    idpId: "00000000-0000-0000-0000-000000000001"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: allow-developers-warp
+  namespace: cc-lb-example
+spec:
+  accountRef:
+    name: cc-lb-example
+  name: allow-developers-warp
+  decision: allow
+  include:
+  - emailDomain:
+      domain: example.com
+  require:
+  - devicePosture:
+      ruleRef:
+        externalId: "00000000-0000-0000-0000-000000000002"
+  sessionDuration: 720h
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000003"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: deny-everyone
+  namespace: cc-lb-example
+spec:
+  accountRef:
+    name: cc-lb-example
+  name: deny-everyone
+  decision: deny
+  include:
+  - everyone: {}
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000004"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cc-lb-admin
+  namespace: cc-lb-example
+spec:
+  accountRef:
+    name: cc-lb-example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: cc-lb
+    sectionName: admin
+  application:
+    name: cc-lb example admin
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

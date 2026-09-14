@@ -1,0 +1,13 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: VirtualNetwork
+metadata:
+  name: prod-private
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: runbear
+  name: prod
+  isDefault: false
+  comment: Production private services
+  managementPolicy: Managed
+  deletionPolicy: Orphan

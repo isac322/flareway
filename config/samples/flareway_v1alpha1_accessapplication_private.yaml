@@ -1,0 +1,56 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cc-lb-private-https
+  namespace: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: cc-lb
+    sectionName: admin-private
+  application:
+    name: cc-lb private HTTPS
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Disabled
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cc-lb-private-l4
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: runbear
+  privateDestinations:
+  - networkRouteRef:
+      name: private-services
+    portRange: "443"
+    l4Protocol: tcp
+  application:
+    name: cc-lb private L4
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+    assumeGatewayTLSDecryption: true
+  managementPolicy: Managed
+  deletionPolicy: Delete

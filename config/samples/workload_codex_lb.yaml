@@ -1,0 +1,292 @@
+# Complete codex-lb migration example. The dashboard rule protects `/`, while
+# `/v1` and `/backend-api/codex` are public carve-outs. Flareway creates one
+# child bypass Access application per carve-out. Replace all example values.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codex-lb-example
+  labels:
+    kubernetes.io/metadata.name: codex-lb-example
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: codex-lb-example-cloudflare-token
+  namespace: flareway-system
+type: Opaque
+stringData:
+  token: replace-with-a-scoped-cloudflare-api-token
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareAccount
+metadata:
+  name: codex-lb-example
+spec:
+  accountId: "00000000000000000000000000000000"
+  credentials:
+    apiTokenSecretRef:
+      name: codex-lb-example-cloudflare-token
+      namespace: flareway-system
+      key: token
+  grants:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: codex-lb-example
+    hostnames:
+    - codex-lb.example.com
+    - codex-lb-admin.example.com
+    zones:
+    - example.com
+    exposures:
+    - Public
+    unprotectedHostnames:
+    - codex-lb.example.com
+    accessPolicyRefs: Allowed
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Denied
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: codex-lb
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  tunnel:
+    name: flareway-example-codex-lb
+  managementPolicy: Managed
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: flareway example; replace before production
+  listeners:
+  - name: app
+    exposure: Public
+  - name: admin
+    exposure: Public
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-lb
+  namespace: codex-lb-example
+spec:
+  selector:
+    app.kubernetes.io/name: codex-lb
+  ports:
+  - name: http
+    port: 2455
+    targetPort: 2455
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: codex-lb
+  namespace: codex-lb-example
+spec:
+  gatewayClassName: flareway
+  infrastructure:
+    parametersRef:
+      group: flareway.bhyoo.com
+      kind: CloudflareTunnel
+      name: codex-lb
+  listeners:
+  - name: app
+    hostname: codex-lb.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+  - name: admin
+    hostname: codex-lb-admin.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: codex-lb
+  namespace: codex-lb-example
+spec:
+  parentRefs:
+  - name: codex-lb
+    sectionName: app
+  hostnames:
+  - codex-lb.example.com
+  rules:
+  - name: public-v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+  - name: public-codex
+    matches:
+    - path:
+        type: PathPrefix
+        value: /backend-api/codex
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+  - name: dashboard
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: codex-lb-admin
+  namespace: codex-lb-example
+spec:
+  parentRefs:
+  - name: codex-lb
+    sectionName: admin
+  hostnames:
+  - codex-lb-admin.example.com
+  rules:
+  - name: dashboard
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: IdentityProvider
+metadata:
+  name: google
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  type: google
+  name: Google
+  managementPolicy: ObserveOnly
+  externalRef:
+    idpId: "00000000-0000-0000-0000-000000000011"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: allow-developers-warp
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  name: allow-developers-warp
+  decision: allow
+  include:
+  - emailDomain:
+      domain: example.com
+  require:
+  - devicePosture:
+      ruleRef:
+        externalId: "00000000-0000-0000-0000-000000000012"
+  sessionDuration: 720h
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000013"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: deny-everyone
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  name: deny-everyone
+  decision: deny
+  include:
+  - everyone: {}
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000014"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: codex-lb-dashboard
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: codex-lb
+    sectionName: dashboard
+  application:
+    name: codex-lb example dashboard
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: codex-lb-admin
+  namespace: codex-lb-example
+spec:
+  accountRef:
+    name: codex-lb-example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: codex-lb
+    sectionName: admin
+  application:
+    name: codex-lb example admin
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

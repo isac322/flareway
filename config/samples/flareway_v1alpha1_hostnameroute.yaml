@@ -1,0 +1,22 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: HostnameRoute
+metadata:
+  name: private-admin
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  hostname: admin.cc-lb.internal
+  tunnelRef:
+    name: cc-lb
+    namespace: llm-proxy
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: llm-proxy
+  comment: Private admin hostname
+  managementPolicy: Managed
+  deletionPolicy: Delete

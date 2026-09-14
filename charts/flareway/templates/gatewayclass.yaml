@@ -1,0 +1,50 @@
+{{- if .Values.gatewayClass.create }}
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: GatewayClassConfig
+metadata:
+  name: {{ .Values.gatewayClass.configName }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.gatewayClass.config.accountRefName }}
+  accountRef:
+    name: {{ . }}
+  {{- end }}
+  conformanceMode: {{ .Values.gatewayClass.config.conformanceMode }}
+  connector:
+    image: {{ .Values.gatewayClass.config.connector.image | quote }}
+    replicas: {{ .Values.gatewayClass.config.connector.replicas }}
+    protocol: {{ .Values.gatewayClass.config.connector.protocol }}
+    gracePeriod: {{ .Values.gatewayClass.config.connector.gracePeriod | quote }}
+    resources:
+      {{- toYaml .Values.gatewayClass.config.connector.resources | nindent 6 }}
+  proxy:
+    image: {{ .Values.gatewayClass.config.proxy.image | quote }}
+    concurrency: {{ .Values.gatewayClass.config.proxy.concurrency }}
+    streamIdleTimeout: {{ .Values.gatewayClass.config.proxy.streamIdleTimeout | quote }}
+    resources:
+      {{- toYaml .Values.gatewayClass.config.proxy.resources | nindent 6 }}
+  privateDNS:
+    image: {{ .Values.gatewayClass.config.privateDNS.image | quote }}
+    resources:
+      {{- toYaml .Values.gatewayClass.config.privateDNS.resources | nindent 6 }}
+  dns:
+    mode: {{ .Values.gatewayClass.config.dns.mode }}
+  originJWT:
+    mode: {{ .Values.gatewayClass.config.originJWT.mode }}
+  conformance:
+    serviceType: {{ .Values.gatewayClass.config.conformance.serviceType }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gatewayClass.name }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+spec:
+  controllerName: flareway.bhyoo.com/gateway-controller
+  parametersRef:
+    group: flareway.bhyoo.com
+    kind: GatewayClassConfig
+    name: {{ .Values.gatewayClass.configName }}
+{{- end }}

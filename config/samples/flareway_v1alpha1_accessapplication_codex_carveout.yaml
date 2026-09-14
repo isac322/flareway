@@ -1,0 +1,78 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: codex-lb
+  namespace: default
+spec:
+  gatewayClassName: flareway
+  listeners:
+  - name: web
+    hostname: codex-lb.example.com
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: codex-lb
+  namespace: default
+spec:
+  parentRefs:
+  - name: codex-lb
+  hostnames:
+  - codex-lb.example.com
+  rules:
+  - name: public-v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+  - name: public-codex
+    matches:
+    - path:
+        type: PathPrefix
+        value: /backend-api/codex
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+  - name: dashboard
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: codex-lb
+      port: 2455
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: codex-lb-dashboard
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: codex-lb
+    sectionName: dashboard
+  application:
+    name: codex-lb dashboard
+    sessionDuration: 720h
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

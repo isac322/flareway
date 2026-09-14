@@ -1,0 +1,157 @@
+{
+  "key": {
+    "Namespace": "default",
+    "Name": "gateway"
+  },
+  "uid": "gateway-uid",
+  "conformanceMode": true,
+  "listeners": [
+    {
+      "name": "http",
+      "hostname": "api.example.com",
+      "port": 80,
+      "envoyPort": 10080,
+      "protocol": "HTTP",
+      "exposure": "Public"
+    }
+  ],
+  "domains": [
+    {
+      "name": "http",
+      "listenerName": "http",
+      "envoyPort": 10080,
+      "protected": false,
+      "virtualHosts": [
+        {
+          "name": "http-6170692e6578616d706c652e636f6d",
+          "hostname": "api.example.com",
+          "routes": [
+            {
+              "name": "default/features/0/0",
+              "match": {
+                "type": "PathPrefix",
+                "value": "/v1"
+              },
+              "headers": [
+                {
+                  "name": "x-tenant",
+                  "type": "Exact",
+                  "value": "blue"
+                }
+              ],
+              "query": [
+                {
+                  "name": "verbose",
+                  "type": "Exact",
+                  "value": "true"
+                }
+              ],
+              "method": "GET",
+              "filters": {
+                "requestHeaders": {
+                  "set": [
+                    {
+                      "name": "x-route",
+                      "value": "features"
+                    }
+                  ]
+                },
+                "responseHeaders": {
+                  "remove": [
+                    "server"
+                  ]
+                },
+                "urlRewrite": {
+                  "hostname": "upstream.example.com",
+                  "path": {
+                    "type": "ReplacePrefixMatch",
+                    "replace": "/"
+                  }
+                },
+                "mirrors": [
+                  {
+                    "backend": {
+                      "name": "mirror",
+                      "namespace": "default",
+                      "clusterName": "default--mirror--9090",
+                      "port": 9090,
+                      "weight": 1,
+                      "filters": {}
+                    },
+                    "percent": 25
+                  }
+                ],
+                "cors": {
+                  "allowOrigins": [
+                    "https://app.example.com"
+                  ],
+                  "allowMethods": [
+                    "GET",
+                    "OPTIONS"
+                  ],
+                  "allowHeaders": [
+                    "x-tenant"
+                  ],
+                  "exposeHeaders": [
+                    "x-request-id"
+                  ],
+                  "maxAge": 600,
+                  "allowCredentials": true
+                }
+              },
+              "backends": [
+                {
+                  "name": "backend",
+                  "namespace": "default",
+                  "clusterName": "default--backend--8080",
+                  "port": 8080,
+                  "weight": 100,
+                  "filters": {}
+                }
+              ],
+              "timeouts": {
+                "request": 15000000000,
+                "backendRequest": 5000000000
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "clusters": [
+    {
+      "name": "default--backend--8080",
+      "namespace": "default",
+      "service": "backend",
+      "port": 8080,
+      "appProtocol": "kubernetes.io/h2c",
+      "endpoints": [
+        {
+          "address": "10.0.0.1",
+          "port": 8081
+        },
+        {
+          "address": "10.0.0.2",
+          "port": 8081
+        }
+      ],
+      "tls": {
+        "serverName": "backend.default.svc.cluster.local",
+        "wellKnownCACertificates": "System",
+        "subjectAltNames": [
+          {
+            "type": "Hostname",
+            "value": "backend.default.svc.cluster.local"
+          }
+        ]
+      }
+    },
+    {
+      "name": "default--mirror--9090",
+      "namespace": "default",
+      "service": "mirror",
+      "port": 9090
+    }
+  ]
+}

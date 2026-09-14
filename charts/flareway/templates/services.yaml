@@ -1,0 +1,45 @@
+{{- if .Values.controllers.gateway }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: flareway-xds
+  namespace: {{ include "flareway.namespace" . }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+  {{- with .Values.xds.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.xds.service.type }}
+  ports:
+    - name: xds
+      port: {{ .Values.xds.service.port }}
+      protocol: TCP
+      targetPort: xds
+  selector:
+    {{- include "flareway.selectorLabels" . | nindent 4 }}
+{{- end }}
+{{- if .Values.metrics.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flareway.fullname" . }}-metrics
+  namespace: {{ include "flareway.namespace" . }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.metrics.service.type }}
+  ports:
+    - name: {{ ternary "https" "http" .Values.metrics.secure }}
+      port: {{ .Values.metrics.service.port }}
+      protocol: TCP
+      targetPort: metrics
+  selector:
+    {{- include "flareway.selectorLabels" . | nindent 4 }}
+{{- end }}

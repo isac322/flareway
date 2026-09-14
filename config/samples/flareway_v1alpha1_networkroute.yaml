@@ -1,0 +1,24 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: NetworkRoute
+metadata:
+  name: private-services
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  network: 10.96.0.0/12
+  tunnelRef:
+    name: cc-lb
+    namespace: llm-proxy
+  virtualNetworkRef:
+    name: prod-private
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: llm-proxy
+  comment: Kubernetes Service CIDR
+  managementPolicy: Managed
+  deletionPolicy: Delete

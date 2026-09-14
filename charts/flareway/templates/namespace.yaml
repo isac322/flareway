@@ -1,0 +1,10 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "flareway.namespace" . }}
+  labels:
+    {{- toYaml .Values.namespace.labels | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.namespace.annotations | nindent 4 }}
+{{- end }}

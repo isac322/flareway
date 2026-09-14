@@ -1,0 +1,374 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  KO_DOCKER_REPO: ghcr.io/isac322/flareway
+  KO_VERSION: v0.19.1
+  COSIGN_VERSION: v2.6.5
+  HELM_VERSION: v4.3.0
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Validate release tag
+        id: release
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Release tags must be SemVer without build metadata (for example, v1.2.3 or v1.2.3-rc.1)."
+            exit 1
+          fi
+          echo "tag=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${GITHUB_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+
+  e2e-gate:
+    name: Recent Cloudflare e2e evidence
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Require a successful scheduled e2e run from the last 24 hours
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import io
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.error
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timedelta, timezone
+
+          repository = os.environ["REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          api = f"https://api.github.com/repos/{repository}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request_json(path):
+              request = urllib.request.Request(f"{api}{path}", headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          def download(path):
+              request = urllib.request.Request(f"{api}{path}", headers=headers)
+
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, request, file_pointer, code, message, response_headers, new_url):
+                      return None
+
+              try:
+                  with urllib.request.build_opener(NoRedirect).open(
+                      request, timeout=30
+                  ) as response:
+                      return response.read()
+              except urllib.error.HTTPError as error:
+                  if error.code not in {302, 303, 307, 308}:
+                      raise
+                  location = error.headers.get("Location")
+                  if not location:
+                      raise RuntimeError("artifact download redirect omitted Location") from error
+
+              # The redirect is a short-lived, pre-signed URL. Do not forward
+              # the GitHub token to the storage host.
+              with urllib.request.urlopen(location, timeout=60) as response:
+                  return response.read()
+
+          query = urllib.parse.urlencode({
+              "branch": "main",
+              "event": "schedule",
+              "per_page": 20,
+          })
+          runs = request_json(
+              f"/actions/workflows/e2e.yaml/runs?{query}"
+          ).get("workflow_runs", [])
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+          failures = []
+          selected = None
+
+          for run in runs:
+              completed_at = run.get("updated_at")
+              if run.get("conclusion") != "success" or not completed_at:
+                  continue
+              completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+              if completed < cutoff:
+                  continue
+
+              artifacts = request_json(
+                  f"/actions/runs/{run['id']}/artifacts?per_page=100"
+              ).get("artifacts", [])
+              expected_name = f"cloudflare-e2e-{run['head_sha']}"
+              artifact = next(
+                  (
+                      item
+                      for item in artifacts
+                      if item["name"] == expected_name and not item["expired"]
+                  ),
+                  None,
+              )
+              if artifact is None:
+                  failures.append(f"run {run['id']}: evidence artifact is missing")
+                  continue
+
+              try:
+                  archive = zipfile.ZipFile(
+                      io.BytesIO(download(f"/actions/artifacts/{artifact['id']}/zip"))
+                  )
+                  names = archive.namelist()
+                  def evidence_file(filename):
+                      candidates = [
+                          name for name in names if name.endswith(filename)
+                      ]
+                      return min(
+                          candidates,
+                          key=lambda name: (name.count("/"), len(name)),
+                      )
+                  latency_name = evidence_file("e2e-latency.json")
+                  warp_name = evidence_file("e2e-private-warp.json")
+                  latencies = json.loads(archive.read(latency_name))
+                  warp = json.loads(archive.read(warp_name))
+                  if not isinstance(latencies, dict) or not isinstance(warp, dict):
+                      raise ValueError("evidence JSON must contain objects")
+              except (KeyError, StopIteration, ValueError, zipfile.BadZipFile) as error:
+                  failures.append(f"run {run['id']}: invalid evidence artifact: {error}")
+                  continue
+
+              required = {
+                  "public-programmed",
+                  "access-aud-secret-blocked",
+                  "access-application-deleted",
+              }
+              missing = sorted(required - latencies.keys())
+              if not any(name.startswith("access-ready-") for name in latencies):
+                  missing.append("access-ready-*")
+              warp_result = warp.get("result")
+              if warp_result not in {"pass", "blocked: plan", "blocked: runner"}:
+                  missing.append("valid private WARP classification")
+              if missing:
+                  failures.append(
+                      f"run {run['id']}: missing evidence: {', '.join(missing)}"
+                  )
+                  continue
+
+              selected = (run, completed, warp_result)
+              break
+
+          if selected is None:
+              print(
+                  "::error::No successful scheduled e2e run completed in the last "
+                  "24 hours with public, access, and WARP classification evidence."
+              )
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(1)
+
+          run, completed, warp_result = selected
+          print(f"Using e2e run {run['html_url']} completed at {completed.isoformat()}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Release e2e gate\n\n")
+              summary.write(f"- Run: [{run['id']}]({run['html_url']})\n")
+              summary.write(f"- Completed: `{completed.isoformat()}`\n")
+              summary.write(f"- WARP: `{warp_result}`\n")
+          PY
+
+  quality:
+    name: Unit, envtest, lint, and Envoy tests
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify generated files
+        run: |
+          make manifests generate
+          git diff --exit-code
+      - name: Run lint and tests
+        run: make lint test test-envoy
+
+  conformance:
+    name: GatewayHTTP conformance
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run Gateway API conformance
+        env:
+          LOCALBIN: ${{ runner.temp }}/bin
+          REPORT_OUTPUT: ${{ github.workspace }}/conformance/reports/v1.6.2/flareway/standard-${{ needs.metadata.outputs.tag }}-default-report.yaml
+          VERSION: ${{ needs.metadata.outputs.tag }}
+        run: hack/run-conformance.sh
+      - name: Upload conformance report and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-api-conformance-${{ needs.metadata.outputs.tag }}
+          path: |
+            conformance/reports/v1.6.2/flareway/
+            artifacts/conformance/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish signed image and Helm chart
+    needs:
+      - metadata
+      - e2e-gate
+      - quality
+      - conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    env:
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install pinned release tools
+        run: make ko cosign helm
+      - name: Authenticate to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${GHCR_TOKEN}" | docker login ghcr.io \
+            --username "${GITHUB_ACTOR}" --password-stdin
+          echo "${GHCR_TOKEN}" | bin/helm registry login ghcr.io \
+            --username "${GITHUB_ACTOR}" --password-stdin
+      - name: Build and push multi-architecture image with SBOM
+        id: image
+        run: |
+          mkdir -p dist/sbom
+          image_ref="$(
+            bin/ko build \
+              --bare \
+              --platform=linux/amd64,linux/arm64 \
+              --tags="${RELEASE_TAG}" \
+              --sbom=spdx \
+              --sbom-dir=dist/sbom \
+              ./cmd
+          )"
+          if [[ "${image_ref}" != ghcr.io/isac322/flareway*@sha256:* ]]; then
+            echo "::error::ko did not return the expected digest reference: ${image_ref}"
+            exit 1
+          fi
+          printf '%s\n' "${image_ref}" > dist/image-digest.txt
+          echo "ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+      - name: Sign and verify the image
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          bin/cosign sign --yes --recursive "${IMAGE_REF}"
+          bin/cosign verify \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_REF}" > dist/cosign-verification.json
+      - name: Package and push Helm chart
+        run: |
+          bin/helm lint charts/flareway
+          bin/helm package charts/flareway \
+            --version "${RELEASE_VERSION}" \
+            --app-version "${RELEASE_TAG}" \
+            --destination dist
+          chart_archive="dist/flareway-${RELEASE_VERSION}.tgz"
+          test -s "${chart_archive}"
+          bin/helm push "${chart_archive}" \
+            oci://ghcr.io/isac322/charts | tee dist/chart-push.txt
+          printf '%s\n' \
+            "oci://ghcr.io/isac322/charts/flareway:${RELEASE_VERSION}" \
+            > dist/chart-ref.txt
+      - name: Create and verify checksums
+        run: |
+          (
+            cd dist
+            mapfile -t files < <(
+              find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort
+            )
+            if (( ${#files[@]} == 0 )); then
+              echo "::error::No release artifacts were produced."
+              exit 1
+            fi
+            sha256sum "${files[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flareway-${{ needs.metadata.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create GitHub release
+        id: github-release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: Flareway ${{ needs.metadata.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.metadata.outputs.version, '-') }}
+          files: |
+            dist/flareway-${{ needs.metadata.outputs.version }}.tgz
+            dist/SHA256SUMS
+            dist/image-digest.txt
+            dist/chart-ref.txt
+            dist/chart-push.txt
+            dist/cosign-verification.json
+            dist/sbom/*

@@ -1,0 +1,24 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: ZeroTrustGatewayPolicy
+metadata:
+  name: allow-private-egress
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: runbear
+  name: flareway/private-egress
+  description: Allow approved private destinations
+  enabled: true
+  precedence: 100
+  filters:
+  - l4
+  action: allow
+  traffic: net.dst.ip in $trusted-egress
+  listRefs:
+  - name: trusted-egress
+  ruleSettings:
+    checkSession:
+      enforce: true
+      duration: 8h
+  managementPolicy: ObserveOnly
+  deletionPolicy: Orphan

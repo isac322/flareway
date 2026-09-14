@@ -1,0 +1,20 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: public
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  tunnel:
+    name: flareway-example-public
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: example public tunnel
+  listeners:
+  - name: web
+    exposure: Public

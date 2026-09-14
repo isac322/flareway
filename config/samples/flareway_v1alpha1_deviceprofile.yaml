@@ -1,0 +1,38 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: DeviceProfile
+metadata:
+  name: default-platform
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: runbear
+  profile:
+    kind: Default
+    fields:
+      switchLocked: true
+      tunnelProtocol: masque
+  splitTunnel:
+    mode: Include
+    static:
+    - address: 10.96.0.0/12
+      description: Kubernetes services
+    routeSources:
+      networkRoutes:
+        selector:
+          matchLabels:
+            flareway.bhyoo.com/device-profile: default
+      hostnameRoutes:
+        selector:
+          matchLabels:
+            flareway.bhyoo.com/device-profile: default
+      privateHostnameRange: true
+  fallbackDomains:
+    static:
+    - suffix: corp.example
+      dnsServer:
+      - 10.96.0.10
+  dnsSearchSuffixes:
+  - suffix: example.com
+    description: Corporate search
+  managementPolicy: ObserveOnly
+  deletionPolicy: Orphan

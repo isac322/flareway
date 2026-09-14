@@ -1,0 +1,40 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: allow-developers-warp
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  name: allow-developers-warp
+  decision: allow
+  include:
+  - group:
+      groupRef:
+        name: developers
+  require:
+  - devicePosture:
+      ruleRef:
+        name: warp
+  sessionDuration: 720h
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000004"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: deny-everyone
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  name: deny-everyone
+  decision: deny
+  include:
+  - everyone: {}
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000005"
+  deletionPolicy: Orphan

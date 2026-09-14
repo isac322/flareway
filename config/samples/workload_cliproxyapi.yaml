@@ -1,0 +1,312 @@
+# Complete cliproxyapi migration example. The dashboard rule protects `/`, while
+# the four API prefixes are public carve-outs. Flareway creates one child bypass
+# Access application per prefix. Replace all example values.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cliproxyapi-example
+  labels:
+    kubernetes.io/metadata.name: cliproxyapi-example
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cliproxyapi-example-cloudflare-token
+  namespace: flareway-system
+type: Opaque
+stringData:
+  token: replace-with-a-scoped-cloudflare-api-token
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareAccount
+metadata:
+  name: cliproxyapi-example
+spec:
+  accountId: "00000000000000000000000000000000"
+  credentials:
+    apiTokenSecretRef:
+      name: cliproxyapi-example-cloudflare-token
+      namespace: flareway-system
+      key: token
+  grants:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: cliproxyapi-example
+    hostnames:
+    - cliproxyapi.example.com
+    - cliproxyapi-admin.example.com
+    zones:
+    - example.com
+    exposures:
+    - Public
+    unprotectedHostnames:
+    - cliproxyapi.example.com
+    accessPolicyRefs: Allowed
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Denied
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: cliproxyapi
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  tunnel:
+    name: flareway-example-cliproxyapi
+  managementPolicy: Managed
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: flareway example; replace before production
+  listeners:
+  - name: app
+    exposure: Public
+  - name: admin
+    exposure: Public
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cliproxyapi
+  namespace: cliproxyapi-example
+spec:
+  selector:
+    app.kubernetes.io/name: cliproxyapi
+  ports:
+  - name: http
+    port: 8317
+    targetPort: 8317
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: cliproxyapi
+  namespace: cliproxyapi-example
+spec:
+  gatewayClassName: flareway
+  infrastructure:
+    parametersRef:
+      group: flareway.bhyoo.com
+      kind: CloudflareTunnel
+      name: cliproxyapi
+  listeners:
+  - name: app
+    hostname: cliproxyapi.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+  - name: admin
+    hostname: cliproxyapi-admin.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cliproxyapi
+  namespace: cliproxyapi-example
+spec:
+  parentRefs:
+  - name: cliproxyapi
+    sectionName: app
+  hostnames:
+  - cliproxyapi.example.com
+  rules:
+  - name: public-v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+  - name: public-v1beta
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1beta
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+  - name: public-openai-v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /openai/v1
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+  - name: public-codex
+    matches:
+    - path:
+        type: PathPrefix
+        value: /backend-api/codex
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+  - name: dashboard
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cliproxyapi-admin
+  namespace: cliproxyapi-example
+spec:
+  parentRefs:
+  - name: cliproxyapi
+    sectionName: admin
+  hostnames:
+  - cliproxyapi-admin.example.com
+  rules:
+  - name: dashboard
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: cliproxyapi
+      port: 8317
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: IdentityProvider
+metadata:
+  name: google
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  type: google
+  name: Google
+  managementPolicy: ObserveOnly
+  externalRef:
+    idpId: "00000000-0000-0000-0000-000000000021"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: allow-developers-warp
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  name: allow-developers-warp
+  decision: allow
+  include:
+  - emailDomain:
+      domain: example.com
+  require:
+  - devicePosture:
+      ruleRef:
+        externalId: "00000000-0000-0000-0000-000000000022"
+  sessionDuration: 720h
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000023"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: deny-everyone
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  name: deny-everyone
+  decision: deny
+  include:
+  - everyone: {}
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000024"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cliproxyapi-dashboard
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: cliproxyapi
+    sectionName: dashboard
+  application:
+    name: cliproxyapi example dashboard
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cliproxyapi-admin
+  namespace: cliproxyapi-example
+spec:
+  accountRef:
+    name: cliproxyapi-example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: cliproxyapi
+    sectionName: admin
+  application:
+    name: cliproxyapi example admin
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

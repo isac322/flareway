@@ -1,0 +1,14 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: IdentityProvider
+metadata:
+  name: google
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  type: google
+  name: Google
+  managementPolicy: ObserveOnly
+  externalRef:
+    idpId: "00000000-0000-0000-0000-000000000001"
+  deletionPolicy: Orphan

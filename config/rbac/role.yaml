@@ -1,0 +1,186 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - namespaces
+  - secrets
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
+- apiGroups:
+  - flareway.bhyoo.com
+  resources:
+  - accessapplications
+  - accessgroups
+  - accesspolicies
+  - cloudflareaccounts
+  - cloudflaretunnels
+  - deviceposturerules
+  - deviceprofiles
+  - devicesettings
+  - gatewayclassconfigs
+  - hostnameroutes
+  - identityproviders
+  - networkroutes
+  - servicetokens
+  - virtualnetworks
+  - zerotrustgatewaypolicies
+  - zerotrustlists
+  - zerotrustorganizations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - flareway.bhyoo.com
+  resources:
+  - accessapplications/finalizers
+  - accessgroups/finalizers
+  - accesspolicies/finalizers
+  - cloudflareaccounts/finalizers
+  - cloudflaretunnels/finalizers
+  - deviceposturerules/finalizers
+  - deviceprofiles/finalizers
+  - devicesettings/finalizers
+  - gatewayclassconfigs/finalizers
+  - hostnameroutes/finalizers
+  - identityproviders/finalizers
+  - networkroutes/finalizers
+  - servicetokens/finalizers
+  - virtualnetworks/finalizers
+  - zerotrustgatewaypolicies/finalizers
+  - zerotrustlists/finalizers
+  - zerotrustorganizations/finalizers
+  verbs:
+  - patch
+  - update
+- apiGroups:
+  - flareway.bhyoo.com
+  resources:
+  - accessapplications/status
+  - accessgroups/status
+  - accesspolicies/status
+  - cloudflareaccounts/status
+  - cloudflaretunnels/status
+  - deviceposturerules/status
+  - deviceprofiles/status
+  - devicesettings/status
+  - gatewayclassconfigs/status
+  - hostnameroutes/status
+  - identityproviders/status
+  - networkroutes/status
+  - servicetokens/status
+  - virtualnetworks/status
+  - zerotrustgatewaypolicies/status
+  - zerotrustlists/status
+  - zerotrustorganizations/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - backendtlspolicies
+  - gatewayclasses
+  - gateways
+  - httproutes
+  - referencegrants
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - backendtlspolicies/status
+  - gatewayclasses/status
+  - gateways/status
+  - httproutes/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

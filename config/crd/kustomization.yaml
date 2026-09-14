@@ -1,0 +1,18 @@
+resources:
+- bases/flareway.bhyoo.com_accessapplications.yaml
+- bases/flareway.bhyoo.com_accessgroups.yaml
+- bases/flareway.bhyoo.com_accesspolicies.yaml
+- bases/flareway.bhyoo.com_cloudflareaccounts.yaml
+- bases/flareway.bhyoo.com_cloudflaretunnels.yaml
+- bases/flareway.bhyoo.com_deviceposturerules.yaml
+- bases/flareway.bhyoo.com_deviceprofiles.yaml
+- bases/flareway.bhyoo.com_devicesettings.yaml
+- bases/flareway.bhyoo.com_gatewayclassconfigs.yaml
+- bases/flareway.bhyoo.com_hostnameroutes.yaml
+- bases/flareway.bhyoo.com_networkroutes.yaml
+- bases/flareway.bhyoo.com_identityproviders.yaml
+- bases/flareway.bhyoo.com_servicetokens.yaml
+- bases/flareway.bhyoo.com_virtualnetworks.yaml
+- bases/flareway.bhyoo.com_zerotrustgatewaypolicies.yaml
+- bases/flareway.bhyoo.com_zerotrustlists.yaml
+- bases/flareway.bhyoo.com_zerotrustorganizations.yaml

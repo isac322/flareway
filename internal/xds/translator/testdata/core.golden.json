@@ -1,0 +1,64 @@
+{
+  "versionLength": 64,
+  "listener": {
+    "address": "0.0.0.0",
+    "port": 10443,
+    "serverNames": [
+      "example.com"
+    ],
+    "tlsSecret": "listener-cert",
+    "routeConfig": "public",
+    "normalizePath": true,
+    "mergeSlashes": true,
+    "escapedSlashAction": "UNESCAPE_AND_REDIRECT",
+    "streamIdleTimeout": "1h0m0s",
+    "connectionIdle": "2m0s",
+    "websocket": true,
+    "ignorePortInHostMatching": true,
+    "tlsInspector": true,
+    "alpn": [
+      "h2",
+      "http/1.1"
+    ]
+  },
+  "routes": [
+    {
+      "name": "items-invalid-backend",
+      "action": "direct-500",
+      "runtimeNumerator": 200000,
+      "cors": true
+    },
+    {
+      "name": "items-valid-backend",
+      "action": "route",
+      "clusters": [
+        "backend-a:80"
+      ],
+      "pathRewrite": "/new",
+      "hostRewrite": "upstream.example",
+      "timeout": "0s",
+      "cors": true
+    },
+    {
+      "name": "redirect",
+      "action": "redirect",
+      "redirectCode": "PERMANENT_REDIRECT"
+    },
+    {
+      "name": "main-not-found",
+      "action": "direct-404"
+    }
+  ],
+  "cluster": {
+    "name": "backend-a",
+    "type": "EDS",
+    "edsService": "backend-a",
+    "http2": true,
+    "sni": "backend.default.svc",
+    "sans": [
+      "DNS:backend.default.svc"
+    ]
+  },
+  "endpoint": "10.0.0.2:8080",
+  "secret": "listener-cert"
+}

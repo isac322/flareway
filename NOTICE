@@ -1,0 +1,15 @@
+Flareway
+Copyright 2026 Byeonghoon Yoo
+
+This product includes adapted functions from the following Apache-2.0-licensed projects:
+
+- Envoy Gateway v1.9.1 (github.com/envoyproxy/gateway), commit
+  0260554fd4f33b787aad77a129fc0ffeb00c1f29,
+  internal/gatewayapi/helpers.go: computeHosts,
+  wildcardHostnameMatchesHostname, and
+  isCrossNamespaceReferencePermitted. License: Apache License 2.0.
+
+- cfgate v0.2.0-alpha.5 (github.com/cfgate/cfgate),
+  internal/controller/status/conditions.go and
+  internal/controller/httproute_controller.go: condition set/merge helpers
+  and the HTTPRoute status preservation pattern. License: Apache License 2.0.

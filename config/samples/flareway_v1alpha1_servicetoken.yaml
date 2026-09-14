@@ -1,0 +1,17 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: ServiceToken
+metadata:
+  name: automation
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  name: flareway/default/automation
+  duration: 8760h
+  secretRef:
+    name: automation-access-token
+  rotation:
+    mode: Manual
+    graceDuration: 24h
+  managementPolicy: Managed
+  deletionPolicy: Delete

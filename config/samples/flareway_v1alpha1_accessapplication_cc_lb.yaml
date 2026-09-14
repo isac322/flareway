@@ -1,0 +1,30 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: cc-lb-admin
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: cc-lb
+    sectionName: admin
+  application:
+    name: cc-lb admin
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: true
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

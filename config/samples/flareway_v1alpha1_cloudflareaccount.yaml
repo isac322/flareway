@@ -1,0 +1,30 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareAccount
+metadata:
+  name: example
+spec:
+  accountId: "00000000000000000000000000000000"
+  credentials:
+    apiTokenSecretRef:
+      name: cloudflare-api-token
+      namespace: flareway-system
+      key: api-token
+  grants:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: default
+    hostnames:
+    - "*.example.com"
+    zones:
+    - example.com
+    exposures:
+    - Public
+    unprotectedHostnames:
+    - app.example.com
+    - codex-lb.example.com
+    accessPolicyRefs: Allowed
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Denied
