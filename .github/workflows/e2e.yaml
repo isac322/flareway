@@ -50,7 +50,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install test tools
-        run: make kind ko kustomize
+        run: make kind kustomize
       - name: Create Kind cluster
         env:
           KIND_CLUSTER_NAME: flareway-e2e
@@ -77,9 +77,14 @@ jobs:
       - name: Build and install Flareway
         env:
           KIND_CLUSTER_NAME: flareway-e2e
-          KO_DOCKER_REPO: kind.local
         run: |
-          controller_image="$(bin/ko build --platform=linux/amd64 --bare ./cmd)"
+          controller_image="flareway-e2e:${GITHUB_SHA}"
+          docker build --platform=linux/amd64 \
+            --tag "${controller_image}" \
+            .
+          bin/kind load docker-image \
+            --name "${KIND_CLUSTER_NAME}" \
+            "${controller_image}"
           kubectl apply --server-side -k config/crd
           bin/kustomize build config/default | \
             sed "s|image: controller:latest|image: ${controller_image}|" | \
