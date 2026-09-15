@@ -121,7 +121,7 @@ conformance: ## Run the portable Gateway API conformance workflow.
 
 .PHONY: e2e
 e2e: ## Run Cloudflare end-to-end tests serially.
-	go test -tags e2e -timeout 60m ./test/e2e/... -ginkgo.label-filter="$(FLAREWAY_E2E_LABELS)" -ginkgo.procs=1
+	go test -tags e2e -timeout 60m ./test/e2e -ginkgo.label-filter="$(FLAREWAY_E2E_LABELS)"
 
 .PHONY: e2e-janitor
 e2e-janitor: ## Remove stale Cloudflare end-to-end test resources.
