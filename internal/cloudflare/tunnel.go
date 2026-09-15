@@ -364,7 +364,7 @@ func (client *Client) GetTunnelConfiguration(ctx context.Context, tunnelID strin
 		result.Version,
 		string(result.Source),
 		result.CreatedAt,
-		result.Config.JSON.RawJSON(),
+		result.JSON.Config.Raw(),
 	)
 	if err != nil {
 		return TunnelConfiguration{}, fmt.Errorf("get Cloudflare tunnel configuration: %w", err)
@@ -393,7 +393,7 @@ func (client *Client) UpdateTunnelConfiguration(ctx context.Context, tunnelID st
 		result.Version,
 		string(result.Source),
 		result.CreatedAt,
-		result.Config.JSON.RawJSON(),
+		result.JSON.Config.Raw(),
 	)
 	if err != nil {
 		return TunnelConfiguration{}, fmt.Errorf("update Cloudflare tunnel configuration: %w", err)

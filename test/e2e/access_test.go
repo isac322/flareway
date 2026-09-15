@@ -99,6 +99,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		})
 		accessApplication = object("flareway.bhyoo.com/v1alpha1", "AccessApplication", namespace, "access", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
+			"type":       "SelfHosted",
 			"targetRefs": []any{map[string]any{
 				"group": "gateway.networking.k8s.io", "kind": "Gateway",
 				"name": accessGateway.GetName(), "sectionName": "web",
@@ -128,6 +129,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		})
 		mixedApplication = object("flareway.bhyoo.com/v1alpha1", "AccessApplication", namespace, "mixed", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
+			"type":       "SelfHosted",
 			"targetRefs": []any{map[string]any{
 				"group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
 				"name": mixedRoute.GetName(), "sectionName": "dashboard",

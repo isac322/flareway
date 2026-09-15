@@ -123,6 +123,7 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 		})
 		accessApplication = object("flareway.bhyoo.com/v1alpha1", "AccessApplication", namespace, "private", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
+			"type":       "SelfHosted",
 			"targetRefs": []any{map[string]any{
 				"group": "gateway.networking.k8s.io", "kind": "Gateway",
 				"name": gateway.GetName(), "sectionName": "private",

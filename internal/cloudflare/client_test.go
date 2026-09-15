@@ -575,17 +575,23 @@ func TestTunnelConfigurationUsesRequestIdentityWhenResponseOmitsIDs(t *testing.T
 			return
 		}
 		response.Header().Set("Content-Type", "application/json")
+		config := any(nil)
+		version := int64(0)
+		if request.Method == http.MethodPut {
+			config = map[string]any{
+				"ingress": []any{map[string]any{"service": "http_status:404"}},
+			}
+			version = 1
+		}
 		_ = json.NewEncoder(response).Encode(map[string]any{
 			"success":  true,
 			"errors":   []any{},
 			"messages": []any{},
 			"result": map[string]any{
-				"config": map[string]any{
-					"ingress": []any{map[string]any{"service": "http_status:404"}},
-				},
+				"config":     config,
 				"created_at": createdAt.Format(time.RFC3339),
 				"source":     "cloudflare",
-				"version":    7,
+				"version":    version,
 			},
 		})
 	}))
@@ -593,7 +599,11 @@ func TestTunnelConfigurationUsesRequestIdentityWhenResponseOmitsIDs(t *testing.T
 	client := New("token", "account", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
 
 	observed, err := client.GetTunnelConfiguration(context.Background(), "tunnel")
-	if err != nil || observed.AccountID != "account" || observed.TunnelID != "tunnel" {
+	if err != nil ||
+		observed.AccountID != "account" ||
+		observed.TunnelID != "tunnel" ||
+		observed.Version != 0 ||
+		string(observed.Config) != "null" {
 		t.Fatalf("GetTunnelConfiguration() = %#v, %v", observed, err)
 	}
 	updated, err := client.UpdateTunnelConfiguration(context.Background(), "tunnel", zero_trust.TunnelCloudflaredConfigurationUpdateParams{
@@ -603,8 +613,30 @@ func TestTunnelConfigurationUsesRequestIdentityWhenResponseOmitsIDs(t *testing.T
 			}}),
 		}),
 	})
-	if err != nil || updated.AccountID != "account" || updated.TunnelID != "tunnel" {
+	if err != nil ||
+		updated.AccountID != "account" ||
+		updated.TunnelID != "tunnel" ||
+		updated.Version != 1 ||
+		!strings.Contains(string(updated.Config), `"http_status:404"`) {
 		t.Fatalf("UpdateTunnelConfiguration() = %#v, %v", updated, err)
+	}
+}
+
+func TestTunnelConfigurationRejectsMissingConfigJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/accounts/account/cfd_tunnel/tunnel/configurations" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(response, `{"success":true,"errors":[],"messages":[],"result":{"source":"cloudflare","version":0}}`)
+	}))
+	t.Cleanup(server.Close)
+	client := New("token", "account", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+
+	_, err := client.GetTunnelConfiguration(context.Background(), "tunnel")
+	if err == nil || !strings.Contains(err.Error(), "invalid tunnel configuration JSON") {
+		t.Fatalf("GetTunnelConfiguration() error = %v", err)
 	}
 }
 
