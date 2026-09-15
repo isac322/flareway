@@ -357,6 +357,8 @@ func (client *Client) GetTunnelConfiguration(ctx context.Context, tunnelID strin
 		return TunnelConfiguration{}, fmt.Errorf("get Cloudflare tunnel configuration: Cloudflare returned an empty configuration")
 	}
 	configuration, err := tunnelConfigurationFromSDK(
+		client.accountID,
+		tunnelID,
 		result.AccountID,
 		result.TunnelID,
 		result.Version,
@@ -384,6 +386,8 @@ func (client *Client) UpdateTunnelConfiguration(ctx context.Context, tunnelID st
 		return TunnelConfiguration{}, fmt.Errorf("update Cloudflare tunnel configuration: Cloudflare returned an empty configuration")
 	}
 	configuration, err := tunnelConfigurationFromSDK(
+		client.accountID,
+		tunnelID,
 		result.AccountID,
 		result.TunnelID,
 		result.Version,
@@ -536,12 +540,18 @@ func tunnelFromSDK(remote *shared.CloudflareTunnel) (Tunnel, error) {
 	}, nil
 }
 
-func tunnelConfigurationFromSDK(accountID, tunnelID string, version int64, source string, createdAt time.Time, rawConfig string) (TunnelConfiguration, error) {
-	if accountID == "" {
-		return TunnelConfiguration{}, fmt.Errorf("cloudflare returned a tunnel configuration without an account ID")
+func tunnelConfigurationFromSDK(expectedAccountID, expectedTunnelID, accountID, tunnelID string, version int64, source string, createdAt time.Time, rawConfig string) (TunnelConfiguration, error) {
+	if expectedAccountID == "" {
+		return TunnelConfiguration{}, fmt.Errorf("tunnel configuration request has no account ID")
 	}
-	if tunnelID == "" {
-		return TunnelConfiguration{}, fmt.Errorf("cloudflare returned a tunnel configuration without a tunnel ID")
+	if expectedTunnelID == "" {
+		return TunnelConfiguration{}, fmt.Errorf("tunnel configuration request has no tunnel ID")
+	}
+	if accountID != "" && accountID != expectedAccountID {
+		return TunnelConfiguration{}, fmt.Errorf("cloudflare returned tunnel configuration account ID %q; expected %q", accountID, expectedAccountID)
+	}
+	if tunnelID != "" && tunnelID != expectedTunnelID {
+		return TunnelConfiguration{}, fmt.Errorf("cloudflare returned tunnel configuration tunnel ID %q; expected %q", tunnelID, expectedTunnelID)
 	}
 	configSource, err := tunnelConfigSourceFromWire(source)
 	if err != nil {
@@ -552,8 +562,8 @@ func tunnelConfigurationFromSDK(accountID, tunnelID string, version int64, sourc
 		return TunnelConfiguration{}, fmt.Errorf("cloudflare returned invalid tunnel configuration JSON")
 	}
 	return TunnelConfiguration{
-		AccountID: accountID,
-		TunnelID:  tunnelID,
+		AccountID: expectedAccountID,
+		TunnelID:  expectedTunnelID,
 		Version:   version,
 		Source:    configSource,
 		CreatedAt: createdAt,

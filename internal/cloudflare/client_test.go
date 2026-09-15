@@ -563,6 +563,96 @@ func TestGetTunnelConfigurationPreservesFullRemoteConfig(t *testing.T) {
 	}
 }
 
+func TestTunnelConfigurationUsesRequestIdentityWhenResponseOmitsIDs(t *testing.T) {
+	createdAt := time.Date(2026, time.September, 15, 0, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/accounts/account/cfd_tunnel/tunnel/configurations" {
+			http.NotFound(response, request)
+			return
+		}
+		if request.Method != http.MethodGet && request.Method != http.MethodPut {
+			response.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"success":  true,
+			"errors":   []any{},
+			"messages": []any{},
+			"result": map[string]any{
+				"config": map[string]any{
+					"ingress": []any{map[string]any{"service": "http_status:404"}},
+				},
+				"created_at": createdAt.Format(time.RFC3339),
+				"source":     "cloudflare",
+				"version":    7,
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	client := New("token", "account", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+
+	observed, err := client.GetTunnelConfiguration(context.Background(), "tunnel")
+	if err != nil || observed.AccountID != "account" || observed.TunnelID != "tunnel" {
+		t.Fatalf("GetTunnelConfiguration() = %#v, %v", observed, err)
+	}
+	updated, err := client.UpdateTunnelConfiguration(context.Background(), "tunnel", zero_trust.TunnelCloudflaredConfigurationUpdateParams{
+		Config: cloudflaresdk.F(zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfig{
+			Ingress: cloudflaresdk.F([]zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfigIngress{{
+				Service: cloudflaresdk.F("http_status:404"),
+			}}),
+		}),
+	})
+	if err != nil || updated.AccountID != "account" || updated.TunnelID != "tunnel" {
+		t.Fatalf("UpdateTunnelConfiguration() = %#v, %v", updated, err)
+	}
+}
+
+func TestTunnelConfigurationRejectsConflictingResponseIdentity(t *testing.T) {
+	tests := []struct {
+		name     string
+		account  string
+		tunnel   string
+		contains string
+	}{
+		{name: "account", account: "other-account", tunnel: "tunnel", contains: "expected \"account\""},
+		{name: "tunnel", account: "account", tunnel: "other-tunnel", contains: "expected \"tunnel\""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != "/accounts/account/cfd_tunnel/tunnel/configurations" {
+					http.NotFound(response, request)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(response).Encode(map[string]any{
+					"success":  true,
+					"errors":   []any{},
+					"messages": []any{},
+					"result": map[string]any{
+						"account_id": test.account,
+						"tunnel_id":  test.tunnel,
+						"config": map[string]any{
+							"ingress": []any{map[string]any{"service": "http_status:404"}},
+						},
+						"created_at": "2026-09-15T00:00:00Z",
+						"source":     "cloudflare",
+						"version":    1,
+					},
+				})
+			}))
+			t.Cleanup(server.Close)
+			client := New("token", "account", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+
+			_, err := client.GetTunnelConfiguration(context.Background(), "tunnel")
+			if err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("GetTunnelConfiguration() error = %v, want substring %q", err, test.contains)
+			}
+		})
+	}
+}
+
 func TestTunnelListOptionsOmitUnsetFieldsAndMapEveryFilter(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
