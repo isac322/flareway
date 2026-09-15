@@ -1,0 +1,50 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: NetworkRoute
+metadata:
+  name: private-services
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: demo
+spec:
+  accountRef:
+    name: example-account
+  network: 10.96.0.0/12
+  tunnelRef:
+    kind: CloudflareTunnel
+    name: private-gateway
+    namespace: demo
+  virtualNetworkRef:
+    name: private-services
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: demo
+  comment: Kubernetes Service CIDR through the Gateway tunnel
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: NetworkRoute
+metadata:
+  name: branch-office
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: demo
+spec:
+  accountRef:
+    name: example-account
+  network: 10.40.0.0/16
+  tunnelRef:
+    kind: WARPConnector
+    name: branch-local
+    namespace: demo
+  # virtualNetworkRef is optional; omission selects the account default virtual network.
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: demo
+  comment: Branch CIDR through the local-HA WARP Connector
+  managementPolicy: Managed
+  deletionPolicy: Delete

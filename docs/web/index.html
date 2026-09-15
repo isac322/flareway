@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flareway Operator — Cloudflare Networking & Zero Trust for Kubernetes</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css">
+</head>
+<body>
+
+  <!-- Tooltip element for interactive diagrams -->
+  <div id="diagram-tooltip" style="position: absolute; display: none; z-index: 2000; background: rgba(17, 24, 39, 0.95); border: 1px solid var(--brand-cf-orange); padding: 8px 12px; border-radius: 6px; font-size: 0.8rem; color: #fff; pointer-events: none; box-shadow: 0 4px 12px rgba(0,0,0,0.5);"></div>
+
+  <!-- Header -->
+  <header class="header">
+    <a href="#" class="brand">
+      <div class="brand-icon">F</div>
+      <div class="brand-text">
+        <h1>Flareway Operator <span class="badge">v1alpha1 Design</span></h1>
+      </div>
+    </a>
+    <div class="header-actions">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="global-search" class="search-input" placeholder="CRD, 개념, 필드 검색...">
+      </div>
+      <button id="theme-toggle-btn" class="btn-icon" title="테마 전환">
+        <span>☀️</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="app-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="nav-group-title">개념 및 아키텍처</div>
+      <a href="#overview" class="nav-link active"><span>01</span> 개요 및 핵심 요약</a>
+      <a href="#concept" class="nav-link"><span>02</span> 하이레벨 개념 & 왜 Flareway인가?</a>
+      <a href="#architecture" class="nav-link"><span>03</span> 시각화: 트래픽 흐름 & 아키텍처</a>
+      
+      <div class="nav-group-title">Gateway API & 보안</div>
+      <a href="#gateway-api" class="nav-link"><span>04</span> Gateway API 매핑 계약</a>
+      <a href="#security" class="nav-link"><span>05</span> Zero Trust & Fail-Closed 보안</a>
+      
+      <div class="nav-group-title">리소스 스펙 & 구현</div>
+      <a href="#crd-catalog" class="nav-link"><span>06</span> CRD 22종 전체 카탈로그</a>
+      <a href="#annotations" class="nav-link"><span>07</span> Annotation 정책 (Zero-Annotation)</a>
+      <a href="#conformance" class="nav-link"><span>08</span> 검증 & Conformance 전략</a>
+      <a href="#decisions" class="nav-link"><span>09</span> 결정 레지스트리 & 잔여 항목</a>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+
+      <!-- Hero Section -->
+      <section id="overview" class="section hero">
+        <div class="hero-tag">🚀 Cloudflare Networking & Zero Trust for Kubernetes</div>
+        <h1>Flareway Operator</h1>
+        <p class="lead">
+          Kubernetes 표준 <strong>Gateway API</strong> 리소스를 기반으로 Cloudflare Tunnel, DNS, Zero Trust Access 및 WARP 사설 네트워크를 선언적으로 통합 관리하는 차세대 오퍼레이터입니다.
+        </p>
+
+        <div class="hero-stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" style="color: var(--brand-cf-orange);">1 : 1 : 1</div>
+            <div class="stat-label">Gateway : Tunnel : DataPlane</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" style="color: var(--brand-k8s-blue);">Dual-Engine</div>
+            <div class="stat-label">cloudflared + Envoy In-Pod</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" style="color: var(--color-success);">Fail-Closed</div>
+            <div class="stat-label">Origin JWT 강제 & 403 차단</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" style="color: var(--color-purple);">Zero-Annot</div>
+            <div class="stat-label">GEP-713 Policy Attachment 표준</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 1: Core Decisions Summary -->
+      <section class="section">
+        <div class="section-header">
+          <div class="section-tag">Executive Summary</div>
+          <h2 class="section-title">핵심 설계 원칙 (12대 결정 요약)</h2>
+          <p class="section-desc">오퍼레이터가 신뢰성, 표준 호환성, 엄격한 보안을 유지하기 위해 채택한 핵심 아키텍처 결정들입니다.</p>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">1. 데이터플레인: cloudflared + Envoy 동시 배치</span>
+              <span class="badge badge-orange">Dual-Engine</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.9rem;">
+              <code>cloudflared</code> 네이티브 인그레스는 L7 기능(헤더/메서드/쿼리 매칭, 가중치 분할, URL 재작성, 리다이렉트)이 전무합니다. 따라서 cloudflared는 <strong>Edge 전송 및 per-ingress JWT 검증</strong>만 수행하고, Gateway API 표준 L7 라우팅은 같은 Pod 내 loopback으로 바인딩된 <strong>Envoy 프록시</strong>가 전담합니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">2. 단일 소유자: 1 Gateway = 1 Tunnel</span>
+              <span class="badge badge-blue">Single-Writer</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.9rem;">
+              Cloudflare Tunnel 설정 API는 전체 문서 교체(whole-object PUT) 방식입니다. 여러 Gateway가 하나의 Tunnel을 공유하면 충돌이 불가피하므로, <strong>하나의 Gateway가 정확히 하나의 Tunnel을 독점 소유</strong>하여 안전하고 결정론적인 조정을 보장합니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">3. Zero-Annotation 철학 (GEP-713 정책 부착)</span>
+              <span class="badge badge-purple">Standard GEP-713</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.9rem;">
+              Gateway API 리소스(Gateway, HTTPRoute)에 Cloudflare 전용 비표준 어노테이션을 일체 읽지 않습니다. 인프라 바인딩은 <code>parametersRef</code>, 보안 정책은 타입 안전한 GEP-713 Direct Policy인 <code>AccessApplication</code> CRD를 통해 바인딩합니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">4. Fail-Closed 보안 & Origin JWT 검증 강제</span>
+              <span class="badge badge-green">Zero Trust Origin</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.9rem;">
+              Edge의 Access 검사만 신뢰하지 않고, cloudflared 수신부에서 <code>Cf-Access-Jwt-Assertion</code>을 서명 검증합니다. 보호 대상 라우트의 AUD가 준비되지 않거나 Access 정책이 삭제되면 라우트는 자동으로 공개되는 것이 아니라 즉시 <code>403 Forbidden</code>으로 차단(Fail-Closed)됩니다.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 2: Concept & Problem -->
+      <section id="concept" class="section">
+        <div class="section-header">
+          <div class="section-tag">High-Level Concept</div>
+          <h2 class="section-title">개념 및 배경: 왜 Flareway가 필요한가?</h2>
+          <p class="section-desc">클라우드플레어 네트워킹과 쿠버네티스 표준 인그레스 모델 간의 본질적인 기술 격차와 해결책을 설명합니다.</p>
+        </div>
+
+        <div class="card" style="margin-bottom: 28px;">
+          <h3 style="margin-bottom: 12px; font-size: 1.25rem;">전통적인 Ingress/cfd의 한계와 L7 기능 격차 (The Capability Gap)</h3>
+          <p style="color: var(--text-secondary); margin-bottom: 16px;">
+            많은 개발자가 <code>cloudflared</code>를 쿠버네티스 인그레스로 직접 연결하려고 시도합니다. 그러나 공식 <code>cloudflared</code>의 인그레스 규칙 엔진은 단순한 호스트명과 비앵커(unanchored) Go 정규식 경로 매칭만을 제공합니다. 쿠버네티스 차세대 표준인 <strong>Gateway API (GatewayHTTP Core Profile)</strong>를 만족하기에는 아래와 같은 치명적인 한계가 존재합니다:
+          </p>
+
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>요구 기능</th>
+                  <th>Gateway API (HTTPRoute) 요구</th>
+                  <th>cloudflared 네이티브 인그레스</th>
+                  <th>Flareway (Dual-Engine 해결책)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>경로 매칭</strong></td>
+                  <td>Exact, PathPrefix, RegularExpression</td>
+                  <td>비앵커 정규식만 지원 (오버랩 취약점 존재)</td>
+                  <td><span class="badge badge-green">완전 지원 (Envoy)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>헤더 / 메서드 매칭</strong></td>
+                  <td>HTTP Method (GET/POST 등), Header, QueryParam</td>
+                  <td><span class="badge badge-danger">미지원</span></td>
+                  <td><span class="badge badge-green">완전 지원 (Envoy)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>트래픽 분할 (Weight)</strong></td>
+                  <td>다중 백엔드 가중치 로드밸런싱 (Canary 90:10)</td>
+                  <td><span class="badge badge-danger">미지원 (단일 Service만 가능)</span></td>
+                  <td><span class="badge badge-green">완전 지원 (Envoy Cluster)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>URL 변환 및 필터</strong></td>
+                  <td>URLRewrite, RequestRedirect, RequestHeaderModifier</td>
+                  <td><span class="badge badge-danger">미지원 (요청 경로 원형 전달)</span></td>
+                  <td><span class="badge badge-green">완전 지원 (Envoy Filter)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>보안: Access JWT 검증</strong></td>
+                  <td>Edge 정책 통과 토큰의 오리진 내 암호학적 검증</td>
+                  <td>HTTP 서비스에 한해 per-ingress 검증 지원</td>
+                  <td><span class="badge badge-green">cloudflared 검증 + Envoy 연계</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Visual Diagram 1: The L7 Gap & Dual Engine Architecture -->
+        <div class="diagram-container">
+          <div class="diagram-header">
+            <span class="diagram-title">📊 다이어그램 1: L7 기능 격차와 Flareway 듀얼 엔진 아키텍처</span>
+            <span class="badge badge-blue">Architecture</span>
+          </div>
+
+          <svg class="svg-diagram" viewBox="0 0 920 340" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <!-- Background grids -->
+            <rect width="920" height="340" rx="12" fill="#0d121d"/>
+            
+            <!-- Box 1: HTTPRoute Specs (Left) -->
+            <g class="flow-node" data-info="<strong>Kubernetes HTTPRoute</strong><br/>헤더 매칭, 메서드 검증, 가중치 트래픽 분할, URL 재작성 등 정교한 L7 요구사항이 기술된 표준 리소스.">
+              <rect x="25" y="40" width="230" height="260" rx="8" fill="#151d30" stroke="#326ce5" stroke-width="2"/>
+              <text x="45" y="70" fill="#60a5fa" font-size="14" font-weight="700">Kubernetes HTTPRoute</text>
+              <rect x="40" y="90" width="200" height="32" rx="4" fill="#1c263d"/>
+              <text x="50" y="111" fill="#9ca3af" font-size="11">Headers: X-Version == v2</text>
+              <rect x="40" y="130" width="200" height="32" rx="4" fill="#1c263d"/>
+              <text x="50" y="151" fill="#9ca3af" font-size="11">Method: POST /api/v1/infer</text>
+              <rect x="40" y="170" width="200" height="32" rx="4" fill="#1c263d"/>
+              <text x="50" y="191" fill="#9ca3af" font-size="11">Backend Split: v1 (90%) : v2 (10%)</text>
+              <rect x="40" y="210" width="200" height="32" rx="4" fill="#1c263d"/>
+              <text x="50" y="231" fill="#9ca3af" font-size="11">Filters: URLRewrite, CORS</text>
+              <rect x="40" y="250" width="200" height="32" rx="4" fill="#ef4444" fill-opacity="0.2" stroke="#ef4444"/>
+              <text x="50" y="271" fill="#fca5a5" font-size="11" font-weight="600">⚠ cfd 네이티브 번역 불가</text>
+            </g>
+
+            <!-- Arrow 1 -->
+            <path d="M 265 170 L 320 170" stroke="#f38020" stroke-width="2" stroke-dasharray="4 4"/>
+            <polygon points="320,165 330,170 320,175" fill="#f38020"/>
+            <text x="270" y="160" fill="#fb923c" font-size="10" font-weight="600">수신/전달</text>
+
+            <!-- Box 2: Gateway Pod (Middle & Right) -->
+            <rect x="340" y="30" width="555" height="280" rx="10" fill="#111827" stroke="#f38020" stroke-width="1.5" stroke-dasharray="6 6"/>
+            <text x="360" y="55" fill="#fb923c" font-size="12" font-weight="700">Flareway Gateway DataPlane Pod (127.0.0.1 Loopback Isolation)</text>
+
+            <!-- Sub-container 1: cloudflared -->
+            <g class="flow-node" data-info="<strong>cloudflared 컨테이너</strong><br/>- Cloudflare Edge와 QUIC/HTTP2 터널 유지<br/>- per-ingress originRequest.access로 JWT 서명 검증<br/>- 오직 127.0.0.1 루프백 포트로만 전달">
+              <rect x="360" y="75" width="230" height="215" rx="8" fill="#1e293b" stroke="#f38020" stroke-width="2"/>
+              <text x="375" y="102" fill="#fb923c" font-size="13" font-weight="700">Container 1: cloudflared</text>
+              <text x="375" y="125" fill="#94a3b8" font-size="11">• Edge QUIC Multiplexing</text>
+              <text x="375" y="145" fill="#94a3b8" font-size="11">• Hostname Ingress Router</text>
+              <rect x="375" y="160" width="200" height="40" rx="4" fill="#f38020" fill-opacity="0.15" stroke="#f38020"/>
+              <text x="385" y="178" fill="#fdba74" font-size="10.5" font-weight="700">originRequest.access 검증</text>
+              <text x="385" y="193" fill="#cbd5e1" font-size="9.5">JWKS 캐시 + AUD Tag 서명 검사</text>
+              <rect x="375" y="210" width="200" height="32" rx="4" fill="#0f172a"/>
+              <text x="385" y="230" fill="#38bdf8" font-size="10.5">→ Forward to 127.0.0.1:18080/1</text>
+              <text x="375" y="268" fill="#10b981" font-size="10" font-weight="600">✓ 검증 완료 트래픽만 전송</text>
+            </g>
+
+            <!-- Loopback Arrow -->
+            <path d="M 600 170 L 635 170" stroke="#10b981" stroke-width="3"/>
+            <polygon points="635,165 645,170 635,175" fill="#10b981"/>
+            <text x="598" y="155" fill="#34d399" font-size="9.5" font-weight="700">Loopback</text>
+            <text x="602" y="195" fill="#94a3b8" font-size="9">127.0.0.1</text>
+
+            <!-- Sub-container 2: Envoy Proxy -->
+            <g class="flow-node" data-info="<strong>Envoy Proxy 컨테이너</strong><br/>- loopback 전용 리스너 바인딩<br/>- HTTPRoute의 모든 L7 헤더/메서드/가중치 완벽 처리<br/>- 클러스터 내 Core Service로 최종 라우팅">
+              <rect x="655" y="75" width="220" height="215" rx="8" fill="#1e293b" stroke="#326ce5" stroke-width="2"/>
+              <text x="670" y="102" fill="#60a5fa" font-size="13" font-weight="700">Container 2: Envoy L7</text>
+              <text x="670" y="125" fill="#94a3b8" font-size="11">• Loopback Listener (:18080/1)</text>
+              <rect x="670" y="140" width="190" height="60" rx="4" fill="#326ce5" fill-opacity="0.15" stroke="#326ce5"/>
+              <text x="678" y="160" fill="#93c5fd" font-size="10.5" font-weight="700">L7 Route Engine</text>
+              <text x="678" y="176" fill="#cbd5e1" font-size="9.5">• Exact/Prefix/Method Match</text>
+              <text x="678" y="191" fill="#cbd5e1" font-size="9.5">• 90:10 Weighted Clusters</text>
+              <rect x="670" y="210" width="190" height="35" rx="4" fill="#0f172a"/>
+              <text x="678" y="232" fill="#34d399" font-size="10">→ Pod IP / ClusterIP Service</text>
+              <text x="670" y="268" fill="#60a5fa" font-size="10" font-weight="600">✓ GatewayHTTP Profile 달성</text>
+            </g>
+          </svg>
+        </div>
+      </section>
+
+      <!-- Section 3: Architecture & Traffic Flows -->
+      <section id="architecture" class="section">
+        <div class="section-header">
+          <div class="section-tag">Interactive Architecture</div>
+          <h2 class="section-title">트래픽 흐름 & 보안 경계 시각화</h2>
+          <p class="section-desc">퍼블릭 인터넷 인그레스와 WARP 사설 네트워크 인그레스의 완전히 분리된 데이터 경로를 대조합니다.</p>
+        </div>
+
+        <div class="diagram-container">
+          <div class="diagram-header">
+            <div class="diagram-title">
+              <span>🔀 트래픽 모드 선택:</span>
+            </div>
+            <div class="diagram-controls">
+              <button class="diagram-tab-btn flow-switcher-btn active" data-flow="public">🌐 Public Ingress (Edge TLS + Origin JWT)</button>
+              <button class="diagram-tab-btn flow-switcher-btn" data-flow="private">🔒 Private WARP Ingress (Synthetic DNS + Sidecar)</button>
+            </div>
+          </div>
+
+          <!-- Public Flow Diagram -->
+          <div class="flow-diagram-view" data-flow="public">
+            <svg class="svg-diagram" viewBox="0 0 940 380" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect width="940" height="380" rx="12" fill="#0b0f19"/>
+              
+              <!-- External Eyeball -->
+              <g class="flow-node" data-info="<strong>사용자 브라우저 / 클라이언트</strong><br/>HTTPS 요청: app.example.com">
+                <rect x="20" y="150" width="120" height="80" rx="8" fill="#1f293d" stroke="#64748b"/>
+                <text x="45" y="185" fill="#f8fafc" font-size="12" font-weight="700">Client</text>
+                <text x="32" y="205" fill="#94a3b8" font-size="10">HTTPS Request</text>
+              </g>
+
+              <path d="M 145 190 L 195 190" stroke="#f38020" stroke-width="2"/>
+              <polygon points="195,185 205,190 195,195" fill="#f38020"/>
+
+              <!-- Cloudflare Edge Zone -->
+              <rect x="210" y="40" width="260" height="300" rx="10" fill="#1e1b18" stroke="#f38020" stroke-width="2"/>
+              <text x="230" y="70" fill="#fb923c" font-size="14" font-weight="800">Cloudflare Edge (Global Anycast)</text>
+
+              <rect x="230" y="90" width="220" height="48" rx="6" fill="#291e13" stroke="#f38020"/>
+              <text x="245" y="112" fill="#fdba74" font-size="11" font-weight="700">1. Edge TLS Termination</text>
+              <text x="245" y="128" fill="#94a3b8" font-size="10">Universal SSL (Apex/Subdomain)</text>
+
+              <rect x="230" y="150" width="220" height="70" rx="6" fill="#291e13" stroke="#f38020"/>
+              <text x="245" y="172" fill="#fdba74" font-size="11" font-weight="700">2. Access Policy Evaluation</text>
+              <text x="245" y="190" fill="#cbd5e1" font-size="10">• 구성된 IdP + 개발자 그룹</text>
+              <text x="245" y="206" fill="#cbd5e1" font-size="10">• WARP Device Posture 검증</text>
+
+              <rect x="230" y="235" width="220" height="55" rx="6" fill="#291e13" stroke="#f38020"/>
+              <text x="245" y="258" fill="#fdba74" font-size="11" font-weight="700">3. JWT Token Minting</text>
+              <text x="245" y="275" fill="#cbd5e1" font-size="9.5">Header: Cf-Access-Jwt-Assertion (RS256)</text>
+
+              <!-- Outbound Tunnel Arrow -->
+              <path d="M 475 190 L 525 190" stroke="#f38020" stroke-width="3"/>
+              <polygon points="525,184 537,190 525,196" fill="#f38020"/>
+              <text x="475" y="175" fill="#fb923c" font-size="10" font-weight="700">QUIC Tunnel</text>
+
+              <!-- Kubernetes Cluster Pod Boundary -->
+              <rect x="540" y="40" width="380" height="300" rx="10" fill="#0e1726" stroke="#326ce5" stroke-width="2"/>
+              <text x="560" y="70" fill="#60a5fa" font-size="14" font-weight="800">Gateway DataPlane Pod (127.0.0.1)</text>
+
+              <!-- cloudflared container -->
+              <rect x="560" y="90" width="165" height="230" rx="6" fill="#172554" stroke="#3b82f6"/>
+              <text x="572" y="115" fill="#93c5fd" font-size="12" font-weight="700">cloudflared</text>
+              <rect x="570" y="130" width="145" height="65" rx="4" fill="#1e3a8a"/>
+              <text x="578" y="148" fill="#f59e0b" font-size="10" font-weight="700">originRequest.access</text>
+              <text x="578" y="164" fill="#cbd5e1" font-size="9">✓ teamName 매치</text>
+              <text x="578" y="178" fill="#cbd5e1" font-size="9">✓ audTag 일치 확인</text>
+              <text x="578" y="190" fill="#cbd5e1" font-size="9">✗ 불일치 시 403 차단</text>
+
+              <rect x="570" y="205" width="145" height="50" rx="4" fill="#0f172a"/>
+              <text x="578" y="224" fill="#38bdf8" font-size="9.5">Loopback Forward:</text>
+              <text x="578" y="240" fill="#a5f3fc" font-size="9">→ 127.0.0.1:18081</text>
+
+              <!-- Loopback Bridge -->
+              <path d="M 730 225 L 755 225" stroke="#10b981" stroke-width="2"/>
+              <polygon points="755,221 763,225 755,229" fill="#10b981"/>
+
+              <!-- Envoy container -->
+              <rect x="765" y="90" width="140" height="230" rx="6" fill="#1e293b" stroke="#10b981"/>
+              <text x="778" y="115" fill="#6ee7b7" font-size="12" font-weight="700">Envoy Proxy</text>
+              <rect x="775" y="130" width="120" height="70" rx="4" fill="#0f172a"/>
+              <text x="782" y="148" fill="#94a3b8" font-size="9.5">Listener: 18081</text>
+              <text x="782" y="164" fill="#34d399" font-size="9.5">HTTPRoute Match</text>
+              <text x="782" y="180" fill="#cbd5e1" font-size="9">• /admin Prefix</text>
+              <text x="782" y="194" fill="#cbd5e1" font-size="9">• Timeouts</text>
+
+              <rect x="775" y="215" width="120" height="40" rx="4" fill="#064e3b"/>
+              <text x="782" y="232" fill="#a7f3d0" font-size="9" font-weight="700">Out to Service:</text>
+              <text x="782" y="246" fill="#ffffff" font-size="9">demo:9090</text>
+            </svg>
+          </div>
+
+          <!-- Private WARP Flow Diagram -->
+          <div class="flow-diagram-view" data-flow="private" style="display: none;">
+            <svg class="svg-diagram" viewBox="0 0 940 390" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect width="940" height="390" rx="12" fill="#0b0f19"/>
+              
+              <!-- WARP Client -->
+              <g class="flow-node" data-info="<strong>WARP 등록 엔드포인트 기기</strong><br/>사설 도메인 admin.internal.example 질의 및 통신">
+                <rect x="15" y="140" width="130" height="90" rx="8" fill="#1e293b" stroke="#f59e0b"/>
+                <text x="35" y="170" fill="#fde68a" font-size="12" font-weight="700">WARP Client</text>
+                <text x="25" y="190" fill="#cbd5e1" font-size="9.5">1. DNS: admin.internal.example</text>
+                <text x="25" y="206" fill="#cbd5e1" font-size="9.5">2. TCP to Synthetic IP</text>
+              </g>
+
+              <path d="M 150 185 L 190 185" stroke="#f59e0b" stroke-width="2"/>
+              <polygon points="190,180 200,185 190,190" fill="#f59e0b"/>
+
+              <!-- Zero Trust Gateway Edge -->
+              <rect x="205" y="30" width="270" height="325" rx="10" fill="#261a0e" stroke="#f59e0b" stroke-width="2"/>
+              <text x="220" y="60" fill="#fcd34d" font-size="13.5" font-weight="800">Cloudflare Gateway Edge (DNS/L4)</text>
+
+              <rect x="220" y="80" width="240" height="60" rx="6" fill="#1a120b" stroke="#f59e0b"/>
+              <text x="232" y="102" fill="#fbbf24" font-size="11" font-weight="700">Step A: Synthetic DNS Response</text>
+              <text x="232" y="120" fill="#cbd5e1" font-size="9.5">클라이언트에 가상 IP 반환:</text>
+              <text x="232" y="133" fill="#fef08a" font-size="9.5" font-family="monospace">172.64.128.0/20 (or IPv6)</text>
+
+              <rect x="220" y="150" width="240" height="75" rx="6" fill="#1a120b" stroke="#f59e0b"/>
+              <text x="232" y="172" fill="#fbbf24" font-size="11" font-weight="700">Step B: Virtual DNS Origin 질의</text>
+              <text x="232" y="190" fill="#cbd5e1" font-size="9.5">Tunnel Virtual DNS(2606:4700::1:53)로</text>
+              <text x="232" y="204" fill="#cbd5e1" font-size="9.5">도메인의 실제 오리진 IP 확인 요청</text>
+              <text x="232" y="217" fill="#a7f3d0" font-size="9.5">→ 응답 127.0.0.1 수신</text>
+
+              <rect x="220" y="235" width="240" height="65" rx="6" fill="#1a120b" stroke="#f59e0b"/>
+              <text x="232" y="256" fill="#fbbf24" font-size="11" font-weight="700">Step C: L4 Packet Rewrite</text>
+              <text x="232" y="272" fill="#cbd5e1" font-size="9.5">목적지 주소를 127.0.0.1:18443으로 변환</text>
+              <text x="232" y="286" fill="#cbd5e1" font-size="9.5">warp-routing L4 스트림으로 전달</text>
+
+              <!-- Tunnel Connection -->
+              <path d="M 480 200 L 525 200" stroke="#f59e0b" stroke-width="2.5"/>
+              <polygon points="525,195 535,200 525,205" fill="#f59e0b"/>
+              <text x="480" y="185" fill="#fde68a" font-size="10" font-weight="700">L4 Tunnel</text>
+
+              <!-- Pod Architecture for Private -->
+              <rect x="540" y="30" width="385" height="325" rx="10" fill="#0e1726" stroke="#326ce5" stroke-width="2"/>
+              <text x="555" y="58" fill="#60a5fa" font-size="13.5" font-weight="800">Gateway DataPlane Pod (Sidecar DNS Architecture)</text>
+
+              <!-- DNS Sidecar -->
+              <rect x="555" y="75" width="180" height="75" rx="6" fill="#1e293b" stroke="#38bdf8"/>
+              <text x="568" y="98" fill="#7dd3fc" font-size="11" font-weight="700">Container 3: DNS Sidecar</text>
+              <text x="568" y="116" fill="#cbd5e1" font-size="9.5">CoreDNS (127.0.0.1:53)</text>
+              <text x="568" y="130" fill="#cbd5e1" font-size="9.5">admin.internal.example → 127.0.0.1 응답</text>
+              <text x="568" y="143" fill="#94a3b8" font-size="8.5">나머지는 kube-dns로 포워딩</text>
+
+              <!-- cloudflared -->
+              <rect x="555" y="160" width="180" height="95" rx="6" fill="#172554" stroke="#3b82f6"/>
+              <text x="568" y="182" fill="#93c5fd" font-size="11" font-weight="700">Container 1: cloudflared</text>
+              <text x="568" y="198" fill="#fde68a" font-size="9">TUNNEL_DNS_RESOLVER_ADDRS</text>
+              <text x="568" y="210" fill="#fde68a" font-size="8.5">= 127.0.0.1:53</text>
+              <text x="568" y="226" fill="#cbd5e1" font-size="9">• net.Dialer: 127.0.0.1:18443</text>
+              <text x="568" y="240" fill="#cbd5e1" font-size="9">• L4 Direct Dial (No JWT Middle)</text>
+
+              <!-- Envoy TLS Listener -->
+              <rect x="750" y="75" width="160" height="260" rx="6" fill="#1e293b" stroke="#10b981"/>
+              <text x="762" y="100" fill="#6ee7b7" font-size="11.5" font-weight="700">Container 2: Envoy</text>
+              <rect x="760" y="115" width="140" height="95" rx="4" fill="#0f172a"/>
+              <text x="768" y="135" fill="#34d399" font-size="10" font-weight="700">Private TLS Listener</text>
+              <text x="768" y="152" fill="#cbd5e1" font-size="9">Port: 18443</text>
+              <text x="768" y="168" fill="#60a5fa" font-size="9">TLS 종료 (certificateRefs)</text>
+              <text x="768" y="184" fill="#f59e0b" font-size="9">jwt_authn 필터 실행</text>
+              <text x="768" y="198" fill="#94a3b8" font-size="8.5">(Gateway TLS Decrypt 시)</text>
+
+              <rect x="760" y="220" width="140" height="40" rx="4" fill="#064e3b"/>
+              <text x="768" y="237" fill="#a7f3d0" font-size="9" font-weight="700">Backend Forward:</text>
+              <text x="768" y="250" fill="#ffffff" font-size="9">demo:9090</text>
+            </svg>
+          </div>
+        </div>
+
+        <!-- Visual Diagram 4: In-Pod Security Boundary -->
+        <div class="card" style="margin-top: 24px;">
+          <h3 style="margin-bottom: 8px;">🛡️ Pod 내부 보안 경계 및 포트 바인딩 구조</h3>
+          <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 16px;">
+            클러스터 내부 워크로드나 다른 파드가 cloudflared의 JWT 검증을 우회하여 Envoy 프록시로 직접 접근하지 못하도록, Envoy와 DNS 사이드카의 모든 데이터 리스너는 <code>127.0.0.1</code>에만 엄격히 바인딩됩니다.
+          </p>
+
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>컴포넌트</th>
+                  <th>포트</th>
+                  <th>바인딩 IP</th>
+                  <th>보안 경계 및 역할</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>cloudflared</code> 관측 포트</td>
+                  <td><code>20241</code></td>
+                  <td><code>0.0.0.0</code> (Pod IP)</td>
+                  <td>쿠버네티스 <code>/ready</code> 프로브 및 Prometheus <code>/metrics</code> 스크랩 전용</td>
+                </tr>
+                <tr>
+                  <td><code>cloudflared</code> DNS Resolver</td>
+                  <td><code>53 (UDP/TCP)</code></td>
+                  <td><code>127.0.0.1</code></td>
+                  <td>Edge의 Virtual DNS 질의를 Pod 내 CoreDNS 사이드카로만 라우팅</td>
+                </tr>
+                <tr>
+                  <td><code>Envoy</code> Public Listener</td>
+                  <td><code>18080</code></td>
+                  <td><code>127.0.0.1</code></td>
+                  <td>Public 경로 트래픽 전용 (어떤 Access 인증 대상도 도달 불가)</td>
+                </tr>
+                <tr>
+                  <td><code>Envoy</code> Protected Listener</td>
+                  <td><code>18081..N</code></td>
+                  <td><code>127.0.0.1</code></td>
+                  <td>JWT 검증이 성공한 보호 도메인 전용 (보호 영역별 격리 리스너)</td>
+                </tr>
+                <tr>
+                  <td><code>Envoy</code> Private TLS Listener</td>
+                  <td><code>18443</code></td>
+                  <td><code>127.0.0.1</code></td>
+                  <td>WARP 사설망 인그레스 전용 리스너 (Envoy 직접 TLS 종료 + jwt_authn)</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 4: Gateway API Contract -->
+      <section id="gateway-api" class="section">
+        <div class="section-header">
+          <div class="section-tag">Specification & Standards</div>
+          <h2 class="section-title">Gateway API 매핑 계약 & Conformance</h2>
+          <p class="section-desc">쿠버네티스 Gateway API v1.6.2 표준 규격을 충실히 준수하며 비지원 필드를 처리하는 계약입니다.</p>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3 style="margin-bottom: 12px;">Gateway 및 Listener 매핑 규칙</h3>
+            <ul style="padding-left: 20px; color: var(--text-secondary); font-size: 0.9rem; line-height: 1.7;">
+              <li><strong>1 Gateway : 1 Tunnel :</strong> <code>Gateway.spec.infrastructure.parametersRef</code>로 <code>CloudflareTunnel</code> CR을 바인딩합니다. 생략 시 동일 이름의 Tunnel이 자동 생성됩니다.</li>
+              <li><strong>Hostname 필수 :</strong> Edge 및 WARP 라우팅 특성상 리스너의 <code>hostname</code> 지정은 필수입니다 (생략 시 <code>Accepted=False/UnsupportedValue</code>).</li>
+              <li><strong>Public TLS 모드 :</strong> Public 리스너는 Cloudflare Universal SSL이 Edge에서 종료되므로 <code>tls.certificateRefs</code>를 지정하면 안 됩니다 (지정 시 <code>UnsupportedValue</code>).</li>
+              <li><strong>Private TLS 모드 :</strong> Private 리스너는 Envoy가 직접 TLS를 종료하므로 <code>certificateRefs</code>가 필수입니다.</li>
+              <li><strong>주소 공개 (status.addresses) :</strong> Public 리스너가 1개 이상 존재할 경우 <code>[{type: Hostname, value: &lt;tunnel-id&gt;.cfargotunnel.com}]</code>을 게시합니다.</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3 style="margin-bottom: 12px;">표준 기능 지원 범위 (Conformance Profile)</h3>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>기능 분류</th>
+                    <th>상태</th>
+                    <th>지원 항목</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>Core Features</strong></td>
+                    <td><span class="badge badge-green">완전 지원</span></td>
+                    <td>HTTPRoute 경로/헤더 매칭, 가중치 분할, 리다이렉트, HeaderModifier</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Extended (L7)</strong></td>
+                    <td><span class="badge badge-green">완전 지원</span></td>
+                    <td>HostRewrite, PathRewrite, CORS, QueryParamMatching, MethodMatching</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Extended (TLS)</strong></td>
+                    <td><span class="badge badge-green">완전 지원</span></td>
+                    <td>BackendTLSPolicy (Upstream Pod TLS 검증 및 SAN 검사)</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Experimental</strong></td>
+                    <td><span class="badge badge-amber">v1 미지원</span></td>
+                    <td>HTTPRouteRetry, sessionPersistence (UnsupportedValue 처리)</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 5: Security & Zero Trust -->
+      <section id="security" class="section">
+        <div class="section-header">
+          <div class="section-tag">Zero Trust Security</div>
+          <h2 class="section-title">보안 불변식 & Fail-Closed 설계</h2>
+          <p class="section-desc">운영자의 실수나 CRD 삭제 시에도 트래픽이 절대 무방비로 외부에 노출되지 않도록 하는 방어 체계입니다.</p>
+        </div>
+
+        <div class="callout callout-danger">
+          <div class="callout-title">🚨 보안 핵심 불변식: 정책 삭제 ≠ 퍼블릭 전환</div>
+          <p>
+            기존에 <code>AccessApplication</code>으로 보호되던 호스트명의 CRD가 삭제되더라도 라우트가 자동으로 퍼블릭으로 열리지 않습니다. 플랫폼 운영자가 <code>CloudflareAccount.spec.grants[].unprotectedHostnames</code>에 해당 호스트명을 명시적으로 등록하지 않은 한, cloudflared는 즉시 <code>http_status:403</code> 규칙을 적용하여 모든 외부 요청을 차단합니다.
+          </p>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Fail-Closed Ingress</span>
+              <span class="badge badge-orange">Edge + Origin</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.88rem;">
+              Access Application의 <code>aud</code>가 발급되기 전까지는 트래픽 포워딩을 시작하지 않습니다. AUD 변경 시에도 구/신 토큰 동시 허용 없이 block-first(403) 원칙을 적용합니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">루프백 리스너 분리</span>
+              <span class="badge badge-blue">Anti-Traversal</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.88rem;">
+              동일 호스트명에서 <code>/admin</code>(보호)과 <code>/v1</code>(공개)이 공존할 때, 공개 리스너에는 애초에 <code>/admin</code> 라우트가 존재하지 않습니다. 따라서 <code>/v1/../admin</code> 같은 경로 탐색 우회가 원천 차단됩니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">플랫폼 승인 경계 (Grants)</span>
+              <span class="badge badge-purple">Multi-Tenancy</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.88rem;">
+              테넌트는 자신이 속한 네임스페이스에 할당된 <code>grants</code> 범위(호스트명 패턴, 존, 백엔드 네임스페이스) 내에서만 리소스를 선언할 수 있으며, 타 테넌트 자원을 침범할 수 없습니다.
+            </p>
+          </div>
+        </div>
+        <!-- Visual Diagram: Fail-Closed State Machine -->
+        <div class="diagram-container" style="margin-top: 28px;">
+          <div class="diagram-header">
+            <span class="diagram-title">🛡️ 다이어그램 3: Fail-Closed 라우트 보호 생명주기 (State Transitions)</span>
+            <span class="badge badge-orange">State Machine</span>
+          </div>
+
+          <svg class="svg-diagram" viewBox="0 0 920 220" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="920" height="220" rx="10" fill="#0b0f19"/>
+
+            <!-- State 1: Route Created -->
+            <g class="flow-node" data-info="<strong>1. 라우트 생성 (Route Created)</strong><br/>HTTPRoute가 Gateway 리스너에 바인딩되었으나, Access 정책 검증 전 단계.">
+              <rect x="25" y="45" width="150" height="60" rx="6" fill="#1e293b" stroke="#64748b"/>
+              <text x="40" y="70" fill="#f8fafc" font-size="11.5" font-weight="700">1. Route Created</text>
+              <text x="40" y="88" fill="#94a3b8" font-size="9.5">Pending Access Policy</text>
+            </g>
+
+            <path d="M 175 75 L 215 75" stroke="#f59e0b" stroke-width="2"/>
+            <polygon points="215,71 223,75 215,79" fill="#f59e0b"/>
+
+            <!-- State 2: Block-First / AUD Wait -->
+            <g class="flow-node" data-info="<strong>2. Block-First 대기 (Fail-Closed)</strong><br/>cloudflared 인그레스 규칙은 403 차단 상태 유지. Edge Access Application이 생성되고 AUD가 발급될 때까지 트래픽 진입 차단.">
+              <rect x="225" y="45" width="175" height="60" rx="6" fill="#451a03" stroke="#f59e0b" stroke-width="2"/>
+              <text x="240" y="68" fill="#fde68a" font-size="11.5" font-weight="700">2. AUD 대기 (403 Block)</text>
+              <text x="240" y="86" fill="#fdba74" font-size="9.5">Programmed=False/Pending</text>
+              <text x="240" y="98" fill="#cbd5e1" font-size="8.5">Ingress: http_status:403</text>
+            </g>
+
+            <path d="M 400 75 L 440 75" stroke="#10b981" stroke-width="2"/>
+            <polygon points="440,71 448,75 440,79" fill="#10b981"/>
+            <text x="405" y="65" fill="#34d399" font-size="8.5" font-weight="700">AUD 발급</text>
+
+            <!-- State 3: Active & Protected -->
+            <g class="flow-node" data-info="<strong>3. 정상 보호 상태 (Active & Protected)</strong><br/>cloudflared per-ingress JWT 미들웨어에 AUD 및 teamName 주입 완료. Envoy 루프백 리스너 활성화 및 프로브 통과.">
+              <rect x="450" y="45" width="185" height="60" rx="6" fill="#064e3b" stroke="#10b981" stroke-width="2"/>
+              <text x="465" y="68" fill="#a7f3d0" font-size="11.5" font-weight="700">3. Active & Protected</text>
+              <text x="465" y="86" fill="#cbd5e1" font-size="9.5">Programmed=True</text>
+              <text x="465" y="98" fill="#34d399" font-size="8.5">originRequest.access: ON</text>
+            </g>
+
+            <!-- Branch on Delete -->
+            <path d="M 542 105 L 542 155" stroke="#ef4444" stroke-width="2"/>
+            <polygon points="538,155 542,163 546,155" fill="#ef4444"/>
+            <text x="550" y="135" fill="#fca5a5" font-size="9.5" font-weight="700">AccessApplication 삭제 발생!</text>
+
+            <!-- State 4: Decision Check -->
+            <g class="flow-node" data-info="<strong>플랫폼 그랜트 검증</strong><br/>삭제 후 자동으로 열리지 않고, 플랫폼의 unprotectedHostnames 목록에 있는지 검증.">
+              <rect x="445" y="165" width="195" height="45" rx="6" fill="#1e293b" stroke="#ef4444"/>
+              <text x="460" y="185" fill="#f87171" font-size="10.5" font-weight="700">플랫폼 승인 검사 (Grants Check)</text>
+              <text x="460" y="198" fill="#cbd5e1" font-size="8.5">unprotectedHostnames 매치 여부</text>
+            </g>
+
+            <!-- Path A: Not Granted -> Block -->
+            <path d="M 445 187 L 340 187" stroke="#ef4444" stroke-width="2"/>
+            <polygon points="340,183 332,187 340,191" fill="#ef4444"/>
+            <text x="350" y="178" fill="#fca5a5" font-size="8.5" font-weight="700">미승인 (Default)</text>
+
+            <g class="flow-node" data-info="<strong>영구 차단 유지 (Fail-Closed)</strong><br/>호스트명이 퍼블릭으로 노출되지 않고 403 차단 상태로 격리 유지.">
+              <rect x="170" y="165" width="160" height="45" rx="6" fill="#7f1d1d" stroke="#ef4444" stroke-width="1.5"/>
+              <text x="185" y="184" fill="#fecaca" font-size="10.5" font-weight="700">⛔ 403 영구 차단 유지</text>
+              <text x="185" y="198" fill="#cbd5e1" font-size="8.5">Fail-Closed 방어 발동</text>
+            </g>
+
+            <!-- Path B: Granted -> Public -->
+            <path d="M 640 187 L 720 187" stroke="#10b981" stroke-width="2"/>
+            <polygon points="720,183 728,187 720,191" fill="#10b981"/>
+            <text x="648" y="178" fill="#34d399" font-size="8.5" font-weight="700">플랫폼 승인 완료</text>
+
+            <g class="flow-node" data-info="<strong>명시적 공개 전환</strong><br/>플랫폼 운영자가 의도적으로 공개를 허가한 경우에만 퍼블릭 라우트로 전환.">
+              <rect x="730" y="165" width="165" height="45" rx="6" fill="#14532d" stroke="#10b981"/>
+              <text x="745" y="184" fill="#bbf7d0" font-size="10.5" font-weight="700">✓ 공인 퍼블릭 전환</text>
+              <text x="745" y="198" fill="#cbd5e1" font-size="8.5">의도된 Public Ingress</text>
+            </g>
+          </svg>
+        </div>
+      </section>
+
+      <!-- Section 6: Complete CRD Catalog -->
+      <section id="crd-catalog" class="section">
+        <div class="section-header">
+          <div class="section-tag">CRD Reference</div>
+          <h2 class="section-title">Flareway CRD 22종 전체 카탈로그</h2>
+          <p class="section-desc">API Group: <code>flareway.bhyoo.com/v1alpha1</code>. 아래 표는 제공되는 모든 Kind를 나열하며, 탭은 핵심 리소스의 소유권과 사용법을 설명합니다.</p>
+        </div>
+        <div class="table-responsive" style="margin-bottom: 28px;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>영역</th>
+                <th>CRD Kinds</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Gateway 및 계정</td>
+                <td><code>GatewayClassConfig</code>, <code>CloudflareAccount</code>, <code>CloudflareTunnel</code></td>
+              </tr>
+              <tr>
+                <td>Access 애플리케이션</td>
+                <td><code>AccessApplication</code>, <code>AccessStandaloneApplication</code></td>
+              </tr>
+              <tr>
+                <td>Access 의존 리소스</td>
+                <td><code>AccessPolicy</code>, <code>AccessGroup</code>, <code>IdentityProvider</code>, <code>AccessCustomPage</code>, <code>DevicePostureRule</code>, <code>DevicePostureIntegration</code>, <code>AccessInfrastructureTarget</code>, <code>ServiceToken</code></td>
+              </tr>
+              <tr>
+                <td>사설 네트워크</td>
+                <td><code>VirtualNetwork</code>, <code>NetworkRoute</code>, <code>HostnameRoute</code>, <code>WARPConnector</code></td>
+              </tr>
+              <tr>
+                <td>디바이스 및 조직 설정</td>
+                <td><code>DeviceProfile</code>, <code>DeviceSettings</code>, <code>ZeroTrustOrganization</code>, <code>ZeroTrustGatewayPolicy</code>, <code>ZeroTrustList</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- Visual Diagram: CRD Hierarchy & Relationship Map -->
+        <div class="diagram-container" style="margin-bottom: 28px;">
+          <div class="diagram-header">
+            <span class="diagram-title">🗺️ 다이어그램 4: CRD 계층 구조 & 소유권 관계도 (Ownership & Relationships)</span>
+            <span class="badge badge-purple">Topology</span>
+          </div>
+
+          <svg class="svg-diagram" viewBox="0 0 940 330" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="940" height="330" rx="10" fill="#0b0f19"/>
+
+            <!-- Tier 1: Platform roots and account-scoped resources -->
+            <rect x="20" y="20" width="900" height="75" rx="8" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4 4"/>
+            <text x="35" y="42" fill="#a5b4fc" font-size="11.5" font-weight="700">Platform roots and account-scoped resources</text>
+
+            <rect x="35" y="52" width="165" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
+            <text x="45" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">CloudflareAccount</text>
+
+            <rect x="215" y="52" width="165" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
+            <text x="225" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">GatewayClassConfig</text>
+
+            <rect x="395" y="52" width="155" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
+            <text x="405" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">DeviceProfile</text>
+
+            <rect x="565" y="52" width="160" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
+            <text x="575" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">VirtualNetwork</text>
+
+            <rect x="740" y="52" width="165" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
+            <text x="750" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">DeviceSettings / Org</text>
+
+            <!-- Connectors Top to Middle/Bottom -->
+            <path d="M 115 84 L 115 130" stroke="#818cf8" stroke-width="1.5"/>
+            <path d="M 297 84 L 297 195" stroke="#818cf8" stroke-width="1.5"/>
+
+            <!-- Tier 2: Platform Namespace (Middle Left) -->
+            <rect x="20" y="115" width="430" height="70" rx="8" fill="#172554" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4 4"/>
+            <text x="35" y="135" fill="#93c5fd" font-size="11" font-weight="700">Platform Namespace: flareway-system (공유 정책 및 규칙)</text>
+
+            <rect x="35" y="145" width="125" height="30" rx="4" fill="#1e3a8a" stroke="#60a5fa"/>
+            <text x="45" y="164" fill="#dbeafe" font-size="10" font-weight="700">AccessPolicy</text>
+
+            <rect x="170" y="145" width="125" height="30" rx="4" fill="#1e3a8a" stroke="#60a5fa"/>
+            <text x="180" y="164" fill="#dbeafe" font-size="10" font-weight="700">AccessGroup</text>
+
+            <rect x="305" y="145" width="130" height="30" rx="4" fill="#1e3a8a" stroke="#60a5fa"/>
+            <text x="315" y="164" fill="#dbeafe" font-size="10" font-weight="700">DevicePosture</text>
+
+            <!-- Connector to Tenant Policy Reference -->
+            <path d="M 95 175 L 95 245" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3 3"/>
+            <polygon points="91,245 95,253 99,245" fill="#f59e0b"/>
+            <text x="102" y="215" fill="#fde68a" font-size="8.5">policyRefs</text>
+
+            <!-- Tier 3: Tenant Namespace (Bottom) -->
+            <rect x="20" y="205" width="900" height="105" rx="8" fill="#0f172a" stroke="#f38020" stroke-width="2"/>
+            <text x="35" y="225" fill="#fdba74" font-size="11.5" font-weight="700">Tenant Namespace: demo (서비스 개발자 워크로드 영역)</text>
+
+            <!-- Gateway -->
+            <rect x="215" y="240" width="165" height="55" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1.5"/>
+            <text x="230" y="260" fill="#38bdf8" font-size="11" font-weight="700">Gateway</text>
+            <text x="230" y="275" fill="#cbd5e1" font-size="8.5">spec.listeners[]</text>
+            <text x="230" y="287" fill="#94a3b8" font-size="8.5">name: admin / proxy</text>
+
+            <!-- Arrow: Gateway <-> CloudflareTunnel -->
+            <path d="M 380 267 L 440 267" stroke="#f38020" stroke-width="2"/>
+            <polygon points="440,263 448,267 440,271" fill="#f38020"/>
+            <polygon points="380,263 372,267 380,271" fill="#f38020"/>
+            <text x="388" y="258" fill="#f38020" font-size="8.5" font-weight="700">1:1 결합</text>
+
+            <!-- CloudflareTunnel -->
+            <rect x="450" y="240" width="170" height="55" rx="6" fill="#291e13" stroke="#f38020" stroke-width="2"/>
+            <text x="465" y="260" fill="#fb923c" font-size="11" font-weight="700">CloudflareTunnel</text>
+            <text x="465" y="275" fill="#fdba74" font-size="8.5">spec.dns.mode: Managed</text>
+            <text x="465" y="287" fill="#cbd5e1" font-size="8.5">listeners[].exposure</text>
+
+            <!-- Arrow: HTTPRoute to Gateway -->
+            <path d="M 685 267 L 620 267" stroke="#38bdf8" stroke-width="1.5"/>
+
+            <!-- HTTPRoute -->
+            <rect x="685" y="240" width="160" height="55" rx="6" fill="#1e293b" stroke="#38bdf8"/>
+            <text x="700" y="260" fill="#7dd3fc" font-size="11" font-weight="700">HTTPRoute</text>
+            <text x="700" y="275" fill="#cbd5e1" font-size="8.5">parentRefs: demo-gateway</text>
+            <text x="700" y="287" fill="#94a3b8" font-size="8.5">backendRefs: Service</text>
+
+            <!-- AccessApplication (Direct Policy) -->
+            <rect x="35" y="240" width="165" height="55" rx="6" fill="#451a03" stroke="#f59e0b" stroke-width="2"/>
+            <text x="45" y="260" fill="#fde68a" font-size="11" font-weight="700">AccessApplication</text>
+            <text x="45" y="275" fill="#fdba74" font-size="8.5">GEP-713 Direct Policy</text>
+            <text x="45" y="287" fill="#cbd5e1" font-size="8.5">targetRefs: Gateway/Route</text>
+
+            <!-- Arrow: AccessApp to Gateway -->
+            <path d="M 200 267 L 215 267" stroke="#f59e0b" stroke-width="2"/>
+            <polygon points="215,263 223,267 215,271" fill="#f59e0b"/>
+          </svg>
+        </div>
+
+        <div class="tabs-container">
+          <div class="tabs-nav">
+            <button class="tab-btn active" data-tab="tenant-crds">👤 테넌트 리소스 (App Namespaces)</button>
+            <button class="tab-btn" data-tab="platform-crds">🏢 플랫폼 인프라 & 계정 (Cluster / flareway-system)</button>
+            <button class="tab-btn" data-tab="warp-crds">🛡️ WARP 사설망 & 디바이스 관리</button>
+          </div>
+
+          <!-- Tenant CRDs Tab -->
+          <div class="tab-content active" data-tab="tenant-crds">
+            <div class="grid-2">
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>CloudflareTunnel</code></span>
+                  <span class="badge badge-blue">Namespaced</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway와 1:1로 결합되어 원격 터널 수명주기, cloudflared/Envoy Pod 배포, DNS 동기화 및 리스너 노출 경로를 관리합니다.
+                </p>
+                <div class="code-box">
+                  <div class="code-header"><span>CloudflareTunnel YAML 스키마 요약</span></div>
+                  <pre>apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata: {name: demo-gateway, namespace: demo}
+spec:
+  accountRef: {name: example-account}
+  dns: {mode: Managed}
+  listeners:
+    - {name: admin, exposure: Private}
+    - {name: proxy, exposure: Public}</pre>
+                </div>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>AccessApplication</code></span>
+                  <span class="badge badge-orange">GEP-713 Direct</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway 또는 HTTPRoute에 부착되는 Zero Trust 접근 제어 정책. Cloudflare Access App 생성 및 AUD 자동 획득을 수행합니다.
+                </p>
+                <div class="code-box">
+                  <div class="code-header"><span>AccessApplication YAML 스키마 요약</span></div>
+                  <pre>apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata: {name: demo-admin, namespace: demo}
+spec:
+  accountRef: {name: example-account}
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: demo-gateway, sectionName: admin}
+  application: {name: demo-admin, sessionDuration: 24h}
+  policies: [{policyRef: {name: allow-team-warp}}]
+  originJWT: {mode: Required}</pre>
+                </div>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>ServiceToken</code></span>
+                  <span class="badge badge-purple">Namespaced</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  기계 대 기계(M2M) 인증을 위한 Access Service Token을 발급받고 시크릿으로 안전하게 클러스터에 주입합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>AccessPolicy</code> (테넌트 참조)</span>
+                  <span class="badge badge-green">Namespaced</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  테넌트 자체 정책 정의 또는 플랫폼 네임스페이스의 표준 공유 정책(ObserveOnly)을 참조하여 재사용합니다.
+                </p>
+              </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>AccessStandaloneApplication</code> &amp; <code>AccessCustomPage</code></span>
+                  <span class="badge badge-orange">Access</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway 대상이 없는 SaaS, Bookmark, Infrastructure, App Launcher, WARP 등의 애플리케이션과 재사용 가능한 Access 사용자 페이지를 선언합니다.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Platform CRDs Tab -->
+          <div class="tab-content" data-tab="platform-crds">
+            <div class="grid-2">
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>CloudflareAccount</code></span>
+                  <span class="badge badge-purple">Cluster-Scoped</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  클라우드플레어 계정 ID, API 토큰 시크릿 참조, 그리고 각 테넌트 네임스페이스의 호스트명 및 기능 허가권(<code>grants</code>)을 정의합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>GatewayClassConfig</code></span>
+                  <span class="badge badge-purple">Cluster-Scoped</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  GatewayClass에서 참조하는 인프라 템플릿. 커넥터 이미지, 리소스 요청, Envoy 프록시 기본값, Conformance 모드를 설정합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>AccessGroup</code> & <code>IdentityProvider</code></span>
+                  <span class="badge badge-blue">Platform Shared</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Okta, Google Workspace, Azure AD 등의 IdP 연동과 개발자/운영자 Access 그룹을 클러스터 전역에서 관리합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>DevicePostureRule</code></span>
+                  <span class="badge badge-green">Platform Shared</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  WARP 클라이언트 연결 상태, 디스크 암호화, EDR(CrowdStrike 등) 검사를 요구하는 단말 보안 자세 규칙을 정의합니다.
+                </p>
+              </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>DevicePostureIntegration</code> &amp; <code>AccessInfrastructureTarget</code></span>
+                  <span class="badge badge-green">Platform Shared</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  외부 단말 보안 공급자 자격 증명은 Secret 참조로 연결하고, Infrastructure Access가 사용할 호스트명과 가상 네트워크별 IP를 등록합니다.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- WARP CRDs Tab -->
+          <div class="tab-content" data-tab="warp-crds">
+            <div class="grid-2">
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>DeviceProfile</code></span>
+                  <span class="badge badge-amber">Single-Writer Aggregator</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  WARP 클라이언트의 Split Tunnel (Include/Exclude)과 Fallback Domains를 전체 목록 교체 API에 맞춰 결정론적으로 집계 및 관리합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>VirtualNetwork</code> & <code>NetworkRoute</code></span>
+                  <span class="badge badge-blue">Private CIDRs</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  사설 네트워크 격리를 위한 VNet 정의 및 쿠버네티스 서비스 CIDR(예: 10.96.0.0/12)의 터널 사설 라우트를 등록합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>HostnameRoute</code></span>
+                  <span class="badge badge-green">Private Hostname (GA)</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  CIDR 없이 내부 사설 도메인(예: <code>admin.internal.example</code>)을 터널로 직접 라우팅하는 Cloudflare One의 신규 기능을 선언합니다.
+                </p>
+              </div>
+
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>ZeroTrustOrganization</code> & <code>DeviceSettings</code></span>
+                  <span class="badge badge-purple">Singleton</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  계정 전역의 구성 가능한 WARP 세션 타임아웃, 인증 도메인(auth_domain), 게이트웨이 프록시 활성화 플래그를 관리합니다.
+                </p>
+              </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>WARPConnector</code></span>
+                  <span class="badge badge-blue">Cloudflare Mesh</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway 데이터플레인과 분리된 WARP Connector를 관리합니다. <code>spec.name</code>의 앞뒤 공백은 제거하지만 대소문자는 구분하며, 이름 자체는 채택 키가 아닙니다. 같은 이름의 기존 커넥터나 대소문자만 다른 이름은 <code>externalRef.tunnelId</code>, <code>AdoptById</code>, 비어 있지 않은 정확한 <code>adoption.expect.name</code> 없이는 충돌합니다. 중단된 생성 복구는 원격 ID와 HA 기능까지 일치하는 컨트롤러 소유 status 체크포인트만 사용하며 사용자 어노테이션은 사용하지 않습니다.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 7: Annotations Policy -->
+      <section id="annotations" class="section">
+        <div class="section-header">
+          <div class="section-tag">Design Discipline</div>
+          <h2 class="section-title">Annotation 정책: 엄격한 Zero-Annotation</h2>
+          <p class="section-desc">Gateway API 리소스에서 어노테이션 남용을 배제하고 정책 부착(Policy Attachment) 표준을 고수합니다.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-bottom: 12px;">어노테이션 배제 이유와 대안 매핑</h3>
+          <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 18px;">
+            쿠버네티스 업스트림 Gateway API 가이드라인은 보안 및 라우팅 정책을 어노테이션으로 처리하는 것을 명시적으로 금지합니다. 어노테이션은 스키마 검증이 불가능하고, RBAC 권한 분리가 어려우며, 오타 발생 시 조용히 실패(silent fail-open)하는 치명적인 보안 결함이 있습니다.
+          </p>
+
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>기존 오퍼레이터들의 어노테이션 방식</th>
+                  <th>문제점</th>
+                  <th>Flareway의 표준 대안</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>cfgate.io/tunnel-ref: my-tunnel</code></td>
+                  <td>비표준 바인딩, 타임아웃/오타 시 묵시적 실패</td>
+                  <td><code>Gateway.spec.infrastructure.parametersRef</code></td>
+                </tr>
+                <tr>
+                  <td><code>cfgate.io/access-policy: allow-devs</code></td>
+                  <td>문자열 나열로 세부 옵션 및 다중 정책 조합 불가</td>
+                  <td><code>AccessApplication</code> CRD (GEP-713 Direct Policy)</td>
+                </tr>
+                <tr>
+                  <td><code>cfgate.io/origin-connect-timeout: 30s</code></td>
+                  <td>어노테이션 비대화 (Sprawl)</td>
+                  <td>표준 <code>HTTPRoute.spec.rules[].timeouts</code> 사용</td>
+                </tr>
+                <tr>
+                  <td><code>cfgate.io/origin-ssl-verify: false</code></td>
+                  <td>보안 정책 우회 위험</td>
+                  <td>표준 <code>BackendTLSPolicy</code>로 mTLS / CA 명시</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+
+      <!-- Section 8: Conformance & Verification -->
+      <section id="conformance" class="section">
+        <div class="section-header">
+          <div class="section-tag">Testing Strategy</div>
+          <h2 class="section-title">검증 및 Conformance 테스트 모델</h2>
+          <p class="section-desc">업스트림 표준 Conformance Suite와 Cloudflare Edge 실환경 E2E를 결합한 2단계 검증 접근법입니다.</p>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3 style="margin-bottom: 10px;">Phase 1: In-Cluster Conformance (공식 리포트)</h3>
+            <p style="color: var(--text-secondary); font-size: 0.88rem; line-height: 1.6;">
+              공식 Gateway API 테스트 러너는 임의의 호스트(<code>example.com</code> 등)로 패킷을 쏘기 때문에 DNS 존 검증을 거치는 Cloudflare Edge를 통과할 수 없습니다. 따라서 <code>conformanceMode: true</code>로 설정하여 클러스터 내부에서 Envoy 포트로 직접 공식 GatewayHTTP Core 프로파일 테스트를 완수하고 공식 적합성 리포트를 제출합니다.
+            </p>
+          </div>
+
+          <div class="card">
+            <h3 style="margin-bottom: 10px;">Phase 2: Cloudflare Edge E2E (실환경 검증)</h3>
+            <p style="color: var(--text-secondary); font-size: 0.88rem; line-height: 1.6;">
+              전용 Cloudflare 테스트 계정으로 Anycast DNS 생성, Universal SSL 인증서 발급, 구성된 ID 공급자의 로그인 및 차단 화면, 비인가 요청에 대한 JWT 위조 방어, WARP 사설 도메인 해석, 세션 만료 동작을 검증합니다.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 9: Decision Registry -->
+      <section id="decisions" class="section">
+        <div class="section-header">
+          <div class="section-tag">Governance & Registry</div>
+          <h2 class="section-title">의사결정 레지스트리 (Decision Registry)</h2>
+          <p class="section-desc">설계 과정에서 확정된 결정사항과 추가 검증이 필요한 잔여 과제를 정리합니다.</p>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>결정 ID</th>
+                <th>구분</th>
+                <th>주요 내용 및 판정</th>
+                <th>상태</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>U-1..U-3</code></td>
+                <td>설정 기본값</td>
+                <td>저장소 <code>docs/</code> 산출물, API Group <code>flareway.bhyoo.com</code>, WARP 심층 설계</td>
+                <td><span class="badge badge-green">확정</span></td>
+              </tr>
+              <tr>
+                <td><code>U-4</code></td>
+                <td>Conformance</td>
+                <td>2단계 검증 채택 (인클러스터 적합성 보고서 + Edge E2E 분리)</td>
+                <td><span class="badge badge-green">확정</span></td>
+              </tr>
+              <tr>
+                <td><code>U-5..U-7</code></td>
+                <td>CRD & DNS</td>
+                <td>혼합 명명(Account/Tunnel 접두어), 1:1 파라미터 바인딩, Tunnel.spec.dns 통합</td>
+                <td><span class="badge badge-green">확정</span></td>
+              </tr>
+              <tr>
+                <td><code>U-8..U-10</code></td>
+                <td>WARP 사설망</td>
+                <td>리스너 노출 모델 A, L4 사설 노출 포함, CoreDNS 사이드카 해석 채택</td>
+                <td><span class="badge badge-green">확정</span></td>
+              </tr>
+              <tr>
+                <td><code>D-08</code></td>
+                <td>세션 폐기 SLO</td>
+                <td>구성 가능한 장기 세션과 cloudflared의 stateless 검증 간 폐기 전파 지연 허용치</td>
+                <td><span class="badge badge-amber">정책 협의 필요</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Footer -->
+      <footer class="footer">
+        <div>
+          <strong>Flareway Operator Documentation</strong> — Cloudflare Networking & Zero Trust for Kubernetes
+        </div>
+        <div>
+          Generated from <code>docs/design/001-cloudflare-gateway-api-integration.md</code>
+        </div>
+      </footer>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,380 @@
+# Standalone Access application variants. Referenced policies, identity providers,
+# custom pages, and remote IDs are placeholders to replace before applying.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: saas-scim-credentials
+  namespace: default
+type: Opaque
+stringData:
+  clientSecret: replace-with-scim-oauth-client-secret
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: saas-oidc-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  zone: example.com
+  type: SaaS
+  application:
+    name: Example OIDC SaaS
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: true
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+    logoUrl: https://static.example.com/saas-logo.svg
+    scimConfig:
+      idpRef:
+        name: google
+      remoteUri: https://saas.example.com/scim/v2
+      authentication:
+        oauth2:
+          authorizationUrl: https://saas.example.com/oauth/authorize
+          clientId: replace-with-scim-client-id
+          clientSecretRef:
+            name: saas-scim-credentials
+            key: clientSecret
+          tokenUrl: https://saas.example.com/oauth/token
+          scopes:
+          - scim.write
+      deactivateOnDelete: true
+      enabled: true
+      mappings:
+      - schema: urn:ietf:params:scim:schemas:core:2.0:User
+        enabled: true
+        filter: active eq true
+        operations:
+          create: true
+          update: true
+          delete: true
+        strictness: Strict
+        transformJsonata: '$merge([$,{ "userName": email }])'
+    tags:
+    - example
+    - saas
+  policies:
+  - policyRef:
+      name: allow-employees
+  saas:
+    authType: OIDC
+    oidc:
+      accessTokenLifetime: 1h
+      allowPkceWithoutClientSecret: true
+      appLauncherUrl: https://saas.example.com/
+      customClaims:
+      - name: department
+        required: true
+        scope: Profile
+        source:
+          name: department
+      - name: groups
+        required: false
+        scope: Groups
+        source:
+          nameByIdp:
+          - idpRef:
+              name: google
+            sourceName: groups
+      grantTypes:
+      - AuthorizationCode
+      - AuthorizationCodeWithPKCE
+      - RefreshTokens
+      - Hybrid
+      - Implicit
+      groupFilterRegex: ^engineering-
+      hybridAndImplicitOptions:
+        returnAccessTokenFromAuthorizationEndpoint: true
+        returnIdTokenFromAuthorizationEndpoint: true
+      publicKey: replace-with-oidc-public-key
+      redirectUris:
+      - https://saas.example.com/oauth/callback
+      refreshTokenOptions:
+        lifetime: 30d
+      scopes:
+      - OpenID
+      - Email
+      - Profile
+      - Groups
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: saas-saml-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SaaS
+  application:
+    name: Example SAML SaaS
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: true
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-employees
+  saas:
+    authType: SAML
+    saml:
+      consumerServiceUrl: https://saml.example.com/saml/acs
+      customAttributes:
+      - friendlyName: Department
+        name: urn:example:claims:department
+        nameFormat: URI
+        required: true
+        source:
+          name: department
+      defaultRelayState: https://saml.example.com/home
+      idpEntityId: https://access.example.com/saml
+      nameIdFormat: Email
+      nameIdTransformJsonata: email
+      publicKey: replace-with-saml-public-key
+      samlAttributeTransformJsonata: '$merge([$,{ "department": department }])'
+      spEntityId: https://saml.example.com/metadata
+      ssoEndpoint: https://saml.example.com/saml/sso
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: bookmark-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: Bookmark
+  application:
+    name: Operations handbook
+    appLauncherVisible: true
+    logoUrl: https://static.example.com/handbook.svg
+    tags:
+    - documentation
+  policies:
+  - policyRef:
+      name: allow-employees
+  bookmark:
+    url: https://handbook.example.com/
+    logoUrl: https://static.example.com/handbook.svg
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: infrastructure-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: Infrastructure
+  application:
+    name: Private SSH
+  infrastructure:
+    targetCriteria:
+    - port: 22
+      protocol: SSH
+      targetAttributes:
+        environment:
+        - private
+        service:
+        - bastion
+    mfaConfig:
+      allowedAuthenticators:
+      - PIVKey
+      - SSHFIDO2Key
+      mfaDisabled: false
+      sessionDuration: 8h
+    policies:
+    - name: allow-private-ssh
+      decision: Allow
+      include:
+      - emailDomain:
+          domain: example.com
+      require:
+      - devicePosture:
+          ruleRef:
+            name: warp
+      exclude:
+      - geo:
+          countryCode: KP
+      connectionRules:
+        ssh:
+          usernames:
+          - ubuntu
+          - ec2-user
+          allowEmailAlias: false
+      mfaConfig:
+        allowedAuthenticators:
+        - SSHFIDO2Key
+        mfaDisabled: false
+        sessionDuration: 1h
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: app-launcher-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: AppLauncher
+  application:
+    sessionDuration: 24h
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    customDenyUrl: https://help.example.com/access-denied
+    customNonIdentityDenyUrl: https://help.example.com/service-auth-denied
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-employees
+  appLauncher:
+    appLauncherLogoUrl: https://static.example.com/launcher-logo.svg
+    backgroundColor: "#f8fafc"
+    headerBackgroundColor: "#0f172a"
+    landingPageDesign:
+      buttonColor: "#2563eb"
+      buttonTextColor: "#ffffff"
+      imageUrl: https://static.example.com/welcome.svg
+      message: Choose an application to continue.
+      title: Company applications
+    footerLinks:
+    - name: Help desk
+      url: https://help.example.com/
+    - name: Privacy
+      url: https://www.example.com/privacy
+    skipAppLauncherLoginPage: false
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: warp-enrollment-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: WARP
+  application:
+    sessionDuration: 24h
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-employees
+  warp: {}
+  externalRef:
+    applicationId: replace-with-existing-warp-enrollment-application-id
+  adoption:
+    mode: AdoptById
+    expect:
+      name: WARP enrollment
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: browser-isolation-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: BISO
+  application:
+    sessionDuration: 8h
+    allowedIdpRefs:
+    - name: google
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-employees
+  biso: {}
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: dashboard-sso-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: DashSSO
+  application:
+    name: Cloudflare dashboard SSO
+    sessionDuration: 8h
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+  policies:
+  - policyRef:
+      name: allow-administrators
+  dashSso:
+    domain: dashboard.example.com
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessStandaloneApplication
+metadata:
+  name: mcp-portal-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: MCPPortal
+  application:
+    name: MCP portal
+    sessionDuration: 8h
+    allowedIdpRefs:
+    - name: google
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  mcpPortal:
+    domain: mcp.example.com
+    destinations:
+    - type: ViaMCPServerPortal
+      viaMcpServerPortal:
+        mcpServerId: replace-with-mcp-server-id
+    - type: Worker
+      worker:
+        workerId: replace-with-worker-id
+    - type: PreviewWorker
+      previewWorker:
+        workerId: replace-with-preview-worker-id
+    - type: AllWorkers
+      allWorkers: {}
+    - type: AllPreviewWorkers
+      allPreviewWorkers: {}
+  managementPolicy: Managed
+  deletionPolicy: Orphan

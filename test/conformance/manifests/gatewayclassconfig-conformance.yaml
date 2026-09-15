@@ -1,0 +1,8 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: GatewayClassConfig
+metadata:
+  name: conformance
+spec:
+  conformanceMode: true
+  conformance:
+    serviceType: LoadBalancer

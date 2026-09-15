@@ -1,0 +1,7 @@
+# Version control and editor files
+.git/
+.gitignore
+.DS_Store
+*.swp
+*.tmp
+*.tgz

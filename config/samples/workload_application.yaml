@@ -1,0 +1,314 @@
+# Complete example for a protected application with public API carve-outs.
+# Flareway creates one child bypass Access application for each public path.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps
+  labels:
+    kubernetes.io/metadata.name: apps
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: workload-example-cloudflare-token
+  namespace: flareway-system
+type: Opaque
+stringData:
+  token: replace-with-a-scoped-cloudflare-api-token
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareAccount
+metadata:
+  name: workload-example-account
+spec:
+  accountId: "00000000000000000000000000000000"
+  credentials:
+    apiTokenSecretRef:
+      name: workload-example-cloudflare-token
+      namespace: flareway-system
+      key: token
+  grants:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: apps
+    hostnames:
+    - app.example.com
+    - admin.example.com
+    zones:
+    - example.com
+    exposures:
+    - Public
+    unprotectedHostnames:
+    - app.example.com
+    accessPolicyRefs: Allowed
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Denied
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: demo-app
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  tunnel:
+    name: flareway-example-demo-app
+  managementPolicy: Managed
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: flareway workload example
+  listeners:
+  - name: app
+    exposure: Public
+  - name: admin
+    exposure: Public
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: apps
+spec:
+  selector:
+    app.kubernetes.io/name: demo-app
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-app
+  namespace: apps
+spec:
+  gatewayClassName: flareway
+  infrastructure:
+    parametersRef:
+      group: flareway.bhyoo.com
+      kind: CloudflareTunnel
+      name: demo-app
+  listeners:
+  - name: app
+    hostname: app.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+  - name: admin
+    hostname: admin.example.com
+    port: 443
+    protocol: HTTPS
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-app
+  namespace: apps
+spec:
+  parentRefs:
+  - name: demo-app
+    sectionName: app
+  hostnames:
+  - app.example.com
+  rules:
+  - name: public-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: demo-app
+      port: 8080
+  - name: public-health
+    matches:
+    - path:
+        type: PathPrefix
+        value: /health
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: demo-app
+      port: 8080
+  - name: dashboard
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: demo-app
+      port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-admin
+  namespace: apps
+spec:
+  parentRefs:
+  - name: demo-app
+    sectionName: admin
+  hostnames:
+  - admin.example.com
+  rules:
+  - name: dashboard
+    timeouts:
+      request: 0s
+    backendRefs:
+    - name: demo-app
+      port: 8080
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: IdentityProvider
+metadata:
+  name: google
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  type: Google
+  name: Google
+  managementPolicy: ObserveOnly
+  externalRef:
+    idpId: "00000000-0000-0000-0000-000000000011"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: allow-developers-warp
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  name: allow-developers-warp
+  decision: Allow
+  include:
+  - emailDomain:
+      domain: example.com
+  require:
+  - devicePosture:
+      ruleRef:
+        externalId: "00000000-0000-0000-0000-000000000012"
+  sessionDuration: 720h
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000013"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: deny-everyone
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  name: deny-everyone
+  decision: Deny
+  include:
+  - everyone: {}
+  managementPolicy: ObserveOnly
+  externalRef:
+    policyId: "00000000-0000-0000-0000-000000000014"
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: demo-dashboard
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: demo-app
+    sectionName: dashboard
+  pathScope:
+    type: PathPrefix
+    value: /
+  application:
+    name: Demo dashboard
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  bypass:
+    children:
+    - hostname: app.example.com
+      path: /api
+      name: Demo public API
+      externalRef:
+        applicationId: replace-with-existing-bypass-application-id
+      adoption:
+        mode: AdoptById
+        expect:
+          name: Demo public API
+      deletionPolicy: Orphan
+    - hostname: app.example.com
+      path: /health
+      name: Demo health endpoint
+      deletionPolicy: Delete
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: demo-admin
+  namespace: apps
+spec:
+  accountRef:
+    name: workload-example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: demo-app
+    sectionName: admin
+  application:
+    name: Demo admin
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    skipInterstitial: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete

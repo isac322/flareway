@@ -1,0 +1,300 @@
+# Gateway-attached Access application variants. Object references and remote IDs
+# are examples; replace them before applying these manifests.
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: demo-admin
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: public
+    sectionName: web
+  application:
+    name: Demo application
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+    appLauncherVisible: true
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+    tags:
+    - example
+    - admin
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+    audienceScope: Application
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: browser-ssh-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SSH
+  ssh: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: infrastructure
+    sectionName: ssh
+  application:
+    name: Browser SSH
+    sessionDuration: 8h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: true
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: browser-vnc-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: VNC
+  vnc: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: infrastructure
+    sectionName: vnc
+  application:
+    name: Browser VNC
+    sessionDuration: 8h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: true
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: browser-rdp-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: RDP
+  rdp:
+    targetCriteria:
+    - port: 3389
+      protocol: RDP
+      targetAttributes:
+        environment:
+        - example
+        service:
+        - remote-desktop
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: infrastructure
+    sectionName: rdp
+  application:
+    name: Browser RDP
+    sessionDuration: 8h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: true
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: mcp-server-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: MCP
+  mcp: {}
+  destinations:
+  - type: ViaMCPServerPortal
+    viaMcpServerPortal:
+      mcpServerId: replace-with-mcp-server-id
+  application:
+    name: MCP server
+    sessionDuration: 8h
+    allowedIdpRefs:
+    - name: google
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+    oauthConfiguration:
+      enabled: true
+      dynamicClientRegistration:
+        enabled: true
+        allowAnyOnLocalhost: false
+        allowAnyOnLoopback: true
+        allowedUris:
+        - https://mcp-client.example.com/callback
+      grant:
+        accessTokenLifetime: 1h
+        sessionDuration: 8h
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: identity-proxy-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: ProxyEndpoint
+  proxyEndpoint: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: identity-proxy
+    sectionName: https
+  application:
+    name: Gateway identity proxy
+    sessionDuration: 8h
+    autoRedirectToIdentity: true
+    allowedIdpRefs:
+    - name: google
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+# Two Access applications share one hostname. Hostname audience scope makes the
+# origin accept every ready AUD compiled for analytics.example.com; no AUD or
+# application ID is embedded in the manifests.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: analytics
+  namespace: default
+spec:
+  gatewayClassName: flareway
+  listeners:
+  - name: http
+    hostname: analytics.example.com
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: analytics
+  namespace: default
+spec:
+  parentRefs:
+  - name: analytics
+    sectionName: http
+  hostnames:
+  - analytics.example.com
+  rules:
+  - name: analytics
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: analytics
+      port: 5000
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: analytics-ui
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: analytics
+    sectionName: http
+  application:
+    name: Analytics UI
+    sessionDuration: 8h
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  originJWT:
+    mode: Required
+    audienceScope: Hostname
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: analytics-reports
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: analytics
+    sectionName: analytics
+  pathScope:
+    type: PathPrefix
+    value: /api/reports
+  application:
+    name: Analytics reports API
+    sessionDuration: 1h
+  policies:
+  - policyRef:
+      name: allow-reporting-service
+  originJWT:
+    mode: Required
+    audienceScope: Hostname
+  managementPolicy: Managed
+  deletionPolicy: Delete

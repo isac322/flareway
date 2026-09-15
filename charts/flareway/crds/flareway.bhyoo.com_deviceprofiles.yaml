@@ -1,0 +1,893 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: deviceprofiles.flareway.bhyoo.com
+spec:
+  group: flareway.bhyoo.com
+  names:
+    categories:
+    - flareway
+    kind: DeviceProfile
+    listKind: DeviceProfileList
+    plural: deviceprofiles
+    shortNames:
+    - dprofile
+    singular: deviceprofile
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.profile.kind
+      name: Kind
+      type: string
+    - jsonPath: .status.profileId
+      name: Profile
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: DeviceProfile owns all mutable fields and whole lists for one
+          Cloudflare device profile.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: DeviceProfileSpec defines one aggregate writer for a remote
+              device profile.
+            properties:
+              accountRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              adoption:
+                default: {}
+                description: AdoptionSpec configures explicit adoption of an existing
+                  remote object.
+                properties:
+                  expect:
+                    description: AdoptionExpect declares remote attributes that must
+                      match before adoption.
+                    properties:
+                      domain:
+                        maxLength: 253
+                        type: string
+                      name:
+                        maxLength: 100
+                        type: string
+                    type: object
+                  mode:
+                    default: None
+                    description: AdoptionMode controls explicit adoption of a remote
+                      resource.
+                    enum:
+                    - None
+                    - AdoptById
+                    type: string
+                type: object
+              deletionPolicy:
+                default: Orphan
+                description: DeletionPolicy controls whether a managed remote resource
+                  is deleted or orphaned.
+                enum:
+                - Delete
+                - Orphan
+                type: string
+              dnsSearchSuffixes:
+                items:
+                  description: DeviceProfileDNSSearchSuffix is one search suffix pushed
+                    to WARP clients.
+                  properties:
+                    description:
+                      maxLength: 256
+                      type: string
+                    suffix:
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                  required:
+                  - suffix
+                  type: object
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: atomic
+              externalRef:
+                description: DeviceProfileExternalReference identifies an existing
+                  custom device profile.
+                properties:
+                  profileId:
+                    minLength: 1
+                    type: string
+                required:
+                - profileId
+                type: object
+              fallbackDomains:
+                description: DeviceProfileFallbackDomains contains statically owned
+                  fallback domains.
+                properties:
+                  static:
+                    items:
+                      description: DeviceProfileFallbackDomain bypasses Gateway DNS
+                        resolution for one suffix.
+                      properties:
+                        description:
+                          maxLength: 256
+                          type: string
+                        dnsServer:
+                          items:
+                            type: string
+                          maxItems: 16
+                          type: array
+                          x-kubernetes-list-type: set
+                        suffix:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                      - suffix
+                      type: object
+                    maxItems: 1000
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
+              managementPolicy:
+                default: ObserveOnly
+                description: ManagementPolicy controls whether Flareway mutates a
+                  remote resource.
+                enum:
+                - Managed
+                - ObserveOnly
+                type: string
+              profile:
+                description: DeviceProfileTarget selects and configures the remote
+                  profile.
+                properties:
+                  fields:
+                    description: |-
+                      DeviceProfileFields contains optional remote profile fields. Pointers preserve
+                      omission separately from explicit false, zero, and empty values.
+                    properties:
+                      allowModeSwitch:
+                        type: boolean
+                      allowUpdates:
+                        type: boolean
+                      allowedToLeave:
+                        type: boolean
+                      autoConnect:
+                        format: int64
+                        type: integer
+                      captivePortal:
+                        format: int64
+                        type: integer
+                      description:
+                        type: string
+                      disableAutoFallback:
+                        type: boolean
+                      enabled:
+                        type: boolean
+                      excludeOfficeIps:
+                        type: boolean
+                      lanAllowMinutes:
+                        format: int64
+                        type: integer
+                      lanAllowSubnetSize:
+                        format: int32
+                        type: integer
+                      name:
+                        type: string
+                      registerInterfaceIpWithDns:
+                        type: boolean
+                      sccmVpnBoundarySupport:
+                        type: boolean
+                      serviceModeV2:
+                        description: DeviceProfileServiceModeV2 configures the WARP
+                          client's service mode.
+                        properties:
+                          mode:
+                            description: DeviceProfileServiceMode selects the operating
+                              mode used by the WARP client.
+                            enum:
+                            - warp
+                            - 1.1.1.1
+                            - proxy
+                            - posture_only
+                            type: string
+                          port:
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                        required:
+                        - mode
+                        type: object
+                        x-kubernetes-validations:
+                        - message: port is required when mode is proxy
+                          rule: self.mode != 'proxy' || has(self.port)
+                        - message: port is only valid when mode is proxy
+                          rule: self.mode == 'proxy' || !has(self.port)
+                      supportUrl:
+                        type: string
+                      switchLocked:
+                        type: boolean
+                      tunnelProtocol:
+                        description: DeviceProfileTunnelProtocol selects the WARP
+                          tunnel transport.
+                        enum:
+                        - wireguard
+                        - masque
+                        type: string
+                      virtualNetworks:
+                        description: DeviceProfileVirtualNetworks configures virtual-network
+                          access by Kubernetes reference.
+                        properties:
+                          allowedRefs:
+                            items:
+                              description: |-
+                                LocalObjectReference contains enough information to let you locate the
+                                referenced object inside the same namespace.
+                              properties:
+                                name:
+                                  default: ""
+                                  description: |-
+                                    Name of the referent.
+                                    This field is effectively required, but due to backwards compatibility is
+                                    allowed to be empty. Instances of this type with an empty value here are
+                                    almost certainly wrong.
+                                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                  type: string
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            maxItems: 1000
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          defaultRef:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - allowedRefs
+                        - defaultRef
+                        type: object
+                    type: object
+                  kind:
+                    default: Default
+                    description: DeviceProfileKind selects the account default profile
+                      or a custom profile.
+                    enum:
+                    - Default
+                    - Custom
+                    type: string
+                  match:
+                    maxLength: 10000
+                    type: string
+                  precedence:
+                    format: int64
+                    minimum: 0
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: Custom profiles require match, precedence, and fields.name
+                  rule: self.kind != 'Custom' || (has(self.match) && self.match !=
+                    "" && has(self.precedence) && has(self.fields) && has(self.fields.name)
+                    && self.fields.name != "")
+                - message: match, precedence, name, description, enabled, lanAllowMinutes,
+                    and lanAllowSubnetSize are only valid for Custom profiles
+                  rule: self.kind == 'Custom' || (!has(self.match) && !has(self.precedence)
+                    && (!has(self.fields) || (!has(self.fields.name) && !has(self.fields.description)
+                    && !has(self.fields.enabled) && !has(self.fields.lanAllowMinutes)
+                    && !has(self.fields.lanAllowSubnetSize))))
+              splitTunnel:
+                description: DeviceProfileSplitTunnel configures the active whole-list
+                  split-tunnel mode.
+                properties:
+                  mode:
+                    description: DeviceProfileSplitTunnelMode selects the one active
+                      whole-list split-tunnel policy.
+                    enum:
+                    - Include
+                    - Exclude
+                    type: string
+                  routeSources:
+                    description: DeviceProfileRouteSources configures route-derived
+                      split-tunnel entries.
+                    properties:
+                      accessApplications:
+                        description: DeviceProfileAccessApplicationSource selects
+                          public Access applications by namespace.
+                        properties:
+                          namespaceSelector:
+                            description: |-
+                              A label selector is a label query over a set of resources. The result of matchLabels and
+                              matchExpressions are ANDed. An empty label selector matches all objects. A null
+                              label selector matches no objects.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - namespaceSelector
+                        type: object
+                      hostnameRoutes:
+                        description: DeviceProfileRouteSelector selects route resources
+                          whose accepted values are aggregated.
+                        properties:
+                          selector:
+                            description: |-
+                              A label selector is a label query over a set of resources. The result of matchLabels and
+                              matchExpressions are ANDed. An empty label selector matches all objects. A null
+                              label selector matches no objects.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - selector
+                        type: object
+                      networkRoutes:
+                        description: DeviceProfileRouteSelector selects route resources
+                          whose accepted values are aggregated.
+                        properties:
+                          selector:
+                            description: |-
+                              A label selector is a label query over a set of resources. The result of matchLabels and
+                              matchExpressions are ANDed. An empty label selector matches all objects. A null
+                              label selector matches no objects.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - selector
+                        type: object
+                      privateHostnameRange:
+                        type: boolean
+                    type: object
+                  static:
+                    items:
+                      description: DeviceProfileSplitTunnelEntry is one address or
+                        hostname in a whole-list update.
+                      properties:
+                        address:
+                          maxLength: 49
+                          minLength: 3
+                          type: string
+                        description:
+                          maxLength: 256
+                          type: string
+                        host:
+                          maxLength: 253
+                          pattern: ^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of address or host is required
+                        rule: has(self.address) != has(self.host)
+                    maxItems: 1000
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: privateHostnameRange and accessApplications are only valid
+                    in Include mode
+                  rule: self.mode == 'Include' || !has(self.routeSources) || (!self.routeSources.privateHostnameRange
+                    && !has(self.routeSources.accessApplications))
+            required:
+            - accountRef
+            - profile
+            - splitTunnel
+            type: object
+            x-kubernetes-validations:
+            - message: Default profiles cannot use externalRef or adoption
+              rule: self.profile.kind != 'Default' || (!has(self.externalRef) && self.adoption.mode
+                == 'None')
+            - message: AdoptById requires externalRef
+              rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+            - message: Managed externalRef requires adoption.mode AdoptById
+              rule: '!has(self.externalRef) || self.managementPolicy == ''ObserveOnly''
+                || self.adoption.mode == ''AdoptById'''
+          status:
+            description: DeviceProfileStatus records the resolved remote profile and
+              aggregate ownership.
+            properties:
+              appliedExclude:
+                items:
+                  description: DeviceProfileAppliedSplitTunnelEntry records an applied
+                    entry and every source that contributed it.
+                  properties:
+                    entry:
+                      description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                        status mirror of a split-tunnel entry.
+                      properties:
+                        address:
+                          type: string
+                        description:
+                          type: string
+                        host:
+                          type: string
+                      type: object
+                    provenance:
+                      items:
+                        type: string
+                      maxItems: 1000
+                      type: array
+                      x-kubernetes-list-type: set
+                  required:
+                  - entry
+                  - provenance
+                  type: object
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: atomic
+              appliedFallback:
+                items:
+                  description: DeviceProfileAppliedFallbackDomain records an applied
+                    fallback and its sources.
+                  properties:
+                    entry:
+                      description: DeviceProfileStatusFallbackDomain is an unvalidated
+                        status mirror of a fallback domain.
+                      properties:
+                        description:
+                          type: string
+                        dnsServer:
+                          items:
+                            type: string
+                          type: array
+                        suffix:
+                          type: string
+                      required:
+                      - suffix
+                      type: object
+                    provenance:
+                      items:
+                        type: string
+                      maxItems: 1000
+                      type: array
+                      x-kubernetes-list-type: set
+                  required:
+                  - entry
+                  - provenance
+                  type: object
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: atomic
+              appliedInclude:
+                items:
+                  description: DeviceProfileAppliedSplitTunnelEntry records an applied
+                    entry and every source that contributed it.
+                  properties:
+                    entry:
+                      description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                        status mirror of a split-tunnel entry.
+                      properties:
+                        address:
+                          type: string
+                        description:
+                          type: string
+                        host:
+                          type: string
+                      type: object
+                    provenance:
+                      items:
+                        type: string
+                      maxItems: 1000
+                      type: array
+                      x-kubernetes-list-type: set
+                  required:
+                  - entry
+                  - provenance
+                  type: object
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: atomic
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              conflicts:
+                items:
+                  type: string
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: set
+              observedGeneration:
+                format: int64
+                type: integer
+              ownershipVerified:
+                type: boolean
+              profileId:
+                type: string
+              wouldApply:
+                description: DeviceProfileWouldApplyStatus is the exact non-secret
+                  diff that Managed mode would write.
+                properties:
+                  dnsSearchSuffixes:
+                    description: DeviceProfileDNSSearchSuffixDiff is the DNS search
+                      suffix diff reported in ObserveOnly mode.
+                    properties:
+                      add:
+                        items:
+                          description: DeviceProfileDNSSearchSuffix is one search
+                            suffix pushed to WARP clients.
+                          properties:
+                            description:
+                              maxLength: 256
+                              type: string
+                            suffix:
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                          - suffix
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remove:
+                        items:
+                          description: DeviceProfileDNSSearchSuffix is one search
+                            suffix pushed to WARP clients.
+                          properties:
+                            description:
+                              maxLength: 256
+                              type: string
+                            suffix:
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                          - suffix
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  exclude:
+                    description: DeviceProfileSplitTunnelDiff is the item-level diff
+                      reported in ObserveOnly mode.
+                    properties:
+                      add:
+                        items:
+                          description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                            status mirror of a split-tunnel entry.
+                          properties:
+                            address:
+                              type: string
+                            description:
+                              type: string
+                            host:
+                              type: string
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remove:
+                        items:
+                          description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                            status mirror of a split-tunnel entry.
+                          properties:
+                            address:
+                              type: string
+                            description:
+                              type: string
+                            host:
+                              type: string
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  fallbackDomains:
+                    description: DeviceProfileFallbackDomainDiff is the fallback-domain
+                      diff reported in ObserveOnly mode.
+                    properties:
+                      add:
+                        items:
+                          description: DeviceProfileStatusFallbackDomain is an unvalidated
+                            status mirror of a fallback domain.
+                          properties:
+                            description:
+                              type: string
+                            dnsServer:
+                              items:
+                                type: string
+                              type: array
+                            suffix:
+                              type: string
+                          required:
+                          - suffix
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remove:
+                        items:
+                          description: DeviceProfileStatusFallbackDomain is an unvalidated
+                            status mirror of a fallback domain.
+                          properties:
+                            description:
+                              type: string
+                            dnsServer:
+                              items:
+                                type: string
+                              type: array
+                            suffix:
+                              type: string
+                          required:
+                          - suffix
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  include:
+                    description: DeviceProfileSplitTunnelDiff is the item-level diff
+                      reported in ObserveOnly mode.
+                    properties:
+                      add:
+                        items:
+                          description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                            status mirror of a split-tunnel entry.
+                          properties:
+                            address:
+                              type: string
+                            description:
+                              type: string
+                            host:
+                              type: string
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remove:
+                        items:
+                          description: DeviceProfileStatusSplitTunnelEntry is an unvalidated
+                            status mirror of a split-tunnel entry.
+                          properties:
+                            address:
+                              type: string
+                            description:
+                              type: string
+                            host:
+                              type: string
+                          type: object
+                        maxItems: 1000
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  profileFields:
+                    items:
+                      type: string
+                    maxItems: 64
+                    type: array
+                    x-kubernetes-list-type: set
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,44 @@
+# Placeholder credentials are separate Secrets so the integration manifest never
+# embeds a real Access client ID or secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: posture-access-client-id
+  namespace: default
+type: Opaque
+stringData:
+  clientId: replace-with-access-client-id
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: posture-access-client-secret
+  namespace: default
+type: Opaque
+stringData:
+  clientSecret: replace-with-access-client-secret
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: DevicePostureIntegration
+metadata:
+  labels:
+    app.kubernetes.io/name: flareway
+    app.kubernetes.io/managed-by: kustomize
+  name: devicepostureintegration-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: CustomS2S
+  name: Example custom posture provider
+  interval: 15m
+  config:
+    apiUrl: https://posture.example.com/v1
+    accessClientIdRef:
+      name: posture-access-client-id
+      key: clientId
+    accessClientSecretRef:
+      name: posture-access-client-secret
+      key: clientSecret
+  managementPolicy: Managed
+  deletionPolicy: Orphan

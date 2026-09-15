@@ -1,0 +1,23 @@
+Flareway {{ .Chart.AppVersion }} is installed in {{ include "flareway.namespace" . }}.
+
+Prerequisite: install the Gateway API v1.6.2 standard CRDs before creating a GatewayClass or Gateway:
+
+  kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+
+{{- if not .Values.gatewayClass.create }}
+The chart did not create a GatewayClass. Create a GatewayClassConfig and GatewayClass, or reinstall with:
+
+  --set gatewayClass.create=true
+{{- else if and (not .Values.gatewayClass.config.conformanceMode) (not .Values.gatewayClass.config.accountRefName) }}
+GatewayClass {{ .Values.gatewayClass.name }} was created without an accountRef. Create a CloudflareAccount and set
+GatewayClassConfig {{ .Values.gatewayClass.configName }} spec.accountRef before using Cloudflare mode.
+{{- end }}
+
+The chart bundles only Flareway CRDs. Helm retains CRDs and the system namespace on uninstall.
+Uninstalling the chart therefore does not delete Flareway custom resources or trigger their remote deletion policies.
+No uninstall hook contacts Cloudflare or deletes remote state.
+
+{{- if and .Values.metrics.enabled .Values.metrics.secure }}
+The metrics endpoint requires Kubernetes authentication and authorization. Bind the ClusterRole
+{{ include "flareway.fullname" . }}-metrics-reader to each scraping ServiceAccount.
+{{- end }}

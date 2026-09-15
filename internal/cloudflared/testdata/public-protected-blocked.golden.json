@@ -1,0 +1,50 @@
+{
+  "config": {
+    "ingress": [
+      {
+        "hostname": "protected.example.com",
+        "originRequest": {
+          "access": {
+            "audTag": [
+              "aud-1"
+            ],
+            "required": true,
+            "teamName": "team"
+          },
+          "connectTimeout": 30,
+          "keepAliveConnections": 100,
+          "keepAliveTimeout": 90,
+          "noHappyEyeballs": true
+        },
+        "path": "^/admin(/|$)",
+        "service": "http://127.0.0.1:18080"
+      },
+      {
+        "hostname": "blocked.example.com",
+        "service": "http_status:403"
+      },
+      {
+        "hostname": "public.example.com",
+        "originRequest": {
+          "connectTimeout": 30,
+          "keepAliveConnections": 100,
+          "keepAliveTimeout": 90,
+          "noHappyEyeballs": true
+        },
+        "service": "http://127.0.0.1:18081"
+      },
+      {
+        "service": "http_status:404"
+      }
+    ],
+    "originRequest": {
+      "connectTimeout": 30,
+      "keepAliveConnections": 100,
+      "keepAliveTimeout": 90,
+      "noHappyEyeballs": true
+    },
+    "warp-routing": {
+      "enabled": true
+    }
+  }
+}
