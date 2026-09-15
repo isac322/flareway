@@ -55,6 +55,7 @@ jobs:
         env:
           KIND_CLUSTER_NAME: flareway-e2e
         run: |
+          kubeconfig="${RUNNER_TEMP}/flareway-e2e.kubeconfig"
           node_args=()
           if docker manifest inspect kindest/node:v1.35.0 >/dev/null 2>&1; then
             node_args=(--image kindest/node:v1.35.0)
@@ -64,8 +65,12 @@ jobs:
           bin/kind create cluster \
             --name "${KIND_CLUSTER_NAME}" \
             --config hack/kind-config.yaml \
+            --kubeconfig "${kubeconfig}" \
             "${node_args[@]}"
-          kubectl config use-context "kind-${KIND_CLUSTER_NAME}"
+          echo "KUBECONFIG=${kubeconfig}" >> "${GITHUB_ENV}"
+          echo "FLAREWAY_E2E_KUBECONFIG=${kubeconfig}" >> "${GITHUB_ENV}"
+          kubectl --kubeconfig "${kubeconfig}" \
+            config use-context "kind-${KIND_CLUSTER_NAME}"
       - name: Install Gateway API
         run: |
           kubectl apply --server-side -f \
