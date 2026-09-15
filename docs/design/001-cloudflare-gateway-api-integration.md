@@ -1,8 +1,8 @@
 # Flareway 설계 001 — Cloudflare(cloudflared · Access · WARP)와 Kubernetes Gateway API의 통합 모델
 
 - 작성일: 2026-09-13
-- 구현 동기화: 2026-09-14
-- 상태: 구현된 `v1alpha1` 계약. 필드 이름과 기본값은 `config/crd/bases/`의 생성 CRD가 최종 기준이다.
+- 구현 동기화: 2026-09-15
+- 상태: 구현된 `v1alpha1` 계약. 이 문서는 기능 경계와 소유권을 설명하며, 필드 이름·enum·기본값의 최종 기준은 `config/crd/bases/`의 생성 CRD다.
 - 입력: `docs/research/01..10-*.md`, `config/crd/bases/`, 구현 및 검증 결과.
 - API group: `flareway.bhyoo.com`. controllerName: `flareway.bhyoo.com/gateway-controller`.
 - 표기: 리서치 보고서 인용은 `[R1]`..`[R10]`(문서 끝 §14). 사용자 확정 결정은 `[U]`, 설계 결정은 `[D]`, 실계정/Edge 검증이 남은 항목은 `[live-blocked]`.
@@ -21,7 +21,7 @@
 | U-6 | Gateway↔Tunnel: **1 Gateway = 1 Tunnel**. `Gateway.spec.infrastructure.parametersRef`는 선택. 생략 시 Gateway 이름으로 `CloudflareTunnel` 자동 생성(ownerReference, `deletionPolicy: Delete`). |
 | U-7 | DNS: 별도 CRD 없음. `CloudflareTunnel.spec.dns`로 통합. Public 리스너가 하나라도 있으면 `Gateway.status.addresses`에 `Hostname`을 공개하고, Private 전용이면 빈 배열. |
 | U-8 | WARP private 노출 모델 **A**: 노출 경로(Public/Private)는 리스너 단위로 플랫폼이 `CloudflareTunnel.spec.listeners[]`에 선언. 테넌트 표면은 `HTTPRoute` + 단일 `AccessApplication`. |
-| U-9 | hostname 없는 L4/IP:port 사설 노출 포함: `NetworkRoute` + `AccessApplication.spec.privateDestinations[]`. |
+| U-9 | hostname 없는 L4/IP:port 사설 노출 포함: `NetworkRoute`/`HostnameRoute` + `AccessApplication.spec.destinations[]`의 typed `Private` variant. |
 | U-10 | private hostname의 클러스터 내 해석: **Pod-local DNS sidecar + `TUNNEL_DNS_RESOLVER_ADDRS`** 채택(§9.4.2). CoreDNS 동작은 M0에서 로컬 측정했으며, Edge가 loopback 응답을 수용하는지는 D-11로 별도 표시한다. |
 
 ---
@@ -31,7 +31,7 @@
 1. **데이터플레인 = upstream `cloudflared` + Envoy, 같은 Pod, Envoy는 Cloudflare 모드에서 기본 loopback 전용.** cloudflared 네이티브 ingress는 hostname + 비앵커 Go regex path만 매칭하며 header/method/query/weight/rewrite/redirect/mirror가 없다 [R2]. GatewayHTTP Core는 이를 요구한다 [R1]. 따라서 cloudflared는 "Edge→Pod 전송 + per-hostname origin JWT 검증"만 담당하고, HTTPRoute 의미론은 Envoy가 처리한다. Private listener의 검증된 fallback과 conformance mode만 Pod IP 바인딩을 쓴다. (기획서 §6.1과 일치, 리서치로 확정.) `[D]`
 2. **1 Gateway : 1 Tunnel : 1 데이터플레인 Deployment.** Tunnel config는 whole-object `PUT`(단일 작성자) [R2]. Gateway가 집계 단위이므로 Tunnel을 Gateway에 1:1 고정하면 aggregator가 불필요하다. `[U-6]`
 3. **확장점은 Gateway API 표준 3종만: `parametersRef`(인프라) · GEP-713 `targetRefs`(정책) · 표준 필드. annotation은 Gateway API 리소스에서 읽지 않는다(zero-annotation).** Gateway API 프로젝트가 정책용 annotation을 명시적으로 비권장하고 [R1][R6], Envoy Gateway가 zero-annotation, ngrok은 Gateway 레벨에만 허용, STRRL은 ADR로 Access annotation을 거부했다 [R5][R7]. Ingress 지원 단계에서만 annotation 키를 예약한다(§7).
-4. **`AccessApplication` = GEP-713 Direct policy.** target: `Gateway`(+`sectionName`=listener), `HTTPRoute`(+`sectionName`=rule name), 그리고 hostname 없는 L4 사설 노출용 `spec.privateDestinations`. 하나의 CRD가 Cloudflare Access Application 하나와 1:1이며 `destinations[]`의 public/private을 그대로 반영한다 [R3][U-8][U-9].
+4. **Access 앱은 용도에 따라 두 Kind로 분리한다.** `AccessApplication`은 GEP-713 Direct policy로 `Gateway`/`HTTPRoute` target을 Cloudflare public/private destination으로 컴파일하고, 필요하면 typed private/MCP/Worker destination을 더한다. `AccessStandaloneApplication`은 Gateway에 붙지 않는 SaaS, Bookmark, Infrastructure, AppLauncher, WARP enrollment, BISO, DashSSO, MCPPortal 앱을 관리한다. 두 Kind 모두 `accountRef`, PascalCase `type`, 그리고 그 type과 일치하는 variant를 필수로 둔다. `[D]`
 5. **origin JWT 검증은 보호 hostname마다 `config.ingress[].originRequest.access{required,teamName,audTag}`로 강제(기본 Required).** AUD는 앱 응답에서 획득(앱 수명 동안 불변) [R3], teamName은 `/access/organizations`의 `auth_domain` 첫 레이블에서 파생한다 [R3]. Private(WARP) 경로는 cloudflared 미들웨어가 없으므로 Envoy `jwt_authn`이 대신하며 Gateway TLS decryption이 전제(§9.4.3).
 6. **보호 영역(protection domain)별로 cloudflared ingress rule과 Envoy 리스너를 분리하며 기본 바인딩은 loopback.** 같은 hostname에서 공개 Q가 보호 P와 서로소이거나 P가 Q를 포함할 때만 혼합을 허용한다. P⊇Q이면 Flareway가 Q마다 더 구체적인 child bypass Access application을 관리한다(§9.2). 그 밖의 혼합은 `Accepted=False`로 차단한다. `[D]`
 7. **DNS는 Tunnel 속성.** listener hostname마다 `<tunnel-id>.cfargotunnel.com` proxied CNAME(wildcard listener→wildcard record)을 만들고, 100자 이하의 결정적 `comment`로 소유권을 기록한다 [R2]. DNS tag는 계정별 quota와 사전 생성 제약이 있으므로 소유권에 사용하지 않는다. `dns.mode: External`이면 external-dns에 위임한다 [R5]. Public 리스너가 하나라도 있으면 `status.addresses`에 `Hostname`을 공개하고, Private 전용이면 빈 배열. `[U-7]`
@@ -53,10 +53,10 @@
 | F-4 | 클라우드 edge 구현은 `status.addresses[].type: Hostname`을 사용(AWS ELB, ngrok, lexfrei). 어떤 SaaS-edge 구현도 공식 conformance report를 제출한 적 없음. suite는 `status.addresses[0]:port`로 직접 dial하며 임의 Host(`example.com`)를 보냄. | [R1][R6][R7] |
 | F-5 | Tunnel config: `PUT /accounts/{a}/cfd_tunnel/{t}/configurations`, `config.ingress[]{hostname,path,service,originRequest}`, `config.originRequest`, `config.warp-routing.enabled`. 전체 교체, `version` 정수 반환, 조건부 헤더 없음. Edge가 cloudflared에 push(수초 내). 마지막 rule은 catch-all 필수. | [R2] |
 | F-6 | cloudflared ingress 매칭: hostname exact 또는 `*.x` suffix match(`strings.HasSuffix`, apex 제외)라 `*.example.com`은 `a.b.example.com`에도 매치한다. Gateway API wildcard도 여러 레이블과 매치하지만 [R1], Access destination wildcard는 한 레이블만 매치한다 [R3]. path는 **비앵커** Go regex, 첫 매치이며 `service` 스킴은 http/https/tcp/ssh/rdp/smb/unix/unix+tls/hello_world/http_status/bastion이다. path rewrite는 없다. | [R2] |
-| F-7 | `originRequest.access{required, teamName, audTag[]}`: `Cf-Access-Jwt-Assertion` 헤더만 검사(쿠키 무시), JWKS `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` 캐시, 실패 시 403. rule별 설정이 top-level을 통째로 override. **http/https/ws 서비스에만** 적용, TCP/WARP 경로에는 없음. | [R2] |
+| F-7 | `originRequest.access{required, teamName, audTag[]}`: `Cf-Access-Jwt-Assertion` 헤더만 검사(쿠키 무시), JWKS `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` 캐시, 실패 시 403. rule별 설정이 top-level을 통째로 override. HTTP/HTTPS와 HTTP-over-UNIX(`unix`, `unix+tls`) origin에 적용하며 raw TCP/WARP에는 적용하지 않는다. | [R2] |
 | F-8 | Tunnel 생성 `POST /cfd_tunnel {name, config_src:"cloudflare"}`, 토큰 `GET .../token`, 삭제 `DELETE ...?cascade=true`. 상태 `inactive/healthy/degraded/down`. `/ready`(200/503), `/metrics`, `--grace-period`(기본 30s, 최대 3m). 계정당 tunnel 1,000, tunnel당 connector 25. | [R2] |
 | F-9 | DNS: `<tunnel-id>.cfargotunnel.com` CNAME, `proxied: true` 필수. record `comment`(≤100자), `tags[]` 지원. Universal SSL은 apex+1단계까지; `*.a.example.com` 다단계는 ACM 필요. | [R2] |
-| F-10 | Access Application: `type: self_hosted`, `destinations[]{type: public, uri}` / `{type: private, hostname|cidr, port_range, l4_protocol, vnet_id}`(`self_hosted_domains` deprecated). `aud`는 생성 시 확정·앱 수명 동안 불변, 모든 destination이 같은 AUD. path는 더 구체적 앱이 우선, 상속 없음. `tags[]` 지원. `policies[]{id, precedence}`로 재사용 정책 부착. | [R3] |
+| F-10 | Access Application wire types는 `self_hosted, saas, ssh, vnc, rdp, mcp, proxy_endpoint, bookmark, infrastructure, app_launcher, warp, biso, dash_sso, mcp_portal`이다. `destinations[]`는 public/private/MCP/Worker variants를 제공하고 `self_hosted_domains`는 deprecated다. `aud`는 앱 수명 동안 불변이며 path는 더 구체적 앱이 우선하고 상속되지 않는다. | [R3] |
 | F-11 | Access Policy(재사용, `/access/policies`): `decision: allow|deny|non_identity|bypass`, `include[]`(OR)/`require[]`(AND)/`exclude[]`(AND NOT), 규칙 타입 `email, email_domain, email_list, everyone, ip, ip_list, certificate, common_name, group, azureAD, github-organization, gsuite, okta, saml, oidc, service_token, any_valid_service_token, external_evaluation, geo, auth_method, device_posture, login_method, auth_context, linked_app_token, user_risk_score, cloudflare_account_member`. WARP 조건은 `device_posture`(type `warp`/`gateway` posture check) 참조로 표현. 평가: bypass/non_identity 먼저, 그 다음 allow/deny를 precedence 순, 첫 매치 종료. 정책/그룹/토큰엔 `tags` 없음(name만). | [R3] |
 | F-12 | Access org: `GET/PUT /access/organizations` → `auth_domain`, `session_duration`, `warp_auth_session_duration`, `allow_authenticate_via_warp`, `is_ui_read_only`. JWT: RS256, 키 6주 회전+7일 grace. Edge 폐기 전파 20–30s; **cloudflared는 stateless 검증이라 폐기 토큰을 `exp`까지 수용**. | [R3] |
 | F-13 | Service token: `client_id`/`client_secret` 생성 시 1회 반환, `/rotate`(`previous_client_secret_expires_at`), `/refresh`. 헤더 `CF-Access-Client-Id/Secret`. | [R3] |
@@ -107,9 +107,9 @@ flowchart LR
 
 | 컨트롤러 | 입력 | 출력(원격) | 출력(클러스터) |
 |---|---|---|---|
-| gateway | GatewayClass, Gateway, HTTPRoute, ReferenceGrant, BackendTLSPolicy, CloudflareTunnel | Tunnel config PUT, DNS record | Deployment(cloudflared+Envoy), Service, PDB, NetworkPolicy, CoreDNS ConfigMap, Delta ADS/SDS snapshot, xDS client Secret |
-| access | AccessApplication, AccessPolicy, AccessGroup, IdentityProvider, DevicePostureRule, ServiceToken | apps/policies/groups/idps/posture/service_tokens | AUD Secret, service-token Secret, status |
-| private-network | VirtualNetwork, NetworkRoute, HostnameRoute | teamnet/routes, virtual_networks, zerotrust/routes/hostname | platform-created HostnameRoute when granted |
+| gateway/tunnel | GatewayClass, Gateway, HTTPRoute, ReferenceGrant, BackendTLSPolicy, CloudflareTunnel | Tunnel lifecycle, Gateway-compiled config or Direct whole-object config, DNS record | Deployment(cloudflared+Envoy), Service, PDB, NetworkPolicy, CoreDNS ConfigMap, Delta ADS/SDS snapshot, connector/management-token Secrets |
+| access | AccessApplication, AccessStandaloneApplication, AccessPolicy, AccessGroup, IdentityProvider, AccessCustomPage, DevicePostureRule, DevicePostureIntegration, AccessInfrastructureTarget, ServiceToken | apps/policies/groups/idps/custom_pages/posture/integrations/targets/service_tokens | AUD, SaaS client, SCIM, and service-token Secrets; status |
+| private-network | VirtualNetwork, NetworkRoute, HostnameRoute, WARPConnector | teamnet routes, virtual networks, hostname routes, WARP Connector tunnel/HA/failover | connector-token Secret, platform-created HostnameRoute when granted |
 | device | DeviceProfile, DeviceSettings | devices/policy(+include/exclude/fallback), devices/settings | status |
 | organization | ZeroTrustOrganization, ZeroTrustGatewayPolicy, ZeroTrustList | access/organizations, gateway/rules, gateway/lists | status |
 | account | CloudflareAccount | token/zone/organization 검증(read) | verified status와 grant 판단 입력 |
@@ -139,7 +139,8 @@ spec:
 
 | Gateway 필드 | Flareway 해석 | 거부/조건 |
 |---|---|---|
-| `spec.infrastructure.parametersRef` → `CloudflareTunnel`(같은 ns) | 이 Gateway의 tunnel·데이터플레인·DNS·리스너 노출 설정. 생략 시 `CloudflareTunnel/<gateway-name>` 자동 생성 `[U-6]`. | 다른 Gateway가 이미 소유한 Tunnel 참조 → `Accepted=False/InvalidParameters`, 메시지 "tunnel owned by <ns/gw>". |
+| `spec.infrastructure.parametersRef` → `CloudflareTunnel`(같은 ns) | 이 Gateway의 tunnel·데이터플레인·DNS·리스너 노출 설정. 생략 시 `CloudflareTunnel/<gateway-name>` 자동 생성 `[U-6]`. Tunnel controller는 선택한 owner를 `status.gatewayRef`와 `status.gatewayUid`의 exact pair로 checkpoint한다. | 다른 Gateway가 이미 소유한 Tunnel 참조 → `Accepted=False/InvalidParameters`, 메시지 "tunnel owned by <ns/gw>". 기록된 UID가 살아 있고 삭제 중이 아니면 더 오래된 Gateway가 나중에 참조해도 preempt할 수 없다. |
+| owner release·삭제·재생성 | 기록된 exact Gateway UID가 참조를 해제하거나 삭제되면 그 UID의 기존 cloudflared Deployment를 먼저 0으로 scale하고 관련 Pod가 종료된 뒤 successor UID를 checkpoint한다. 같은 이름의 재생성 Gateway는 이전 `gatewayUid`를 승계하지 않는다. | drain 전 successor의 token, Deployment, remote config, DNS, Tunnel/Gateway status write를 차단한다. |
 | auto-created ↔ explicit Tunnel 전환 | 현재 Tunnel의 `deletionPolicy: Orphan`일 때만 허용. 보호 rule 403 → 새 Tunnel Ready → DNS 재지정 → 이전 Tunnel orphan 순으로 block-first 전환. | 그 외 `Accepted=False/InvalidParameters`, 메시지 "tunnel switch requires deletionPolicy: Orphan on the current tunnel". |
 | `spec.infrastructure.labels/annotations` | 데이터플레인 Deployment/Pod에 전파(`GatewayInfrastructurePropagation`). | — |
 | `spec.listeners[].hostname` | **필수**(Edge/WARP 모두 hostname 기반). `*.example.com` wildcard는 apex를 제외한 여러 레이블 깊이와 매치한다(F-6). | 없음 → `Accepted=False/UnsupportedValue`. zone 기준 다단계 wildcard(`*.a.example.com`) → `Accepted=False/UnsupportedValue`(ACM 미관리, F-9). `CloudflareAccount.grants`에 없는 hostname → `Accepted=False/UnsupportedValue`+메시지 "hostname not granted". |
@@ -209,89 +210,122 @@ v1alpha1에서 Flareway ExtensionRef kind는 없다. 참조되면 표준대로 �
 
 ---
 
-## 5. Flareway가 제공하는 Cloudflare 기능 범위
+## 5. 구현된 Cloudflare parity matrix
 
-### 5.1 cloudflared / Tunnel
+이 표는 “지원/미지원” 계획표가 아니라 현재 CRD와 컨트롤러의 소유 경계를 기록한 ledger다. **공식 API의 create/update 가능한 필드는 spec에 두고, 원격 ID·timestamp·health·`read_only` 같은 서버 소유 값은 status에만 둔다.** HTTP 응답의 `success`, `errors`, `messages`, `result`, pagination/result-info 같은 transport envelope는 Kubernetes desired state가 아니므로 CRD에 복제하지 않는다.
 
-| 기능 | v1 | 형태 |
+### 5.1 Tunnel: Gateway mode와 Direct mode
+
+| 표면 | 구현 계약 | 소유자 |
 |---|---|---|
-| 원격 관리 Tunnel 생성·토큰·삭제(cascade)·adoption | 제공 | `CloudflareTunnel` |
-| cloudflared Deployment(replica, image, resources, `--protocol`, `--grace-period`, metrics/ready) | 제공 | `CloudflareTunnel.spec.connector` |
-| `config.ingress[]` 전체 작성(단일 작성자) | 제공 | gateway 컨트롤러 |
-| `originRequest.access` per-rule JWT 검증 | 제공(기본 강제) | `AccessApplication.spec.originJWT` |
-| 그 외 `originRequest.*`(connectTimeout, noTLSVerify, httpHostHeader, caPool, http2Origin ...) | **비노출** | cloudflared→Envoy는 항상 loopback http. backend 측 동등 기능은 표준 `BackendTLSPolicy`/`HTTPRoute.timeouts`. `CloudflareOriginPolicy`류 CRD 불필요 `[D]` |
-| `warp-routing.enabled` | 제공(자동) | `NetworkRoute`/`HostnameRoute`가 이 Tunnel을 참조하면 on |
-| tcp/ssh/rdp/smb/bastion `service` | 미제공 | Gateway API 밖. 필요 시 후속 |
-| Edge 제한(100s 헤더 대기, 본문 크기, WS 100s idle) | 검증·문서 | `status` 조건 없음; e2e 테스트로 확인(D-03) |
+| Tunnel lifecycle | 생성, 조회, token Secret, cascade 삭제, `ObserveOnly`, `AdoptById`, `Delete|Orphan`. Managed remote ID는 `status.ownershipVerified: true`일 때만 재사용한다. ObserveOnly에서 관측한 ID는 matching `externalRef`+`AdoptById`+`adoption.expect.name` 없이는 Managed로 전환할 수 없다. | `CloudflareTunnel` |
+| `configuration.mode: Gateway` | 기본값. Gateway/HTTPRoute를 집계해 whole-object config를 작성하고 `connector`, `proxy`, `privateDNS`, `listeners`, loopback Envoy에 유효한 `originRequest` subset을 사용 | gateway/tunnel controller |
+| `configuration.mode: Direct` | 명시적 opt-in. `configuration.direct.ingress[]`, top-level `originRequest`, `warpRouting`을 Cloudflare config에 그대로 단독 소유 | `CloudflareTunnel` |
+| Direct ingress services | `http`, `https`, `tcp`, `ssh`, `rdp`, `smb`, `unix`, `unixTLS`, `helloWorld`, `httpStatus`, `bastion` 중 정확히 하나 | 각 `ingress[]` rule |
+| Full `originRequest` | `access{audTags,teamName,required}`, `caPool`, `connectTimeout`, `disableChunkedEncoding`, `http2Origin`, `httpHostHeader`, `keepAliveConnections`, `keepAliveTimeout`, `matchSNIToHost`, `noHappyEyeballs`, `noTLSVerify`, `originServerName`, `proxyType`, `tcpKeepAlive`, `tlsTimeout`, `ipRules` | Direct top-level 또는 rule override |
+| WARP routing | `enabled`, `connectTimeout`, `tcpKeepAlive`, `maxActiveFlows` | Direct: `configuration.direct.warpRouting`; Gateway: typed route 참조에서 자동 계산 |
+| Management token | `resources: [Logs]`로 단기 token Secret 요청 | `spec.managementToken` |
 
-### 5.2 DNS
+Direct mode의 마지막 ingress rule은 hostname/path가 없는 catch-all이어야 한다. `originRequest.access`는 HTTP 계열 origin에만, `ipRules`는 `bastion` 또는 `proxyType: SOCKS5`에만 유효하다. Direct mode에서는 Gateway가 소유하는 `connector`, `proxy`, `privateDNS`, Gateway용 `originRequest`, `listeners`를 함께 쓸 수 없다. Gateway mode의 `originRequest`는 `connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`, `keepAliveConnections`, `noHappyEyeballs`, `disableChunkedEncoding`, `http2Origin`만 노출한다. `dns`는 두 mode 모두에 적용된다.
 
-| 기능 | v1 | 형태 |
+### 5.2 DNS와 account/zone scope
+
+| 표면 | 구현 계약 |
+|---|---|
+| DNS ownership | `dns.mode: Managed|External`; Managed는 listener/Direct hostname CNAME을 소유하고 External은 주소만 게시 |
+| Record fields | `recordComment`, `proxied`, `ttl`, `settings.ipv4Only`, `settings.ipv6Only` |
+| Validation | proxied record는 automatic TTL(`1`), IP-family setting은 `proxied: true`, `ipv4Only`와 `ipv6Only`는 상호 배타 |
+| Account scope | `zone` 생략 시 account endpoint 사용 |
+| Zone scope | `zone`은 `CloudflareAccount.status.verified.zones`의 exact DNS name으로 ID를 해석; 확인되지 않은 zone은 원격 write 전에 거부 |
+| Tenant authorization | `CloudflareAccount.spec.grants[]`가 namespace, hostname, zone, exposure, platform object, typed private route, custom page/posture integration/standalone-app 참조, backend를 각각 허용 |
+
+### 5.3 Access applications
+
+모든 public enum은 PascalCase다. 두 application Kind 모두 `accountRef`, immutable `type`, 그리고 type과 일치하는 variant를 요구한다.
+
+| Kind | 구현된 type | 용도 |
 |---|---|---|
-| listener hostname → proxied CNAME(`comment`/`tags` 소유권) | 제공 | `CloudflareTunnel.spec.dns.mode: Managed` |
-| external-dns 위임 | 제공 | `mode: External` + `status.addresses` |
-| foreign record 충돌 감지·adoption | 제공 | 이름 일치만으론 미인수, `Conflict` 보고 |
-| ACM/다단계 wildcard, custom hostname, zone SSL 설정 | 미제공 | 거부/문서 |
+| `AccessApplication` | `SelfHosted`, `SSH`, `VNC`, `RDP`, `MCP`, `ProxyEndpoint` | Gateway API target에 붙는 GEP-713 Direct policy |
+| `AccessStandaloneApplication` | `SaaS`, `Bookmark`, `Infrastructure`, `AppLauncher`, `WARP`, `BISO`, `DashSSO`, `MCPPortal` | Gateway target 없이 계정/zone Access app 직접 관리 |
 
-### 5.3 Access
+`AccessApplication.targetRefs[]`는 같은 namespace의 `gateway.networking.k8s.io` `Gateway` 또는 `HTTPRoute`만 받으며 `sectionName`으로 listener/rule을 고른다. `pathScope`는 target에서 파생된 hostname을 `Exact` 또는 기본 `PathPrefix` 경계로 더 좁힌다. `destinations[]`는 discriminated union으로 `Private`, `ViaMCPServerPortal`, `Worker`, `PreviewWorker`, `AllWorkers`, `AllPreviewWorkers`를 추가한다. Public destination은 `targetRefs`에서만 컴파일하며 deprecated `self_hosted_domains`는 노출하지 않는다.
 
-| 기능 | v1 | 형태 |
-|---|---|---|
-| self_hosted 앱(public destinations = hostname[/path]) | 제공 | `AccessApplication` target Gateway listener / HTTPRoute |
-| self_hosted 앱(private destinations = hostname:port / cidr:port) | 제공 `[U-8][U-9]` | 같은 CRD, Private 리스너 target 또는 `privateDestinations[]` |
-| 앱 옵션: `session_duration, allowed_idps, auto_redirect_to_identity, app_launcher_visible, enable_binding_cookie, http_only_cookie_attribute, same_site_cookie_attribute, path_cookie_attribute, service_auth_401_redirect, skip_interstitial, options_preflight_bypass, cors_headers, custom_deny_message/url, custom_non_identity_deny_url, allow_authenticate_via_warp, skip_app_launcher_login_page, read_service_tokens_from_header, tags` | 제공 | `spec.application.*` (동일 이름 camelCase) |
-| 재사용 정책(include/require/exclude 전 규칙 타입, decision 4종, precedence, session_duration, purpose_justification, approval, isolation_required) | 제공 | `AccessPolicy` |
-| Access Group(중첩) | 제공 | `AccessGroup` |
-| IdP 관리/참조 | 제공 | `IdentityProvider`(Managed/ObserveOnly) |
-| Device posture rule 관리/참조 | 제공 | `DevicePostureRule`(Managed/ObserveOnly) |
-| Service token 발급·회전·Secret 출력 | 제공 | `ServiceToken` |
-| AUD → `originRequest.access.audTag` 자동 연결, teamName 자동 획득 | 제공 | access+gateway 컨트롤러 |
-| 앱 타입 saas/ssh/vnc/infrastructure/rdp/mcp 등 | 미제공 | 범위 밖 |
-| Edge 폐기 즉시성(cloudflared stateless) | 문서·SLO | D-08 |
+`originJWT.mode`의 기본값은 `Required`다. `audienceScope: Application`은 현재 app AUD만, `Hostname`은 hostname에서 Ready인 모든 app AUD를 허용하며 `Hostname`은 `Required`와만 조합한다. Private TLS decryption을 원격에서 증명할 수 없을 때만 `assumeGatewayTLSDecryption`으로 플랫폼 책임을 명시한다.
 
-### 5.4 WARP / 사설망 / 조직
+같은 hostname의 protected parent 아래 public route가 생기면 Flareway는 child bypass app을 block-first 순서로 관리한다. 기존 child를 가져오려면 `bypass.children[]`에 정규화된 `hostname`+`path`, `externalRef.applicationId`, `adoption.mode: AdoptById`, 기대값을 명시한다. 이름 일치만으로 child를 인수하지 않으며, `ObserveOnly` parent는 모든 child에 `externalRef`가 있어야 한다.
 
-| 기능 | v1 | 형태 |
-|---|---|---|
-| Virtual network | 제공 | `VirtualNetwork` |
-| CIDR route(tunnel, vnet) | 제공 | `NetworkRoute` |
-| Private hostname route | 제공 | `HostnameRoute`(Private 리스너에서 자동 생성 또는 명시) |
-| Device profile(default/custom, 모든 필드, split tunnel include/exclude, fallback domains) — 단일 소유 집계 | 제공 | `DeviceProfile` |
-| 계정 device settings | 제공 | `DeviceSettings`(singleton) |
-| Access organization(warp_auth_session_duration 등) | 제공 | `ZeroTrustOrganization`(singleton) |
-| Gateway(SWG) network/dns/http 정책 | 제공(network 우선) | `ZeroTrustGatewayPolicy` |
-| Zero Trust Gateway list | 제공 | `ZeroTrustList`(플랫폼) |
-| WARP Connector(Cloudflare Mesh), Gateway resolver/location 설정 | 미제공 | 범위 밖 |
+### 5.4 Access field families와 Secret 경계
+
+| 기능군 | 구현된 표면 |
+|---|---|
+| 공통 app settings | session, WARP auth, iframe/interstitial, IdP redirect/ref, launcher, service-auth 401, binding/cookie/SameSite/path, CORS, service-token header, deny pages, custom page refs, eager redirect, logo, MFA, OAuth authorization server, SCIM, clientless isolation URL, tags |
+| SaaS | OIDC/SAML discriminated config, claims/attributes, grants/scopes, redirect URIs, transforms, token lifetimes; create-only client secret은 controller-owned Secret에 저장 |
+| SCIM | `HTTPBasic`, `OAuthBearerToken`, `OAuth2`, `AccessServiceToken`, 또는 ordered `multiple`; password/token/client secret은 Secret/ref에서만 읽고 status에는 기록하지 않음 |
+| `AccessCustomPage` | `IdentityDenied`, `Forbidden`, `Login`, `Interstitial`; HTML/Liquid와 `contractVersion` |
+| `DevicePostureIntegration` | `WorkspaceOne`, `CrowdstrikeS2S`, `Uptycs`, `Intune`, `Kolide`, `TaniumS2S`, `SentinelOneS2S`, `CustomS2S`; 모든 credential은 Secret key reference |
+| `AccessInfrastructureTarget` | hostname + IPv4/IPv6, 각 address의 `virtualNetworkRef` 또는 external `virtualNetworkId` |
+| `ServiceToken` | account/zone endpoint, enable/duration, `Manual|OnExpiry` rotation; Secret keys `CF-Access-Client-Id`, `CF-Access-Client-Secret`과 grace-period previous keys |
+
+### 5.5 WARP와 typed private routes
+
+| 기능 | 구현 계약 |
+|---|---|
+| WARP enrollment application | `AccessStandaloneApplication` `type: WARP` + `warp: {}` |
+| WARP Connector | 독립 `WARPConnector`; connector token Secret, bounded client/connection status, HA `None|Disabled|AWS|Local`, explicit failover request |
+| Typed route target | `TunnelReference.kind: CloudflareTunnel|WARPConnector`, `name`, optional `namespace` |
+| CIDR/hostname route | `NetworkRoute`와 `HostnameRoute` 모두 typed tunnel ref, `allowedNamespaces`, ownership/adoption을 사용 |
+| Access private destination | `networkRouteRef` 또는 `hostnameRouteRef` 중 하나, optional CIDR subset, `portRange`, `l4Protocol: TCP|UDP` |
+| Device and Gateway policy | `DeviceProfile`, `DeviceSettings`, `ZeroTrustOrganization`, `ZeroTrustGatewayPolicy`, `ZeroTrustList`의 전체 typed surface |
+
+`CloudflareTunnel`은 Gateway data plane을 가진 Tunnel이고 `WARPConnector`는 Gateway data plane이 없는 Cloudflare Mesh connector다. 두 리소스를 문자열 ID로 혼용하지 않는다.
+
+### 5.6 Parity ledger와 제외 원칙
+
+| Cloudflare API 요소 | Flareway 표현 |
+|---|---|
+| 사용자 변경 가능 값 | typed spec field 또는 typed reference |
+| create-only credential | controller-owned Secret 또는 사용자가 지정한 Secret reference |
+| 원격 ID, timestamps, health, connection summaries, computed audience/domain | bounded status |
+| API `read_only`, UI-only toggle reason, server-computed fields | status 관측만; desired spec으로 쓰지 않음 |
+| HTTP envelope와 pagination | 제외; controller transport concern |
+| deprecated wire aliases | 제외; canonical field로 clean cutover |
+
+이 경계는 기능 누락이 아니라 ownership 규칙이다. migration은 기존 remote ID를 `externalRef`로 고정하고 `ObserveOnly`로 먼저 관측한 뒤, `AdoptById`와 `adoption.expect`가 일치할 때만 Managed로 전환한다. application `type`, Tunnel `configuration.mode`, typed route `kind`, Secret 소유권을 한 번에 추측하거나 이름으로 자동 변환하지 않는다.
 
 ---
 
 ## 6. CRD 카탈로그
 
-공통 spec 필드(§10): `accountRef`, `managementPolicy`, `externalRef`, `adoption`, `deletionPolicy`. 공통 status: `remoteId`, `observedGeneration`, `ownership`, `conditions[]`(`Accepted`, `Ready`, `Synced`, `CleanupBlocked`, `Conflict`).
+공통 spec 필드(§10): `accountRef`, `managementPolicy`, `externalRef`, `adoption`, `deletionPolicy`. 공통 status는 원격 ID와 bounded 관측값, `observedGeneration`, ownership, conditions를 기록하며 Secret 값은 기록하지 않는다.
 
 범위 구분: **플랫폼**(cluster-scoped 또는 `flareway-system` namespace 한정; 계정 전역 객체) / **테넌트**(namespaced, 앱 namespace).
 
 | Kind | scope | 책임 | Cloudflare 객체 |
 |---|---|---|---|
-| `CloudflareAccount` | Cluster | 계정·credential SecretRef·테넌트 grants | (읽기 검증) |
+| `CloudflareAccount` | Cluster | 계정·credential SecretRef·tenant grants·verified zones | read-only account/zone/org 검증 |
 | `GatewayClassConfig` | Cluster | GatewayClass 기본값 | — |
-| `CloudflareTunnel` | Namespaced(테넌트) | Tunnel + 데이터플레인 + DNS + 리스너 노출 | cfd_tunnel, configurations, dns_records |
-| `AccessApplication` | Namespaced(테넌트, Direct policy) | Access 앱 + 정책 부착 + origin JWT | access/apps |
-| `AccessPolicy` | Namespaced(테넌트) 또는 플랫폼 | 재사용 정책 | access/policies |
-| `AccessGroup` | 플랫폼 | 그룹 | access/groups |
-| `IdentityProvider` | 플랫폼 | IdP | access/identity_providers |
-| `DevicePostureRule` | 플랫폼 | posture rule | devices/posture |
-| `ServiceToken` | Namespaced(테넌트) | 서비스 토큰 + Secret | access/service_tokens |
-| `VirtualNetwork` | 플랫폼 | VNet | teamnet/virtual_networks |
-| `NetworkRoute` | 플랫폼 | CIDR route | teamnet/routes |
-| `HostnameRoute` | 플랫폼 | private hostname route | zerotrust/routes/hostname |
-| `DeviceProfile` | 플랫폼 | device profile 전체 + split tunnel/fallback 집계 | devices/policy(+lists) |
-| `DeviceSettings` | 플랫폼 singleton | 계정 device settings | devices/settings |
-| `ZeroTrustOrganization` | 플랫폼 singleton | Access org 설정 | access/organizations |
-| `ZeroTrustGatewayPolicy` | 플랫폼 | SWG rule | gateway/rules |
-| `ZeroTrustList` | 플랫폼 | Gateway rule 참조 목록 | gateway/lists |
+| `CloudflareTunnel` | Namespaced | Gateway 또는 Direct Tunnel config, connector, DNS | cfd_tunnel, configurations, dns_records |
+| `WARPConnector` | Namespaced | Mesh connector lifecycle, token, HA, failover | WARP Connector tunnel/configuration |
+| `AccessApplication` | Namespaced, Direct policy | Gateway-attached Access app, destinations, bypass children, origin JWT | access/apps |
+| `AccessStandaloneApplication` | Namespaced | non-Gateway app 전 type | access/apps |
+| `AccessPolicy` | Namespaced | reusable policy | access/policies |
+| `AccessGroup` | Namespaced | group | access/groups |
+| `IdentityProvider` | Namespaced | IdP와 SCIM directory | access/identity_providers |
+| `AccessCustomPage` | Namespaced | custom HTML/Liquid page | access/custom_pages |
+| `DevicePostureRule` | Namespaced | posture rule | devices/posture |
+| `DevicePostureIntegration` | Namespaced | third-party posture provider | devices/posture/integration |
+| `AccessInfrastructureTarget` | Namespaced | Access infrastructure hostname/IP target | access/infrastructure/targets |
+| `ServiceToken` | Namespaced | service token + Secret | access/service_tokens |
+| `VirtualNetwork` | Namespaced | VNet | teamnet/virtual_networks |
+| `NetworkRoute` | Namespaced | typed CIDR route | teamnet/routes |
+| `HostnameRoute` | Namespaced | typed private hostname route | zerotrust/routes/hostname |
+| `DeviceProfile` | Namespaced | device profile + split tunnel/fallback aggregate | devices/policy(+lists) |
+| `DeviceSettings` | Namespaced singleton | account device settings | devices/settings |
+| `ZeroTrustOrganization` | Namespaced singleton | Access organization | access/organizations |
+| `ZeroTrustGatewayPolicy` | Namespaced | SWG rule | gateway/rules |
+| `ZeroTrustList` | Namespaced | Gateway list | gateway/lists |
 
-기획서 §7 대비 변경: `CloudflareDNSPolicy` 삭제(→`CloudflareTunnel.spec.dns`, `[U-7]`), `CloudflareAccountDeviceSettings`→`DeviceSettings`, `CloudflareOrganizationSettings`→`ZeroTrustOrganization`, `CloudflareGatewayPolicy`→`ZeroTrustGatewayPolicy`(K8s Gateway와 혼동 방지), `HostnameRoute`(F-17)와 `ZeroTrustList` 추가, origin policy류 CRD 미도입(§5.1). 리스너별 무보호 허용 boolean 개념은 제거하고 플랫폼 소유 grant의 `unprotectedHostnames`로 대체한다.
+기획서 이후 clean cutover: `CloudflareDNSPolicy`는 `CloudflareTunnel.spec.dns`로 통합하고, private destination은 `AccessApplication.spec.destinations[].private` typed union으로 확정했다. `AccessStandaloneApplication`, `AccessCustomPage`, `DevicePostureIntegration`, `AccessInfrastructureTarget`, `WARPConnector`를 추가했고, Tunnel은 기본 `Gateway`와 명시적 `Direct` configuration mode를 분리했다. 이전 필드나 alias는 남기지 않는다.
 
 Kind 접두어는 `CloudflareAccount`, `CloudflareTunnel`에만 사용한다. 그 외 Kind는 §6 표의 승인된 이름을 유지하며, 타 프로젝트와 이름이 겹쳐도 API group으로 구분한다.
 
@@ -311,8 +345,11 @@ spec:
       zones: ["runbear.io"]
       exposures: [Public, Private]
       unprotectedHostnames: ["cc-lb-proxy.runbear.io"] # Access 없이 허용할 hostname
-      accessPolicyRefs: Allowed             # 이 namespace가 플랫폼 AccessPolicy/Group을 참조 가능한지
-      privateRoutes:                        # privateDestinations에서 참조 가능한 플랫폼 route
+      accessPolicyRefs: Allowed
+      accessCustomPageRefs: Allowed
+      devicePostureIntegrationRefs: Allowed
+      accessStandaloneApplicationRefs: Allowed
+      privateRoutes:                        # destinations[].private에서 참조 가능한 route
         networkRouteSelector: {matchLabels: {flareway.bhyoo.com/tenant: llm-proxy}}
         hostnameRouteSelector: {matchLabels: {flareway.bhyoo.com/tenant: llm-proxy}}
       backends:                             # ReferenceGrant에 더해 적용하는 SSRF 경계
@@ -346,7 +383,7 @@ spec:
   connector:
     image: cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4
     replicas: 2
-    protocol: auto
+    protocol: Auto
     gracePeriod: 60s
   proxy:
     image: envoyproxy/envoy:distroless-v1.39.1
@@ -360,7 +397,7 @@ spec:
   conformance: {serviceType: LoadBalancer}
 ```
 
-### 6.3 `CloudflareTunnel` (Namespaced, Gateway와 같은 ns)
+### 6.3 `CloudflareTunnel` (Namespaced)
 
 ```yaml
 kind: CloudflareTunnel
@@ -369,16 +406,20 @@ spec:
   accountRef: {name: runbear}
   tunnel:
     name: k8s-llm-proxy-cc-lb               # 기본 "<cluster>-<ns>-<name>"
-    externalRef: {tunnelId: "<uuid>"}       # 선택: 기존 tunnel 관측/인수
+    # externalRef: {tunnelId: "<uuid>"}     # ObserveOnly 또는 AdoptById에서만 활성화
   managementPolicy: Managed                 # Managed | ObserveOnly
   adoption: {mode: None}                    # None | AdoptById (externalRef 필요, §10)
   deletionPolicy: Delete                    # Delete | Orphan
+  configuration: {mode: Gateway}           # 기본값; Gateway/HTTPRoute가 config를 소유
   connector: {}                            # GatewayClassConfig override
   proxy: {}                                # GatewayClassConfig override
   privateDNS: {}                           # GatewayClassConfig override
   dns:
     mode: Managed                          # Managed | External
-    recordComment: "platform ingress"       # 선택: 자동 소유권 comment 뒤의 사용자 메모
+    recordComment: "platform ingress"
+    proxied: true
+    ttl: 1
+    settings: {ipv4Only: false, ipv6Only: false}
   listeners:
     - name: admin                          # Gateway.spec.listeners[].name
       exposure: Private
@@ -388,21 +429,50 @@ spec:
       exposure: Public
 status:
   tunnelId: "<uuid>"
-  connectorState: healthy                 # healthy | degraded | down | inactive
+  ownershipVerified: true
+  connectorState: Healthy                  # Healthy | Degraded | Down | Inactive
   configVersion: {desired: 42, desiredHash: "<sha256>", applied: 42}
   hostnames: [{hostname: cc-lb.runbear.io, protectionDomain: cc-lb-admin, accessApplication: llm-proxy/cc-lb-admin, guard: Forwarding, appliedVersion: 42}]
-  addresses: [{type: Hostname, value: "<id>.cfargotunnel.com"}]
-  dnsRecords: [{hostname: cc-lb.runbear.io, recordId: "<id>", zoneId: "<id>", state: Ready}]
+  dnsRecords: [{hostname: cc-lb.runbear.io, recordId: "<uuid>", zoneId: "<uuid>", ownershipComment: "flareway ..."}]
   listeners: [{name: admin, exposure: Private, binding: Loopback, protectionDomains: [{name: cc-lb-admin, envoyPort: 443, protected: true}]}]
   gatewayRef: {name: cc-lb}
+  gatewayUid: "<kubernetes-gateway-uid>"
   conditions: [Accepted, TunnelReady, ConfigApplied, DNSReady, PrivateListenerDegraded, Ready, CleanupBlocked, Conflict]
 ```
 
-- 하나의 Tunnel은 정확히 하나의 Gateway에 소유된다. 두 번째 Gateway 참조는 거부.
+Direct mode는 Gateway mode와 별도 소유 경계다.
+
+```yaml
+kind: CloudflareTunnel
+spec:
+  accountRef: {name: runbear}
+  tunnel: {name: direct-origin}
+  configuration:
+    mode: Direct
+    direct:
+      ingress:
+        - hostname: ssh.runbear.io
+          service: {ssh: {address: sshd.default.svc.cluster.local:22}}
+          originRequest: {proxyType: Regular, tcpKeepAlive: 30}
+        - service: {httpStatus: {code: 404}}
+      originRequest:
+        connectTimeout: 30
+        noHappyEyeballs: false
+        tcpKeepAlive: 30
+      warpRouting:
+        enabled: true
+        connectTimeout: 30
+        maxActiveFlows: 1000
+  dns: {mode: Managed, proxied: true, ttl: 1}
+```
+
+Direct service union은 `http`, `https`, `tcp`, `ssh`, `rdp`, `smb`, `unix`, `unixTLS`, `helloWorld`, `httpStatus`, `bastion`을 모두 제공한다. 마지막 catch-all rule, HTTP origin에만 허용되는 `originRequest.access`, Bastion/SOCKS5에만 허용되는 `ipRules` validation을 admission에서 적용한다.
+
+- Gateway mode Tunnel은 정확히 하나의 Gateway UID가 소유한다. Direct mode는 Gateway data plane을 만들지 않으며, Gateway→Direct 전환은 기록된 UID의 기존 cloudflared Deployment와 Pod를 먼저 drain한 뒤 owner checkpoint를 해제한다.
 - `PrivateListenerDegraded=True`는 Private listener가 loopback 대신 Pod IP에 바인딩된 경우를 뜻한다.
 - 같은 Gateway에서 같은 hostname을 Public과 Private로 함께 노출하는 것은 v1에서 금지한다. `CloudflareTunnel`은 `Accepted=False`, 메시지 "hostname exposure must be unique per Gateway"를 기록하며, 별도 hostname을 사용해야 한다.
 - Private 리스너는 `listeners[].hostnameRoute.create`가 기본 `true`이며, 이 Tunnel을 가리키는 `NetworkRoute` 또는 `HostnameRoute`가 실제로 있을 때만 `warp-routing.enabled: true`를 켠다. 대상 route가 없으면 `Programmed=False/Pending`, 메시지 "no private route targets this tunnel". Public만이면 끈다. Private-only Tunnel에서 `dns.mode: External`이면 `DNSReady=True/NotApplicable`.
-- ObserveOnly Tunnel(예: Terraform 소유 `runbear-operation-private`)에는 config를 쓰지 않는다. 이런 Tunnel을 Gateway가 참조하면 `Programmed=False/Pending` + 메시지 "tunnel is ObserveOnly; no ingress will be written". (기획서 §10.4: 공유 tunnel 부분 reconcile 금지)
+- ObserveOnly Tunnel(예: Terraform 소유 `runbear-operation-private`)은 account credential로 지정 ID를 조회하고 bounded 상태만 투영한다. `ownershipVerified`는 항상 `false`다. connector/management token 조회, token Secret 생성·갱신, cloudflared Deployment, DNS/config/name write, remote delete를 수행하지 않는다. 이런 Tunnel을 Gateway가 참조하면 `Programmed=False/Pending`와 ObserveOnly 사유를 기록한다. (기획서 §10.4: 공유 tunnel 부분 reconcile 금지)
 
 ### 6.4 `AccessApplication` (Namespaced, GEP-713 Direct policy)
 
@@ -413,38 +483,56 @@ metadata:
   namespace: llm-proxy
   labels: {gateway.networking.k8s.io/policy: Direct}     # CRD에 고정
 spec:
-  accountRef: {name: runbear}                             # 생략 시 Tunnel의 account
-  targetRefs:                                             # 같은 namespace만
+  accountRef: {name: runbear}
+  zone: runbear.io                                           # 선택; 생략하면 account endpoint
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:                                                # 같은 namespace만
     - {group: gateway.networking.k8s.io, kind: HTTPRoute, name: cc-lb-admin}
-    # 또는 {group: gateway.networking.k8s.io, kind: Gateway, name: cc-lb, sectionName: admin}   # 리스너 전체
-    # 또는 {kind: HTTPRoute, name: x, sectionName: <rules[].name>}                                # rule 하나
-  privateDestinations: []                                 # hostname 없는 L4 노출(§6.4.2), targetRefs와 병행 가능
+    # 또는 {group: gateway.networking.k8s.io, kind: Gateway, name: cc-lb, sectionName: admin}
+    # 또는 {group: gateway.networking.k8s.io, kind: HTTPRoute, name: x, sectionName: rule-name}
+  pathScope: {type: PathPrefix, value: /admin}               # 선택: target 결과를 더 좁힘
+  destinations:                                              # Public은 targetRefs에서만 파생
+    - type: Private
+      private:
+        networkRouteRef: {name: llm-proxy-svc-cidr}
+        cidr: 10.96.12.34/32
+        portRange: "5432"
+        l4Protocol: TCP
   application:
-    name: runbear-operation-cc_lb                         # 기본 "<ns>/<name>"
+    name: runbear-operation-cc_lb
     sessionDuration: 720h
     allowAuthenticateViaWarp: true
     skipInterstitial: true
     autoRedirectToIdentity: true
-    allowedIdpRefs: [{name: google}]                      # IdentityProvider CR 또는 {externalId}
+    allowedIdpRefs: [{name: google}]
     appLauncherVisible: false
     serviceAuth401Redirect: true
-    tags: []                                              # flareway 소유 태그는 컨트롤러가 추가
-  policies:                                               # 순서 = precedence
-    - policyRef: {name: allow-developers-warp, namespace: flareway-system}   # AccessPolicy CR(플랫폼, grant 필요)
-    - policyRef: {name: deny-everyone, namespace: flareway-system}
-    # 또는 {externalRef: {policyId: "<uuid>"}}  → ObserveOnly 참조 (Terraform 소유)
+    customPageRefs: [{objectRef: {name: denied-page, namespace: flareway-system}}]
+    tags: []
+  policies:                                                  # 순서 = remote precedence
+    - policyRef: {name: allow-developers-warp, namespace: flareway-system}
+    - externalRef: {policyId: "<terraform-policy-uuid>"}
   originJWT:
-    mode: Required                                        # Required | Disabled(플랫폼 승인 라벨 필요, D-07)
-    assumeGatewayTLSDecryption: false                      # 관측 불가한 Private TLS decryption의 플랫폼 명시
+    mode: Required
+    audienceScope: Application                               # Application | Hostname
+    assumeGatewayTLSDecryption: false
+  bypass:
+    children:
+      - hostname: cc-lb.runbear.io
+        path: /admin/healthz
+        externalRef: {applicationId: "<existing-child-uuid>"}
+        adoption: {mode: AdoptById, expect: {name: existing-health-bypass}}
+        deletionPolicy: Orphan
   managementPolicy: Managed
-  externalRef: {applicationId: "<uuid>"}                   # ObserveOnly 참조 또는 AdoptById 대상
-  adoption: {mode: None}                                  # AdoptById → 기존 앱 ID/AUD 유지(§10)
+  # externalRef: {applicationId: "<uuid>"}                   # ObserveOnly 또는 AdoptById에서만 활성화
+  adoption: {mode: None}
   deletionPolicy: Delete
 status:
   applicationId: "<uuid>"
-  destinations: [{type: public, uri: "cc-lb.runbear.io"}]
+  destinations: [{type: Public, uri: "cc-lb.runbear.io/admin"}]
   dataPlanes: [{tunnel: cc-lb, listener: admin, protectionDomain: cc-lb-admin, envoyPort: 18081}]
-  bypassApplications: [{hostname: codex-lb.runbear.io, path: /v1, applicationId: "<child-uuid>"}]
+  bypassApplications: [{hostname: cc-lb.runbear.io, path: /admin/healthz, applicationId: "<child-uuid>", origin: Adopted}]
   ancestors:
     - ancestorRef: {kind: Gateway, name: cc-lb}
       controllerName: flareway.bhyoo.com/gateway-controller
@@ -455,31 +543,56 @@ status:
 
 | target | Public 리스너 | Private 리스너 |
 |---|---|---|
-| `Gateway` + `sectionName`(listener) | `{type: public, uri: "<listener.hostname>"}` (wildcard면 `*.x`) | `{type: private, hostname: <hostname>, portRange: "<listener.port>", l4Protocol: tcp, vnetId}` |
+| `Gateway` + `sectionName`(listener) | `{type: Public, uri: "<listener.hostname>"}` (wildcard면 `*.x`) | `{type: Private, hostname: <hostname>, portRange: "<listener.port>", l4Protocol: TCP, vnetId}` |
 | hostname 없는 `HTTPRoute` + wildcard listener | listener hostname으로 해석(`*.x` destination) | listener hostname과 listener port로 해석 |
-| `HTTPRoute` 전체 | hostnames × (모든 rule의 `Exact`/`PathPrefix` 경로의 최소 공통 prefix 집합) → `uri` 목록. `RegularExpression`·header/method/query-only rule은 hostname 전체로 승격(over-protect, fail-closed) | hostnames → `{type: private, hostname, portRange: "<listener.port>"}` (path 없음, F-10 private은 port 단위) |
-| `HTTPRoute` + `sectionName`(rule) | 그 rule의 path만 | 위와 같음 |
+| `HTTPRoute` 전체 | hostnames × (모든 rule의 `Exact`/`PathPrefix` 경로의 최소 공통 prefix 집합) → `uri` 목록. `RegularExpression`·header/method/query-only rule은 hostname 전체로 승격(over-protect, fail-closed) | hostnames → `{type: Private, hostname, portRange: "<listener.port>"}` |
+| `HTTPRoute` + `sectionName`(rule) 또는 `pathScope` | 지정 rule 또는 scope의 `Exact`/`PathPrefix` path만 | private destination은 path가 아니라 listener port 단위 |
 
 - 한 앱의 모든 destination은 같은 AUD → 한 앱이 여러 hostname을 덮어도 cloudflared `audTag`는 앱당 1개. **다른 앱의 AUD를 같은 rule에 넣지 않는다**(기획서 §8.4).
 - wildcard listener에서는 cloudflared와 Gateway API가 더 깊은 hostname까지 매치하지만 Access destination `*.x`는 한 레이블만 보호한다. 더 깊은 hostname은 JWT 없이 보호 cloudflared rule에 도달해 403으로 fail-closed하며, condition 메시지는 "Access wildcard covers one label; deeper hostnames are denied at origin".
 - 같은 hostname에 두 AccessApplication이 겹치는 path를 target하면 후발(생성 timestamp) `Accepted=False/Conflicted`(F-2).
 - AUD는 `status`, event, log에 기록하지 않고 컨트롤러 내부 캐시인 오퍼레이터 소유 Secret `flareway-system/aud-<uid>`에 보관한다.
 
-#### 6.4.2 `privateDestinations[]` (hostname 없는 L4, `[U-9]`)
+#### 6.4.2 `destinations[].private` (hostname 없는 L4, `[U-9]`)
 
 ```yaml
-privateDestinations:
-  - networkRouteRef: {name: llm-proxy-svc-cidr}     # 플랫폼 NetworkRoute; 이 CIDR 안이어야 함
-    cidr: 10.96.12.34/32                             # 선택: route CIDR의 부분집합
-    portRange: "5432"
-    l4Protocol: tcp
-  - hostnameRouteRef: {name: db-internal}            # HostnameRoute 참조
-    portRange: "5432-5433"
+destinations:
+  - type: Private
+    private:
+      networkRouteRef: {name: llm-proxy-svc-cidr}
+      cidr: 10.96.12.34/32
+      portRange: "5432"
+      l4Protocol: TCP
+  - type: Private
+    private:
+      hostnameRouteRef: {name: db-internal}
+      portRange: "5432-5433"
+      l4Protocol: TCP
 ```
 
-- Gateway API 밖의 노출이므로 `ancestors`에는 참조한 `NetworkRoute`/`HostnameRoute`를 ancestor로 기록. 커버하는 route가 없으면 `Accepted=False/TargetNotFound`.
-- 참조는 `CloudflareAccount.spec.grants[].privateRoutes`의 해당 selector와 route의 `spec.allowedNamespaces`가 모두 AccessApplication namespace를 허용할 때만 Accepted다. 하나라도 거부하면 `Accepted=False/RefNotPermitted`.
-- origin JWT 없음 → `OriginJWTEnforced=False/NotApplicable` 조건을 항상 기록.
+- `private.networkRouteRef`와 `private.hostnameRouteRef` 중 정확히 하나가 필요하다. optional `cidr`은 NetworkRoute 범위의 부분집합이어야 한다.
+- Gateway API 밖의 destination이므로 `ancestors`에는 참조한 `NetworkRoute`/`HostnameRoute`를 기록한다. 커버하는 route가 없으면 `Accepted=False/TargetNotFound`.
+- `CloudflareAccount.spec.grants[].privateRoutes` selector와 route의 `spec.allowedNamespaces`가 모두 AccessApplication namespace를 허용해야 한다.
+- origin JWT를 적용할 HTTP data plane이 없는 destination은 `OriginJWTEnforced=False/NotApplicable`이다.
+
+#### 6.4.3 `AccessStandaloneApplication`
+
+```yaml
+kind: AccessStandaloneApplication
+metadata: {name: device-enrollment, namespace: flareway-system}
+spec:
+  accountRef: {name: runbear}
+  type: WARP
+  warp: {}
+  policies:
+    - policyRef: {name: managed-devices}
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+```
+
+Gateway에 붙는 type은 `AccessApplication`의 `SelfHosted|SSH|VNC|RDP|MCP|ProxyEndpoint`, 붙지 않는 type은 `AccessStandaloneApplication`의 `SaaS|Bookmark|Infrastructure|AppLauncher|WARP|BISO|DashSSO|MCPPortal`이다. `accountRef`, immutable `type`, 정확히 하나의 matching variant가 필수다.
+
+SaaS는 immutable `authType: OIDC|SAML`과 대응 config를 사용한다. OIDC grant/scope/custom claim, SAML attribute/JSONata, Infrastructure SSH target/inline Allow policy, App Launcher 디자인, WARP enrollment, BISO, DashSSO, MCPPortal destination을 typed field로 제공한다. SaaS create-only client secret은 `status.saas.clientSecretRef`가 가리키는 controller-owned Secret에만 보관한다. 공통 `application.scimConfig`의 password/token/client secret도 Secret 또는 `ServiceToken` reference로만 입력한다.
 
 ### 6.5 `AccessPolicy`
 
@@ -489,7 +602,7 @@ metadata: {name: allow-developers-warp, namespace: flareway-system}
 spec:
   accountRef: {name: runbear}
   name: allow_developers_warp
-  decision: allow                        # allow | deny | nonIdentity | bypass
+  decision: Allow                        # Allow | Deny | NonIdentity | Bypass
   include:
     - group: {groupRef: {name: developers}}          # AccessGroup CR 또는 {externalId}
     - emailDomain: {domain: runbear.io}
@@ -500,8 +613,9 @@ spec:
   purposeJustification: {required: false}
   approval: {required: false, groups: []}
   isolationRequired: false
-  managementPolicy: Managed | ObserveOnly              # ObserveOnly + externalRef = Terraform 정책 참조
+  managementPolicy: ObserveOnly
   externalRef: {policyId: "<uuid>"}
+  deletionPolicy: Orphan
 status: {policyId, referencedBy: [...]}
 ```
 
@@ -509,33 +623,47 @@ status: {policyId, referencedBy: [...]}
 
 정책 이름 prefix `flareway/<ns>/<name>`을 원격 `name`에 넣어 ledger로 쓴다(F-11: 정책엔 tags 없음).
 
-### 6.6 `AccessGroup`, `IdentityProvider`, `DevicePostureRule` (플랫폼)
+### 6.6 Access 보조 리소스
 
 - `AccessGroup.spec.{name, include, require, exclude}` — 규칙 타입은 AccessPolicy와 동일, 중첩은 `group.groupRef`.
-- `IdentityProvider.spec.{type, name, config (SecretRef로 client secret), scimConfig}` — `managementPolicy: ObserveOnly` + `externalRef.idpId`가 기본 사용 형태(cc-lb 이전 시 Google IdP는 Terraform 소유).
-- `DevicePostureRule.spec.{type, name, description, schedule, expiration, match[], input}` — 원격 `description`에 ledger 기록.
+- `IdentityProvider.spec.{accountRef, type, name, config, scimConfig}` — client secret과 SCIM token은 Secret reference로만 입력한다.
+- `DevicePostureRule.spec.{accountRef, type, name, description, schedule, expiration, match[], input}` — 원격 `description`에 ledger를 기록한다.
+- `AccessCustomPage.spec.{accountRef, name, type, html, contractVersion}` — type은 `IdentityDenied|Forbidden|Login|Interstitial`.
+- `DevicePostureIntegration.spec.{accountRef, type, name, interval, config}` — third-party credential은 Secret key reference다.
+- `AccessInfrastructureTarget.spec.{accountRef, hostname, ip}` — IPv4/IPv6별 `virtualNetworkRef` 또는 `virtualNetworkId`를 사용한다.
 
 ### 6.7 `ServiceToken`
 
 ```yaml
 kind: ServiceToken
-spec: {accountRef, name, duration: 8760h, secretRef: {name: cc-lb-ci-token}, rotation: {mode: Manual|OnExpiry, graceDuration: 24h}}
-status: {tokenId, clientId, expiresAt, rotatedAt}
+spec:
+  accountRef: {name: runbear}
+  name: cc-lb-ci
+  enabled: true
+  duration: 8760h
+  secretRef: {name: cc-lb-ci-token}
+  rotation: {mode: Manual, graceDuration: 24h}
+  deletionPolicy: Delete
+status: {tokenId: "<uuid>", clientId: "<client-id>", expiresAt: "...", rotatedAt: "..."}
 ```
 
 - Secret 키 `CF-Access-Client-Id`, `CF-Access-Client-Secret`. Secret이 사라져도 자동 회전 금지(기획서 §10.3); `rotation.mode: Manual`이면 `spec.rotation.requestedAt` 갱신으로 회전.
 
-### 6.8 `VirtualNetwork` / 6.9 `NetworkRoute` / 6.10 `HostnameRoute` (플랫폼)
+### 6.8 `VirtualNetwork` / 6.9 `NetworkRoute` / 6.10 `HostnameRoute`
 
 ```yaml
 kind: VirtualNetwork
-spec: {accountRef, name: prod, isDefault: false, comment}
+spec:
+  accountRef: {name: runbear}
+  name: prod
+  isDefault: false
+  comment: "production routes"
 ---
 kind: NetworkRoute
 spec:
   accountRef: {name: runbear}
   network: 10.96.0.0/12                    # Service CIDR 등. 전체 Pod CIDR 자동 광고 금지(플랫폼이 명시)
-  tunnelRef: {name: cc-lb, namespace: llm-proxy}   # CloudflareTunnel
+  tunnelRef: {kind: CloudflareTunnel, name: cc-lb, namespace: llm-proxy}
   virtualNetworkRef: {name: prod}
   allowedNamespaces: {from: Same}            # Same | All | Selector
   # allowedNamespaces: {from: Selector, selector: {matchLabels: {...}}}
@@ -545,7 +673,7 @@ kind: HostnameRoute
 spec:
   accountRef: {name: runbear}
   hostname: admin.cc-lb.internal
-  tunnelRef: {name: cc-lb, namespace: llm-proxy}
+  tunnelRef: {kind: WARPConnector, name: mesh-egress, namespace: flareway-system}
   # 해석은 항상 Tunnel 데이터플레인 Pod의 DNS sidecar가 127.0.0.1로 답한다(§9.4.2). 별도 옵션 없음.
   allowedNamespaces: {from: Same}            # Same | All | Selector
   # allowedNamespaces: {from: Selector, selector: {matchLabels: {...}}}
@@ -555,6 +683,28 @@ spec:
 - 같은 VNet 내 CIDR 중첩은 admission에서 거부(F-16). `HostnameRoute`가 fallback domain suffix와 겹치면 `Accepted=False`(F-18 caveat).
 - `HostnameRoute.hostname` wildcard는 `*.internal.local`처럼 선두의 전체 레이블 하나만 허용한다. 저장할 때 선두 `*.`를 제거해 suffix를 보관하고 정확히 한 레이블 깊이만 매치한다. partial/mid/multi-level wildcard는 admission에서 거부한다.
 - `CloudflareTunnel.spec.listeners[].hostnameRoute.create`의 기본값은 `true`이며 이 리소스를 플랫폼 namespace에 자동 생성한다(grant `platformObjects: Allowed` 필요, 아니면 플랫폼이 수동 생성).
+
+`TunnelReference.kind`는 `CloudflareTunnel|WARPConnector`이며 생략하면 `CloudflareTunnel`이다. 이 typed discriminator와 name/namespace로 remote tunnel 종류를 결정하며 문자열 tunnel ID를 route spec에 넣지 않는다.
+
+#### 6.10.1 `WARPConnector`
+
+```yaml
+kind: WARPConnector
+metadata: {name: mesh-egress, namespace: flareway-system}
+spec:
+  accountRef: {name: runbear}
+  name: mesh-egress
+  highAvailability:
+    enabled: true
+    mode: Local
+    local:
+      vips: [{address: 10.96.0.10}]
+  # failover: {clientId: "<linked-client>", requestId: "manual-20260915-1"} # client 연결 후 명시
+  managementPolicy: Managed
+  deletionPolicy: Orphan
+```
+
+`WARPConnector`는 Gateway data plane이 없는 별도 Mesh tunnel이다. controller-owned token Secret, bounded client/connection status, create-only `highAvailability.enabled`, `None|Disabled|AWS|Local` provider config, explicit failover를 관리한다. AWS는 `aws.fnrId`, Local은 `local.vips[]`가 필요하고 failover를 반복하려면 `requestId`를 바꾼다.
 
 ### 6.11 `DeviceProfile` (플랫폼, 단일 집계 작성자)
 
@@ -584,7 +734,7 @@ spec:
   fallbackDomains:
     static: [{suffix: corp.local, dnsServer: [...]}]
   dnsSearchSuffixes: [{suffix: runbear.io, description: "corporate search"}]
-  managementPolicy: Managed | ObserveOnly
+  managementPolicy: Managed
   deletionPolicy: Orphan                      # 기본 보호
 status:
   profileId, appliedInclude: [...provenance...], appliedFallback: [...], conflicts: [...]
@@ -649,8 +799,8 @@ spec:
 | 기획서/타 프로젝트 annotation | Flareway 귀착 |
 |---|---|
 | `cfgate.io/tunnel-ref`(Gateway) | `Gateway.spec.infrastructure.parametersRef` |
-| `cfgate.io/origin-*`, `cloudflare.com/*`(origin params) | 불필요(§5.1); backend TLS/timeout은 표준 `BackendTLSPolicy`/`HTTPRoute.timeouts` |
-| `cfgate.io/cloudflare-proxied`, `cfgate.io/ttl` | Tunnel CNAME은 항상 proxied/auto → 노출 없음 |
+| `cfgate.io/origin-*`, `cloudflare.com/*`(origin params) | Gateway mode의 backend TLS/timeout은 표준 `BackendTLSPolicy`/`HTTPRoute.timeouts`; Direct mode의 full origin policy는 `CloudflareTunnel.spec.configuration.direct.originRequest` |
+| `cfgate.io/cloudflare-proxied`, `cfgate.io/ttl` | `CloudflareTunnel.spec.dns.{proxied,ttl,settings}` |
 | `cfgate.io/access-policy`, STRRL Access annotation | `AccessApplication` policy attachment |
 | `cfgate.io/deletion-policy: orphan` | `spec.deletionPolicy` |
 | 노출 경로(public/private) | `CloudflareTunnel.spec.listeners[].exposure` `[U-8]` |
@@ -676,7 +826,7 @@ Ingress에는 parametersRef/targetRef가 없으므로 그때만 annotation을 �
 - `targetRefs[]` = `LocalPolicyTargetReferenceWithSectionName`(group/kind/name/sectionName). **같은 namespace만**. cross-namespace는 v1 미지원(Istio/Envoy Gateway와 동일, F-2). 플랫폼 `AccessPolicy`/`AccessGroup` **참조**(policyRef)는 target이 아니라 참조이므로 허용하되 `CloudflareAccount.grants.accessPolicyRefs`로 인가.
 - 허용 kind: `Gateway`(sectionName=listener 권장; 없으면 모든 Public/Private 리스너 → 각 hostname 앱 destination), `HTTPRoute`(sectionName=rule name 선택).
 - 충돌: 같은 hostname/path 영역을 두 정책이 target → 오래된 것 승, 패자 `Accepted=False/Conflicted`. 같은 target에 Gateway-level과 Route-level 정책이 있으면 **더 구체적인(Route) 것이 그 hostname/path 범위를 담당하고 나머지는 Gateway-level** — Cloudflare 앱 path precedence(F-10)와 동일 의미.
-- 상태: `status.ancestors[]`에 각 Gateway(및 privateDestinations의 route) ancestor를 기록. 조건 `Accepted`, `Programmed`(앱 생성·AUD 획득·ingress/Envoy 적용·probe 통과), `OriginJWTEnforced`.
+- 상태: `status.ancestors[]`에 각 Gateway와 `destinations[].private`가 참조한 route ancestor를 기록. 조건 `Accepted`, `Programmed`, `OriginJWTEnforced`.
 - Gateway/HTTPRoute 쪽 상태: 보호 대상 route의 `parents[].conditions`에 `flareway.bhyoo.com/AccessProtected=True` 확장 조건(표준 조건 외 구현별 조건은 허용) 기록.
 
 ---
@@ -762,16 +912,16 @@ AUD가 바뀌거나 보호 경계를 보존할 수 없으면 block-first로 처�
 
 ## 10. 소유권 · adoption · 삭제
 
-공통 필드:
+공통 lifecycle 필드는 다음 계약을 따른다.
 
-```yaml
-managementPolicy: Managed | ObserveOnly
-externalRef: {<kind>Id: "<uuid>"}           # ObserveOnly 참조 또는 adoption 대상
-adoption:
-  mode: None | AdoptById                     # 이름 일치 자동 인수 없음
-  expect: {name: "...", domain: "..."}       # 인수 전 원격 속성 검증(불일치 → Conflict)
-deletionPolicy: Delete | Orphan              # 전역/공유 객체 기본 Orphan
-```
+| 목적 | 필드 조합 |
+|---|---|
+| 새 객체 관리 | `managementPolicy: Managed`, `adoption.mode: None`; `externalRef` 없음. controller가 생성한 ID만 `ownershipVerified: true`로 checkpoint |
+| 기존 객체 관측 | `managementPolicy: ObserveOnly`, `externalRef`, 일반적으로 `deletionPolicy: Orphan`; 관측 ID는 `ownershipVerified: false` |
+| 기존 객체 인수 | `managementPolicy: Managed`, `externalRef`, `adoption.mode: AdoptById`, `adoption.expect.name`; externalRef·expect가 실제 원격 객체와 모두 일치한 뒤에만 `ownershipVerified: true` |
+| 삭제 정책 | `Delete` 또는 `Orphan`; 공유/계정 전역 객체의 안전 기본값은 `Orphan`. `ownershipVerified: false`인 원격 ID는 `Delete`여도 삭제하지 않고 orphan 상태로 보고 |
+
+이름 일치와 `status.tunnelId`만으로는 ownership proof가 되지 않는다. ObserveOnly에서 얻은 Tunnel ID를 Managed reconcile, rename, config, DNS, token 발급, connector, delete에 사용할 수 없다. 각 Kind의 `externalRef` ID 필드는 생성 CRD에 정의된 정확한 이름을 사용한다.
 
 Ledger:
 
@@ -793,12 +943,12 @@ Ledger:
 
 route가 attach된 상태에서 Gateway 또는 Tunnel을 삭제하면 다음 순서를 지킨다.
 
-1. 모든 Public ingress rule을 403으로 바꾸고 Private virtual host를 deny-all로 만든다.
+1. 기록된 exact `gatewayRef`+`gatewayUid`가 아직 살아 있으면 그 UID만 hostname을 403/deny-all로 전환할 수 있다.
 2. `dns.mode: Managed` DNS record를 회수한다.
-3. `--grace-period` 동안 기존 연결을 drain한다.
+3. 기록된 Gateway UID의 cloudflared Deployment를 0으로 scale하고, 그 Tunnel token을 쓰는 Pod와 connector가 종료될 때까지 successor를 승인하지 않는다.
 4. 해당 Gateway/Tunnel을 target하는 AccessApplication을 `Programmed=False/TargetNotFound`로 전환한다. `managementPolicy: Managed`인 remote app은 그 앱의 `deletionPolicy: Delete`일 때만 삭제하고, Orphan이면 남긴다.
 5. `NetworkRoute` 또는 `HostnameRoute`가 계속 Tunnel을 가리키면 Tunnel을 `CleanupBlocked`로 두고 플랫폼이 먼저 route를 제거하도록 요구한다.
-6. 참조가 사라지면 `DELETE cfd_tunnel?cascade=true`를 호출한다.
+6. `status.ownershipVerified: true`인 Tunnel만 connection eviction 후 `DELETE cfd_tunnel?cascade=true`를 호출한다. ObserveOnly 또는 unverified ID는 원격을 보존하고 orphan으로 보고한다.
 
 ---
 

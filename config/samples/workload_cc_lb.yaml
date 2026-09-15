@@ -160,7 +160,7 @@ metadata:
 spec:
   accountRef:
     name: cc-lb-example
-  type: google
+  type: Google
   name: Google
   managementPolicy: ObserveOnly
   externalRef:
@@ -176,7 +176,7 @@ spec:
   accountRef:
     name: cc-lb-example
   name: allow-developers-warp
-  decision: allow
+  decision: Allow
   include:
   - emailDomain:
       domain: example.com
@@ -199,7 +199,7 @@ spec:
   accountRef:
     name: cc-lb-example
   name: deny-everyone
-  decision: deny
+  decision: Deny
   include:
   - everyone: {}
   managementPolicy: ObserveOnly
@@ -215,6 +215,8 @@ metadata:
 spec:
   accountRef:
     name: cc-lb-example
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: Gateway

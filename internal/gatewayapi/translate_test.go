@@ -686,6 +686,126 @@ func TestCompileCORSDefaultAndFilterOnlyRule(t *testing.T) {
 		t.Fatalf("filter-only ResolvedRefs = %#v", resolved)
 	}
 }
+func TestTranslateBackendClusterIdentitiesRemainDistinct(t *testing.T) {
+	in := baseInputs()
+	in.Gateway.Spec.Listeners[0].AllowedRoutes = &gatewayv1.AllowedRoutes{Namespaces: &gatewayv1.RouteNamespaces{
+		From: new(gatewayv1.NamespacesFromAll),
+	}}
+	in.Services = []corev1.Service{
+		service("team", "api--admin", 80, nil),
+		service("team--api", "admin", 80, nil),
+	}
+
+	ready := true
+	endpointName := "http"
+	firstEndpointPort := int32(8081)
+	secondEndpointPort := int32(8082)
+	in.EndpointSlices = []discoveryv1.EndpointSlice{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "api-admin", Namespace: "team", Labels: map[string]string{discoveryv1.LabelServiceName: "api--admin"}},
+			Ports:      []discoveryv1.EndpointPort{{Name: &endpointName, Port: &firstEndpointPort}},
+			Endpoints:  []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "admin", Namespace: "team--api", Labels: map[string]string{discoveryv1.LabelServiceName: "admin"}},
+			Ports:      []discoveryv1.EndpointPort{{Name: &endpointName, Port: &secondEndpointPort}},
+			Endpoints:  []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
+		},
+	}
+	in.BackendTLSPolicies = []gatewayv1.BackendTLSPolicy{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "api-admin-tls", Namespace: "team", Generation: 1},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: "", Kind: "Service", Name: "api--admin"}}},
+				Validation: gatewayv1.BackendTLSPolicyValidation{
+					Hostname:                "api-admin.team.example.com",
+					WellKnownCACertificates: new(gatewayv1.WellKnownCACertificatesSystem),
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "admin-tls", Namespace: "team--api", Generation: 1},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: "", Kind: "Service", Name: "admin"}}},
+				Validation: gatewayv1.BackendTLSPolicyValidation{
+					Hostname:                "admin.team-api.example.com",
+					WellKnownCACertificates: new(gatewayv1.WellKnownCACertificatesSystem),
+				},
+			},
+		},
+	}
+
+	mirrorNamespace := gatewayv1.Namespace("team--api")
+	gatewayNamespace := gatewayv1.Namespace("default")
+	in.ReferenceGrants = []gatewayv1.ReferenceGrant{{
+		ObjectMeta: metav1.ObjectMeta{Name: "allow-admin-mirror", Namespace: "team--api"},
+		Spec: gatewayv1.ReferenceGrantSpec{
+			From: []gatewayv1.ReferenceGrantFrom{{Group: gatewayv1.Group(gatewayGroup), Kind: "HTTPRoute", Namespace: "team"}},
+			To:   []gatewayv1.ReferenceGrantTo{{Group: "", Kind: "Service", Name: new(gatewayv1.ObjectName("admin"))}},
+		},
+	}}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "collision", Namespace: "team", Generation: 1},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", Namespace: &gatewayNamespace}}},
+			Rules: []gatewayv1.HTTPRouteRule{{
+				Filters: []gatewayv1.HTTPRouteFilter{{
+					Type: gatewayv1.HTTPRouteFilterRequestMirror,
+					RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{BackendRef: gatewayv1.BackendObjectReference{
+						Name: "admin", Namespace: &mirrorNamespace, Port: new(gatewayv1.PortNumber(80)),
+					}},
+				}},
+				BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{
+					Name: "api--admin", Port: new(gatewayv1.PortNumber(80)),
+				}}}},
+			}},
+		},
+	}}
+
+	gateway, statuses := Translate(in)
+	if len(gateway.Domains) != 1 || len(gateway.Domains[0].VirtualHosts) != 1 || len(gateway.Domains[0].VirtualHosts[0].Routes) != 1 {
+		t.Fatalf("translated collision route = %#v", gateway.Domains)
+	}
+	translated := gateway.Domains[0].VirtualHosts[0].Routes[0]
+	firstName := "k8s://team/api--admin:80"
+	secondName := "k8s://team--api/admin:80"
+	if len(translated.Backends) != 1 || translated.Backends[0].ClusterName != firstName {
+		t.Fatalf("route backend = %#v, want cluster %q", translated.Backends, firstName)
+	}
+	if len(translated.Filters.Mirrors) != 1 || translated.Filters.Mirrors[0].Backend.ClusterName != secondName {
+		t.Fatalf("route mirrors = %#v, want cluster %q", translated.Filters.Mirrors, secondName)
+	}
+
+	clusters := make(map[string]ir.Cluster, len(gateway.Clusters))
+	for _, cluster := range gateway.Clusters {
+		clusters[cluster.Name] = cluster
+	}
+	if len(clusters) != 2 {
+		t.Fatalf("clusters = %#v, want two distinct clusters", gateway.Clusters)
+	}
+	firstCluster, firstFound := clusters[firstName]
+	secondCluster, secondFound := clusters[secondName]
+	if !firstFound || firstCluster.Namespace != "team" || firstCluster.Service != "api--admin" || firstCluster.Port != 80 ||
+		!reflect.DeepEqual(firstCluster.Endpoints, []ir.Endpoint{{Address: "10.0.0.1", Port: 8081}}) ||
+		firstCluster.TLS == nil || firstCluster.TLS.ServerName != "api-admin.team.example.com" {
+		t.Fatalf("first cluster = %#v", firstCluster)
+	}
+	if !secondFound || secondCluster.Namespace != "team--api" || secondCluster.Service != "admin" || secondCluster.Port != 80 ||
+		!reflect.DeepEqual(secondCluster.Endpoints, []ir.Endpoint{{Address: "10.0.0.2", Port: 8082}}) ||
+		secondCluster.TLS == nil || secondCluster.TLS.ServerName != "admin.team-api.example.com" {
+		t.Fatalf("second cluster = %#v", secondCluster)
+	}
+	for _, key := range []types.NamespacedName{
+		{Namespace: "team", Name: "api-admin-tls"},
+		{Namespace: "team--api", Name: "admin-tls"},
+	} {
+		condition := findPolicyCondition(statuses.BackendTLSPolicies[key], gatewayv1.PolicyConditionAccepted)
+		if condition == nil || condition.Status != metav1.ConditionTrue {
+			t.Fatalf("BackendTLSPolicy %s Accepted = %#v", key, condition)
+		}
+	}
+}
+
 func TestTranslateFeaturesGolden(t *testing.T) {
 	in := baseInputs()
 	h2c := "kubernetes.io/h2c"
@@ -785,7 +905,11 @@ func TestTranslateCloudflareExposureAndGrants(t *testing.T) {
 				Name: "private", Exposure: v1alpha1.ExposurePrivate,
 			}},
 		},
-		Status: v1alpha1.CloudflareTunnelStatus{TunnelID: "11111111-1111-1111-1111-111111111111"},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "flareway-tunnel-edge"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: in.Gateway.Name}, GatewayUID: in.Gateway.UID,
+		},
 	}
 
 	gateway, statuses := Translate(in)
@@ -813,6 +937,98 @@ func TestTranslateCloudflareExposureAndGrants(t *testing.T) {
 	}
 	if accepted := findGatewayCondition(statuses.Gateway, gatewayv1.GatewayConditionAccepted); accepted == nil || accepted.Status != metav1.ConditionTrue || accepted.Reason != string(gatewayv1.GatewayReasonListenersNotValid) {
 		t.Fatalf("Gateway partial acceptance after hostname denial = %#v", accepted)
+	}
+}
+
+func TestTranslateDoesNotUseUnverifiedObserveOnlyOrDeletedTunnelIdentity(t *testing.T) {
+	in := baseInputs()
+	in.GatewayClassConfig.Spec.ConformanceMode = false
+	in.CloudflareAccount = &v1alpha1.CloudflareAccount{Spec: v1alpha1.CloudflareAccountSpec{AccountID: "account"}}
+	in.CloudflareTunnel = &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: in.Gateway.Namespace},
+		Spec:       v1alpha1.CloudflareTunnelSpec{ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "observed", GatewayRef: &corev1.LocalObjectReference{Name: in.Gateway.Name}, GatewayUID: in.Gateway.UID,
+		},
+	}
+	gateway, _ := Translate(in)
+	if gateway.Cloudflare != nil {
+		t.Fatalf("ObserveOnly Tunnel produced managed Cloudflare IR: %#v", gateway.Cloudflare)
+	}
+	in.CloudflareTunnel.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
+	gateway, _ = Translate(in)
+	if gateway.Cloudflare != nil {
+		t.Fatalf("unverified Tunnel produced managed Cloudflare IR: %#v", gateway.Cloudflare)
+	}
+	deletedAt := metav1.NewTime(time.Unix(200, 0))
+	in.CloudflareTunnel.Status.OwnershipVerified = true
+	in.CloudflareTunnel.Status.ConnectorTokenSecretRef = &corev1.LocalObjectReference{Name: "connector-token"}
+	in.CloudflareTunnel.Status.DeletedAt = &deletedAt
+	addressType := gatewayv1.HostnameAddressType
+	in.CloudflareTunnel.Status.Addresses = []gatewayv1.GatewayStatusAddress{{Type: &addressType, Value: "observed.cfargotunnel.com"}}
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name: "http", Exposure: v1alpha1.ExposurePrivate, Binding: v1alpha1.ListenerBindingPodIP,
+	}}
+	in.Services = []corev1.Service{{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway-gw-" + in.Gateway.Name, Namespace: in.Gateway.Namespace},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "10.96.0.10"},
+	}}
+	gateway, statuses := Translate(in)
+	if gateway.Cloudflare != nil {
+		t.Fatalf("remotely deleted Tunnel produced connector-bearing Cloudflare IR: %#v", gateway.Cloudflare)
+	}
+	for _, listener := range gateway.Listeners {
+		if listener.Binding == ir.ListenerBindingPodIP {
+			t.Fatalf("remotely deleted Tunnel retained private listener binding: %#v", gateway.Listeners)
+		}
+	}
+	if len(statuses.Gateway.Addresses) != 0 {
+		t.Fatalf("remotely deleted Tunnel published Gateway addresses: %#v", statuses.Gateway.Addresses)
+	}
+}
+
+func TestTranslateGatewayOriginRequest(t *testing.T) {
+	in := baseInputs()
+	in.GatewayClassConfig.Spec.ConformanceMode = false
+	connectTimeout := metav1.Duration{Duration: 30 * time.Second}
+	keepAliveTimeout := metav1.Duration{Duration: 90 * time.Second}
+	tcpKeepAlive := metav1.Duration{Duration: 15 * time.Second}
+	keepAliveConnections := int64(100)
+	noHappyEyeballs := false
+	disableChunked := true
+	http2Origin := true
+	in.GatewayClassConfig.Spec.OriginRequest = v1alpha1.GatewayOriginRequestSpec{
+		ConnectTimeout: &connectTimeout, KeepAliveTimeout: &keepAliveTimeout, TCPKeepAlive: &tcpKeepAlive,
+		KeepAliveConnections: &keepAliveConnections, NoHappyEyeballs: &noHappyEyeballs,
+		DisableChunkedEncoding: &disableChunked, HTTP2Origin: &http2Origin,
+	}
+	in.CloudflareAccount = &v1alpha1.CloudflareAccount{Spec: v1alpha1.CloudflareAccountSpec{AccountID: "0123456789abcdef0123456789abcdef"}}
+	in.CloudflareTunnel = &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "default"},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "flareway-tunnel-edge"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: in.Gateway.Name}, GatewayUID: in.Gateway.UID,
+		},
+	}
+
+	gateway, _ := Translate(in)
+	if gateway == nil || gateway.Cloudflare == nil {
+		t.Fatal("Cloudflare IR was not produced")
+	}
+	origin := gateway.Cloudflare.OriginRequest
+	if origin.ConnectTimeout == nil || *origin.ConnectTimeout != 30*time.Second ||
+		origin.KeepAliveTimeout == nil || *origin.KeepAliveTimeout != 90*time.Second ||
+		origin.TCPKeepAlive == nil || *origin.TCPKeepAlive != 15*time.Second ||
+		origin.KeepAliveConnections == nil || *origin.KeepAliveConnections != 100 ||
+		origin.NoHappyEyeballs == nil || *origin.NoHappyEyeballs ||
+		origin.DisableChunkedEncoding == nil || !*origin.DisableChunkedEncoding ||
+		origin.HTTP2Origin == nil || !*origin.HTTP2Origin {
+		t.Fatalf("Gateway origin request IR = %#v", origin)
+	}
+	keepAliveConnections = 7
+	if *origin.KeepAliveConnections != 100 {
+		t.Fatal("Gateway origin request IR retained mutable API pointers")
 	}
 }
 

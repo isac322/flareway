@@ -35,6 +35,7 @@ func (s *Server) registerAccessRoutes() {
 		s.Handle(http.MethodGet, `^/`+prefix+`/[^/]+/access/apps/[^/]+$`, s.getAccessApplication)
 		s.Handle(http.MethodPut, `^/`+prefix+`/[^/]+/access/apps/[^/]+$`, s.updateAccessApplication)
 		s.Handle(http.MethodDelete, `^/`+prefix+`/[^/]+/access/apps/[^/]+$`, s.deleteAccessApplication)
+		s.Handle(http.MethodPost, `^/`+prefix+`/[^/]+/access/apps/[^/]+/revoke_tokens$`, s.revokeAccessApplicationTokens)
 
 		s.Handle(http.MethodPost, `^/`+prefix+`/[^/]+/access/groups$`, s.createAccessGroup)
 		s.Handle(http.MethodGet, `^/`+prefix+`/[^/]+/access/groups$`, s.listAccessGroups)
@@ -76,7 +77,7 @@ func (s *Server) registerAccessRoutes() {
 
 func (s *Server) createAccessApplication(w http.ResponseWriter, r *http.Request) {
 	resource, ok := decodeAccessResource(w, r, "body")
-	if !ok || !requireStrings(w, resource, "name", "type") || !validateApplicationPolicies(w, resource) {
+	if !ok || !requireStrings(w, resource, "type") || !validateApplicationPolicies(w, resource) {
 		return
 	}
 	scope := accessScope(r.URL.Path)
@@ -86,7 +87,7 @@ func (s *Server) createAccessApplication(w http.ResponseWriter, r *http.Request)
 	if !validateApplicationTagsLocked(w, s.State, r.URL.Path, resource) {
 		return
 	}
-	if duplicateResourceName(s.State.accessApps[scope], resourceString(resource, "name"), "") {
+	if name := resourceString(resource, "name"); name != "" && duplicateResourceName(s.State.accessApps[scope], name, "") {
 		WriteError(w, http.StatusConflict, 1005, "Access application name already exists")
 		return
 	}
@@ -96,9 +97,11 @@ func (s *Server) createAccessApplication(w http.ResponseWriter, r *http.Request)
 	resource["aud"] = "aud-" + id
 	resource["created_at"] = now
 	resource["updated_at"] = now
+	response := accessApplicationCreateResponse(resource, id)
+	stripAccessApplicationSecrets(resource)
 	s.State.accessApps[scope][id] = cloneAccessResource(resource)
 	s.State.adjustPolicyAppCountsLocked(scope, nil, resource)
-	writeResult(w, http.StatusOK, resource)
+	writeResult(w, http.StatusOK, response)
 }
 
 func (s *Server) listAccessApplications(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +127,7 @@ func (s *Server) getAccessApplication(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) updateAccessApplication(w http.ResponseWriter, r *http.Request) {
 	resource, ok := decodeAccessResource(w, r, "body")
-	if !ok || !requireStrings(w, resource, "name", "type") || !validateApplicationPolicies(w, resource) {
+	if !ok || !requireStrings(w, resource, "type") || !validateApplicationPolicies(w, resource) {
 		return
 	}
 	scope, id := accessScope(r.URL.Path), pathPart(r.URL.Path, 4)
@@ -138,7 +141,7 @@ func (s *Server) updateAccessApplication(w http.ResponseWriter, r *http.Request)
 		WriteError(w, http.StatusNotFound, 1001, "Access application not found")
 		return
 	}
-	if duplicateResourceName(s.State.accessApps[scope], resourceString(resource, "name"), id) {
+	if name := resourceString(resource, "name"); name != "" && duplicateResourceName(s.State.accessApps[scope], name, id) {
 		WriteError(w, http.StatusConflict, 1005, "Access application name already exists")
 		return
 	}
@@ -146,6 +149,7 @@ func (s *Server) updateAccessApplication(w http.ResponseWriter, r *http.Request)
 	resource["aud"] = existing["aud"]
 	resource["created_at"] = existing["created_at"]
 	resource["updated_at"] = time.Now().UTC()
+	stripAccessApplicationSecrets(resource)
 	s.State.accessApps[scope][id] = cloneAccessResource(resource)
 	s.State.adjustPolicyAppCountsLocked(scope, existing, resource)
 	writeResult(w, http.StatusOK, resource)
@@ -165,6 +169,59 @@ func (s *Server) deleteAccessApplication(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeResult(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (s *Server) revokeAccessApplicationTokens(w http.ResponseWriter, r *http.Request) {
+	scope, id := accessScope(r.URL.Path), pathPart(r.URL.Path, 4)
+	s.State.mu.RLock()
+	_, found := s.State.accessApps[scope][id]
+	s.State.mu.RUnlock()
+	if !found {
+		WriteError(w, http.StatusNotFound, 1001, "Access application not found")
+		return
+	}
+	writeResult(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func accessApplicationCreateResponse(resource AccessResource, id string) AccessResource {
+	response := cloneAccessResource(resource)
+	stripAccessApplicationSecrets(response)
+	if resourceString(response, "type") != "saas" {
+		return response
+	}
+	saas, ok := response["saas_app"].(map[string]any)
+	if !ok {
+		saas = make(map[string]any)
+		response["saas_app"] = saas
+	}
+	saas["client_secret"] = "saas-secret-" + id
+	return response
+}
+
+func stripAccessApplicationSecrets(resource AccessResource) {
+	if saas, ok := resource["saas_app"].(map[string]any); ok {
+		delete(saas, "client_secret")
+	}
+	scim, ok := resource["scim_config"].(map[string]any)
+	if !ok {
+		return
+	}
+	switch authentication := scim["authentication"].(type) {
+	case map[string]any:
+		stripAccessAuthenticationSecrets(authentication)
+	case []any:
+		for _, item := range authentication {
+			if object, ok := item.(map[string]any); ok {
+				stripAccessAuthenticationSecrets(object)
+			}
+		}
+	}
+}
+
+func stripAccessAuthenticationSecrets(authentication map[string]any) {
+	delete(authentication, "password")
+	delete(authentication, "token")
+	delete(authentication, "client_secret")
 }
 
 func (s *Server) createAccessTag(w http.ResponseWriter, r *http.Request) {
@@ -888,8 +945,10 @@ func optionalTime(value any) *time.Time {
 	if !ok || text == "" {
 		return nil
 	}
+	// cloudflare-go v7 encodes date-time request fields with time.RFC3339.
+	// Reject fractional seconds instead of silently accepting a different wire contract.
 	parsed, err := time.Parse(time.RFC3339, text)
-	if err != nil {
+	if err != nil || parsed.Format(time.RFC3339) != text {
 		return nil
 	}
 	return &parsed

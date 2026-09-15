@@ -8,6 +8,9 @@ spec:
     name: example
   tunnel:
     name: flareway-example-public
+  configuration:
+    # Gateway mode is the sole writer of ingress assembled from Gateway API resources.
+    mode: Gateway
   managementPolicy: Managed
   adoption:
     mode: None
@@ -15,6 +18,11 @@ spec:
   dns:
     mode: Managed
     recordComment: example public tunnel
+    proxied: true
+    ttl: 1
+    settings:
+      ipv4Only: false
+      ipv6Only: true
   listeners:
   - name: web
     exposure: Public

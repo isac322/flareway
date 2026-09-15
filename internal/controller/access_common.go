@@ -75,7 +75,7 @@ func accessClientForAccount(
 	}
 	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
 		!metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return nil, nil, fmt.Errorf("CloudflareAccount %q is not ready", accountName)
+		return nil, nil, fmt.Errorf("the CloudflareAccount %q is not ready", accountName)
 	}
 	namespace := new(corev1.Namespace)
 	if err := kube.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
@@ -270,7 +270,7 @@ func validateAccessReference(_, _, kind, accountName string, deletionTimestamp *
 
 func resolveGroupID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetAccessGroup(ctx, ref.ExternalID); err != nil {
+		if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
 			return "", fmt.Errorf("validate external AccessGroup: %w", err)
 		}
 		return ref.ExternalID, nil
@@ -318,7 +318,7 @@ func resolveIDPID(ctx context.Context, kube client.Client, namespace string, acc
 
 func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetServiceToken(ctx, ref.ExternalID); err != nil {
+		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
 			return "", fmt.Errorf("validate external ServiceToken: %w", err)
 		}
 		return ref.ExternalID, nil

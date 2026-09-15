@@ -66,10 +66,14 @@ rules:
   - flareway.bhyoo.com
   resources:
   - accessapplications
+  - accesscustompages
   - accessgroups
+  - accessinfrastructuretargets
   - accesspolicies
+  - accessstandaloneapplications
   - cloudflareaccounts
   - cloudflaretunnels
+  - devicepostureintegrations
   - deviceposturerules
   - deviceprofiles
   - devicesettings
@@ -79,6 +83,7 @@ rules:
   - networkroutes
   - servicetokens
   - virtualnetworks
+  - warpconnectors
   - zerotrustgatewaypolicies
   - zerotrustlists
   - zerotrustorganizations
@@ -95,7 +100,9 @@ rules:
   resources:
   - accessapplications/finalizers
   - accessgroups/finalizers
+  - accessinfrastructuretargets/finalizers
   - accesspolicies/finalizers
+  - accessstandaloneapplications/finalizers
   - cloudflareaccounts/finalizers
   - cloudflaretunnels/finalizers
   - deviceposturerules/finalizers
@@ -107,6 +114,7 @@ rules:
   - networkroutes/finalizers
   - servicetokens/finalizers
   - virtualnetworks/finalizers
+  - warpconnectors/finalizers
   - zerotrustgatewaypolicies/finalizers
   - zerotrustlists/finalizers
   - zerotrustorganizations/finalizers
@@ -117,10 +125,14 @@ rules:
   - flareway.bhyoo.com
   resources:
   - accessapplications/status
+  - accesscustompages/status
   - accessgroups/status
+  - accessinfrastructuretargets/status
   - accesspolicies/status
+  - accessstandaloneapplications/status
   - cloudflareaccounts/status
   - cloudflaretunnels/status
+  - devicepostureintegrations/status
   - deviceposturerules/status
   - deviceprofiles/status
   - devicesettings/status
@@ -130,12 +142,20 @@ rules:
   - networkroutes/status
   - servicetokens/status
   - virtualnetworks/status
+  - warpconnectors/status
   - zerotrustgatewaypolicies/status
   - zerotrustlists/status
   - zerotrustorganizations/status
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - flareway.bhyoo.com
+  resources:
+  - accesscustompages/finalizers
+  - devicepostureintegrations/finalizers
+  verbs:
   - update
 - apiGroups:
   - gateway.networking.k8s.io

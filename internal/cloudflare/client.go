@@ -50,6 +50,7 @@ type API interface {
 	TunnelAPI
 	TunnelAdministrationAPI
 	DNSAPI
+	WARPConnectorAPI
 	AccessAPI
 	NetworkAPI
 	DeviceAPI

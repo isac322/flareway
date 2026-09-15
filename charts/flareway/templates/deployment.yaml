@@ -52,11 +52,7 @@ spec:
             - --health-probe-bind-address=:8081
             - --webhook-port=-1
             - --xds-bind-address=:{{ .Values.xds.service.port }}
-            - --enable-gateway-controllers={{ .Values.controllers.gateway }}
-            - --enable-access-controllers={{ .Values.controllers.access }}
-            - --enable-private-network-controllers={{ .Values.controllers.privateNetwork }}
-            - --enable-device-controllers={{ .Values.controllers.device }}
-            - --enable-organization-controllers={{ .Values.controllers.organization }}
+            {{- include "flareway.controllerArgs" . | nindent 12 }}
             {{- if .Values.metrics.enabled }}
             - --metrics-bind-address=:{{ .Values.metrics.service.port }}
             - --metrics-secure={{ .Values.metrics.secure }}

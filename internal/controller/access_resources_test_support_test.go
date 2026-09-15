@@ -19,25 +19,28 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 )
 
 type fakeAccessResourceCloudflare struct {
 	flarecloudflare.AccessAPI
-	mu          sync.Mutex
-	next        int
-	policies    map[string]flarecloudflare.AccessPolicy
-	groups      map[string]flarecloudflare.AccessGroup
-	providers   map[string]flarecloudflare.IdentityProvider
-	posture     map[string]flarecloudflare.DevicePostureRule
-	tokens      map[string]flarecloudflare.ServiceToken
-	secrets     map[string]string
-	rotations   int
-	clientCalls int
-	clientErr   error
+	mu           sync.Mutex
+	next         int
+	policies     map[string]flarecloudflare.AccessPolicy
+	groups       map[string]flarecloudflare.AccessGroup
+	providers    map[string]flarecloudflare.IdentityProvider
+	posture      map[string]flarecloudflare.DevicePostureRule
+	tokens       map[string]flarecloudflare.ServiceToken
+	secrets      map[string]string
+	tokenCreates int
+	rotations    int
+	clientCalls  int
+	clientErr    error
 }
 
 func newFakeAccessResourceCloudflare() *fakeAccessResourceCloudflare {
@@ -55,6 +58,7 @@ func (f *fakeAccessResourceCloudflare) reset() {
 	f.posture = map[string]flarecloudflare.DevicePostureRule{}
 	f.tokens = map[string]flarecloudflare.ServiceToken{}
 	f.secrets = map[string]string{}
+	f.tokenCreates = 0
 	f.rotations = 0
 	f.clientCalls = 0
 	f.clientErr = nil
@@ -69,17 +73,56 @@ func (f *fakeAccessResourceCloudflare) newID(prefix string) string {
 	f.next++
 	return fmt.Sprintf("%s-%d", prefix, f.next)
 }
+func cloneResolvedAccessRules(in []flarecloudflare.ResolvedAccessRule) []flarecloudflare.ResolvedAccessRule {
+	if in == nil {
+		return nil
+	}
+	out := make([]flarecloudflare.ResolvedAccessRule, len(in))
+	for i := range in {
+		out[i] = in[i]
+		out[i].Values = append([]string(nil), in[i].Values...)
+	}
+	return out
+}
+
+func fakeAccessPolicy(id string, in flarecloudflare.AccessPolicyInput) flarecloudflare.AccessPolicy {
+	v := flarecloudflare.AccessPolicy{
+		ID: id, Name: in.Name, Decision: in.Decision,
+		Include:         cloneResolvedAccessRules(in.Include),
+		Require:         cloneResolvedAccessRules(in.Require),
+		Exclude:         cloneResolvedAccessRules(in.Exclude),
+		SessionDuration: in.SessionDuration, PurposeJustificationPrompt: in.PurposeJustificationPrompt,
+		ApprovalGroups: append([]flarecloudflare.AccessApprovalGroup(nil), in.ApprovalGroups...),
+	}
+	if in.PurposeJustificationRequired != nil {
+		v.PurposeJustificationRequired = *in.PurposeJustificationRequired
+	}
+	if in.ApprovalRequired != nil {
+		v.ApprovalRequired = *in.ApprovalRequired
+	}
+	if in.IsolationRequired != nil {
+		v.IsolationRequired = *in.IsolationRequired
+	}
+	if in.ConnectionRules != nil {
+		v.ConnectionRules = *in.ConnectionRules
+	}
+	if in.MFAConfig != nil {
+		v.MFAConfig = *in.MFAConfig
+	}
+	return v
+}
+
 func (f *fakeAccessResourceCloudflare) CreateAccessPolicy(_ context.Context, in flarecloudflare.AccessPolicyInput) (flarecloudflare.AccessPolicy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.AccessPolicy{ID: f.newID("policy"), Name: in.Name, Decision: in.Decision, SessionDuration: in.SessionDuration}
+	v := fakeAccessPolicy(f.newID("policy"), in)
 	f.policies[v.ID] = v
 	return v, nil
 }
 func (f *fakeAccessResourceCloudflare) UpdateAccessPolicy(_ context.Context, id string, in flarecloudflare.AccessPolicyInput) (flarecloudflare.AccessPolicy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.AccessPolicy{ID: id, Name: in.Name, Decision: in.Decision, SessionDuration: in.SessionDuration}
+	v := fakeAccessPolicy(id, in)
 	f.policies[id] = v
 	return v, nil
 }
@@ -107,55 +150,107 @@ func (f *fakeAccessResourceCloudflare) DeleteAccessPolicy(_ context.Context, id 
 	delete(f.policies, id)
 	return nil
 }
-func (f *fakeAccessResourceCloudflare) CreateAccessGroup(_ context.Context, in flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, error) {
+func fakeAccessGroupKey(scope flarecloudflare.AccessScope, id string) string {
+	if scope.ZoneID == "" {
+		return id
+	}
+	return "zone:" + scope.ZoneID + "/" + id
+}
+
+func fakeAccessGroup(id string, in flarecloudflare.AccessGroupInput) flarecloudflare.AccessGroup {
+	isDefault := in.IsDefault
+	return flarecloudflare.AccessGroup{
+		ID: id, Name: in.Name,
+		Include:   cloneResolvedAccessRules(in.Include),
+		Require:   cloneResolvedAccessRules(in.Require),
+		Exclude:   cloneResolvedAccessRules(in.Exclude),
+		IsDefault: &isDefault,
+	}
+}
+
+func (f *fakeAccessResourceCloudflare) onlyAccessGroupID() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.AccessGroup{ID: f.newID("group"), Name: in.Name}
-	f.groups[v.ID] = v
+	if len(f.groups) != 1 {
+		return ""
+	}
+	for _, group := range f.groups {
+		return group.ID
+	}
+	return ""
+}
+
+func (f *fakeAccessResourceCloudflare) CreateAccessGroup(_ context.Context, scope flarecloudflare.AccessScope, in flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v := fakeAccessGroup(f.newID("group"), in)
+	f.groups[fakeAccessGroupKey(scope, v.ID)] = v
 	return v, nil
 }
-func (f *fakeAccessResourceCloudflare) UpdateAccessGroup(_ context.Context, id string, in flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, error) {
+func (f *fakeAccessResourceCloudflare) UpdateAccessGroup(_ context.Context, scope flarecloudflare.AccessScope, id string, in flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.AccessGroup{ID: id, Name: in.Name}
-	f.groups[id] = v
+	v := fakeAccessGroup(id, in)
+	f.groups[fakeAccessGroupKey(scope, id)] = v
 	return v, nil
 }
-func (f *fakeAccessResourceCloudflare) GetAccessGroup(_ context.Context, id string) (flarecloudflare.AccessGroup, error) {
+func (f *fakeAccessResourceCloudflare) GetAccessGroup(_ context.Context, scope flarecloudflare.AccessScope, id string) (flarecloudflare.AccessGroup, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v, ok := f.groups[id]
+	v, ok := f.groups[fakeAccessGroupKey(scope, id)]
 	if !ok {
 		return v, fmt.Errorf("group not found")
 	}
 	return v, nil
 }
-func (f *fakeAccessResourceCloudflare) ListAccessGroups(context.Context) ([]flarecloudflare.AccessGroup, error) {
+func (f *fakeAccessResourceCloudflare) ListAccessGroups(_ context.Context, options flarecloudflare.AccessGroupListOptions) ([]flarecloudflare.AccessGroup, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]flarecloudflare.AccessGroup, 0, len(f.groups))
-	for _, v := range f.groups {
-		out = append(out, v)
+	prefix := ""
+	if options.Scope.ZoneID != "" {
+		prefix = "zone:" + options.Scope.ZoneID + "/"
+	}
+	for key, v := range f.groups {
+		inScope := (prefix == "" && !strings.HasPrefix(key, "zone:")) || (prefix != "" && strings.HasPrefix(key, prefix))
+		if inScope && (options.Name == "" || v.Name == options.Name) && (options.Search == "" || strings.Contains(v.Name, options.Search)) {
+			out = append(out, v)
+		}
 	}
 	return out, nil
 }
-func (f *fakeAccessResourceCloudflare) DeleteAccessGroup(_ context.Context, id string) error {
+func (f *fakeAccessResourceCloudflare) DeleteAccessGroup(_ context.Context, scope flarecloudflare.AccessScope, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.groups, id)
+	delete(f.groups, fakeAccessGroupKey(scope, id))
 	return nil
 }
+func fakeIdentityProvider(id string, in flarecloudflare.IdentityProviderInput) flarecloudflare.IdentityProvider {
+	config := *in.Config.DeepCopy()
+	config.ClientSecretRef = nil
+	var scim *v1alpha1.IdentityProviderSCIMConfig
+	if in.SCIMConfig != nil {
+		scimConfigCopy := *in.SCIMConfig.DeepCopy()
+		scimConfigCopy.SecretRef = nil
+		scim = &scimConfigCopy
+	}
+	return flarecloudflare.IdentityProvider{
+		ID: id, Name: in.Name, Type: in.Type, Config: config, SCIMConfig: scim,
+		SAMLCertificateSetID: in.SAMLCertificateSetID,
+	}
+}
+
 func (f *fakeAccessResourceCloudflare) CreateIdentityProvider(_ context.Context, in flarecloudflare.IdentityProviderInput) (flarecloudflare.IdentityProvider, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.IdentityProvider{ID: f.newID("idp"), Name: in.Name, Type: string(in.Type)}
+	v := fakeIdentityProvider(f.newID("idp"), in)
 	f.providers[v.ID] = v
 	return v, nil
 }
 func (f *fakeAccessResourceCloudflare) UpdateIdentityProvider(_ context.Context, id string, in flarecloudflare.IdentityProviderInput) (flarecloudflare.IdentityProvider, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.IdentityProvider{ID: id, Name: in.Name, Type: string(in.Type)}
+	v := fakeIdentityProvider(id, in)
 	f.providers[id] = v
 	return v, nil
 }
@@ -183,17 +278,29 @@ func (f *fakeAccessResourceCloudflare) DeleteIdentityProvider(_ context.Context,
 	delete(f.providers, id)
 	return nil
 }
+func fakeDevicePostureRule(id string, in flarecloudflare.DevicePostureRuleInput) flarecloudflare.DevicePostureRule {
+	input := *in.Input.DeepCopy()
+	if in.ConnectionID != "" {
+		input.IntegrationRef = &v1alpha1.DevicePostureIntegrationReference{ExternalID: in.ConnectionID}
+	}
+	return flarecloudflare.DevicePostureRule{
+		ID: id, Name: in.Name, Type: in.Type, Description: in.Description, Enabled: true,
+		Schedule: in.Schedule, Expiration: in.Expiration,
+		Match: append([]v1alpha1.DevicePostureMatch(nil), in.Match...), Input: input,
+	}
+}
+
 func (f *fakeAccessResourceCloudflare) CreateDevicePostureRule(_ context.Context, in flarecloudflare.DevicePostureRuleInput) (flarecloudflare.DevicePostureRule, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.DevicePostureRule{ID: f.newID("posture"), Name: in.Name, Type: string(in.Type), Description: in.Description, Enabled: true, Schedule: in.Schedule, Expiration: in.Expiration}
+	v := fakeDevicePostureRule(f.newID("posture"), in)
 	f.posture[v.ID] = v
 	return v, nil
 }
 func (f *fakeAccessResourceCloudflare) UpdateDevicePostureRule(_ context.Context, id string, in flarecloudflare.DevicePostureRuleInput) (flarecloudflare.DevicePostureRule, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := flarecloudflare.DevicePostureRule{ID: id, Name: in.Name, Type: string(in.Type), Description: in.Description, Enabled: true, Schedule: in.Schedule, Expiration: in.Expiration}
+	v := fakeDevicePostureRule(id, in)
 	f.posture[id] = v
 	return v, nil
 }
@@ -221,48 +328,66 @@ func (f *fakeAccessResourceCloudflare) DeleteDevicePostureRule(_ context.Context
 	delete(f.posture, id)
 	return nil
 }
-func (f *fakeAccessResourceCloudflare) CreateServiceToken(_ context.Context, in flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceTokenSecret, error) {
+func fakeServiceTokenKey(scope flarecloudflare.AccessScope, id string) string {
+	if scope.ZoneID == "" {
+		return id
+	}
+	return "zone:" + scope.ZoneID + "/" + id
+}
+
+func (f *fakeAccessResourceCloudflare) CreateServiceToken(_ context.Context, scope flarecloudflare.AccessScope, in flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceTokenSecret, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.tokenCreates++
 	id := f.newID("token")
-	v := flarecloudflare.ServiceToken{ID: id, ClientID: "client-" + id, Name: in.Name, Duration: in.Duration, Enabled: true, ExpiresAt: time.Now().Add(365 * 24 * time.Hour)}
-	f.tokens[id] = v
+	v := flarecloudflare.ServiceToken{ID: id, ClientID: "client-" + id, Name: in.Name, Duration: in.Duration, Enabled: in.Enabled, ExpiresAt: time.Now().Add(365 * 24 * time.Hour)}
+	key := fakeServiceTokenKey(scope, id)
+	f.tokens[key] = v
 	secret := "secret-" + id
-	f.secrets[id] = secret
+	f.secrets[key] = secret
 	return flarecloudflare.ServiceTokenSecret{ServiceToken: v, ClientSecret: secret}, nil
 }
-func (f *fakeAccessResourceCloudflare) UpdateServiceToken(_ context.Context, id string, in flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceToken, error) {
+func (f *fakeAccessResourceCloudflare) UpdateServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string, in flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v := f.tokens[id]
+	key := fakeServiceTokenKey(scope, id)
+	v := f.tokens[key]
 	v.Name = in.Name
 	v.Duration = in.Duration
-	f.tokens[id] = v
+	v.Enabled = in.Enabled
+	f.tokens[key] = v
 	return v, nil
 }
-func (f *fakeAccessResourceCloudflare) GetServiceToken(_ context.Context, id string) (flarecloudflare.ServiceToken, error) {
+func (f *fakeAccessResourceCloudflare) GetServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string) (flarecloudflare.ServiceToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v, ok := f.tokens[id]
+	v, ok := f.tokens[fakeServiceTokenKey(scope, id)]
 	if !ok {
 		return v, fmt.Errorf("service token not found")
 	}
 	return v, nil
 }
-func (f *fakeAccessResourceCloudflare) ListServiceTokens(context.Context) ([]flarecloudflare.ServiceToken, error) {
+func (f *fakeAccessResourceCloudflare) ListServiceTokens(_ context.Context, scope flarecloudflare.AccessScope) ([]flarecloudflare.ServiceToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]flarecloudflare.ServiceToken, 0, len(f.tokens))
-	for _, v := range f.tokens {
-		out = append(out, v)
+	prefix := ""
+	if scope.ZoneID != "" {
+		prefix = "zone:" + scope.ZoneID + "/"
+	}
+	for key, v := range f.tokens {
+		if (prefix == "" && !strings.HasPrefix(key, "zone:")) || (prefix != "" && strings.HasPrefix(key, prefix)) {
+			out = append(out, v)
+		}
 	}
 	return out, nil
 }
-func (f *fakeAccessResourceCloudflare) DeleteServiceToken(_ context.Context, id string) error {
+func (f *fakeAccessResourceCloudflare) DeleteServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.tokens, id)
-	delete(f.secrets, id)
+	key := fakeServiceTokenKey(scope, id)
+	delete(f.tokens, key)
+	delete(f.secrets, key)
 	return nil
 }
 func (f *fakeAccessResourceCloudflare) RotateServiceToken(_ context.Context, id string, _ time.Time) (flarecloudflare.ServiceTokenSecret, error) {

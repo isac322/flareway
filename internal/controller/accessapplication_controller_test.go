@@ -86,6 +86,92 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		gomega.Expect(validInternalDigestTag(bypassOne, accessBypassTagPrefix)).To(gomega.BeTrue())
 	})
 
+	ginkgo.It("deletes only the intended legacy AUD Secrets when namespaced-name labels collide", func() {
+		fixtureID := accessFixtureCounter.Add(1)
+		left := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "a--b", Name: "c", UID: types.UID(fmt.Sprintf("left-%d", fixtureID)),
+		}}
+		right := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "a", Name: "b--c", UID: types.UID(fmt.Sprintf("right-%d", fixtureID)),
+		}}
+		legacyLabel := left.Namespace + "--" + left.Name
+		gomega.Expect(legacyLabel).To(gomega.Equal(right.Namespace + "--" + right.Name))
+		leftSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: accessApplicationAUDNamespace,
+			Name:      "aud-" + string(left.UID) + "-legacy",
+			Labels: map[string]string{
+				v1alpha1.AccessApplicationAUDSecretLabel:  legacyLabel,
+				v1alpha1.AccessApplicationGatewayAUDLabel: "unrelated",
+			},
+		}}
+		rightSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: accessApplicationAUDNamespace,
+			Name:      "aud-" + string(right.UID) + "-legacy",
+			Labels: map[string]string{
+				v1alpha1.AccessApplicationAUDSecretLabel:  legacyLabel,
+				v1alpha1.AccessApplicationGatewayAUDLabel: "unrelated",
+			},
+		}}
+		gomega.Expect(testClient.Create(testContext, leftSecret)).To(gomega.Succeed())
+		gomega.Expect(testClient.Create(testContext, rightSecret)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			gomega.Expect(client.IgnoreNotFound(testClient.Delete(context.Background(), leftSecret))).To(gomega.Succeed())
+			gomega.Expect(client.IgnoreNotFound(testClient.Delete(context.Background(), rightSecret))).To(gomega.Succeed())
+		})
+
+		reconciler := &AccessApplicationReconciler{Client: testClient}
+		gomega.Eventually(func(g gomega.Gomega) {
+			secrets, err := reconciler.listApplicationAUDSecrets(testContext, left)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(secrets).To(gomega.HaveLen(2))
+		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(reconciler.deleteAUDSecrets(testContext, left)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testClient.Get(testContext, client.ObjectKeyFromObject(leftSecret), &corev1.Secret{}))
+		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Eventually(func() error {
+			return testClient.Get(testContext, client.ObjectKeyFromObject(rightSecret), &corev1.Secret{})
+		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("converts observed Access CORS headers without losing fields", func() {
+		allowAllHeaders := true
+		allowAllMethods := false
+		allowAllOrigins := true
+		allowCredentials := false
+		maxAge := int64(600)
+		observed := flarecloudflare.AccessApplication{CORSHeaders: &flarecloudflare.AccessApplicationCORSHeaders{
+			AllowAllHeaders: &allowAllHeaders, AllowAllMethods: &allowAllMethods,
+			AllowAllOrigins: &allowAllOrigins, AllowCredentials: &allowCredentials,
+			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			AllowedMethods: []v1alpha1.AccessCORSMethod{"GET", "POST"},
+			AllowedOrigins: []string{"https://one.example", "https://two.example"},
+			MaxAge:         &maxAge,
+		}}
+
+		input := accessApplicationInputFromObserved(observed)
+		gomega.Expect(input.CORSHeaders).To(gomega.Equal(&v1alpha1.AccessCORSHeaders{
+			AllowAllHeaders: &allowAllHeaders, AllowAllMethods: &allowAllMethods,
+			AllowAllOrigins: &allowAllOrigins, AllowCredentials: &allowCredentials,
+			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			AllowedMethods: []v1alpha1.AccessCORSMethod{"GET", "POST"},
+			AllowedOrigins: []string{"https://one.example", "https://two.example"},
+			MaxAge:         &maxAge,
+		}))
+		observed.CORSHeaders.AllowedHeaders[0] = "mutated"
+		gomega.Expect(input.CORSHeaders.AllowedHeaders).To(gomega.Equal([]string{"Authorization", "Content-Type"}))
+
+		roundTripped := fakeAccessApplicationFromInput(flarecloudflare.AccessApplication{}, input)
+		gomega.Expect(roundTripped.CORSHeaders).To(gomega.Equal(&flarecloudflare.AccessApplicationCORSHeaders{
+			AllowAllHeaders: &allowAllHeaders, AllowAllMethods: &allowAllMethods,
+			AllowAllOrigins: &allowAllOrigins, AllowCredentials: &allowCredentials,
+			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			AllowedMethods: []v1alpha1.AccessCORSMethod{"GET", "POST"},
+			AllowedOrigins: []string{"https://one.example", "https://two.example"},
+			MaxAge:         &maxAge,
+		}))
+	})
+
 	ginkgo.It("requires the exact bypass child name for recovery and deletion", func() {
 		remote := newFakeAccessApplicationCloudflare()
 		ownerTag := accessDigestTag(accessOwnerTagPrefix, "owner")
@@ -98,7 +184,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}
 		remote.Put(wrongChild)
 
-		recovered, found, err := findOwnedBypassApplication(testContext, remote, ownerTag, bypassTag, expectedName)
+		recovered, found, err := findOwnedBypassApplication(testContext, remote, flarecloudflare.AccessScope{}, ownerTag, bypassTag, expectedName)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(found).To(gomega.BeFalse())
 		gomega.Expect(recovered.ID).To(gomega.BeEmpty())
@@ -106,7 +192,11 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 
 		application := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: "tenant"},
-			Spec:       v1alpha1.AccessApplicationSpec{Application: v1alpha1.AccessApplicationSettings{Name: parentName}},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "account"}, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Application: v1alpha1.AccessApplicationSettings{Name: parentName},
+			},
 		}
 		wrongParent := flarecloudflare.AccessApplication{
 			ID: "wrong-parent", Name: "other/parent",
@@ -126,11 +216,14 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			remote.PutTag(tagName)
 		}
 		remote.Put(flarecloudflare.AccessApplication{
-			ID: "external-adopted", Name: "tenant/desired",
+			ID: "external-adopted", Type: flarecloudflare.AccessApplicationTypeSelfHosted,
+			Name: "tenant/desired", Domain: "tenant.example",
 			Tags: []string{accessManagedTag, ownerTag},
 		})
 		application := &v1alpha1.AccessApplication{
 			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "account"}, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
 				Application: v1alpha1.AccessApplicationSettings{Name: "tenant/desired"},
 				ExternalRef: &v1alpha1.AccessApplicationExternalReference{ApplicationID: "external-adopted"},
 				Adoption: v1alpha1.AdoptionSpec{
@@ -143,16 +236,74 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		observed, err := (&AccessApplicationReconciler{}).reconcileRemoteApplication(
 			testContext,
 			remote,
+			flarecloudflare.AccessScope{},
 			application,
 			flarecloudflare.AccessApplicationInput{
-				Name: "tenant/desired",
+				Type: flarecloudflare.AccessApplicationTypeSelfHosted,
+				Name: "tenant/desired", Domain: "tenant.example",
 				Tags: []string{accessManagedTag, ownerTag},
 			},
 			ownerTag,
 		)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(observed.ID).To(gomega.Equal("external-adopted"))
-		gomega.Expect(remote.Calls()).To(gomega.ContainElement("Update:external-adopted"))
+		gomega.Expect(remote.Calls()).NotTo(gomega.ContainElement("Update:external-adopted"))
+	})
+
+	ginkgo.It("checks adoption domain before any parent update", func() {
+		remote := newFakeAccessApplicationCloudflare()
+		remote.Put(flarecloudflare.AccessApplication{
+			ID: "wrong-domain", Type: flarecloudflare.AccessApplicationTypeSelfHosted,
+			Name: "tenant/app", Domain: "other.example",
+		})
+		application := &v1alpha1.AccessApplication{Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted, SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Application: v1alpha1.AccessApplicationSettings{Name: "tenant/app"},
+			ExternalRef: &v1alpha1.AccessApplicationExternalReference{ApplicationID: "wrong-domain"},
+			Adoption: v1alpha1.AdoptionSpec{Mode: v1alpha1.AdoptionModeAdoptByID, Expect: v1alpha1.AdoptionExpect{
+				Name: "tenant/app", Domain: "expected.example",
+			}},
+		}}
+		_, err := (&AccessApplicationReconciler{}).reconcileRemoteApplication(
+			testContext, remote, flarecloudflare.AccessScope{}, application,
+			flarecloudflare.AccessApplicationInput{
+				Type: flarecloudflare.AccessApplicationTypeSelfHosted, Name: "tenant/app", Domain: "expected.example",
+			},
+			accessDigestTag(accessOwnerTagPrefix, "owner"),
+		)
+		gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("domain")))
+		gomega.Expect(remote.Calls()).NotTo(gomega.ContainElement("Update:wrong-domain"))
+	})
+
+	ginkgo.It("observes declared bypass children without Cloudflare writes", func() {
+		remote := newFakeAccessApplicationCloudflare()
+		remote.Put(flarecloudflare.AccessApplication{
+			ID: "terraform-child", Type: flarecloudflare.AccessApplicationTypeSelfHosted,
+			Name: "runbear-operation-api-public", Domain: "api.example.test/public",
+			Policies: []flarecloudflare.AccessApplicationPolicy{{ID: "bypass-policy", Precedence: 1}},
+		})
+		application := &v1alpha1.AccessApplication{Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted, SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			Bypass: v1alpha1.AccessBypassSpec{Children: []v1alpha1.AccessBypassChildSpec{{
+				Hostname: "api.example.test", Path: "/public", Name: "runbear-operation-api-public",
+				ExternalRef: &v1alpha1.AccessApplicationExternalReference{ApplicationID: "terraform-child"},
+				Adoption: v1alpha1.AdoptionSpec{Expect: v1alpha1.AdoptionExpect{
+					Name: "runbear-operation-api-public", Domain: "api.example.test/public",
+				}},
+			}}},
+		}}
+		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+			testContext, remote, flarecloudflare.AccessScope{}, application,
+			[]gatewayapi.AccessBypass{{Hostname: "api.example.test", Path: "/public"}},
+			accessDigestTag(accessOwnerTagPrefix, "owner"), "cluster",
+		)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(children).To(gomega.HaveLen(1))
+		gomega.Expect(children[0].ApplicationID).To(gomega.Equal("terraform-child"))
+		gomega.Expect(remote.Calls()).To(gomega.Equal([]string{"Get:terraform-child"}))
 	})
 
 	ginkgo.It("removes an obsolete remote bypass even when its Kubernetes status was lost", func() {
@@ -164,20 +315,26 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		for _, tagName := range []string{accessManagedTag, ownerTag, bypassTag} {
 			remote.PutTag(tagName)
 		}
-		created, err := remote.CreateAccessApplication(testContext, flarecloudflare.AccessApplicationInput{
-			Name: childName, Domain: "api.example.test",
+		createdResult, err := remote.CreateAccessApplication(testContext, flarecloudflare.AccessScope{}, flarecloudflare.AccessApplicationInput{
+			Type: flarecloudflare.AccessApplicationTypeSelfHosted, Name: childName, Domain: "api.example.test",
 			Tags: []string{accessManagedTag, ownerTag, bypassTag},
 		})
+		created := createdResult.Application
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		application := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: "tenant"},
-			Spec:       v1alpha1.AccessApplicationSpec{Application: v1alpha1.AccessApplicationSettings{Name: parentName}},
-			Status:     v1alpha1.AccessApplicationStatus{ApplicationID: "parent-id"},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "account"}, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Application: v1alpha1.AccessApplicationSettings{Name: parentName},
+			},
+			Status: v1alpha1.AccessApplicationStatus{ApplicationID: "parent-id"},
 		}
 		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 			testContext,
 			remote,
+			flarecloudflare.AccessScope{},
 			application,
 			nil,
 			ownerTag,
@@ -198,9 +355,13 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}
 		application := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant"},
-			Spec: v1alpha1.AccessApplicationSpec{PrivateDestinations: []v1alpha1.AccessPrivateDestinationSpec{{
-				NetworkRouteRef: &corev1.LocalObjectReference{Name: route.Name}, PortRange: "443",
-			}}},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "account"},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted, SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Destinations: []v1alpha1.AccessApplicationDestinationSpec{privateApplicationDestination(v1alpha1.AccessPrivateDestinationSpec{
+					NetworkRouteRef: &corev1.LocalObjectReference{Name: route.Name}, PortRange: "443",
+				})},
+			},
 		}
 		failure := validatePrivateRouteLifecycle(gatewayapi.Inputs{NetworkRoutes: []v1alpha1.NetworkRoute{route}}, application)
 		gomega.Expect(failure).NotTo(gomega.BeNil())
@@ -251,7 +412,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
 			g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
-			g.Expect(application.Status.Destinations).To(gomega.ContainElement(v1alpha1.AccessApplicationDestinationStatus{Type: "public", URI: fixture.hostname}))
+			g.Expect(application.Status.Destinations).To(gomega.ContainElement(v1alpha1.AccessApplicationDestinationStatus{Type: v1alpha1.AccessApplicationDestinationPublic, URI: fixture.hostname}))
 			g.Expect(application.Status.Ancestors).To(gomega.HaveLen(1))
 			g.Expect(application.Status.Ancestors[0].ControllerName).To(gomega.Equal(gatewayapi.ControllerName))
 			accepted := findCondition(application.Status.Conditions, accessApplicationConditionAccepted)
@@ -259,10 +420,18 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
+		var gateway gatewayv1.Gateway
+		gomega.Expect(testClient.Get(testContext, fixture.gatewayKey, &gateway)).To(gomega.Succeed())
 		var secret corev1.Secret
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret)).To(gomega.Succeed())
 		gomega.Expect(secret.Data[v1alpha1.AccessApplicationAUDSecretKey]).To(gomega.Equal([]byte("aud-" + application.Status.ApplicationID)))
-		gomega.Expect(secret.Labels[v1alpha1.AccessApplicationAUDSecretLabel]).To(gomega.Equal(fixture.namespace + "--access"))
+		gomega.Expect(secret.Labels[v1alpha1.AccessApplicationAUDSecretLabel]).To(gomega.Equal(applicationAUDIdentityLabel(&application)))
+		gomega.Expect(secret.Labels[v1alpha1.AccessApplicationGatewayAUDLabel]).To(gomega.Equal(gatewayAUDIdentityLabel(&gateway)))
+		gomega.Expect(string(secret.Data[v1alpha1.AccessApplicationIDSecretKey])).To(gomega.Equal(application.Status.ApplicationID))
+		gomega.Expect(string(secret.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey])).To(gomega.Equal(fixture.applicationKey.String()))
+		gomega.Expect(string(secret.Data[v1alpha1.AccessApplicationUIDSecretKey])).To(gomega.Equal(string(application.UID)))
+		gomega.Expect(string(secret.Data[v1alpha1.AccessApplicationGatewayNamespacedNameSecretKey])).To(gomega.Equal(fixture.gatewayKey.String()))
+		gomega.Expect(string(secret.Data[v1alpha1.AccessApplicationGatewayUIDSecretKey])).To(gomega.Equal(string(gateway.UID)))
 		statusJSON, err := json.Marshal(application.Status)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(string(statusJSON)).NotTo(gomega.ContainSubstring("aud-"))
@@ -303,12 +472,12 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 	ginkgo.It("resolves a route-authorized private destination without publishing an AUD Secret", func() {
 		fixture := newAccessFixture("private-route", false, false)
 		fixture.application.Spec.TargetRefs = nil
-		fixture.application.Spec.PrivateDestinations = []v1alpha1.AccessPrivateDestinationSpec{{
+		fixture.application.Spec.Destinations = []v1alpha1.AccessApplicationDestinationSpec{privateApplicationDestination(v1alpha1.AccessPrivateDestinationSpec{
 			NetworkRouteRef: &corev1.LocalObjectReference{Name: "private-route"},
 			CIDR:            "10.96.12.34/32",
 			PortRange:       "5432",
-			L4Protocol:      v1alpha1.AccessL4ProtocolTCP,
-		}}
+			L4Protocol:      new(v1alpha1.AccessL4ProtocolTCP),
+		})}
 		fixture.create()
 
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -335,8 +504,8 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			Spec: v1alpha1.NetworkRouteSpec{
 				AccountRef:        corev1.LocalObjectReference{Name: fixture.account},
 				Network:           "10.96.0.0/16",
-				TunnelRef:         v1alpha1.NamespacedObjectReference{Name: fixture.tunnelKey.Name},
-				VirtualNetworkRef: corev1.LocalObjectReference{Name: vnet.Name},
+				TunnelRef:         v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: fixture.tunnelKey.Name},
+				VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
 				AllowedNamespaces: v1alpha1.AllowedNamespaces{From: v1alpha1.AllowedNamespaceFromSame},
 			},
 		}
@@ -347,7 +516,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
 			g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
 			g.Expect(application.Status.Destinations).To(gomega.HaveLen(1))
-			g.Expect(application.Status.Destinations[0].Type).To(gomega.Equal("private"))
+			g.Expect(application.Status.Destinations[0].Type).To(gomega.Equal(v1alpha1.AccessApplicationDestinationPrivate))
 			g.Expect(application.Status.Destinations[0].CIDR).To(gomega.Equal("10.96.12.34/32"))
 			g.Expect(application.Status.Destinations[0].PortRange).To(gomega.Equal("5432"))
 			g.Expect(application.Status.Ancestors).To(gomega.HaveLen(1))
@@ -362,11 +531,12 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(origin.Reason).To(gomega.Equal("NotApplicable"))
 		}).WithTimeout(30 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
-		var secrets corev1.SecretList
-		gomega.Expect(testClient.List(testContext, &secrets, client.InNamespace(accessApplicationAUDNamespace), client.MatchingLabels{
-			v1alpha1.AccessApplicationAUDSecretLabel: fixture.namespace + "--" + fixture.applicationKey.Name,
-		})).To(gomega.Succeed())
-		gomega.Expect(secrets.Items).To(gomega.BeEmpty())
+		var secret corev1.Secret
+		err := testClient.Get(testContext, types.NamespacedName{
+			Namespace: accessApplicationAUDNamespace,
+			Name:      accessAUDSecretName(&application, fixture.gatewayKey),
+		}, &secret)
+		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
 		var ledger corev1.Secret
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{
 			Namespace: accessApplicationAUDNamespace, Name: privateTunnelLedgerSecretName(application.UID),
@@ -419,12 +589,12 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(25 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
-	ginkgo.It("rejects an external bypass policy before creating the parent application", func() {
+	ginkgo.It("allows a reusable external bypass policy without changing route authorization", func() {
 		fixture := newAccessFixture("external-bypass", false, false)
 		fixture.application.Spec.Policies = []v1alpha1.AccessApplicationPolicyReference{{
 			ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "external-bypass"},
 		}}
-		testAccessCloudflare.SetPolicy(flarecloudflare.AccessPolicy{ID: "external-bypass", Name: "foreign-bypass", Decision: "bypass"})
+		testAccessCloudflare.SetPolicy(flarecloudflare.AccessPolicy{ID: "external-bypass", Name: "foreign-bypass", Decision: "Bypass"})
 		fixture.create()
 
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -432,11 +602,11 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
 			accepted := findCondition(application.Status.Conditions, accessApplicationConditionAccepted)
 			g.Expect(accepted).NotTo(gomega.BeNil())
-			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
-			g.Expect(accepted.Reason).To(gomega.Equal("Invalid"))
-			g.Expect(accepted.Message).To(gomega.ContainSubstring("operator-managed"))
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(testAccessCloudflare.Input(application.Status.ApplicationID).Policies).To(gomega.Equal(
+				[]flarecloudflare.AccessApplicationPolicyAttachment{{ID: "external-bypass", Precedence: 1}},
+			))
 		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
-		gomega.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Create:" + fixture.remoteName()))
 	})
 
 	ginkgo.It("recovers ambiguous parent and child creates by ownership tags without duplicates", func() {
@@ -472,8 +642,16 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
 		calls := testAccessCloudflare.Calls()
-		gomega.Expect(countAccessCall(calls, "GetTag:"+accessManagedTag)).To(gomega.BeNumerically(">=", 2))
-		gomega.Expect(nthIndexOfAccessCall(calls, "GetTag:"+accessManagedTag, 2)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "Create:"+fixture.remoteName())))
+		listIndex := indexOfAccessCall(calls, "ListTags")
+		createTagIndex := indexOfAccessCall(calls, "CreateTag:"+accessManagedTag)
+		confirmTagIndex := indexOfAccessCall(calls, "GetTag:"+accessManagedTag)
+		createApplicationIndex := indexOfAccessCall(calls, "Create:"+fixture.remoteName())
+		confirmationCalls := accessCallsWithPrefix(calls, "GetTag:")
+		gomega.Expect(confirmationCalls).To(gomega.HaveEach(gomega.Equal("GetTag:" + accessManagedTag)))
+		gomega.Expect(len(confirmationCalls)).To(gomega.BeNumerically(">=", 1))
+		gomega.Expect(listIndex).To(gomega.BeNumerically("<", createTagIndex))
+		gomega.Expect(createTagIndex).To(gomega.BeNumerically("<", confirmTagIndex))
+		gomega.Expect(confirmTagIndex).To(gomega.BeNumerically("<", createApplicationIndex))
 	})
 
 	ginkgo.It("does not accept a tag create conflict until a follow-up get confirms the tag", func() {
@@ -490,14 +668,23 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(accepted.Message).To(gomega.ContainSubstring("confirm Access tag"))
 			g.Expect(application.Status.ApplicationID).To(gomega.BeEmpty())
 		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
-		gomega.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Create:" + fixture.remoteName()))
+		calls := testAccessCloudflare.Calls()
+		listIndex := indexOfAccessCall(calls, "ListTags")
+		createTagIndex := indexOfAccessCall(calls, "CreateTag:"+accessManagedTag)
+		confirmTagIndex := indexOfAccessCall(calls, "GetTag:"+accessManagedTag)
+		confirmationCalls := accessCallsWithPrefix(calls, "GetTag:")
+		gomega.Expect(confirmationCalls).To(gomega.HaveEach(gomega.Equal("GetTag:" + accessManagedTag)))
+		gomega.Expect(len(confirmationCalls)).To(gomega.BeNumerically(">=", 1))
+		gomega.Expect(listIndex).To(gomega.BeNumerically("<", createTagIndex))
+		gomega.Expect(createTagIndex).To(gomega.BeNumerically("<", confirmTagIndex))
+		gomega.Expect(accessCallsWithPrefix(calls, "Create:")).To(gomega.BeEmpty())
 	})
 
 	ginkgo.It("observes an external application without creating or updating it", func() {
 		fixture := newAccessFixture("observe", false, false)
 		fixture.application.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
 		fixture.application.Spec.ExternalRef = &v1alpha1.AccessApplicationExternalReference{ApplicationID: "external-observed"}
-		testAccessCloudflare.Put(flarecloudflare.AccessApplication{ID: "external-observed", AUD: "aud-external-observed", Name: "terraform-app", Domain: fixture.hostname, Type: "self_hosted"})
+		testAccessCloudflare.Put(flarecloudflare.AccessApplication{ID: "external-observed", AUD: "aud-external-observed", Name: "terraform-app", Domain: fixture.hostname, Type: flarecloudflare.AccessApplicationTypeSelfHosted})
 		fixture.create()
 
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -514,8 +701,10 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 	ginkgo.It("adopts the explicitly named remote application before managing it", func() {
 		fixture := newAccessFixture("adopt", false, false)
 		fixture.application.Spec.ExternalRef = &v1alpha1.AccessApplicationExternalReference{ApplicationID: "external-adopted"}
-		fixture.application.Spec.Adoption = v1alpha1.AdoptionSpec{Mode: v1alpha1.AdoptionModeAdoptByID, Expect: v1alpha1.AdoptionExpect{Name: "existing-app"}}
-		testAccessCloudflare.Put(flarecloudflare.AccessApplication{ID: "external-adopted", AUD: "aud-external-adopted", Name: "existing-app", Domain: fixture.hostname, Type: "self_hosted"})
+		fixture.application.Spec.Adoption = v1alpha1.AdoptionSpec{Mode: v1alpha1.AdoptionModeAdoptByID, Expect: v1alpha1.AdoptionExpect{
+			Name: "existing-app", Domain: fixture.hostname,
+		}}
+		testAccessCloudflare.Put(flarecloudflare.AccessApplication{ID: "external-adopted", AUD: "aud-external-adopted", Name: "existing-app", Domain: fixture.hostname, Type: flarecloudflare.AccessApplicationTypeSelfHosted})
 		fixture.create()
 
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -523,9 +712,25 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
 			g.Expect(application.Status.ApplicationID).To(gomega.Equal("external-adopted"))
 			g.Expect(findCondition(application.Status.Conditions, accessApplicationConditionAccepted).Status).To(gomega.Equal(metav1.ConditionTrue))
-			g.Expect(testAccessCloudflare.Input("external-adopted").Name).To(gomega.Equal(fixture.remoteName()))
-			g.Expect(countAccessCall(testAccessCloudflare.Calls(), "Update:external-adopted")).To(gomega.BeNumerically(">=", 2))
+			input := testAccessCloudflare.Input("external-adopted")
+			g.Expect(input.Name).To(gomega.Equal(fixture.remoteName()))
+			g.Expect(input.Domain).To(gomega.Equal(fixture.hostname))
+			var secret corev1.Secret
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret)).To(gomega.Succeed())
+			g.Expect(secret.Data[v1alpha1.AccessApplicationAUDSecretKey]).To(gomega.Equal([]byte("aud-external-adopted")))
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		calls := testAccessCloudflare.Calls()
+		getIndex := indexOfAccessCall(calls, "Get:external-adopted")
+		tagCheckIndex := indexOfAccessCall(calls, "ListTags")
+		updateIndex := indexOfAccessCall(calls, "Update:external-adopted")
+		gomega.Expect(calls).To(gomega.ContainElement("Get:external-adopted"))
+		gomega.Expect(accessCallsWithPrefix(calls, "Update:")).To(gomega.Equal([]string{"Update:external-adopted"}))
+		gomega.Expect(getIndex).To(gomega.BeNumerically("<", tagCheckIndex))
+		gomega.Expect(tagCheckIndex).To(gomega.BeNumerically("<", updateIndex))
+		gomega.Expect(accessCallsWithPrefix(calls, "Create:")).To(gomega.BeEmpty())
+		gomega.Expect(testAccessCloudflare.Has("external-adopted")).To(gomega.BeTrue())
+		gomega.Expect(testAccessCloudflare.ApplicationCount()).To(gomega.Equal(1))
 	})
 
 	ginkgo.It("gives the older application collision precedence", func() {
@@ -817,6 +1022,9 @@ func newAccessFixture(prefix string, unprotected, carveout bool) *accessFixture 
 	fixture.application = &v1alpha1.AccessApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: fixture.applicationKey.Name, Namespace: fixture.applicationKey.Namespace},
 		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: fixture.account},
+			Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
 			TargetRefs:       []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{Group: gatewayv1.Group("gateway.networking.k8s.io"), Kind: targetKind, Name: targetName, SectionName: &section}},
 			Application:      v1alpha1.AccessApplicationSettings{Name: fixture.remoteName(), SessionDuration: "1h"},
 			Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
@@ -936,12 +1144,18 @@ func (f *accessFixture) createAdditionalGateway(gatewayName, tunnelName, hostnam
 	gomega.Expect(testClient.Create(testContext, tunnel)).To(gomega.Succeed())
 	return gateway, tunnel
 }
+func privateApplicationDestination(spec v1alpha1.AccessPrivateDestinationSpec) v1alpha1.AccessApplicationDestinationSpec {
+	return v1alpha1.AccessApplicationDestinationSpec{
+		Type: v1alpha1.AccessApplicationDestinationPrivate, Private: &spec,
+	}
+}
+
 func preparePrivateNetworkRouteAccess(fixture *accessFixture) (*v1alpha1.AccessApplication, *v1alpha1.NetworkRoute) {
 	fixture.application.Spec.TargetRefs = nil
-	fixture.application.Spec.PrivateDestinations = []v1alpha1.AccessPrivateDestinationSpec{{
+	fixture.application.Spec.Destinations = []v1alpha1.AccessApplicationDestinationSpec{privateApplicationDestination(v1alpha1.AccessPrivateDestinationSpec{
 		NetworkRouteRef: &corev1.LocalObjectReference{Name: "private-route"},
-		CIDR:            "10.96.12.34/32", PortRange: "5432", L4Protocol: v1alpha1.AccessL4ProtocolTCP,
-	}}
+		CIDR:            "10.96.12.34/32", PortRange: "5432", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP),
+	})}
 	fixture.create()
 	gomega.Eventually(func(g gomega.Gomega) {
 		var account v1alpha1.CloudflareAccount
@@ -962,8 +1176,8 @@ func preparePrivateNetworkRouteAccess(fixture *accessFixture) (*v1alpha1.AccessA
 		ObjectMeta: metav1.ObjectMeta{Name: "private-route", Namespace: fixture.namespace, Labels: map[string]string{"private-route": "allowed"}},
 		Spec: v1alpha1.NetworkRouteSpec{
 			AccountRef: corev1.LocalObjectReference{Name: fixture.account}, Network: "10.96.0.0/16",
-			TunnelRef:         v1alpha1.NamespacedObjectReference{Name: fixture.tunnelKey.Name},
-			VirtualNetworkRef: corev1.LocalObjectReference{Name: vnet.Name},
+			TunnelRef:         v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: fixture.tunnelKey.Name},
+			VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
 			AllowedNamespaces: v1alpha1.AllowedNamespaces{From: v1alpha1.AllowedNamespaceFromSame},
 		},
 	}
@@ -973,7 +1187,7 @@ func preparePrivateNetworkRouteAccess(fixture *accessFixture) (*v1alpha1.AccessA
 		g.Expect(testClient.Get(testContext, fixture.applicationKey, application)).To(gomega.Succeed())
 		g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
 		g.Expect(application.Status.Destinations).To(gomega.HaveLen(1))
-		g.Expect(application.Status.Destinations[0].Type).To(gomega.Equal("private"))
+		g.Expect(application.Status.Destinations[0].Type).To(gomega.Equal(v1alpha1.AccessApplicationDestinationPrivate))
 		g.Expect(findCondition(application.Status.Conditions, accessApplicationConditionProgrammed).Status).To(gomega.Equal(metav1.ConditionTrue))
 	}).WithTimeout(30 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	return application, route
@@ -1067,27 +1281,14 @@ func indexOfAccessCall(calls []string, target string) int {
 	return len(calls) + 1
 }
 
-func nthIndexOfAccessCall(calls []string, target string, occurrence int) int {
-	for index, call := range calls {
-		if call != target {
-			continue
-		}
-		occurrence--
-		if occurrence == 0 {
-			return index
-		}
-	}
-	return len(calls) + 1
-}
-
-func countAccessCall(calls []string, target string) int {
-	count := 0
+func accessCallsWithPrefix(calls []string, prefix string) []string {
+	matches := make([]string, 0)
 	for _, call := range calls {
-		if call == target {
-			count++
+		if strings.HasPrefix(call, prefix) {
+			matches = append(matches, call)
 		}
 	}
-	return count
+	return matches
 }
 
 func firstTagWithPrefix(tags []string, prefix string) string {
@@ -1131,7 +1332,7 @@ func (f *fakeAccessApplicationCloudflare) Reset() {
 	f.applications = make(map[string]flarecloudflare.AccessApplication)
 	f.inputs = make(map[string]flarecloudflare.AccessApplicationInput)
 	f.policies = map[string]flarecloudflare.AccessPolicy{
-		"policy-allow": {ID: "policy-allow", Name: "allow", Decision: "allow"},
+		"policy-allow": {ID: "policy-allow", Name: "allow", Decision: "Allow"},
 	}
 	f.providers = make(map[string]flarecloudflare.IdentityProvider)
 	f.tags = make(map[string]flarecloudflare.AccessTag)
@@ -1140,7 +1341,7 @@ func (f *fakeAccessApplicationCloudflare) Reset() {
 	f.next = 0
 	f.ambiguousCreates = 0
 	f.tagCreateConflicts = make(map[string]int)
-	f.bypassPolicy = flarecloudflare.AccessPolicy{ID: "bypass-policy", Name: "bypass", Decision: "bypass"}
+	f.bypassPolicy = flarecloudflare.AccessPolicy{ID: "bypass-policy", Name: "bypass", Decision: "Bypass"}
 }
 
 func (f *fakeAccessApplicationCloudflare) Calls() []string {
@@ -1228,34 +1429,93 @@ func (f *fakeAccessApplicationCloudflare) record(operation string) error {
 func (f *fakeAccessApplicationCloudflare) validateApplicationTags(input flarecloudflare.AccessApplicationInput) error {
 	for _, name := range input.Tags {
 		if _, found := f.tags[name]; !found {
-			return fmt.Errorf("Access application tag %q does not exist", name)
+			return fmt.Errorf("access application tag %q does not exist", name)
 		}
 	}
 	return nil
 }
 
-func (f *fakeAccessApplicationCloudflare) CreateAccessApplication(_ context.Context, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplication, error) {
+func fakeAccessApplicationFromInput(application flarecloudflare.AccessApplication, input flarecloudflare.AccessApplicationInput) flarecloudflare.AccessApplication {
+	application.Type = input.Type
+	if application.Type == "" {
+		application.Type = flarecloudflare.AccessApplicationTypeSelfHosted
+	}
+	application.Domain = input.Domain
+	application.Name = input.Name
+	application.Destinations = slices.Clone(input.Destinations)
+	application.Policies = make([]flarecloudflare.AccessApplicationPolicy, 0, len(input.Policies))
+	for _, policy := range input.Policies {
+		application.Policies = append(application.Policies, flarecloudflare.AccessApplicationPolicy{ID: policy.ID, Precedence: policy.Precedence})
+	}
+	application.AllowedIDPs = slices.Clone(input.AllowedIDPs)
+	application.SessionDuration = input.SessionDuration
+	application.AllowAuthenticateViaWARP = input.AllowAuthenticateViaWARP
+	application.AllowIframe = input.AllowIframe
+	application.SkipInterstitial = input.SkipInterstitial
+	application.AutoRedirectToIdentity = input.AutoRedirectToIdentity
+	application.AppLauncherVisible = input.AppLauncherVisible
+	application.ServiceAuth401Redirect = input.ServiceAuth401Redirect
+	application.EnableBindingCookie = input.EnableBindingCookie
+	application.EagerRedirectCookieSetting = input.EagerRedirectCookieSetting
+	application.HTTPOnlyCookieAttribute = input.HTTPOnlyCookieAttribute
+	application.SameSiteCookieAttribute = input.SameSiteCookieAttribute
+	application.PathCookieAttribute = input.PathCookieAttribute
+	application.OptionsPreflightBypass = input.OptionsPreflightBypass
+	application.CORSHeaders = fakeAccessApplicationCORSHeadersFromInput(input.CORSHeaders)
+	application.ReadServiceTokensFromHeader = input.ReadServiceTokensFromHeader
+	application.CustomDenyMessage = input.CustomDenyMessage
+	application.CustomDenyURL = input.CustomDenyURL
+	application.CustomNonIdentityDenyURL = input.CustomNonIdentityDenyURL
+	application.CustomPages = slices.Clone(input.CustomPages)
+	application.Tags = slices.Clone(input.Tags)
+	application.LogoURL = input.LogoURL
+	application.UseClientlessIsolationAppLauncherURL = input.UseClientlessIsolationAppLauncherURL
+	application.MFAConfig = input.MFAConfig
+	application.OAuthConfiguration = input.OAuthConfiguration
+	application.TargetCriteria = slices.Clone(input.TargetCriteria)
+	application.AppLauncherLogoURL = input.AppLauncherLogoURL
+	application.BackgroundColor = input.BackgroundColor
+	application.FooterLinks = slices.Clone(input.FooterLinks)
+	application.HeaderBackgroundColor = input.HeaderBackgroundColor
+	application.LandingPageDesign = input.LandingPageDesign
+	application.SkipAppLauncherLoginPage = input.SkipAppLauncherLoginPage
+	return application
+}
+
+func fakeAccessApplicationCORSHeadersFromInput(value *v1alpha1.AccessCORSHeaders) *flarecloudflare.AccessApplicationCORSHeaders {
+	if value == nil {
+		return nil
+	}
+	return &flarecloudflare.AccessApplicationCORSHeaders{
+		AllowAllHeaders: value.AllowAllHeaders, AllowAllMethods: value.AllowAllMethods,
+		AllowAllOrigins: value.AllowAllOrigins, AllowCredentials: value.AllowCredentials,
+		AllowedHeaders: slices.Clone(value.AllowedHeaders), AllowedMethods: slices.Clone(value.AllowedMethods),
+		AllowedOrigins: slices.Clone(value.AllowedOrigins), MaxAge: value.MaxAge,
+	}
+}
+
+func (f *fakeAccessApplicationCloudflare) CreateAccessApplication(_ context.Context, _ flarecloudflare.AccessScope, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplicationCreateResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("Create:" + input.Name); err != nil {
-		return flarecloudflare.AccessApplication{}, err
+		return flarecloudflare.AccessApplicationCreateResult{}, err
 	}
 	if err := f.validateApplicationTags(input); err != nil {
-		return flarecloudflare.AccessApplication{}, err
+		return flarecloudflare.AccessApplicationCreateResult{}, err
 	}
 	f.next++
 	id := fmt.Sprintf("access-app-%d", f.next)
-	application := flarecloudflare.AccessApplication{ID: id, AUD: "aud-" + id, Name: input.Name, Domain: input.Domain, Type: "self_hosted", SessionDuration: input.SessionDuration, Tags: slices.Clone(input.Tags)}
+	application := fakeAccessApplicationFromInput(flarecloudflare.AccessApplication{ID: id, AUD: "aud-" + id}, input)
 	f.applications[id] = application
 	f.inputs[id] = input
 	if f.ambiguousCreates > 0 {
 		f.ambiguousCreates--
-		return flarecloudflare.AccessApplication{}, errors.New("ambiguous create result")
+		return flarecloudflare.AccessApplicationCreateResult{}, errors.New("ambiguous create result")
 	}
-	return application, nil
+	return flarecloudflare.AccessApplicationCreateResult{Application: application}, nil
 }
 
-func (f *fakeAccessApplicationCloudflare) UpdateAccessApplication(_ context.Context, id string, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplication, error) {
+func (f *fakeAccessApplicationCloudflare) UpdateAccessApplication(_ context.Context, _ flarecloudflare.AccessScope, id string, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplication, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("Update:" + id); err != nil {
@@ -1268,16 +1528,13 @@ func (f *fakeAccessApplicationCloudflare) UpdateAccessApplication(_ context.Cont
 	if !found {
 		return flarecloudflare.AccessApplication{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
 	}
-	application.Name = input.Name
-	application.Domain = input.Domain
-	application.SessionDuration = input.SessionDuration
-	application.Tags = slices.Clone(input.Tags)
+	application = fakeAccessApplicationFromInput(application, input)
 	f.applications[id] = application
 	f.inputs[id] = input
 	return application, nil
 }
 
-func (f *fakeAccessApplicationCloudflare) GetAccessApplication(_ context.Context, id string) (flarecloudflare.AccessApplication, error) {
+func (f *fakeAccessApplicationCloudflare) GetAccessApplication(_ context.Context, _ flarecloudflare.AccessScope, id string) (flarecloudflare.AccessApplication, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("Get:" + id); err != nil {
@@ -1290,7 +1547,7 @@ func (f *fakeAccessApplicationCloudflare) GetAccessApplication(_ context.Context
 	return application, nil
 }
 
-func (f *fakeAccessApplicationCloudflare) ListAccessApplications(_ context.Context) ([]flarecloudflare.AccessApplication, error) {
+func (f *fakeAccessApplicationCloudflare) ListAccessApplications(_ context.Context, _ flarecloudflare.AccessScope) ([]flarecloudflare.AccessApplication, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("List"); err != nil {
@@ -1303,7 +1560,7 @@ func (f *fakeAccessApplicationCloudflare) ListAccessApplications(_ context.Conte
 	return result, nil
 }
 
-func (f *fakeAccessApplicationCloudflare) DeleteAccessApplication(_ context.Context, id string) error {
+func (f *fakeAccessApplicationCloudflare) DeleteAccessApplication(_ context.Context, _ flarecloudflare.AccessScope, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.record("Delete:" + id); err != nil {
@@ -1317,6 +1574,12 @@ func (f *fakeAccessApplicationCloudflare) DeleteAccessApplication(_ context.Cont
 	return nil
 }
 
+func (f *fakeAccessApplicationCloudflare) RevokeAccessApplicationTokens(_ context.Context, _ flarecloudflare.AccessScope, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.record("Revoke:" + id)
+}
+
 func (f *fakeAccessApplicationCloudflare) GetAccessTag(_ context.Context, name string) (flarecloudflare.AccessTag, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1327,6 +1590,33 @@ func (f *fakeAccessApplicationCloudflare) GetAccessTag(_ context.Context, name s
 	if !found {
 		return flarecloudflare.AccessTag{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
 	}
+	return tag, nil
+}
+
+func (f *fakeAccessApplicationCloudflare) ListAccessTags(context.Context) ([]flarecloudflare.AccessTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("ListTags"); err != nil {
+		return nil, err
+	}
+	result := make([]flarecloudflare.AccessTag, 0, len(f.tags))
+	for _, tag := range f.tags {
+		result = append(result, tag)
+	}
+	slices.SortFunc(result, func(left, right flarecloudflare.AccessTag) int { return strings.Compare(left.Name, right.Name) })
+	return result, nil
+}
+
+func (f *fakeAccessApplicationCloudflare) UpdateAccessTag(_ context.Context, name, newName string) (flarecloudflare.AccessTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tag, found := f.tags[name]
+	if !found {
+		return flarecloudflare.AccessTag{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
+	}
+	delete(f.tags, name)
+	tag.Name = newName
+	f.tags[newName] = tag
 	return tag, nil
 }
 
@@ -1365,6 +1655,14 @@ func (f *fakeAccessApplicationCloudflare) DeleteAccessTag(_ context.Context, nam
 	}
 	delete(f.tags, name)
 	return nil
+}
+
+func (f *fakeAccessApplicationCloudflare) GetAccessCustomPage(_ context.Context, _ string) (flarecloudflare.AccessCustomPage, error) {
+	return flarecloudflare.AccessCustomPage{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
+}
+
+func (f *fakeAccessApplicationCloudflare) ListAccessCustomPages(context.Context) ([]flarecloudflare.AccessCustomPageSummary, error) {
+	return nil, nil
 }
 
 func (f *fakeAccessApplicationCloudflare) GetAccessPolicy(_ context.Context, id string) (flarecloudflare.AccessPolicy, error) {

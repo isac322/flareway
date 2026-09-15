@@ -207,8 +207,10 @@ func supportedAppProtocol(protocol string) bool {
 	return protocol == "" || strings.EqualFold(protocol, "HTTP") || strings.EqualFold(protocol, "HTTPS") || protocol == "kubernetes.io/h2c" || strings.HasPrefix(protocol, "kubernetes.io/ws")
 }
 
+// clusterName is injective for Kubernetes namespaces and Service names because
+// neither component can contain '/' or ':', leaving unambiguous boundaries.
 func clusterName(namespace, service string, port int32) string {
-	return fmt.Sprintf("%s--%s--%d", namespace, service, port)
+	return fmt.Sprintf("k8s://%s/%s:%d", namespace, service, port)
 }
 
 func extractEndpoints(endpointSlices []discoveryv1.EndpointSlice, service *corev1.Service, servicePort *corev1.ServicePort) []ir.Endpoint {

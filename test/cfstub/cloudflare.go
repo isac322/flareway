@@ -48,6 +48,10 @@ func (s *Server) registerCloudflareRoutes() {
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/access/organizations$`, s.getOrganization)
 
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/cfd_tunnel/[^/]+/token$`, s.getTunnelToken)
+	s.Handle(http.MethodPost, `^/accounts/[^/]+/cfd_tunnel/[^/]+/management$`, s.issueTunnelManagementToken)
+	s.Handle(http.MethodGet, `^/accounts/[^/]+/cfd_tunnel/[^/]+/connectors/[^/]+$`, s.getTunnelConnector)
+	s.Handle(http.MethodGet, `^/accounts/[^/]+/cfd_tunnel/[^/]+/connections$`, s.listTunnelConnections)
+	s.Handle(http.MethodDelete, `^/accounts/[^/]+/cfd_tunnel/[^/]+/connections$`, s.deleteTunnelConnections)
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/cfd_tunnel/[^/]+/configurations$`, s.getTunnelConfiguration)
 	s.Handle(http.MethodPut, `^/accounts/[^/]+/cfd_tunnel/[^/]+/configurations$`, s.updateTunnelConfiguration)
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/cfd_tunnel/[^/]+$`, s.getTunnel)
@@ -106,14 +110,54 @@ func (s *Server) getOrganization(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listTunnels(w http.ResponseWriter, r *http.Request) {
 	accountID := pathPart(r.URL.Path, 1)
 	name := r.URL.Query().Get("name")
-	includeDeleted := strings.EqualFold(r.URL.Query().Get("is_deleted"), "true")
+	uuid := r.URL.Query().Get("uuid")
+	status := r.URL.Query().Get("status")
+	includePrefix := r.URL.Query().Get("include_prefix")
+	excludePrefix := r.URL.Query().Get("exclude_prefix")
+	isDeleted, hasDeletedFilter := r.URL.Query()["is_deleted"]
+	existedAt, existedAtOK := parseOptionalTime(w, r.URL.Query().Get("existed_at"))
+	if !existedAtOK {
+		return
+	}
+	wasActiveAt, wasActiveAtOK := parseOptionalTime(w, r.URL.Query().Get("was_active_at"))
+	if !wasActiveAtOK {
+		return
+	}
+	wasInactiveAt, wasInactiveAtOK := parseOptionalTime(w, r.URL.Query().Get("was_inactive_at"))
+	if !wasInactiveAtOK {
+		return
+	}
 	s.State.mu.RLock()
 	items := make([]Tunnel, 0, len(s.State.tunnels[accountID]))
 	for _, tunnel := range s.State.tunnels[accountID] {
-		if tunnel.DeletedAt != nil && !includeDeleted {
-			continue
+		if hasDeletedFilter {
+			wantDeleted := strings.EqualFold(isDeleted[0], "true")
+			if (tunnel.DeletedAt != nil) != wantDeleted {
+				continue
+			}
 		}
 		if name != "" && tunnel.Name != name {
+			continue
+		}
+		if uuid != "" && tunnel.ID != uuid {
+			continue
+		}
+		if status != "" && tunnel.Status != status {
+			continue
+		}
+		if includePrefix != "" && !strings.HasPrefix(tunnel.Name, includePrefix) {
+			continue
+		}
+		if excludePrefix != "" && strings.HasPrefix(tunnel.Name, excludePrefix) {
+			continue
+		}
+		if existedAt != nil && (tunnel.CreatedAt.After(*existedAt) || (tunnel.DeletedAt != nil && !tunnel.DeletedAt.After(*existedAt))) {
+			continue
+		}
+		if wasActiveAt != nil && (tunnel.ConnsActiveAt == nil || tunnel.ConnsActiveAt.After(*wasActiveAt)) {
+			continue
+		}
+		if wasInactiveAt != nil && (tunnel.ConnsInactiveAt == nil || tunnel.ConnsInactiveAt.After(*wasInactiveAt)) {
 			continue
 		}
 		tunnel.Connections = cloneConnections(tunnel.Connections)
@@ -154,6 +198,7 @@ func (s *Server) createTunnel(w http.ResponseWriter, r *http.Request) {
 		AccountTag: accountID,
 		Name:       input.Name,
 		Status:     "inactive",
+		TunType:    "cfd_tunnel",
 		ConfigSrc:  input.ConfigSrc,
 		CreatedAt:  now,
 	}
@@ -208,9 +253,26 @@ func (s *Server) editTunnel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteTunnel(w http.ResponseWriter, r *http.Request) {
 	accountID, tunnelID := pathPart(r.URL.Path, 1), pathPart(r.URL.Path, 3)
 	now := time.Now().UTC()
+	cascade := strings.EqualFold(r.URL.Query().Get("cascade"), "true")
 	s.State.mu.Lock()
 	tunnel, ok := s.State.tunnels[accountID][tunnelID]
 	if ok && tunnel.DeletedAt == nil {
+		hasConnections := len(tunnel.Connections) > 0
+		for _, connector := range s.State.tunnelConnectors[tunnelID] {
+			if len(connector.Conns) > 0 {
+				hasConnections = true
+				break
+			}
+		}
+		if hasConnections && !cascade {
+			s.State.mu.Unlock()
+			WriteError(w, http.StatusConflict, 1005, "tunnel has active connections")
+			return
+		}
+		if cascade {
+			tunnel.Connections = nil
+			delete(s.State.tunnelConnectors, tunnelID)
+		}
 		tunnel.DeletedAt = &now
 		s.State.tunnels[accountID][tunnelID] = tunnel
 	}
@@ -233,6 +295,101 @@ func (s *Server) getTunnelToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeResult(w, http.StatusOK, token)
+}
+
+func (s *Server) issueTunnelManagementToken(w http.ResponseWriter, r *http.Request) {
+	accountID, tunnelID := pathPart(r.URL.Path, 1), pathPart(r.URL.Path, 3)
+	var input struct {
+		Resources []string `json:"resources"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if len(input.Resources) == 0 {
+		WriteError(w, http.StatusBadRequest, 1004, "resources are required")
+		return
+	}
+	for _, resource := range input.Resources {
+		if resource != "logs" {
+			WriteError(w, http.StatusBadRequest, 1004, "unsupported management resource")
+			return
+		}
+	}
+	s.State.mu.Lock()
+	tunnel, ok := s.State.tunnels[accountID][tunnelID]
+	if !ok || tunnel.DeletedAt != nil {
+		s.State.mu.Unlock()
+		WriteError(w, http.StatusNotFound, 1001, "tunnel not found")
+		return
+	}
+	token := s.State.tunnelManagementTokens[tunnelID]
+	if token == "" {
+		token = "stub-management-token-" + tunnelID
+		s.State.tunnelManagementTokens[tunnelID] = token
+	}
+	s.State.mu.Unlock()
+	writeResult(w, http.StatusOK, token)
+}
+
+func (s *Server) getTunnelConnector(w http.ResponseWriter, r *http.Request) {
+	accountID, tunnelID := pathPart(r.URL.Path, 1), pathPart(r.URL.Path, 3)
+	connectorID := pathPart(r.URL.Path, 5)
+	s.State.mu.RLock()
+	tunnel, tunnelOK := s.State.tunnels[accountID][tunnelID]
+	connector, connectorOK := s.State.tunnelConnectors[tunnelID][connectorID]
+	connector = cloneTunnelConnector(connector)
+	s.State.mu.RUnlock()
+	if !tunnelOK || tunnel.DeletedAt != nil || !connectorOK {
+		WriteError(w, http.StatusNotFound, 1001, "tunnel connector not found")
+		return
+	}
+	writeResult(w, http.StatusOK, connector)
+}
+
+func (s *Server) listTunnelConnections(w http.ResponseWriter, r *http.Request) {
+	accountID, tunnelID := pathPart(r.URL.Path, 1), pathPart(r.URL.Path, 3)
+	s.State.mu.RLock()
+	tunnel, ok := s.State.tunnels[accountID][tunnelID]
+	connectors := make([]TunnelConnector, 0, len(s.State.tunnelConnectors[tunnelID]))
+	for _, connector := range s.State.tunnelConnectors[tunnelID] {
+		connectors = append(connectors, cloneTunnelConnector(connector))
+	}
+	s.State.mu.RUnlock()
+	if !ok || tunnel.DeletedAt != nil {
+		WriteError(w, http.StatusNotFound, 1001, "tunnel not found")
+		return
+	}
+	sort.Slice(connectors, func(i, j int) bool { return connectors[i].ID < connectors[j].ID })
+	writeResult(w, http.StatusOK, connectors)
+}
+
+func (s *Server) deleteTunnelConnections(w http.ResponseWriter, r *http.Request) {
+	accountID, tunnelID := pathPart(r.URL.Path, 1), pathPart(r.URL.Path, 3)
+	connectorID := r.URL.Query().Get("client_id")
+	s.State.mu.Lock()
+	tunnel, ok := s.State.tunnels[accountID][tunnelID]
+	if ok && tunnel.DeletedAt == nil {
+		if connectorID == "" {
+			delete(s.State.tunnelConnectors, tunnelID)
+			tunnel.Connections = nil
+		} else {
+			delete(s.State.tunnelConnectors[tunnelID], connectorID)
+			filtered := tunnel.Connections[:0]
+			for _, connection := range tunnel.Connections {
+				if value, _ := connection["client_id"].(string); value != connectorID {
+					filtered = append(filtered, connection)
+				}
+			}
+			tunnel.Connections = filtered
+		}
+		s.State.tunnels[accountID][tunnelID] = tunnel
+	}
+	s.State.mu.Unlock()
+	if !ok || tunnel.DeletedAt != nil {
+		WriteError(w, http.StatusNotFound, 1001, "tunnel not found")
+		return
+	}
+	writeResult(w, http.StatusOK, nil)
 }
 
 func (s *Server) getTunnelConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -512,4 +669,16 @@ func firstQuery(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func parseOptionalTime(w http.ResponseWriter, value string) (*time.Time, bool) {
+	if value == "" {
+		return nil, true
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, 1004, "invalid timestamp filter")
+		return nil, false
+	}
+	return &parsed, true
 }

@@ -77,8 +77,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -115,19 +117,58 @@ spec:
               input:
                 description: |-
                   DevicePostureInput is the typed superset accepted by Cloudflare posture rules.
-                  The rule Type determines which fields Cloudflare evaluates.
+                  Type determines which fields are required and sent.
                 properties:
                   activeThreats:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     type: string
+                    x-kubernetes-int-or-string: true
+                  authState:
+                    items:
+                      description: DevicePostureKolideAuthState selects a Kolide authentication
+                        state.
+                      enum:
+                      - Good
+                      - Notified
+                      - WillBlock
+                      - Blocked
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
                   certificateId:
                     type: string
+                  checkDisks:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
                   checkPrivateKey:
                     type: boolean
                   commonName:
                     type: string
                   complianceStatus:
+                    description: DevicePostureComplianceStatus selects a provider
+                      compliance state.
+                    enum:
+                    - Compliant
+                    - NonCompliant
+                    - Unknown
+                    - NotApplicable
+                    - InGracePeriod
+                    - Error
                     type: string
-                  connectionId:
+                  countOperator:
+                    description: DevicePostureOperator selects a numeric or version
+                      comparison.
+                    enum:
+                    - LessThan
+                    - LessThanOrEqual
+                    - GreaterThan
+                    - GreaterThanOrEqual
+                    - Equal
                     type: string
                   domain:
                     type: string
@@ -137,32 +178,111 @@ spec:
                     type: boolean
                   exists:
                     type: boolean
+                  extendedKeyUsage:
+                    items:
+                      description: DevicePostureExtendedKeyUsage selects a certificate
+                        key purpose.
+                      enum:
+                      - ClientAuth
+                      - EmailProtection
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
                   id:
                     type: string
                   infected:
                     type: boolean
+                  integrationRef:
+                    description: DevicePostureIntegrationReference selects a managed
+                      integration or an external integration ID.
+                    properties:
+                      externalId:
+                        minLength: 1
+                        type: string
+                      objectRef:
+                        description: NamespacedLocalObjectReference identifies a namespaced
+                          Flareway resource.
+                        properties:
+                          name:
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace defaults to the referencing object's
+                              namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of objectRef or externalId is required
+                      rule: has(self.objectRef) != has(self.externalId)
                   isActive:
                     type: boolean
                   issueCount:
                     type: string
                   lastSeen:
                     type: string
+                  locations:
+                    description: DevicePostureCertificateLocations selects certificate
+                      paths and trust stores.
+                    properties:
+                      paths:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      trustStores:
+                        items:
+                          description: DevicePostureTrustStore selects a certificate
+                            trust store.
+                          enum:
+                          - System
+                          - User
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                    type: object
                   networkStatus:
+                    description: DevicePostureNetworkStatus selects a SentinelOne
+                      network state.
+                    enum:
+                    - Connected
+                    - Disconnected
+                    - Disconnecting
+                    - Connecting
                     type: string
                   operatingSystem:
-                    description: DevicePosturePlatform selects operating systems on
-                      which a posture check runs.
+                    description: DevicePosturePlatform selects an operating system.
                     enum:
-                    - windows
-                    - mac
-                    - linux
-                    - android
-                    - ios
-                    - chromeos
+                    - Windows
+                    - Mac
+                    - Linux
+                    - Android
+                    - IOS
+                    - ChromeOS
                     type: string
                   operationalState:
+                    description: DevicePostureOperationalState selects a SentinelOne
+                      agent state.
+                    enum:
+                    - NotApplicable
+                    - PartiallyDisabled
+                    - AutomaticallyFullyDisabled
+                    - FullyDisabled
+                    - AutomaticallyPartiallyDisabled
+                    - DisabledError
+                    - DatabaseCorruption
                     type: string
                   operator:
+                    description: DevicePostureOperator selects a numeric or version
+                      comparison.
+                    enum:
+                    - LessThan
+                    - LessThanOrEqual
+                    - GreaterThan
+                    - GreaterThanOrEqual
+                    - Equal
                     type: string
                   os:
                     type: string
@@ -179,30 +299,73 @@ spec:
                   requireAll:
                     type: boolean
                   riskLevel:
+                    description: DevicePostureRiskLevel selects a Tanium risk level.
+                    enum:
+                    - Low
+                    - Medium
+                    - High
+                    - Critical
                     type: string
                   score:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    type: string
+                    x-kubernetes-int-or-string: true
+                  scoreOperator:
+                    description: DevicePostureOperator selects a numeric or version
+                      comparison.
+                    enum:
+                    - LessThan
+                    - LessThanOrEqual
+                    - GreaterThan
+                    - GreaterThanOrEqual
+                    - Equal
                     type: string
                   sensorConfig:
                     type: string
                   sha256:
                     type: string
                   state:
+                    description: DevicePostureState selects a CrowdStrike device state.
+                    enum:
+                    - Online
+                    - Offline
+                    - Unknown
                     type: string
+                  subjectAlternativeNames:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
                   thumbprint:
                     type: string
                   totalScore:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     type: string
+                    x-kubernetes-int-or-string: true
                   updateWindowDays:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     type: string
+                    x-kubernetes-int-or-string: true
                   version:
                     type: string
                   versionOperator:
+                    description: DevicePostureOperator selects a numeric or version
+                      comparison.
                     enum:
-                    - <
-                    - <=
-                    - '>'
-                    - '>='
-                    - ==
+                    - LessThan
+                    - LessThanOrEqual
+                    - GreaterThan
+                    - GreaterThanOrEqual
+                    - Equal
                     type: string
                 type: object
               managementPolicy:
@@ -218,15 +381,14 @@ spec:
                   description: DevicePostureMatch selects a platform for posture evaluation.
                   properties:
                     platform:
-                      description: DevicePosturePlatform selects operating systems
-                        on which a posture check runs.
+                      description: DevicePosturePlatform selects an operating system.
                       enum:
-                      - windows
-                      - mac
-                      - linux
-                      - android
-                      - ios
-                      - chromeos
+                      - Windows
+                      - Mac
+                      - Linux
+                      - Android
+                      - IOS
+                      - ChromeOS
                       type: string
                   required:
                   - platform
@@ -242,25 +404,29 @@ spec:
                 description: DevicePostureRuleType selects a Cloudflare posture check
                   implementation.
                 enum:
-                - file
-                - application
-                - serial_number
-                - os_version
-                - domain_joined
-                - firewall
-                - disk_encryption
-                - client_certificate
-                - warp
-                - gateway
-                - unique_client_id
-                - antivirus
-                - intune
-                - crowdstrike_s2s
-                - sentinelone_s2s
-                - kolide
-                - tanium_s2s
-                - uptycs
-                - workspace_one
+                - File
+                - Application
+                - Tanium
+                - Gateway
+                - WARP
+                - DiskEncryption
+                - SerialNumber
+                - SentinelOne
+                - CarbonBlack
+                - Firewall
+                - OSVersion
+                - DomainJoined
+                - ClientCertificate
+                - ClientCertificateV2
+                - Antivirus
+                - UniqueClientID
+                - Kolide
+                - TaniumS2S
+                - CrowdstrikeS2S
+                - Intune
+                - WorkspaceOne
+                - SentinelOneS2S
+                - CustomS2S
                 type: string
             required:
             - accountRef
@@ -272,9 +438,27 @@ spec:
               rule: self.managementPolicy != 'ObserveOnly' || has(self.externalRef)
             - message: AdoptById requires externalRef
               rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+            - message: integration-backed posture rules require input.integrationRef
+              rule: '!(self.type in [''Tanium'',''TaniumS2S'',''CrowdstrikeS2S'',''Intune'',''WorkspaceOne'',''Kolide'',''SentinelOneS2S'',''CustomS2S''])
+                || (has(self.input) && has(self.input.integrationRef))'
+            - message: input.integrationRef is only valid for integration-backed posture
+                rules
+              rule: (self.type in ['Tanium','TaniumS2S','CrowdstrikeS2S','Intune','WorkspaceOne','Kolide','SentinelOneS2S','CustomS2S'])
+                || !has(self.input) || !has(self.input.integrationRef)
+            - message: Firewall requires enabled and operatingSystem
+              rule: self.type != 'Firewall' || (has(self.input) && has(self.input.enabled)
+                && has(self.input.operatingSystem))
+            - message: CustomS2S requires score and operator
+              rule: self.type != 'CustomS2S' || (has(self.input) && has(self.input.score)
+                && has(self.input.operator))
+            - message: ClientCertificateV2 requires certificateId, checkPrivateKey,
+                and operatingSystem
+              rule: self.type != 'ClientCertificateV2' || (has(self.input) && has(self.input.checkPrivateKey)
+                && has(self.input.operatingSystem) && size(self.input.certificateId)
+                > 0)
           status:
             description: DevicePostureRuleStatus records the remote rule identity
-              and conditions.
+              and observed state.
             properties:
               conditions:
                 items:
@@ -335,6 +519,326 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observed:
+                description: DevicePostureRuleObservedState retains mutable remote
+                  fields for drift comparison.
+                properties:
+                  description:
+                    type: string
+                  enabled:
+                    type: boolean
+                  expiration:
+                    type: string
+                  input:
+                    description: |-
+                      DevicePostureInput is the typed superset accepted by Cloudflare posture rules.
+                      Type determines which fields are required and sent.
+                    properties:
+                      activeThreats:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        type: string
+                        x-kubernetes-int-or-string: true
+                      authState:
+                        items:
+                          description: DevicePostureKolideAuthState selects a Kolide
+                            authentication state.
+                          enum:
+                          - Good
+                          - Notified
+                          - WillBlock
+                          - Blocked
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      certificateId:
+                        type: string
+                      checkDisks:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      checkPrivateKey:
+                        type: boolean
+                      commonName:
+                        type: string
+                      complianceStatus:
+                        description: DevicePostureComplianceStatus selects a provider
+                          compliance state.
+                        enum:
+                        - Compliant
+                        - NonCompliant
+                        - Unknown
+                        - NotApplicable
+                        - InGracePeriod
+                        - Error
+                        type: string
+                      countOperator:
+                        description: DevicePostureOperator selects a numeric or version
+                          comparison.
+                        enum:
+                        - LessThan
+                        - LessThanOrEqual
+                        - GreaterThan
+                        - GreaterThanOrEqual
+                        - Equal
+                        type: string
+                      domain:
+                        type: string
+                      eidLastSeen:
+                        type: string
+                      enabled:
+                        type: boolean
+                      exists:
+                        type: boolean
+                      extendedKeyUsage:
+                        items:
+                          description: DevicePostureExtendedKeyUsage selects a certificate
+                            key purpose.
+                          enum:
+                          - ClientAuth
+                          - EmailProtection
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      id:
+                        type: string
+                      infected:
+                        type: boolean
+                      integrationRef:
+                        description: DevicePostureIntegrationReference selects a managed
+                          integration or an external integration ID.
+                        properties:
+                          externalId:
+                            minLength: 1
+                            type: string
+                          objectRef:
+                            description: NamespacedLocalObjectReference identifies
+                              a namespaced Flareway resource.
+                            properties:
+                              name:
+                                minLength: 1
+                                type: string
+                              namespace:
+                                description: Namespace defaults to the referencing
+                                  object's namespace.
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of objectRef or externalId is required
+                          rule: has(self.objectRef) != has(self.externalId)
+                      isActive:
+                        type: boolean
+                      issueCount:
+                        type: string
+                      lastSeen:
+                        type: string
+                      locations:
+                        description: DevicePostureCertificateLocations selects certificate
+                          paths and trust stores.
+                        properties:
+                          paths:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                          trustStores:
+                            items:
+                              description: DevicePostureTrustStore selects a certificate
+                                trust store.
+                              enum:
+                              - System
+                              - User
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                        type: object
+                      networkStatus:
+                        description: DevicePostureNetworkStatus selects a SentinelOne
+                          network state.
+                        enum:
+                        - Connected
+                        - Disconnected
+                        - Disconnecting
+                        - Connecting
+                        type: string
+                      operatingSystem:
+                        description: DevicePosturePlatform selects an operating system.
+                        enum:
+                        - Windows
+                        - Mac
+                        - Linux
+                        - Android
+                        - IOS
+                        - ChromeOS
+                        type: string
+                      operationalState:
+                        description: DevicePostureOperationalState selects a SentinelOne
+                          agent state.
+                        enum:
+                        - NotApplicable
+                        - PartiallyDisabled
+                        - AutomaticallyFullyDisabled
+                        - FullyDisabled
+                        - AutomaticallyPartiallyDisabled
+                        - DisabledError
+                        - DatabaseCorruption
+                        type: string
+                      operator:
+                        description: DevicePostureOperator selects a numeric or version
+                          comparison.
+                        enum:
+                        - LessThan
+                        - LessThanOrEqual
+                        - GreaterThan
+                        - GreaterThanOrEqual
+                        - Equal
+                        type: string
+                      os:
+                        type: string
+                      osDistroName:
+                        type: string
+                      osDistroRevision:
+                        type: string
+                      osVersionExtra:
+                        type: string
+                      overall:
+                        type: string
+                      path:
+                        type: string
+                      requireAll:
+                        type: boolean
+                      riskLevel:
+                        description: DevicePostureRiskLevel selects a Tanium risk
+                          level.
+                        enum:
+                        - Low
+                        - Medium
+                        - High
+                        - Critical
+                        type: string
+                      score:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        type: string
+                        x-kubernetes-int-or-string: true
+                      scoreOperator:
+                        description: DevicePostureOperator selects a numeric or version
+                          comparison.
+                        enum:
+                        - LessThan
+                        - LessThanOrEqual
+                        - GreaterThan
+                        - GreaterThanOrEqual
+                        - Equal
+                        type: string
+                      sensorConfig:
+                        type: string
+                      sha256:
+                        type: string
+                      state:
+                        description: DevicePostureState selects a CrowdStrike device
+                          state.
+                        enum:
+                        - Online
+                        - Offline
+                        - Unknown
+                        type: string
+                      subjectAlternativeNames:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      thumbprint:
+                        type: string
+                      totalScore:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        type: string
+                        x-kubernetes-int-or-string: true
+                      updateWindowDays:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        type: string
+                        x-kubernetes-int-or-string: true
+                      version:
+                        type: string
+                      versionOperator:
+                        description: DevicePostureOperator selects a numeric or version
+                          comparison.
+                        enum:
+                        - LessThan
+                        - LessThanOrEqual
+                        - GreaterThan
+                        - GreaterThanOrEqual
+                        - Equal
+                        type: string
+                    type: object
+                  match:
+                    items:
+                      description: DevicePostureMatch selects a platform for posture
+                        evaluation.
+                      properties:
+                        platform:
+                          description: DevicePosturePlatform selects an operating
+                            system.
+                          enum:
+                          - Windows
+                          - Mac
+                          - Linux
+                          - Android
+                          - IOS
+                          - ChromeOS
+                          type: string
+                      required:
+                      - platform
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  name:
+                    type: string
+                  schedule:
+                    type: string
+                  type:
+                    description: DevicePostureRuleType selects a Cloudflare posture
+                      check implementation.
+                    enum:
+                    - File
+                    - Application
+                    - Tanium
+                    - Gateway
+                    - WARP
+                    - DiskEncryption
+                    - SerialNumber
+                    - SentinelOne
+                    - CarbonBlack
+                    - Firewall
+                    - OSVersion
+                    - DomainJoined
+                    - ClientCertificate
+                    - ClientCertificateV2
+                    - Antivirus
+                    - UniqueClientID
+                    - Kolide
+                    - TaniumS2S
+                    - CrowdstrikeS2S
+                    - Intune
+                    - WorkspaceOne
+                    - SentinelOneS2S
+                    - CustomS2S
+                    type: string
+                type: object
               observedGeneration:
                 format: int64
                 type: integer

@@ -31,16 +31,16 @@ const (
 )
 
 // ConnectorProtocol selects the transport protocol used by cloudflared.
-// +kubebuilder:validation:Enum=auto;quic;http2
+// +kubebuilder:validation:Enum=Auto;QUIC;HTTP2
 type ConnectorProtocol string
 
 const (
-	// ConnectorProtocolAuto lets cloudflared select the protocol.
-	ConnectorProtocolAuto ConnectorProtocol = "auto"
-	// ConnectorProtocolQUIC is a supported API value.
-	ConnectorProtocolQUIC ConnectorProtocol = "quic"
-	// ConnectorProtocolHTTP2 is a supported API value.
-	ConnectorProtocolHTTP2 ConnectorProtocol = "http2"
+	// ConnectorProtocolAuto lets cloudflared choose the transport protocol.
+	ConnectorProtocolAuto ConnectorProtocol = "Auto"
+	// ConnectorProtocolQUIC uses the QUIC transport protocol.
+	ConnectorProtocolQUIC ConnectorProtocol = "QUIC"
+	// ConnectorProtocolHTTP2 uses the HTTP/2 transport protocol.
+	ConnectorProtocolHTTP2 ConnectorProtocol = "HTTP2"
 )
 
 // DNSMode controls whether Flareway manages public DNS records.
@@ -48,9 +48,9 @@ const (
 type DNSMode string
 
 const (
-	// DNSModeManaged enables managed DNS records.
+	// DNSModeManaged lets Flareway manage public DNS records.
 	DNSModeManaged DNSMode = "Managed"
-	// DNSModeExternal is a supported API value.
+	// DNSModeExternal leaves public DNS records externally managed.
 	DNSModeExternal DNSMode = "External"
 )
 
@@ -59,79 +59,86 @@ const (
 type OriginJWTMode string
 
 const (
-	// OriginJWTModeRequired enables origin JWT validation.
+	// OriginJWTModeRequired requires Access origin JWT validation.
 	OriginJWTModeRequired OriginJWTMode = "Required"
-	// OriginJWTModeDisabled is a supported API value.
+	// OriginJWTModeDisabled disables Access origin JWT validation.
 	OriginJWTModeDisabled OriginJWTMode = "Disabled"
 )
 
 // ConnectorSpec configures the cloudflared connector containers.
 type ConnectorSpec struct {
-	// Image is the cloudflared container image.
 	// +kubebuilder:default="cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4"
 	Image string `json:"image,omitempty"`
-
-	// Replicas is the desired number of connector pods.
 	// +kubebuilder:default=2
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=25
 	Replicas *int32 `json:"replicas,omitempty"`
-
-	// Protocol is the transport protocol used to connect to Cloudflare.
-	// +kubebuilder:default=auto
+	// +kubebuilder:default=Auto
 	Protocol ConnectorProtocol `json:"protocol,omitempty"`
-
-	// GracePeriod is the cloudflared shutdown grace period.
 	// +kubebuilder:default="60s"
-	GracePeriod metav1.Duration `json:"gracePeriod,omitempty"`
-
-	// Resources specifies compute resources for the cloudflared container.
-	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	GracePeriod metav1.Duration             `json:"gracePeriod,omitempty"`
+	Resources   corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // ProxySpec configures the Envoy proxy containers.
 type ProxySpec struct {
-	// Image is the Envoy container image.
 	// +kubebuilder:default="envoyproxy/envoy:distroless-v1.39.1"
-	Image string `json:"image,omitempty"`
-
-	// Resources specifies compute resources for the Envoy container.
+	Image     string                      `json:"image,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
-
-	// StreamIdleTimeout is the Envoy downstream stream idle timeout.
 	// +kubebuilder:default="1h"
 	StreamIdleTimeout metav1.Duration `json:"streamIdleTimeout,omitempty"`
-
-	// Concurrency is the number of Envoy worker threads.
 	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
 	Concurrency *int32 `json:"concurrency,omitempty"`
 }
 
 // PrivateDNSSpec configures the CoreDNS sidecar used by private listeners.
 type PrivateDNSSpec struct {
-	// Image is the CoreDNS container image.
 	// +kubebuilder:default="coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
-	Image string `json:"image,omitempty"`
-
-	// Resources specifies compute resources for the CoreDNS container.
+	Image     string                      `json:"image,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
+// DNSRecordSettings configures Cloudflare DNS record IP-family behavior.
+// +kubebuilder:validation:XValidation:rule="!(has(self.ipv4Only) && self.ipv4Only && has(self.ipv6Only) && self.ipv6Only)",message="ipv4Only and ipv6Only cannot both be true"
+type DNSRecordSettings struct {
+	IPv4Only *bool `json:"ipv4Only,omitempty"`
+	IPv6Only *bool `json:"ipv6Only,omitempty"`
+}
+
 // GatewayClassDNSConfig configures DNS ownership for Gateways in a class.
+// +kubebuilder:validation:XValidation:rule="!has(self.ttl) || self.ttl == 1 || (self.ttl >= 60 && self.ttl <= 86400)",message="ttl must be 1 (automatic) or between 60 and 86400 seconds"
+// +kubebuilder:validation:XValidation:rule="!has(self.proxied) || !self.proxied || !has(self.ttl) || self.ttl == 1",message="proxied DNS records require automatic ttl"
+// +kubebuilder:validation:XValidation:rule="!has(self.settings) || ((!has(self.settings.ipv4Only) || !self.settings.ipv4Only) && (!has(self.settings.ipv6Only) || !self.settings.ipv6Only)) || (has(self.proxied) && self.proxied)",message="ipv4Only or ipv6Only requires proxied=true"
 type GatewayClassDNSConfig struct {
-	// Mode controls whether Flareway manages public DNS records.
 	// +kubebuilder:default=Managed
 	Mode DNSMode `json:"mode,omitempty"`
+	// +kubebuilder:default=true
+	Proxied  *bool              `json:"proxied,omitempty"`
+	TTL      *int64             `json:"ttl,omitempty"`
+	Settings *DNSRecordSettings `json:"settings,omitempty"`
 }
 
 // GatewayClassOriginJWTConfig configures the default Access origin JWT policy.
 type GatewayClassOriginJWTConfig struct {
-	// Mode controls whether Access applications require origin JWT validation.
 	// +kubebuilder:default=Required
 	Mode OriginJWTMode `json:"mode,omitempty"`
 }
 
+// GatewayOriginRequestSpec contains only origin settings valid for cloudflared's loopback Envoy origin.
+type GatewayOriginRequestSpec struct {
+	ConnectTimeout   *metav1.Duration `json:"connectTimeout,omitempty"`
+	KeepAliveTimeout *metav1.Duration `json:"keepAliveTimeout,omitempty"`
+	TCPKeepAlive     *metav1.Duration `json:"tcpKeepAlive,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	KeepAliveConnections   *int64 `json:"keepAliveConnections,omitempty"`
+	NoHappyEyeballs        *bool  `json:"noHappyEyeballs,omitempty"`
+	DisableChunkedEncoding *bool  `json:"disableChunkedEncoding,omitempty"`
+	HTTP2Origin            *bool  `json:"http2Origin,omitempty"`
+}
+
 // ConformanceSpec configures the data-plane Service used by conformance mode.
 type ConformanceSpec struct {
-	// ServiceType selects how the conformance data plane is exposed.
 	// +kubebuilder:default=LoadBalancer
 	// +kubebuilder:validation:Enum=LoadBalancer;ClusterIP
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
@@ -139,35 +146,23 @@ type ConformanceSpec struct {
 
 // GatewayClassConfigSpec defines defaults and operating mode for a GatewayClass.
 // +kubebuilder:validation:XValidation:rule="!self.conformanceMode || !has(self.accountRef)",message="accountRef must be omitted when conformanceMode is true"
+// +kubebuilder:validation:XValidation:rule="self.conformanceMode || (has(self.accountRef) && has(self.accountRef.name) && size(self.accountRef.name) > 0)",message="accountRef.name is required unless conformanceMode is true"
 type GatewayClassConfigSpec struct {
-	// AccountRef is the default CloudflareAccount used by Gateways in this class.
 	AccountRef *corev1.LocalObjectReference `json:"accountRef,omitempty"`
-
-	// Connector configures cloudflared.
 	// +kubebuilder:default={}
 	Connector ConnectorSpec `json:"connector,omitempty"`
-
-	// Proxy configures Envoy.
 	// +kubebuilder:default={}
 	Proxy ProxySpec `json:"proxy,omitempty"`
-
-	// PrivateDNS configures the CoreDNS sidecar for private listeners.
 	// +kubebuilder:default={}
 	PrivateDNS PrivateDNSSpec `json:"privateDNS,omitempty"`
-
-	// DNS configures public DNS ownership.
 	// +kubebuilder:default={}
 	DNS GatewayClassDNSConfig `json:"dns,omitempty"`
-
-	// OriginJWT configures the default Access origin JWT requirement.
 	// +kubebuilder:default={}
 	OriginJWT GatewayClassOriginJWTConfig `json:"originJWT,omitempty"`
-
-	// ConformanceMode disables Cloudflare integration and exposes Envoy directly.
+	// +kubebuilder:default={}
+	OriginRequest GatewayOriginRequestSpec `json:"originRequest,omitempty"`
 	// +kubebuilder:default=false
 	ConformanceMode bool `json:"conformanceMode,omitempty"`
-
-	// Conformance configures the conformance-mode data plane.
 	// +kubebuilder:default={}
 	Conformance ConformanceSpec `json:"conformance,omitempty"`
 }
@@ -180,8 +175,7 @@ type GatewayClassConfigSpec struct {
 type GatewayClassConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	Spec GatewayClassConfigSpec `json:"spec,omitempty"`
+	Spec              GatewayClassConfigSpec `json:"spec,omitempty"`
 }
 
 // +kubebuilder:object:root=true

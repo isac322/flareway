@@ -19,6 +19,7 @@ limitations under the License.
 package ir
 
 import (
+	"slices"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -64,13 +65,131 @@ type Gateway struct {
 // Cloudflare identifies the remotely managed tunnel used by a production
 // Gateway. It is absent in conformance mode.
 type Cloudflare struct {
-	AccountID        string `json:"accountId"`
-	TunnelName       string `json:"tunnelName"`
-	TunnelID         string `json:"tunnelId,omitempty"`
-	TokenSecretName  string `json:"tokenSecretName"`
-	ManagementPolicy string `json:"managementPolicy"`
-	Teardown         bool   `json:"teardown,omitempty"`
-	WARPRouting      bool   `json:"warpRouting,omitempty"`
+	AccountID        string               `json:"accountId"`
+	TunnelName       string               `json:"tunnelName"`
+	TunnelID         string               `json:"tunnelId,omitempty"`
+	TokenSecretName  string               `json:"tokenSecretName"`
+	ManagementPolicy string               `json:"managementPolicy"`
+	Teardown         bool                 `json:"teardown,omitempty"`
+	WARPRouting      bool                 `json:"warpRouting,omitempty"`
+	OriginRequest    GatewayOriginRequest `json:"originRequest"`
+}
+
+// GatewayOriginRequest contains only settings that can affect cloudflared's
+// loopback connection to the in-pod Envoy proxy.
+type GatewayOriginRequest struct {
+	ConnectTimeout         *time.Duration `json:"connectTimeout,omitempty"`
+	KeepAliveTimeout       *time.Duration `json:"keepAliveTimeout,omitempty"`
+	TCPKeepAlive           *time.Duration `json:"tcpKeepAlive,omitempty"`
+	KeepAliveConnections   *int64         `json:"keepAliveConnections,omitempty"`
+	NoHappyEyeballs        *bool          `json:"noHappyEyeballs,omitempty"`
+	DisableChunkedEncoding *bool          `json:"disableChunkedEncoding,omitempty"`
+	HTTP2Origin            *bool          `json:"http2Origin,omitempty"`
+}
+
+// TunnelConfiguration is a complete remotely managed cloudflared
+// configuration. Ingress order is significant.
+type TunnelConfiguration struct {
+	Ingress       []TunnelIngress `json:"ingress"`
+	OriginRequest *OriginRequest  `json:"originRequest,omitempty"`
+	WARPRouting   *WARPRouting    `json:"warpRouting,omitempty"`
+}
+
+// TunnelIngress is one ordered cloudflared ingress rule.
+type TunnelIngress struct {
+	Hostname      string               `json:"hostname,omitempty"`
+	Path          string               `json:"path,omitempty"`
+	Service       TunnelIngressService `json:"service"`
+	OriginRequest *OriginRequest       `json:"originRequest,omitempty"`
+}
+
+// TunnelIngressService selects exactly one official cloudflared ingress
+// service without exposing Cloudflare's wire string syntax to API translation.
+type TunnelIngressService struct {
+	HTTP       *TunnelAddressService    `json:"http,omitempty"`
+	HTTPS      *TunnelAddressService    `json:"https,omitempty"`
+	TCP        *TunnelAddressService    `json:"tcp,omitempty"`
+	SSH        *TunnelAddressService    `json:"ssh,omitempty"`
+	RDP        *TunnelAddressService    `json:"rdp,omitempty"`
+	SMB        *TunnelAddressService    `json:"smb,omitempty"`
+	Unix       *TunnelUnixService       `json:"unix,omitempty"`
+	UnixTLS    *TunnelUnixService       `json:"unixTLS,omitempty"`
+	HelloWorld *TunnelBuiltinService    `json:"helloWorld,omitempty"`
+	HTTPStatus *TunnelHTTPStatusService `json:"httpStatus,omitempty"`
+	Bastion    *TunnelBuiltinService    `json:"bastion,omitempty"`
+}
+
+// TunnelAddressService identifies a host:port origin.
+type TunnelAddressService struct {
+	Address string `json:"address"`
+}
+
+// TunnelUnixService identifies an absolute UNIX domain socket path.
+type TunnelUnixService struct {
+	Path string `json:"path"`
+}
+
+// TunnelHTTPStatusService configures the embedded HTTP status responder.
+type TunnelHTTPStatusService struct {
+	Code int32 `json:"code"`
+}
+
+// TunnelBuiltinService marks a parameterless embedded service.
+type TunnelBuiltinService struct{}
+
+// OriginProxyType is translated to cloudflared's lowercase wire value only
+// while compiling the Cloudflare request.
+type OriginProxyType string
+
+const (
+	// OriginProxyTypeRegular selects cloudflared's regular origin proxy.
+	OriginProxyTypeRegular OriginProxyType = "Regular"
+	// OriginProxyTypeSOCKS5 selects cloudflared's SOCKS5 origin proxy.
+	OriginProxyTypeSOCKS5 OriginProxyType = "SOCKS5"
+)
+
+// OriginRequest contains the full remotely configurable cloudflared origin
+// request. Integer durations are seconds, matching Cloudflare's API.
+type OriginRequest struct {
+	Access                 *OriginAccess    `json:"access,omitempty"`
+	CAPool                 *string          `json:"caPool,omitempty"`
+	ConnectTimeout         *int64           `json:"connectTimeout,omitempty"`
+	DisableChunkedEncoding *bool            `json:"disableChunkedEncoding,omitempty"`
+	HTTP2Origin            *bool            `json:"http2Origin,omitempty"`
+	HTTPHostHeader         *string          `json:"httpHostHeader,omitempty"`
+	KeepAliveConnections   *int64           `json:"keepAliveConnections,omitempty"`
+	KeepAliveTimeout       *int64           `json:"keepAliveTimeout,omitempty"`
+	MatchSNIToHost         *bool            `json:"matchSNIToHost,omitempty"`
+	NoHappyEyeballs        *bool            `json:"noHappyEyeballs,omitempty"`
+	NoTLSVerify            *bool            `json:"noTLSVerify,omitempty"`
+	OriginServerName       *string          `json:"originServerName,omitempty"`
+	ProxyType              *OriginProxyType `json:"proxyType,omitempty"`
+	TCPKeepAlive           *int64           `json:"tcpKeepAlive,omitempty"`
+	TLSTimeout             *int64           `json:"tlsTimeout,omitempty"`
+	IPRules                []OriginIPRule   `json:"ipRules,omitempty"`
+}
+
+// OriginIPRule is one ordered CIDR allow or deny rule for a SOCKS or bastion
+// origin service.
+type OriginIPRule struct {
+	Prefix string  `json:"prefix"`
+	Ports  []int32 `json:"ports,omitempty"`
+	Allow  bool    `json:"allow"`
+}
+
+// OriginAccess configures cloudflared's built-in Access JWT validator.
+type OriginAccess struct {
+	AUDTags  []string `json:"audTags"`
+	TeamName string   `json:"teamName"`
+	Required *bool    `json:"required,omitempty"`
+}
+
+// WARPRouting configures private-network packet routing through the tunnel.
+type WARPRouting struct {
+	Enabled        *bool  `json:"enabled,omitempty"`
+	ConnectTimeout *int64 `json:"connectTimeout,omitempty"`
+	TCPKeepAlive   *int64 `json:"tcpKeepAlive,omitempty"`
+	MaxActiveFlows *int64 `json:"maxActiveFlows,omitempty"`
 }
 
 // Listener describes a Gateway listener and its actual Envoy bind port.
@@ -107,10 +226,25 @@ type ProtectionDomain struct {
 
 // AccessGuard describes Cloudflare Access JWT enforcement for a domain.
 type AccessGuard struct {
-	AUD                    string `json:"aud"`
-	TeamName               string `json:"teamName"`
-	AuthDomain             string `json:"authDomain"`
-	OptionsPreflightBypass bool   `json:"optionsPreflightBypass"`
+	AUDs                   []string `json:"auds,omitempty"`
+	TeamName               string   `json:"teamName"`
+	AuthDomain             string   `json:"authDomain"`
+	OptionsPreflightBypass bool     `json:"optionsPreflightBypass"`
+}
+
+// CanonicalAUDs returns the non-empty audience set in deterministic order.
+func (guard *AccessGuard) CanonicalAUDs() []string {
+	if guard == nil {
+		return nil
+	}
+	audiences := make([]string, 0, len(guard.AUDs))
+	for _, audience := range guard.AUDs {
+		if audience != "" {
+			audiences = append(audiences, audience)
+		}
+	}
+	slices.Sort(audiences)
+	return slices.Compact(audiences)
 }
 
 // VirtualHost is an Envoy virtual host. Routes are already precedence-sorted.

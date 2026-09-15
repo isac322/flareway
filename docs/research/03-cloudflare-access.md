@@ -1,13 +1,13 @@
 # Cloudflare Access (Zero Trust) Architecture & API Reference
 
-**Document Version / Date:** 2026-09-12  
-**Target:** Cloudflare Access (Zero Trust) — Applications, Policies, Groups, Service Tokens, Identity Providers, Device Posture, JWT Validation, Session Semantics, Tunnel Interplay, and SDK/Terraform Mapping.
+**Document Version / Date:** 2026-09-14
+**Target:** Cloudflare Access (Zero Trust) API facts and their implemented Flareway `v1alpha1` mapping.
 
 ---
 
 ## Summary (10 bullets max)
 
-1. **Access Application API**: Created at `/accounts/{account_id}/access/apps`. Self-hosted apps configure public hostnames/paths or private network routes; the modern `destinations` array supersedes the deprecated `self_hosted_domains` field (deprecated through late 2025).
+1. **Access Application API**: Applications use account-scoped `/accounts/{account_id}/access/apps` or zone-scoped `/zones/{zone_id}/access/apps`. Self-hosted apps configure public hostnames/paths or private network routes; the modern `destinations` array supersedes the deprecated `self_hosted_domains` field.
 2. **AUD Tag Stability**: The Audience (`aud`) tag is a 64-character hex string generated once at application creation. It remains immutable across domain, destination, and policy updates, changing only if the application is deleted and recreated.
 3. **Domain & Path Overlap**: Cloudflare Edge enforces exact/more-specific path precedence (`example.com/admin` takes precedence over `example.com`), and no rules are inherited from parent paths to explicit child apps.
 4. **Policy Engine & Decisions**: Reusable policies exist at `/accounts/{account_id}/access/policies` with actions `bypass`, `non_identity` (Service Auth), `allow`, and `deny` (Block). Bypass and Non-Identity are evaluated first, followed by Allow and Deny in order of precedence; first matching decision terminates evaluation.
@@ -18,13 +18,94 @@
 9. **Revocation Latency Caveat**: Cloudflare Edge cookie and token revocation propagates globally within 20–30 seconds. However, origins or `cloudflared` connectors that validate JWTs statelessly without calling edge revocation lists will accept revoked tokens until cryptographic expiration (`exp`).
 10. **Flareway Ownership & Rate Limits**: Applications support account-level tags, but every tag must exist before assignment and tag names are limited to 35 characters. Flareway therefore creates a shared `flareway-managed` tag plus bounded SHA-256-derived owner/bypass tags. Policies, groups, and service tokens only support `name`, requiring prefixed naming conventions. The standard Cloudflare API rate limit is 1,200 requests per 5 minutes.
 
+
+## Flareway parity implementation
+
+The Cloudflare wire API uses lower-case discriminators, but Flareway's public enums are PascalCase. Every application manifest requires `spec.accountRef`, immutable `spec.type`, and exactly one matching variant. The split between the two Kubernetes Kinds is an ownership boundary, not a feature gap.
+
+| Cloudflare application | Flareway Kind and variant |
+|---|---|
+| `self_hosted` | `AccessApplication` `type: SelfHosted`, `selfHosted: {}` |
+| `ssh` | `AccessApplication` `type: SSH`, `ssh: {}` |
+| `vnc` | `AccessApplication` `type: VNC`, `vnc: {}` |
+| `rdp` | `AccessApplication` `type: RDP`, `rdp.targetCriteria[]` |
+| `mcp` | `AccessApplication` `type: MCP`, `mcp: {}` |
+| `proxy_endpoint` | `AccessApplication` `type: ProxyEndpoint`, `proxyEndpoint: {}` |
+| `saas` | `AccessStandaloneApplication` `type: SaaS`, typed OIDC or SAML `saas` config |
+| `bookmark` | `AccessStandaloneApplication` `type: Bookmark`, `bookmark` config |
+| `infrastructure` | `AccessStandaloneApplication` `type: Infrastructure`, target criteria and inline allow policies |
+| `app_launcher` | `AccessStandaloneApplication` `type: AppLauncher`, launcher presentation config |
+| `warp` | `AccessStandaloneApplication` `type: WARP`, `warp: {}` for device enrollment |
+| `biso` | `AccessStandaloneApplication` `type: BISO`, `biso: {}` |
+| `dash_sso` | `AccessStandaloneApplication` `type: DashSSO`, `dashSso.domain` |
+| `mcp_portal` | `AccessStandaloneApplication` `type: MCPPortal`, domain and typed destinations |
+
+### Gateway attachment, destinations, and audiences
+
+`AccessApplication` is a GEP-713 Direct policy. `targetRefs[]` accepts same-namespace `gateway.networking.k8s.io` `Gateway` and `HTTPRoute` objects; `sectionName` selects a listener or a named route rule. Public destinations are compiled from those targets. `pathScope` narrows the compiled region with `Exact` or `PathPrefix` without changing the underlying HTTPRoute backend.
+
+Additional `destinations[]` use a discriminated union: `Private`, `ViaMCPServerPortal`, `Worker`, `PreviewWorker`, `AllWorkers`, or `AllPreviewWorkers`. A `Private` destination references exactly one `NetworkRoute` or `HostnameRoute`, then may add a CIDR subset, `portRange`, and `l4Protocol: TCP|UDP`. Flareway deliberately does not expose deprecated `self_hosted_domains`.
+
+`originJWT.mode` defaults to `Required`. `audienceScope: Application` accepts only the application's AUD. `audienceScope: Hostname` accepts all ready Access application audiences compiled for that hostname and requires `mode: Required`. On a private listener, `assumeGatewayTLSDecryption` records the platform's assertion when the controller cannot observe Gateway TLS decryption directly.
+
+### Public carve-outs and adoption
+
+Cloudflare gives a more-specific path application precedence and does not inherit the parent policy. Flareway uses that behavior to create explicit child bypass applications for public paths inside a protected parent. The controller writes child IDs and origins to `status.bypassApplications`.
+
+Adoption is never name-based. To adopt a pre-existing child, declare its normalized `hostname` and `path` in `spec.bypass.children[]`, set `externalRef.applicationId`, and use `adoption.mode: AdoptById` with expected attributes. `ObserveOnly` requires an external reference for the parent and every child. This preserves parent and child AUDs during migration.
+
+### Complete application settings and Secret handling
+
+The shared `application` block covers session duration, WARP authentication, iframe/interstitial behavior, IdP selection and automatic redirect, App Launcher visibility, service-auth 401 behavior, binding and cookie settings, CORS, service-token header selection, deny messages/URLs, custom pages, eager redirect cookie, logo, MFA, OAuth authorization-server settings, SCIM, clientless isolation launcher URL, and user tags.
+
+SCIM authentication is typed as `HTTPBasic`, `OAuthBearerToken`, `OAuth2`, `AccessServiceToken`, or an ordered `multiple` list. Passwords, bearer tokens, OAuth client secrets, and service-token credentials come from Kubernetes Secret keys or `ServiceToken` references. SaaS create responses can contain a one-time client secret; Flareway stores it in a controller-owned Secret and exposes only `status.saas.clientSecretRef`.
+
+`ServiceToken` supports account or verified-zone scope, enabled state, duration, `Manual` or `OnExpiry` rotation, and a grace period. Its Secret uses `CF-Access-Client-Id` and `CF-Access-Client-Secret`; grace-period credentials use the corresponding `-Previous` keys. `IdentityProvider` client secrets and SCIM tokens, and `DevicePostureIntegration` provider credentials, are also reference-only.
+
+### Additional Access resources
+
+| Resource | Implemented surface |
+|---|---|
+| `AccessCustomPage` | `IdentityDenied`, `Forbidden`, `Login`, `Interstitial`; HTML/Liquid template and `contractVersion` |
+| `DevicePostureIntegration` | `WorkspaceOne`, `CrowdstrikeS2S`, `Uptycs`, `Intune`, `Kolide`, `TaniumS2S`, `SentinelOneS2S`, `CustomS2S` |
+| `AccessInfrastructureTarget` | hostname plus IPv4 and/or IPv6, each using a `VirtualNetwork` reference or external virtual-network ID |
+| `IdentityProvider` | typed providers, Secret-backed client config, SCIM settings, bounded SCIM directory status |
+| `AccessPolicy` and `AccessGroup` | complete typed rule union and reusable references |
+
+### Adjacent Tunnel, DNS, and WARP ownership
+
+Access application parity depends on explicit Tunnel ownership. `CloudflareTunnel.spec.configuration.mode` defaults to `Gateway`, where the Gateway controller owns the whole config and exposes only the loopback-Envoy `originRequest` subset. `Direct` is an explicit alternative that owns ordered `ingress[]`, top-level and per-rule full `originRequest`, and `warpRouting`.
+
+Direct ingress supports `http`, `https`, `tcp`, `ssh`, `rdp`, `smb`, `unix`, `unixTLS`, `helloWorld`, `httpStatus`, and `bastion`. Full `originRequest` covers Access JWT, CA/SNI/TLS, HTTP/2 and Host behavior, connect/TLS/keepalive timing, Happy Eyeballs, chunked encoding, proxy type, and IP rules. The final rule is a catch-all. Direct mode cannot share the Gateway-owned connector, proxy, private DNS, origin request, or listener fields.
+
+`WARPConnector` represents a separate Cloudflare Mesh connector with a token Secret, bounded client/connection status, `None|Disabled|AWS|Local` HA, and explicit failover. `NetworkRoute` and `HostnameRoute` use `tunnelRef.kind: CloudflareTunnel|WARPConnector`; omitted kind defaults to `CloudflareTunnel`. The Access `Private` destination references one of those typed route objects instead of embedding an untyped tunnel ID.
+
+Tunnel DNS applies in both modes and exposes `mode: Managed|External`, `recordComment`, `proxied`, `ttl`, and `settings.ipv4Only|ipv6Only`. A proxied record uses automatic TTL, and IP-family filtering requires a proxied record. Access apps and service tokens select account scope by omitting `zone` or verified-zone scope by supplying the exact DNS zone name.
+
+### Scope, ledger, and exclusions
+
+An omitted application `zone` uses the account endpoint. A provided DNS zone name is resolved to an ID only from `CloudflareAccount.status.verified.zones`; an unverified zone fails before a remote write. Account grants independently authorize hostname/zone/exposure, platform objects, reusable policies, custom pages, posture integrations, standalone apps, private routes, and Kubernetes backends.
+
+The parity ledger separates desired state from transport and observation:
+
+| API category | Flareway treatment |
+|---|---|
+| create/update field | typed spec field or typed object reference |
+| create-only credential | controller-owned Secret or user Secret reference |
+| remote ID, timestamp, generated audience/domain, health | bounded status |
+| `read_only` and server-computed values | observed status only |
+| `success`, `errors`, `messages`, `result`, pagination/result-info | excluded HTTP envelope |
+| deprecated alias | omitted in favor of the canonical field |
+
+These exclusions do not mark Cloudflare features as unavailable. They prevent response metadata, one-time secrets, and server-owned values from becoming competing desired-state writers.
+
 ---
 
 ## Applications
 
-### Application Endpoint & Schema (`type: self_hosted`)
-- **Primary Endpoint:** `POST /accounts/{account_id}/access/apps` (mutually exclusive with zone-scoped `/zones/{zone_id}/access/apps`).
-- **Resource Type:** `self_hosted`.
+### Self-hosted wire endpoint and schema
+- **Primary Endpoint:** `POST /accounts/{account_id}/access/apps` or the mutually exclusive zone-scoped endpoint.
+- **Resource Type:** Cloudflare wire value `self_hosted`; Flareway public value `SelfHosted`.
 
 | Field Name | Type | Description |
 |---|---|---|

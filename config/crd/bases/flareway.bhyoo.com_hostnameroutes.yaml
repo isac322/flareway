@@ -51,8 +51,8 @@ spec:
           metadata:
             type: object
           spec:
-            description: HostnameRouteSpec defines an exact or single-label wildcard
-              hostname routed through a CloudflareTunnel.
+            description: HostnameRouteSpec defines a private hostname routed through
+              a typed tunnel reference.
             properties:
               accountRef:
                 description: |-
@@ -80,8 +80,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -184,8 +186,6 @@ spec:
                 - routeId
                 type: object
               hostname:
-                description: Hostname accepts an exact DNS name or a wildcard occupying
-                  exactly the first label.
                 maxLength: 253
                 pattern: ^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
                 type: string
@@ -198,9 +198,17 @@ spec:
                 - ObserveOnly
                 type: string
               tunnelRef:
-                description: NamespacedObjectReference identifies a namespaced Flareway
-                  resource.
+                description: TunnelReference identifies a namespaced CloudflareTunnel
+                  or WARPConnector.
                 properties:
+                  kind:
+                    default: CloudflareTunnel
+                    description: TunnelReferenceKind selects a supported private-route
+                      tunnel resource.
+                    enum:
+                    - CloudflareTunnel
+                    - WARPConnector
+                    type: string
                   name:
                     minLength: 1
                     type: string
@@ -224,14 +232,16 @@ spec:
               rule: '!has(self.externalRef) || self.managementPolicy == ''ObserveOnly''
                 || self.adoption.mode == ''AdoptById'''
             - message: accountRef.name is required
-              rule: has(self.accountRef.name) && self.accountRef.name != ""
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: tunnelRef.name is required
+              rule: has(self.tunnelRef.name) && size(self.tunnelRef.name) > 0
           status:
-            description: HostnameRouteStatus records the remote route identity and
-              applied claim.
+            description: HostnameRouteStatus records actionable hostname-route and
+              lookup metadata.
             properties:
               applied:
                 description: HostnameRouteAppliedStatus is the exact hostname and
-                  resolved tunnel last applied.
+                  resolved remote tunnel last applied.
                 properties:
                   hostname:
                     type: string
@@ -239,6 +249,18 @@ spec:
                     format: int64
                     type: integer
                   tunnelId:
+                    type: string
+                  tunnelType:
+                    description: TunnelRemoteType is the public representation of
+                      a Cloudflare tunnel type.
+                    enum:
+                    - CloudflareTunnel
+                    - WARPConnector
+                    - WARP
+                    - Magic
+                    - IPSec
+                    - GRE
+                    - CNI
                     type: string
                 type: object
               comment:
@@ -298,16 +320,41 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              createdAt:
+                format: date-time
+                type: string
+              deletedAt:
+                format: date-time
+                type: string
+              hostname:
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
               ownershipVerified:
                 type: boolean
               routeId:
+                type: string
+              tunnelId:
+                type: string
+              tunnelName:
+                type: string
+              tunnelType:
+                description: TunnelRemoteType is the public representation of a Cloudflare
+                  tunnel type.
+                enum:
+                - CloudflareTunnel
+                - WARPConnector
+                - WARP
+                - Magic
+                - IPSec
+                - GRE
+                - CNI
                 type: string
             type: object
         type: object

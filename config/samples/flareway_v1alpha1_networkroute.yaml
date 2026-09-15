@@ -10,6 +10,7 @@ spec:
     name: runbear
   network: 10.96.0.0/12
   tunnelRef:
+    kind: CloudflareTunnel
     name: cc-lb
     namespace: llm-proxy
   virtualNetworkRef:
@@ -19,6 +20,31 @@ spec:
     selector:
       matchLabels:
         flareway.bhyoo.com/tenant: llm-proxy
-  comment: Kubernetes Service CIDR
+  comment: Kubernetes Service CIDR through the Gateway tunnel
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: NetworkRoute
+metadata:
+  name: branch-office
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  network: 10.40.0.0/16
+  tunnelRef:
+    kind: WARPConnector
+    name: branch-local
+    namespace: llm-proxy
+  # virtualNetworkRef is optional; omission selects the account default virtual network.
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: llm-proxy
+  comment: Branch CIDR through the local-HA WARP Connector
   managementPolicy: Managed
   deletionPolicy: Delete

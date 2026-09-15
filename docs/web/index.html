@@ -45,7 +45,7 @@
       <a href="#security" class="nav-link"><span>05</span> Zero Trust & Fail-Closed 보안</a>
       
       <div class="nav-group-title">리소스 스펙 & 구현</div>
-      <a href="#crd-catalog" class="nav-link"><span>06</span> CRD 16종 상세 카탈로그</a>
+      <a href="#crd-catalog" class="nav-link"><span>06</span> CRD 22종 전체 카탈로그</a>
       <a href="#annotations" class="nav-link"><span>07</span> Annotation 정책 (Zero-Annotation)</a>
       <a href="#example-cclb" class="nav-link"><span>08</span> 실전 적용: cc-lb 블루프린트</a>
       <a href="#conformance" class="nav-link"><span>09</span> 검증 & Conformance 전략</a>
@@ -676,8 +676,40 @@
       <section id="crd-catalog" class="section">
         <div class="section-header">
           <div class="section-tag">CRD Reference</div>
-          <h2 class="section-title">Flareway CRD 16종 상세 카탈로그</h2>
-          <p class="section-desc">API Group: <code>flareway.bhyoo.com/v1alpha1</code>. 플랫폼 범위와 테넌트 범위로 명확히 구분됩니다.</p>
+          <h2 class="section-title">Flareway CRD 22종 전체 카탈로그</h2>
+          <p class="section-desc">API Group: <code>flareway.bhyoo.com/v1alpha1</code>. 아래 표는 제공되는 모든 Kind를 나열하며, 탭은 핵심 리소스의 소유권과 사용법을 설명합니다.</p>
+        </div>
+        <div class="table-responsive" style="margin-bottom: 28px;">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>영역</th>
+                <th>CRD Kinds</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Gateway 및 계정</td>
+                <td><code>GatewayClassConfig</code>, <code>CloudflareAccount</code>, <code>CloudflareTunnel</code></td>
+              </tr>
+              <tr>
+                <td>Access 애플리케이션</td>
+                <td><code>AccessApplication</code>, <code>AccessStandaloneApplication</code></td>
+              </tr>
+              <tr>
+                <td>Access 의존 리소스</td>
+                <td><code>AccessPolicy</code>, <code>AccessGroup</code>, <code>IdentityProvider</code>, <code>AccessCustomPage</code>, <code>DevicePostureRule</code>, <code>DevicePostureIntegration</code>, <code>AccessInfrastructureTarget</code>, <code>ServiceToken</code></td>
+              </tr>
+              <tr>
+                <td>사설 네트워크</td>
+                <td><code>VirtualNetwork</code>, <code>NetworkRoute</code>, <code>HostnameRoute</code>, <code>WARPConnector</code></td>
+              </tr>
+              <tr>
+                <td>디바이스 및 조직 설정</td>
+                <td><code>DeviceProfile</code>, <code>DeviceSettings</code>, <code>ZeroTrustOrganization</code>, <code>ZeroTrustGatewayPolicy</code>, <code>ZeroTrustList</code></td>
+              </tr>
+            </tbody>
+          </table>
         </div>
         <!-- Visual Diagram: CRD Hierarchy & Relationship Map -->
         <div class="diagram-container" style="margin-bottom: 28px;">
@@ -689,9 +721,9 @@
           <svg class="svg-diagram" viewBox="0 0 940 330" fill="none" xmlns="http://www.w3.org/2000/svg">
             <rect width="940" height="330" rx="10" fill="#0b0f19"/>
 
-            <!-- Tier 1: Cluster Scope (Top) -->
+            <!-- Tier 1: Platform roots and account-scoped resources -->
             <rect x="20" y="20" width="900" height="75" rx="8" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4 4"/>
-            <text x="35" y="42" fill="#a5b4fc" font-size="11.5" font-weight="700">Cluster Scoped (플랫폼 계정 & 디바이스 정책)</text>
+            <text x="35" y="42" fill="#a5b4fc" font-size="11.5" font-weight="700">Platform roots and account-scoped resources</text>
 
             <rect x="35" y="52" width="165" height="32" rx="4" fill="#312e81" stroke="#818cf8"/>
             <text x="45" y="72" fill="#e0e7ff" font-size="10.5" font-weight="700">CloudflareAccount</text>
@@ -793,7 +825,8 @@
                 </p>
                 <div class="code-box">
                   <div class="code-header"><span>CloudflareTunnel YAML 스키마 요약</span></div>
-                  <pre>kind: CloudflareTunnel
+                  <pre>apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
 metadata: {name: cc-lb, namespace: llm-proxy}
 spec:
   accountRef: {name: runbear}
@@ -814,12 +847,16 @@ spec:
                 </p>
                 <div class="code-box">
                   <div class="code-header"><span>AccessApplication YAML 스키마 요약</span></div>
-                  <pre>kind: AccessApplication
-metadata: {name: cc-lb-admin}
+                  <pre>apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata: {name: cc-lb-admin, namespace: llm-proxy}
 spec:
+  accountRef: {name: runbear}
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
     - {group: gateway.networking.k8s.io, kind: Gateway, name: cc-lb, sectionName: admin}
-  application: {sessionDuration: 720h}
+  application: {name: runbear-operation-cc-lb, sessionDuration: 720h}
   policies: [{policyRef: {name: allow-developers-warp}}]
   originJWT: {mode: Required}</pre>
                 </div>
@@ -842,6 +879,15 @@ spec:
                 </div>
                 <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
                   테넌트 자체 정책 정의 또는 플랫폼 네임스페이스의 표준 공유 정책(ObserveOnly)을 참조하여 재사용합니다.
+                </p>
+              </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>AccessStandaloneApplication</code> &amp; <code>AccessCustomPage</code></span>
+                  <span class="badge badge-orange">Access</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway 대상이 없는 SaaS, Bookmark, Infrastructure, App Launcher, WARP 등의 애플리케이션과 재사용 가능한 Access 사용자 페이지를 선언합니다.
                 </p>
               </div>
             </div>
@@ -889,6 +935,15 @@ spec:
                   WARP 클라이언트 연결 상태, 디스크 암호화, EDR(CrowdStrike 등) 검사를 요구하는 단말 보안 자세 규칙을 정의합니다.
                 </p>
               </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>DevicePostureIntegration</code> &amp; <code>AccessInfrastructureTarget</code></span>
+                  <span class="badge badge-green">Platform Shared</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  외부 단말 보안 공급자 자격 증명은 Secret 참조로 연결하고, Infrastructure Access가 사용할 호스트명과 가상 네트워크별 IP를 등록합니다.
+                </p>
+              </div>
             </div>
           </div>
 
@@ -932,6 +987,15 @@ spec:
                 </div>
                 <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
                   계정 전역의 WARP 세션 타임아웃(720h), 인증 도메인(auth_domain), 게이트웨이 프록시 활성화 플래그를 관리합니다.
+                </p>
+              </div>
+              <div class="card crd-card">
+                <div class="card-header">
+                  <span class="card-title"><code>WARPConnector</code></span>
+                  <span class="badge badge-blue">Cloudflare Mesh</span>
+                </div>
+                <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 12px;">
+                  Gateway 데이터플레인과 분리된 WARP Connector를 관리합니다. <code>spec.name</code>의 앞뒤 공백은 제거하지만 대소문자는 구분하며, 이름 자체는 채택 키가 아닙니다. 같은 이름의 기존 커넥터나 대소문자만 다른 이름은 <code>externalRef.tunnelId</code>, <code>AdoptById</code>, 비어 있지 않은 정확한 <code>adoption.expect.name</code> 없이는 충돌합니다. 중단된 생성 복구는 원격 ID와 HA 기능까지 일치하는 컨트롤러 소유 status 체크포인트만 사용하며 사용자 어노테이션은 사용하지 않습니다.
                 </p>
               </div>
             </div>
@@ -1076,6 +1140,9 @@ metadata:
   name: cc-lb-admin
   namespace: llm-proxy
 spec:
+  accountRef: {name: runbear}
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
     - {group: gateway.networking.k8s.io, kind: Gateway, name: cc-lb, sectionName: admin}
   application:

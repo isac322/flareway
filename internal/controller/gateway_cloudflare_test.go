@@ -17,19 +17,27 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/xds/translator"
@@ -39,9 +47,14 @@ func TestGatewayCloudflareEffectiveConfigOverrides(t *testing.T) {
 	base := defaultGatewayClassConfig()
 	base.Spec.Connector.Image = "base-cloudflared"
 	base.Spec.Proxy.Image = "base-envoy"
+	tcpKeepAlive := metav1.Duration{Duration: 15 * time.Second}
+	http2Origin := true
 	tunnel := &v1alpha1.CloudflareTunnel{Spec: v1alpha1.CloudflareTunnelSpec{
 		Connector: &v1alpha1.ConnectorSpec{Image: "override-cloudflared", Replicas: ptr.To[int32](3)},
 		Proxy:     &v1alpha1.ProxySpec{Image: "override-envoy", StreamIdleTimeout: metav1.Duration{Duration: 2 * time.Hour}},
+		OriginRequest: &v1alpha1.GatewayOriginRequestSpec{
+			TCPKeepAlive: &tcpKeepAlive, HTTP2Origin: &http2Origin,
+		},
 	}}
 
 	got := effectiveGatewayConfig(base, tunnel)
@@ -54,8 +67,281 @@ func TestGatewayCloudflareEffectiveConfigOverrides(t *testing.T) {
 	if got.Spec.Proxy.Image != "override-envoy" || got.Spec.Proxy.StreamIdleTimeout.Duration != 2*time.Hour {
 		t.Fatalf("proxy override = %#v", got.Spec.Proxy)
 	}
+
+	if got.Spec.OriginRequest.ConnectTimeout == nil || got.Spec.OriginRequest.ConnectTimeout.Duration != 30*time.Second ||
+		got.Spec.OriginRequest.KeepAliveTimeout == nil || got.Spec.OriginRequest.KeepAliveTimeout.Duration != 90*time.Second ||
+		got.Spec.OriginRequest.KeepAliveConnections == nil || *got.Spec.OriginRequest.KeepAliveConnections != 100 ||
+		got.Spec.OriginRequest.NoHappyEyeballs == nil || *got.Spec.OriginRequest.NoHappyEyeballs ||
+		got.Spec.OriginRequest.TCPKeepAlive == nil || got.Spec.OriginRequest.TCPKeepAlive.Duration != 15*time.Second ||
+		got.Spec.OriginRequest.HTTP2Origin == nil || !*got.Spec.OriginRequest.HTTP2Origin {
+		t.Fatalf("origin request override/defaults = %#v", got.Spec.OriginRequest)
+	}
 	if base.Spec.Connector.Image != "base-cloudflared" || base.Spec.Proxy.Image != "base-envoy" {
 		t.Fatal("effectiveGatewayConfig mutated the base config")
+	}
+}
+func TestGatewayCloudflareRefusesDirectTunnelOwnership(t *testing.T) {
+	tunnel := &v1alpha1.CloudflareTunnel{
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			Configuration: v1alpha1.CloudflareTunnelConfiguration{Mode: v1alpha1.CloudflareTunnelConfigurationModeDirect},
+		},
+	}
+	reconciler := new(GatewayReconciler)
+	if _, err := reconciler.reconcileCloudflaredConfiguration(context.Background(), &ir.Gateway{}, tunnel, &v1alpha1.CloudflareAccount{}); err == nil {
+		t.Fatal("Gateway configuration writer accepted a Direct-mode tunnel")
+	}
+	if err := reconciler.patchTunnelGatewayStatus(context.Background(), nil, tunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil); err == nil {
+		t.Fatal("Gateway status writer accepted a Direct-mode tunnel")
+	}
+}
+
+func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+	}
+	tunnelInfrastructure := func() *gatewayv1.GatewayInfrastructure {
+		return &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: tunnel.Name,
+		}}
+	}
+	first := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "first", Namespace: tunnel.Namespace, UID: "first-uid",
+			CreationTimestamp: metav1.NewTime(time.Unix(100, 0)),
+		},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: tunnelInfrastructure()},
+	}
+	second := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "second", Namespace: tunnel.Namespace, UID: "second-uid",
+			CreationTimestamp: metav1.NewTime(time.Unix(200, 0)),
+		},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: tunnelInfrastructure()},
+	}
+	tunnel.Status = v1alpha1.CloudflareTunnelStatus{
+		TunnelID:                "remote-id",
+		OwnershipVerified:       true,
+		ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "tunnel-token"},
+		GatewayRef:              &corev1.LocalObjectReference{Name: first.Name},
+		GatewayUID:              first.UID,
+		ConfigVersion:           v1alpha1.CloudflareTunnelConfigVersion{Desired: 7, DesiredHash: "first-owner"},
+		Hostnames:               []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "first.example.com"}},
+	}
+	account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: tunnel.Spec.AccountRef.Name}}
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(first, second, tunnel).
+		WithObjects(tunnel, account, first, second).
+		Build()
+	reconciler := &GatewayReconciler{Client: kube}
+	cfg := defaultGatewayClassConfig()
+
+	_, selectedAccount, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), first, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stop || selectedAccount == nil {
+		t.Fatalf("recorded owner resolution stopped=%v account=%#v", stop, selectedAccount)
+	}
+
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || selectedAccount != nil {
+		t.Fatalf("non-owner Gateway resolution stopped=%v account=%#v", stop, selectedAccount)
+	}
+
+	if err := kube.Delete(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || selectedAccount != nil {
+		t.Fatalf("successor bypassed ownership checkpoint stopped=%v account=%#v", stop, selectedAccount)
+	}
+	var currentTunnel v1alpha1.CloudflareTunnel
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
+		t.Fatal(err)
+	}
+	beforeStatus := currentTunnel.DeepCopy()
+	currentTunnel.Status.GatewayRef = &corev1.LocalObjectReference{Name: second.Name}
+	currentTunnel.Status.GatewayUID = second.UID
+	if err := kube.Status().Patch(context.Background(), &currentTunnel, client.MergeFrom(beforeStatus)); err != nil {
+		t.Fatal(err)
+	}
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stop || selectedAccount == nil {
+		t.Fatalf("checkpointed successor resolution stopped=%v account=%#v", stop, selectedAccount)
+	}
+
+	staleFirst := first.DeepCopy()
+	if err := kube.Delete(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	replacement := first.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = "replacement-uid"
+	replacement.CreationTimestamp = metav1.NewTime(time.Unix(300, 0))
+	replacement.DeletionTimestamp = nil
+	replacement.Finalizers = nil
+	replacement.Status = gatewayv1.GatewayStatus{}
+	if err := kube.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), staleFirst, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || selectedAccount != nil {
+		t.Fatalf("stale same-name UID resolution stopped=%v account=%#v", stop, selectedAccount)
+	}
+	var untouchedReplacement gatewayv1.Gateway
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(replacement), &untouchedReplacement); err != nil {
+		t.Fatal(err)
+	}
+	if len(untouchedReplacement.Status.Conditions) != 0 {
+		t.Fatalf("stale UID patched replacement Gateway status: %#v", untouchedReplacement.Status)
+	}
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || selectedAccount != nil {
+		t.Fatalf("replacement bypassed UID ownership checkpoint stopped=%v account=%#v", stop, selectedAccount)
+	}
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
+		t.Fatal(err)
+	}
+	beforeStatus = currentTunnel.DeepCopy()
+	currentTunnel.Status.GatewayRef = &corev1.LocalObjectReference{Name: replacement.Name}
+	currentTunnel.Status.GatewayUID = replacement.UID
+	if err := kube.Status().Patch(context.Background(), &currentTunnel, client.MergeFrom(beforeStatus)); err != nil {
+		t.Fatal(err)
+	}
+	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stop || selectedAccount == nil {
+		t.Fatalf("checkpointed replacement resolution stopped=%v account=%#v", stop, selectedAccount)
+	}
+}
+
+func TestGatewayCloudflareRejectsRemotelyDeletedTunnel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	key := types.NamespacedName{Namespace: "apps", Name: "edge"}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: "gateway-uid", Generation: 3},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			}},
+		},
+		Status: gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{{Value: "stale.cfargotunnel.com"}},
+		},
+	}
+	deletedAt := metav1.NewTime(time.Now().Round(0))
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: key.Namespace, UID: "tunnel-uid"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID:                "remote-id",
+			DeletedAt:               &deletedAt,
+			OwnershipVerified:       true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "connector-token"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: gateway.Name},
+			GatewayUID:              gateway.UID,
+			ConfigVersion:           v1alpha1.CloudflareTunnelConfigVersion{Desired: 7, DesiredHash: "preserve"},
+			Hostnames:               []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "app.example.com", Guard: v1alpha1.HostnameGuardForwarding}},
+		},
+	}
+	beforeTunnel := tunnel.DeepCopy()
+	account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: tunnel.Spec.AccountRef.Name}}
+	snapshots := newFakeSnapshotPublisher()
+	snapshots.versions[key.String()] = "stale"
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(gateway, tunnel).
+		WithObjects(gateway, tunnel, account).
+		Build()
+	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
+
+	selectedTunnel, selectedAccount, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), gateway, defaultGatewayClassConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || selectedAccount != nil || selectedTunnel == nil {
+		t.Fatalf("soft-deleted Tunnel resolution stopped=%v account=%#v tunnel=%#v", stop, selectedAccount, selectedTunnel)
+	}
+	if snapshots.Version(key.String()) != "" {
+		t.Fatal("soft-deleted Tunnel retained its xDS snapshot")
+	}
+	var observedGateway gatewayv1.Gateway
+	if err := kube.Get(context.Background(), key, &observedGateway); err != nil {
+		t.Fatal(err)
+	}
+	if len(observedGateway.Status.Addresses) != 0 {
+		t.Fatalf("soft-deleted Tunnel retained Gateway addresses: %#v", observedGateway.Status.Addresses)
+	}
+	programmed := meta.FindStatusCondition(observedGateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if programmed == nil || programmed.Status != metav1.ConditionFalse || !strings.Contains(programmed.Message, "remotely deleted") {
+		t.Fatalf("soft-deleted Tunnel Programmed condition = %#v", programmed)
+	}
+
+	compiled := &ir.Gateway{Key: key, UID: gateway.UID}
+	if _, err := reconciler.validateGatewayTunnelWriter(context.Background(), compiled, selectedTunnel); err == nil {
+		t.Fatal("soft-deleted Tunnel authorized Gateway writer validation")
+	}
+	if _, err := reconciler.reconcileCloudflaredConfiguration(context.Background(), compiled, selectedTunnel, account); err == nil {
+		t.Fatal("soft-deleted Tunnel authorized Cloudflare configuration")
+	}
+	if err := reconciler.patchTunnelGatewayStatus(context.Background(), compiled, selectedTunnel, v1alpha1.CloudflareTunnelConfigVersion{Desired: 9}, nil, nil); err == nil {
+		t.Fatal("soft-deleted Tunnel authorized Gateway-owned Tunnel status")
+	}
+	var observedTunnel v1alpha1.CloudflareTunnel
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &observedTunnel); err != nil {
+		t.Fatal(err)
+	}
+	if !equality.Semantic.DeepEqual(observedTunnel.Status.ConfigVersion, beforeTunnel.Status.ConfigVersion) ||
+		!equality.Semantic.DeepEqual(observedTunnel.Status.Hostnames, beforeTunnel.Status.Hostnames) ||
+		!equality.Semantic.DeepEqual(observedTunnel.Status.Listeners, beforeTunnel.Status.Listeners) {
+		t.Fatalf("soft-deleted Tunnel Gateway-owned status changed: %#v", observedTunnel.Status)
 	}
 }
 
@@ -75,8 +361,9 @@ func TestGatewayCloudflareStatusAndTeardownHelpers(t *testing.T) {
 			DeletionTimestamp: &metav1.Time{Time: time.Unix(100, 0)},
 		},
 		Status: v1alpha1.CloudflareTunnelStatus{
-			TunnelID:  "11111111-1111-1111-1111-111111111111",
-			Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "app.example.com", Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 7}},
+			TunnelID:          "11111111-1111-1111-1111-111111111111",
+			OwnershipVerified: true,
+			Hostnames:         []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "app.example.com", Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 7}},
 		},
 	}
 
@@ -88,6 +375,12 @@ func TestGatewayCloudflareStatusAndTeardownHelpers(t *testing.T) {
 	if len(addresses) != 1 || addresses[0].Type == nil || *addresses[0].Type != gatewayv1.HostnameAddressType || addresses[0].Value != tunnel.Status.TunnelID+".cfargotunnel.com" {
 		t.Fatalf("tunnel addresses = %#v", addresses)
 	}
+	deletedAt := metav1.Now()
+	tunnel.Status.DeletedAt = &deletedAt
+	if addresses := tunnelGatewayAddresses(gateway, tunnel); len(addresses) != 0 {
+		t.Fatalf("remotely deleted Tunnel addresses = %#v, want none", addresses)
+	}
+	tunnel.Status.DeletedAt = nil
 	if !shouldScaleDownTunnel(tunnel) {
 		t.Fatal("blocked teardown with no DNS records did not permit scale-down")
 	}
@@ -137,7 +430,7 @@ func TestAccessBlockFirstGateway(t *testing.T) {
 		Listeners:  []ir.Listener{{Name: "http", Exposure: ir.ExposurePublic}},
 		Domains: []ir.ProtectionDomain{{
 			Name: "protected", ListenerName: "http", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
-			Access:       &ir.AccessGuard{AUD: "new-aud", TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
+			Access:       &ir.AccessGuard{AUDs: []string{"new-aud"}, TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
 			VirtualHosts: []ir.VirtualHost{{Hostname: "app.example.com"}},
 		}},
 	}
@@ -199,22 +492,35 @@ func TestDesiredTunnelHostnamesPreservePerDomainHandshake(t *testing.T) {
 }
 
 func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testing.T) {
-	reconciler := &GatewayReconciler{}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-			v1alpha1.AccessApplicationGatewayAUDLabel: "apps--edge",
-			v1alpha1.AccessApplicationAUDSecretLabel:  "apps--access",
-		}},
-		Data: map[string][]byte{
-			"ready":                                []byte("true"),
-			v1alpha1.AccessApplicationAUDSecretKey: []byte("restored-aud"),
-			v1alpha1.AccessApplicationIDSecretKey:  []byte("application-id"),
-		},
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{
+		Name: "edge", Namespace: "apps", UID: "gateway-uid",
+	}}
+	application := v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "apps", UID: "application-uid"},
+		Status:     v1alpha1.AccessApplicationStatus{ApplicationID: "application-id"},
 	}
-	reconciler.latchAUDRevocation(secret)
-	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps"}}
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatalf("add Gateway scheme: %v", err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add Flareway scheme: %v", err)
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(gateway, &application).Build()
+	reconciler := &GatewayReconciler{
+		Client: kube, OperatorNamespace: dataplane.DefaultOperatorNamespace, audRevocations: &audRevocationState{},
+	}
+	secret := boundAUDSecret(
+		accessAUDSecretName(&application, client.ObjectKeyFromObject(gateway)),
+		&application,
+		gateway,
+		"restored-aud",
+	)
 	inputs := gatewayapi.Inputs{
-		AccessApplications: []v1alpha1.AccessApplication{{ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "apps"}}},
+		AccessApplications: []v1alpha1.AccessApplication{application},
 		AUDSecrets: map[types.NamespacedName]gatewayapi.AUDSecret{{
 			Namespace: "apps", Name: "access",
 		}: {AUD: "restored-aud", ApplicationID: "application-id", Ready: true}},
@@ -226,7 +532,17 @@ func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testi
 			Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
 		}},
 	}}
-	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs)
+
+	forged := secret.DeepCopy()
+	forged.Namespace = gateway.Namespace
+	reconciler.latchAUDRevocation(context.Background(), forged)
+	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
+	if !inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
+		t.Fatal("tenant-forged AUD handoff altered Gateway readiness")
+	}
+
+	reconciler.latchAUDRevocation(context.Background(), &secret)
+	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
 	if inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
 		t.Fatal("restored AUD escaped the revocation latch before Blocked was applied")
 	}
@@ -237,7 +553,7 @@ func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testi
 	inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}] = gatewayapi.AUDSecret{
 		AUD: "restored-aud", ApplicationID: "application-id", Ready: true,
 	}
-	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs)
+	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
 	if !inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
 		t.Fatal("fresh Blocked handshake did not release restored AUD")
 	}

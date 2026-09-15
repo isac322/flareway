@@ -50,7 +50,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: AccessApplicationSpec defines one self-hosted Cloudflare
+            description: AccessApplicationSpec defines one Gateway-attached Cloudflare
               Access application.
             properties:
               accountRef:
@@ -79,8 +79,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -93,10 +95,12 @@ spec:
                     type: string
                 type: object
               application:
-                description: AccessApplicationSettings configures a self-hosted Access
-                  application.
+                description: AccessApplicationSettings contains fields shared by Access
+                  application variants.
                 properties:
                   allowAuthenticateViaWarp:
+                    type: boolean
+                  allowIframe:
                     type: boolean
                   allowedIdpRefs:
                     items:
@@ -104,8 +108,10 @@ spec:
                         IdP or an external IdP ID.
                       properties:
                         externalId:
+                          minLength: 1
                           type: string
                         name:
+                          minLength: 1
                           type: string
                       type: object
                       x-kubernetes-validations:
@@ -135,6 +141,18 @@ spec:
                         x-kubernetes-list-type: set
                       allowedMethods:
                         items:
+                          description: AccessCORSMethod is an HTTP method accepted
+                            by Cloudflare Access CORS settings.
+                          enum:
+                          - GET
+                          - POST
+                          - HEAD
+                          - PUT
+                          - DELETE
+                          - CONNECT
+                          - OPTIONS
+                          - TRACE
+                          - PATCH
                           type: string
                         type: array
                         x-kubernetes-list-type: set
@@ -153,17 +171,100 @@ spec:
                     type: string
                   customNonIdentityDenyUrl:
                     type: string
-                  customPages:
+                  customPageRefs:
                     items:
-                      type: string
+                      description: AccessCustomPageReference selects a managed AccessCustomPage
+                        or an external page ID.
+                      properties:
+                        externalId:
+                          minLength: 1
+                          type: string
+                        objectRef:
+                          description: NamespacedLocalObjectReference identifies a
+                            namespaced Flareway resource.
+                          properties:
+                            name:
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Namespace defaults to the referencing object's
+                                namespace.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of objectRef or externalId is required
+                        rule: has(self.objectRef) != has(self.externalId)
+                    maxItems: 25
                     type: array
-                    x-kubernetes-list-type: set
+                    x-kubernetes-list-type: atomic
+                  eagerRedirectCookieSetting:
+                    type: boolean
                   enableBindingCookie:
                     type: boolean
                   httpOnlyCookieAttribute:
                     type: boolean
+                  logoUrl:
+                    type: string
+                  mfaConfig:
+                    description: AccessApplicationMFAConfig configures application-level
+                      MFA.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: AccessApplicationMFAAuthenticator is an application-level
+                            MFA method.
+                          enum:
+                          - TOTP
+                          - Biometrics
+                          - SecurityKey
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                        type: string
+                    type: object
                   name:
                     type: string
+                  oauthConfiguration:
+                    description: AccessApplicationOAuthConfiguration makes Access
+                      an OAuth authorization server.
+                    properties:
+                      dynamicClientRegistration:
+                        description: AccessOAuthDynamicClientRegistration configures
+                          OAuth dynamic clients.
+                        properties:
+                          allowAnyOnLocalhost:
+                            type: boolean
+                          allowAnyOnLoopback:
+                            type: boolean
+                          allowedUris:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                          enabled:
+                            type: boolean
+                        type: object
+                      enabled:
+                        type: boolean
+                      grant:
+                        description: AccessOAuthGrant configures OAuth token and session
+                          lifetimes.
+                        properties:
+                          accessTokenLifetime:
+                            pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                            type: string
+                          sessionDuration:
+                            pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                            type: string
+                        type: object
+                    type: object
                   optionsPreflightBypass:
                     type: boolean
                   pathCookieAttribute:
@@ -171,22 +272,454 @@ spec:
                   readServiceTokensFromHeader:
                     type: string
                   sameSiteCookieAttribute:
+                    description: AccessSameSiteCookieAttribute configures the SameSite
+                      cookie attribute.
                     enum:
-                    - lax
-                    - strict
-                    - none
+                    - Lax
+                    - Strict
+                    - None
                     type: string
+                  scimConfig:
+                    description: AccessApplicationSCIMConfig configures outbound SCIM
+                      provisioning.
+                    properties:
+                      authentication:
+                        description: AccessSCIMAuthentication selects one authentication
+                          method or an ordered set.
+                        properties:
+                          accessServiceToken:
+                            description: AccessSCIMAccessServiceTokenAuthentication
+                              selects a managed ServiceToken.
+                            properties:
+                              serviceTokenRef:
+                                description: NamespacedLocalObjectReference identifies
+                                  a namespaced Flareway resource.
+                                properties:
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                  namespace:
+                                    description: Namespace defaults to the referencing
+                                      object's namespace.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                            required:
+                            - serviceTokenRef
+                            type: object
+                          httpBasic:
+                            description: AccessSCIMHTTPBasicAuthentication configures
+                              SCIM HTTP Basic authentication.
+                            properties:
+                              passwordSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                              user:
+                                minLength: 1
+                                type: string
+                            required:
+                            - passwordSecretRef
+                            - user
+                            type: object
+                          multiple:
+                            items:
+                              description: AccessSCIMAuthenticationMethod is one member
+                                of a multi-authentication list.
+                              properties:
+                                accessServiceToken:
+                                  description: AccessSCIMAccessServiceTokenAuthentication
+                                    selects a managed ServiceToken.
+                                  properties:
+                                    serviceTokenRef:
+                                      description: NamespacedLocalObjectReference
+                                        identifies a namespaced Flareway resource.
+                                      properties:
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                        namespace:
+                                          description: Namespace defaults to the referencing
+                                            object's namespace.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                  required:
+                                  - serviceTokenRef
+                                  type: object
+                                httpBasic:
+                                  description: AccessSCIMHTTPBasicAuthentication configures
+                                    SCIM HTTP Basic authentication.
+                                  properties:
+                                    passwordSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    user:
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - passwordSecretRef
+                                  - user
+                                  type: object
+                                oauth2:
+                                  description: AccessSCIMOAuth2Authentication configures
+                                    OAuth 2 client credentials for SCIM.
+                                  properties:
+                                    authorizationUrl:
+                                      minLength: 1
+                                      type: string
+                                    clientId:
+                                      minLength: 1
+                                      type: string
+                                    clientSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    scopes:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: set
+                                    tokenUrl:
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - authorizationUrl
+                                  - clientId
+                                  - clientSecretRef
+                                  - tokenUrl
+                                  type: object
+                                oauthBearerToken:
+                                  description: AccessSCIMOAuthBearerTokenAuthentication
+                                    configures a static bearer token.
+                                  properties:
+                                    tokenSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                  required:
+                                  - tokenSecretRef
+                                  type: object
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one SCIM authentication method is
+                                  required
+                                rule: (has(self.httpBasic)?1:0)+(has(self.oauthBearerToken)?1:0)+(has(self.oauth2)?1:0)+(has(self.accessServiceToken)?1:0)
+                                  == 1
+                            maxItems: 4
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          oauth2:
+                            description: AccessSCIMOAuth2Authentication configures
+                              OAuth 2 client credentials for SCIM.
+                            properties:
+                              authorizationUrl:
+                                minLength: 1
+                                type: string
+                              clientId:
+                                minLength: 1
+                                type: string
+                              clientSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                              scopes:
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              tokenUrl:
+                                minLength: 1
+                                type: string
+                            required:
+                            - authorizationUrl
+                            - clientId
+                            - clientSecretRef
+                            - tokenUrl
+                            type: object
+                          oauthBearerToken:
+                            description: AccessSCIMOAuthBearerTokenAuthentication
+                              configures a static bearer token.
+                            properties:
+                              tokenSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                            required:
+                            - tokenSecretRef
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one SCIM authentication variant is required
+                          rule: (has(self.httpBasic)?1:0)+(has(self.oauthBearerToken)?1:0)+(has(self.oauth2)?1:0)+(has(self.accessServiceToken)?1:0)+(has(self.multiple)?1:0)
+                            == 1
+                      deactivateOnDelete:
+                        type: boolean
+                      enabled:
+                        type: boolean
+                      idpRef:
+                        description: AccessIdentityProviderReference selects a managed
+                          IdP or an external IdP ID.
+                        properties:
+                          externalId:
+                            minLength: 1
+                            type: string
+                          name:
+                            minLength: 1
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of name or externalId is required
+                          rule: has(self.name) != has(self.externalId)
+                      mappings:
+                        items:
+                          description: AccessSCIMMapping transforms or filters one
+                            SCIM resource type.
+                          properties:
+                            enabled:
+                              type: boolean
+                            filter:
+                              type: string
+                            operations:
+                              description: AccessSCIMMappingOperations selects SCIM
+                                operations for one mapping.
+                              properties:
+                                create:
+                                  type: boolean
+                                delete:
+                                  type: boolean
+                                update:
+                                  type: boolean
+                              type: object
+                            schema:
+                              minLength: 1
+                              type: string
+                            strictness:
+                              description: AccessSCIMMappingStrictness controls handling
+                                of unknown SCIM values.
+                              enum:
+                              - Strict
+                              - Passthrough
+                              type: string
+                            transformJsonata:
+                              type: string
+                          required:
+                          - schema
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remoteUri:
+                        minLength: 1
+                        type: string
+                    required:
+                    - idpRef
+                    - remoteUri
+                    type: object
                   serviceAuth401Redirect:
                     type: boolean
                   sessionDuration:
+                    pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
                     type: string
                   skipInterstitial:
                     type: boolean
                   tags:
                     items:
+                      maxLength: 35
+                      pattern: ^[A-Za-z0-9_-]+$
                       type: string
+                      x-kubernetes-validations:
+                      - message: tag names starting with flareway- are reserved by
+                          the operator
+                        rule: '!self.startsWith(''flareway-'')'
+                    maxItems: 23
                     type: array
                     x-kubernetes-list-type: set
+                  useClientlessIsolationAppLauncherUrl:
+                    type: boolean
+                type: object
+                x-kubernetes-validations:
+                - message: optionsPreflightBypass cannot be true when corsHeaders
+                    is set
+                  rule: '!has(self.optionsPreflightBypass) || !self.optionsPreflightBypass
+                    || !has(self.corsHeaders)'
+                - message: autoRedirectToIdentity requires exactly one allowedIdpRef
+                  rule: '!has(self.autoRedirectToIdentity) || !self.autoRedirectToIdentity
+                    || (has(self.allowedIdpRefs) && size(self.allowedIdpRefs) == 1)'
+              bypass:
+                default: {}
+                description: AccessBypassSpec declares adoptable identities for carve-outs
+                  compiled from routes.
+                properties:
+                  children:
+                    items:
+                      description: AccessBypassChildSpec declares remote identity
+                        and adoption for one compiled carve-out.
+                      properties:
+                        adoption:
+                          default: {}
+                          description: AdoptionSpec configures explicit adoption of
+                            an existing remote object.
+                          properties:
+                            expect:
+                              description: AdoptionExpect declares remote attributes
+                                that must match before adoption.
+                              properties:
+                                domain:
+                                  maxLength: 253
+                                  type: string
+                                name:
+                                  maxLength: 100
+                                  type: string
+                              type: object
+                            mode:
+                              default: None
+                              description: AdoptionMode controls explicit adoption
+                                of a remote resource.
+                              enum:
+                              - None
+                              - AdoptById
+                              type: string
+                          type: object
+                        deletionPolicy:
+                          default: Orphan
+                          description: DeletionPolicy controls whether a managed remote
+                            resource is deleted or orphaned.
+                          enum:
+                          - Delete
+                          - Orphan
+                          type: string
+                        externalRef:
+                          description: AccessApplicationExternalReference identifies
+                            an existing Access application.
+                          properties:
+                            applicationId:
+                              minLength: 1
+                              type: string
+                          required:
+                          - applicationId
+                          type: object
+                        hostname:
+                          minLength: 1
+                          type: string
+                        name:
+                          type: string
+                        path:
+                          minLength: 1
+                          pattern: ^/
+                          type: string
+                        policyRef:
+                          description: |-
+                            AccessApplicationPolicyReference selects a managed policy or an external policy ID.
+                            Slice order defines remote policy precedence.
+                          properties:
+                            externalRef:
+                              description: AccessApplicationPolicyExternalReference
+                                identifies a reusable Access policy.
+                              properties:
+                                policyId:
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - policyId
+                              type: object
+                            policyRef:
+                              description: NamespacedLocalObjectReference identifies
+                                a namespaced Flareway resource.
+                              properties:
+                                name:
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  description: Namespace defaults to the referencing
+                                    object's namespace.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                          type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of policyRef or externalRef is required
+                            rule: has(self.policyRef) != has(self.externalRef)
+                      required:
+                      - hostname
+                      - path
+                      type: object
+                      x-kubernetes-validations:
+                      - message: AdoptById requires externalRef
+                        rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - hostname
+                    - path
+                    x-kubernetes-list-type: map
                 type: object
               deletionPolicy:
                 default: Delete
@@ -196,6 +729,154 @@ spec:
                 - Delete
                 - Orphan
                 type: string
+              destinations:
+                description: |-
+                  Destinations adds Cloudflare-side private, MCP, and Worker destinations.
+                  Public destinations are derived from TargetRefs. The deprecated
+                  self_hosted_domains wire field is intentionally not exposed.
+                items:
+                  description: AccessApplicationDestinationSpec is a discriminated
+                    destination union.
+                  properties:
+                    allPreviewWorkers:
+                      description: AccessAllPreviewWorkersDestinationSpec selects
+                        all Worker previews.
+                      type: object
+                    allWorkers:
+                      description: AccessAllWorkersDestinationSpec selects all production
+                        Workers.
+                      type: object
+                    previewWorker:
+                      description: AccessWorkerDestinationSpec selects a Cloudflare
+                        Worker.
+                      properties:
+                        workerId:
+                          minLength: 1
+                          type: string
+                      required:
+                      - workerId
+                      type: object
+                    private:
+                      description: AccessPrivateDestinationSpec selects one managed
+                        private route.
+                      properties:
+                        cidr:
+                          type: string
+                        hostnameRouteRef:
+                          description: |-
+                            LocalObjectReference contains enough information to let you locate the
+                            referenced object inside the same namespace.
+                          properties:
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        l4Protocol:
+                          description: AccessL4Protocol selects a private destination
+                            transport protocol. Omission matches both.
+                          enum:
+                          - TCP
+                          - UDP
+                          type: string
+                        networkRouteRef:
+                          description: |-
+                            LocalObjectReference contains enough information to let you locate the
+                            referenced object inside the same namespace.
+                          properties:
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        portRange:
+                          pattern: ^[0-9]+(-[0-9]+)?$
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of networkRouteRef or hostnameRouteRef
+                          is required
+                        rule: has(self.networkRouteRef) != has(self.hostnameRouteRef)
+                    public:
+                      description: AccessPublicDestinationSpec directly identifies
+                        a public hostname or path.
+                      properties:
+                        uri:
+                          minLength: 1
+                          type: string
+                      required:
+                      - uri
+                      type: object
+                    type:
+                      description: AccessApplicationDestinationType selects a Cloudflare
+                        Access destination variant.
+                      enum:
+                      - Public
+                      - Private
+                      - ViaMCPServerPortal
+                      - Worker
+                      - PreviewWorker
+                      - AllWorkers
+                      - AllPreviewWorkers
+                      type: string
+                    viaMcpServerPortal:
+                      description: AccessMCPServerPortalDestinationSpec selects an
+                        AI Controls MCP server.
+                      properties:
+                        mcpServerId:
+                          minLength: 1
+                          type: string
+                      required:
+                      - mcpServerId
+                      type: object
+                    worker:
+                      description: AccessWorkerDestinationSpec selects a Cloudflare
+                        Worker.
+                      properties:
+                        workerId:
+                          minLength: 1
+                          type: string
+                      required:
+                      - workerId
+                      type: object
+                  required:
+                  - type
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one destination variant is required
+                    rule: (has(self.public)?1:0)+(has(self.private)?1:0)+(has(self.viaMcpServerPortal)?1:0)+(has(self.worker)?1:0)+(has(self.previewWorker)?1:0)+(has(self.allWorkers)?1:0)+(has(self.allPreviewWorkers)?1:0)
+                      == 1
+                  - message: public is required if and only if type is Public
+                    rule: (self.type == 'Public') == has(self.public)
+                  - message: private is required if and only if type is Private
+                    rule: (self.type == 'Private') == has(self.private)
+                  - message: viaMcpServerPortal is required if and only if type is
+                      ViaMCPServerPortal
+                    rule: (self.type == 'ViaMCPServerPortal') == has(self.viaMcpServerPortal)
+                  - message: worker is required if and only if type is Worker
+                    rule: (self.type == 'Worker') == has(self.worker)
+                  - message: previewWorker is required if and only if type is PreviewWorker
+                    rule: (self.type == 'PreviewWorker') == has(self.previewWorker)
+                  - message: allWorkers is required if and only if type is AllWorkers
+                    rule: (self.type == 'AllWorkers') == has(self.allWorkers)
+                  - message: allPreviewWorkers is required if and only if type is
+                      AllPreviewWorkers
+                    rule: (self.type == 'AllPreviewWorkers') == has(self.allPreviewWorkers)
+                maxItems: 100
+                type: array
+                x-kubernetes-list-type: atomic
               externalRef:
                 description: AccessApplicationExternalReference identifies an existing
                   Access application.
@@ -214,12 +895,24 @@ spec:
                 - Managed
                 - ObserveOnly
                 type: string
+              mcp:
+                description: AccessMCPApplicationSpec selects the MCP server request
+                  shape.
+                type: object
               originJWT:
                 default: {}
                 description: AccessOriginJWTSpec configures origin JWT enforcement.
                 properties:
                   assumeGatewayTLSDecryption:
                     type: boolean
+                  audienceScope:
+                    default: Application
+                    description: AccessOriginJWTAudienceScope selects which application
+                      audiences an origin accepts.
+                    enum:
+                    - Application
+                    - Hostname
+                    type: string
                   mode:
                     default: Required
                     description: AccessOriginJWTMode controls origin JWT verification.
@@ -228,10 +921,52 @@ spec:
                     - Disabled
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: Hostname audienceScope requires mode Required
+                  rule: '!has(self.audienceScope) || self.audienceScope != ''Hostname''
+                    || !has(self.mode) || self.mode == ''Required'''
+              pathScope:
+                description: AccessTargetPath narrows a Gateway attachment to a protected
+                  path.
+                properties:
+                  type:
+                    default: PathPrefix
+                    description: |-
+                      PathMatchType specifies the semantics of how HTTP paths should be compared.
+                      Valid PathMatchType values, along with their support levels, are:
+
+                      * "Exact" - Core
+                      * "PathPrefix" - Core
+                      * "RegularExpression" - Implementation Specific
+
+                      PathPrefix and Exact paths must be syntactically valid:
+
+                      - Must begin with the `/` character
+                      - Must not contain consecutive `/` characters (e.g. `/foo///`, `//`).
+
+                      Note that values may be added to this enum, implementations
+                      must ensure that unknown values will not cause a crash.
+
+                      Unknown values here must result in the implementation setting the
+                      Accepted Condition for the Route to `status: False`, with a
+                      Reason of `UnsupportedValue`.
+                    enum:
+                    - Exact
+                    - PathPrefix
+                    - RegularExpression
+                    type: string
+                  value:
+                    minLength: 1
+                    pattern: ^/
+                    type: string
+                required:
+                - value
+                type: object
               policies:
                 items:
-                  description: AccessApplicationPolicyReference selects a managed
-                    policy or an external policy ID.
+                  description: |-
+                    AccessApplicationPolicyReference selects a managed policy or an external policy ID.
+                    Slice order defines remote policy precedence.
                   properties:
                     externalRef:
                       description: AccessApplicationPolicyExternalReference identifies
@@ -251,6 +986,8 @@ spec:
                           minLength: 1
                           type: string
                         namespace:
+                          description: Namespace defaults to the referencing object's
+                            namespace.
                           type: string
                       required:
                       - name
@@ -263,64 +1000,61 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: atomic
-              privateDestinations:
-                items:
-                  description: AccessPrivateDestinationSpec exposes a non-HTTP destination
-                    through Access.
-                  properties:
-                    cidr:
-                      type: string
-                    hostnameRouteRef:
-                      description: |-
-                        LocalObjectReference contains enough information to let you locate the
-                        referenced object inside the same namespace.
+              proxyEndpoint:
+                description: AccessProxyEndpointApplicationSpec selects the Gateway
+                  proxy endpoint request shape.
+                type: object
+              rdp:
+                description: AccessRDPApplicationSpec configures browser RDP target
+                  criteria.
+                properties:
+                  targetCriteria:
+                    items:
+                      description: AccessTargetCriterion selects infrastructure targets
+                        by port, protocol and attributes.
                       properties:
-                        name:
-                          default: ""
-                          description: |-
-                            Name of the referent.
-                            This field is effectively required, but due to backwards compatibility is
-                            allowed to be empty. Instances of this type with an empty value here are
-                            almost certainly wrong.
-                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        port:
+                          format: int32
+                          maximum: 65535
+                          minimum: 1
+                          type: integer
+                        protocol:
+                          description: AccessTargetProtocol is a target criterion
+                            protocol.
+                          enum:
+                          - SSH
+                          - TCP
+                          - RDP
                           type: string
+                        targetAttributes:
+                          additionalProperties:
+                            items:
+                              type: string
+                            type: array
+                          minProperties: 1
+                          type: object
+                      required:
+                      - port
+                      - protocol
+                      - targetAttributes
                       type: object
-                      x-kubernetes-map-type: atomic
-                    l4Protocol:
-                      default: tcp
-                      description: AccessL4Protocol is the transport protocol for
-                        a private Access destination.
-                      enum:
-                      - tcp
-                      - udp
-                      type: string
-                    networkRouteRef:
-                      description: |-
-                        LocalObjectReference contains enough information to let you locate the
-                        referenced object inside the same namespace.
-                      properties:
-                        name:
-                          default: ""
-                          description: |-
-                            Name of the referent.
-                            This field is effectively required, but due to backwards compatibility is
-                            allowed to be empty. Instances of this type with an empty value here are
-                            almost certainly wrong.
-                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                          type: string
-                      type: object
-                      x-kubernetes-map-type: atomic
-                    portRange:
-                      pattern: ^[0-9]+(-[0-9]+)?$
-                      type: string
-                  type: object
-                  x-kubernetes-validations:
-                  - message: exactly one of networkRouteRef or hostnameRouteRef is
-                      required
-                    rule: has(self.networkRouteRef) != has(self.hostnameRouteRef)
-                maxItems: 100
-                type: array
-                x-kubernetes-list-type: atomic
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - targetCriteria
+                type: object
+                x-kubernetes-validations:
+                - message: RDP target criteria require RDP protocol
+                  rule: self.targetCriteria.all(c, c.protocol == 'RDP')
+              selfHosted:
+                description: AccessSelfHostedApplicationSpec selects the self-hosted
+                  request shape.
+                type: object
+              ssh:
+                description: AccessSSHApplicationSpec selects the browser SSH request
+                  shape.
+                type: object
               targetRefs:
                 items:
                   description: |-
@@ -375,22 +1109,76 @@ spec:
                 maxItems: 32
                 type: array
                 x-kubernetes-list-type: atomic
+              type:
+                description: AccessApplicationType selects a Gateway-attached Access
+                  application variant.
+                enum:
+                - SelfHosted
+                - SSH
+                - VNC
+                - RDP
+                - MCP
+                - ProxyEndpoint
+                type: string
+                x-kubernetes-validations:
+                - message: type is immutable
+                  rule: self == oldSelf
+              vnc:
+                description: AccessVNCApplicationSpec selects the browser VNC request
+                  shape.
+                type: object
+              zone:
+                description: Zone is an optional DNS zone name resolved through CloudflareAccount
+                  status.
+                minLength: 1
+                type: string
             required:
+            - accountRef
             - application
             - policies
+            - type
             type: object
             x-kubernetes-validations:
-            - message: at least one targetRef or privateDestination is required
-              rule: (has(self.targetRefs) && size(self.targetRefs) > 0) || (has(self.privateDestinations)
-                && size(self.privateDestinations) > 0)
+            - message: accountRef.name is required
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: exactly one application variant is required
+              rule: (has(self.selfHosted)?1:0)+(has(self.ssh)?1:0)+(has(self.vnc)?1:0)+(has(self.rdp)?1:0)+(has(self.mcp)?1:0)+(has(self.proxyEndpoint)?1:0)
+                == 1
+            - message: selfHosted is required if and only if type is SelfHosted
+              rule: (self.type == 'SelfHosted') == has(self.selfHosted)
+            - message: ssh is required if and only if type is SSH
+              rule: (self.type == 'SSH') == has(self.ssh)
+            - message: vnc is required if and only if type is VNC
+              rule: (self.type == 'VNC') == has(self.vnc)
+            - message: rdp is required if and only if type is RDP
+              rule: (self.type == 'RDP') == has(self.rdp)
+            - message: mcp is required if and only if type is MCP
+              rule: (self.type == 'MCP') == has(self.mcp)
+            - message: proxyEndpoint is required if and only if type is ProxyEndpoint
+              rule: (self.type == 'ProxyEndpoint') == has(self.proxyEndpoint)
+            - message: ProxyEndpoint requires targetRefs only; other types require
+                targetRefs or destinations
+              rule: 'self.type == ''ProxyEndpoint'' ? (has(self.targetRefs) && size(self.targetRefs)
+                > 0 && (!has(self.destinations) || size(self.destinations) == 0))
+                : ((has(self.targetRefs) && size(self.targetRefs) > 0) || (has(self.destinations)
+                && size(self.destinations) > 0))'
             - message: targetRefs must reference gateway.networking.k8s.io Gateway
                 or HTTPRoute objects
               rule: '!has(self.targetRefs) || self.targetRefs.all(t, t.group == ''gateway.networking.k8s.io''
                 && (t.kind == ''Gateway'' || t.kind == ''HTTPRoute''))'
+            - message: public destinations must be compiled from targetRefs
+              rule: '!has(self.destinations) || self.destinations.all(d, d.type !=
+                ''Public'')'
+            - message: pathScope requires targetRefs
+              rule: '!has(self.pathScope) || (has(self.targetRefs) && size(self.targetRefs)
+                > 0)'
             - message: ObserveOnly requires externalRef
               rule: self.managementPolicy != 'ObserveOnly' || has(self.externalRef)
             - message: AdoptById requires externalRef
               rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+            - message: ObserveOnly requires externalRef for every bypass child
+              rule: self.managementPolicy != 'ObserveOnly' || !has(self.bypass) ||
+                !has(self.bypass.children) || self.bypass.children.all(c, has(c.externalRef))
           status:
             description: AccessApplicationStatus records the remote application without
               exposing its AUD.
@@ -695,9 +1483,28 @@ spec:
                   properties:
                     applicationId:
                       type: string
+                    deletionPolicy:
+                      description: DeletionPolicy controls whether a managed remote
+                        resource is deleted or orphaned.
+                      enum:
+                      - Delete
+                      - Orphan
+                      type: string
                     hostname:
                       type: string
+                    name:
+                      type: string
+                    origin:
+                      description: AccessBypassApplicationOrigin records how a bypass
+                        child entered management.
+                      enum:
+                      - Created
+                      - Recovered
+                      - Adopted
+                      type: string
                     path:
+                      type: string
+                    policyId:
                       type: string
                   required:
                   - applicationId
@@ -823,28 +1630,64 @@ spec:
                     hostname:
                       type: string
                     l4Protocol:
-                      description: AccessL4Protocol is the transport protocol for
-                        a private Access destination.
+                      description: AccessL4Protocol selects a private destination
+                        transport protocol. Omission matches both.
                       enum:
-                      - tcp
-                      - udp
+                      - TCP
+                      - UDP
+                      type: string
+                    mcpServerId:
                       type: string
                     portRange:
                       type: string
                     type:
+                      description: AccessApplicationDestinationType selects a Cloudflare
+                        Access destination variant.
                       enum:
-                      - public
-                      - private
+                      - Public
+                      - Private
+                      - ViaMCPServerPortal
+                      - Worker
+                      - PreviewWorker
+                      - AllWorkers
+                      - AllPreviewWorkers
                       type: string
                     uri:
                       type: string
                     vnetId:
+                      type: string
+                    workerId:
                       type: string
                   required:
                   - type
                   type: object
                 type: array
                 x-kubernetes-list-type: atomic
+              domain:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              ownershipVerified:
+                type: boolean
+              tags:
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
+              type:
+                description: AccessApplicationType selects a Gateway-attached Access
+                  application variant.
+                enum:
+                - SelfHosted
+                - SSH
+                - VNC
+                - RDP
+                - MCP
+                - ProxyEndpoint
+                type: string
+              zoneId:
+                type: string
             type: object
         type: object
     served: true

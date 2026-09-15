@@ -7,7 +7,7 @@ spec:
   accountRef:
     name: example
   name: allow-developers-warp
-  decision: allow
+  decision: Allow
   include:
   - group:
       groupRef:
@@ -16,10 +16,36 @@ spec:
   - devicePosture:
       ruleRef:
         name: warp
+  exclude:
+  - geo:
+      countryCode: KP
   sessionDuration: 720h
+  purposeJustification:
+    required: true
+    prompt: Enter the incident or change ticket for this session.
+  approval:
+    required: true
+    groups:
+    - approvalsNeeded: 1
+      emailAddresses:
+      - access-approvers@example.com
+  isolationRequired: false
+  connectionRules:
+    rdp:
+      allowedClipboardLocalToRemoteFormats:
+      - Text
+      allowedClipboardRemoteToLocalFormats:
+      - Text
+      - File
+  mfaConfig:
+    allowedAuthenticators:
+    - TOTP
+    - SecurityKey
+    mfaDisabled: false
+    sessionDuration: 8h
   managementPolicy: ObserveOnly
   externalRef:
-    policyId: "00000000-0000-0000-0000-000000000004"
+    policyId: replace-with-existing-allow-policy-id
   deletionPolicy: Orphan
 ---
 apiVersion: flareway.bhyoo.com/v1alpha1
@@ -31,10 +57,25 @@ spec:
   accountRef:
     name: example
   name: deny-everyone
-  decision: deny
+  decision: Deny
   include:
   - everyone: {}
   managementPolicy: ObserveOnly
   externalRef:
-    policyId: "00000000-0000-0000-0000-000000000005"
+    policyId: replace-with-existing-deny-policy-id
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: bypass-public-api
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  name: bypass-public-api
+  decision: Bypass
+  include:
+  - everyone: {}
+  managementPolicy: Managed
   deletionPolicy: Orphan

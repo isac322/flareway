@@ -16,6 +16,9 @@ spec:
     name: runbear
   tunnel:
     name: flareway-runbear-cc-lb-private
+  configuration:
+    # Gateway owns the complete remote ingress program for this tunnel.
+    mode: Gateway
   managementPolicy: Managed
   deletionPolicy: Delete
   dns:

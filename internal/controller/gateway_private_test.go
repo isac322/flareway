@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,8 +34,8 @@ func TestBlockPrivateDomainsPreservesPublicForwarding(t *testing.T) {
 			{Name: "private", Exposure: ir.ExposurePrivate},
 		},
 		Domains: []ir.ProtectionDomain{
-			{Name: "public", ListenerName: "public", Guard: ir.GuardForwarding, Access: &ir.AccessGuard{AUD: "public"}},
-			{Name: "private", ListenerName: "private", Guard: ir.GuardForwarding, Access: &ir.AccessGuard{AUD: "private"}},
+			{Name: "public", ListenerName: "public", Guard: ir.GuardForwarding, Access: &ir.AccessGuard{AUDs: []string{"public"}}},
+			{Name: "private", ListenerName: "private", Guard: ir.GuardForwarding, Access: &ir.AccessGuard{AUDs: []string{"private"}}},
 		},
 	}
 	blockPrivateDomains(gateway)
@@ -90,5 +91,44 @@ func TestPrivateListenerVirtualNetworkMustBeReadyAndSameAccount(t *testing.T) {
 	vnet.Spec.AccountRef.Name = "other"
 	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{vnet}) {
 		t.Fatal("different-account VirtualNetwork was accepted")
+	}
+}
+
+func TestPrivateRouteTargetsOnlyCloudflareTunnels(t *testing.T) {
+	tunnel := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: "tenant"}}
+	for name, testCase := range map[string]struct {
+		ref  v1alpha1.TunnelReference
+		want bool
+	}{
+		"default kind": {
+			ref:  v1alpha1.TunnelReference{Name: "tunnel"},
+			want: true,
+		},
+		"CloudflareTunnel": {
+			ref:  v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: "tunnel"},
+			want: true,
+		},
+		"WARPConnector": {
+			ref: v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindWARPConnector, Name: "tunnel"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := privateRouteTargetsTunnel(testCase.ref, "tenant", tunnel); got != testCase.want {
+				t.Fatalf("privateRouteTargetsTunnel() = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestGatewayRouteWatchIgnoresWARPConnectorReferences(t *testing.T) {
+	route := &v1alpha1.NetworkRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant"},
+		Spec: v1alpha1.NetworkRouteSpec{TunnelRef: v1alpha1.TunnelReference{
+			Kind: v1alpha1.TunnelReferenceKindWARPConnector,
+			Name: "connector",
+		}},
+	}
+	if requests := (&GatewayReconciler{}).mapPrivateRouteToGateways(context.Background(), route); len(requests) != 0 {
+		t.Fatalf("WARPConnector route enqueued Gateway reconciles: %#v", requests)
 	}
 }

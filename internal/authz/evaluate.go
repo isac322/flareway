@@ -64,11 +64,13 @@ type Request struct {
 	Zone     string
 	Exposure v1alpha1.Exposure
 
-	Unprotected     bool
-	AccessPolicyRef bool
-	PlatformObject  bool
-	PrivateRoute    *PrivateRouteRequest
-	Backend         *BackendRequest
+	Unprotected                 bool
+	AccessPolicyRef             bool
+	AccessCustomPageRef         bool
+	DevicePostureIntegrationRef bool
+	PlatformObject              bool
+	PrivateRoute                *PrivateRouteRequest
+	Backend                     *BackendRequest
 }
 
 // Decision is the deterministic result of evaluating account grants.
@@ -79,8 +81,9 @@ type Decision struct {
 	GrantIndex int
 }
 
-// Evaluate permits a request only when one namespace-matching grant permits all
-// activated gates. Combining permissions across different grants is forbidden.
+// Evaluate always requires a namespace-matching grant, including when no
+// operation-specific gates are activated. One matching grant must permit every
+// activated gate; combining permissions across grants is forbidden.
 func Evaluate(account *v1alpha1.CloudflareAccount, namespace *corev1.Namespace, request Request) Decision {
 	if account == nil {
 		return denied(ReasonRefNotPermitted, "CloudflareAccount is required")
@@ -132,6 +135,12 @@ func evaluateGrant(grant *v1alpha1.CloudflareAccountGrant, namespace *corev1.Nam
 	}
 	if request.AccessPolicyRef && grant.AccessPolicyRefs != v1alpha1.GrantPermissionAllowed {
 		return denied(ReasonRefNotPermitted, "platform Access policy references are not granted")
+	}
+	if request.AccessCustomPageRef && grant.AccessCustomPageRefs != v1alpha1.GrantPermissionAllowed {
+		return denied(ReasonRefNotPermitted, "managed Access custom page references are not granted")
+	}
+	if request.DevicePostureIntegrationRef && grant.DevicePostureIntegrationRefs != v1alpha1.GrantPermissionAllowed {
+		return denied(ReasonRefNotPermitted, "managed device posture integration references are not granted")
 	}
 	if request.PlatformObject && grant.PlatformObjects != v1alpha1.GrantPermissionAllowed {
 		return denied(ReasonRefNotPermitted, "platform object management is not granted")

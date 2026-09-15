@@ -129,13 +129,13 @@ func resolveGatewayPolicyDesired(ctx context.Context, kube client.Client, object
 	for _, ref := range refs {
 		list := new(v1alpha1.ZeroTrustList)
 		if err := kube.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: ref.Name}, list); err != nil {
-			return result, privateInvalid("TargetNotFound", "ZeroTrustList %s/%s was not found: %v", object.Namespace, ref.Name, err)
+			return result, privateInvalid("TargetNotFound", "the ZeroTrustList %s/%s was not found: %v", object.Namespace, ref.Name, err)
 		}
 		if !list.DeletionTimestamp.IsZero() || list.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
-			return result, privateInvalid("RefNotPermitted", "ZeroTrustList %s/%s is deleting or uses a different CloudflareAccount", object.Namespace, ref.Name)
+			return result, privateInvalid("RefNotPermitted", "the ZeroTrustList %s/%s is deleting or uses a different CloudflareAccount", object.Namespace, ref.Name)
 		}
 		if !metaConditionTrue(list.Status.Conditions, v1alpha1.ZeroTrustListConditionAccepted) || list.Status.ListID == "" {
-			return result, privateInvalid("Pending", "ZeroTrustList %s/%s is not Accepted with a remote list ID", object.Namespace, ref.Name)
+			return result, privateInvalid("Pending", "the ZeroTrustList %s/%s is not Accepted with a remote list ID", object.Namespace, ref.Name)
 		}
 		replacements := 0
 		result.Traffic, replacements = replaceGatewayListToken(result.Traffic, ref.Name, list.Status.ListID)
@@ -217,7 +217,7 @@ func observeGatewayRule(ctx context.Context, api flarecloudflare.GatewayRuleAPI,
 		}
 	}
 	if len(matches) == 0 {
-		return flarecloudflare.GatewayRule{}, privateInvalid("TargetNotFound", "Cloudflare Gateway rule %q was not found", object.Spec.Name)
+		return flarecloudflare.GatewayRule{}, privateInvalid("TargetNotFound", "the Cloudflare Gateway rule %q was not found", object.Spec.Name)
 	}
 	if len(matches) > 1 {
 		return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "multiple Cloudflare Gateway rules are named %q", object.Spec.Name)
@@ -231,7 +231,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) ensureManaged(ctx context.Context, ap
 	acquiring := adopting && !object.Status.OwnershipVerified
 	if adopting {
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.RuleID == "" {
-			return flarecloudflare.GatewayRule{}, privateInvalid("Invalid", "AdoptById requires externalRef.ruleId")
+			return flarecloudflare.GatewayRule{}, privateInvalid("Invalid", "adoption mode AdoptById requires externalRef.ruleId")
 		}
 		if id != "" && id != object.Spec.ExternalRef.RuleID {
 			return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "status rule ID %q does not match adoption target %q", id, object.Spec.ExternalRef.RuleID)
@@ -254,7 +254,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) ensureManaged(ctx context.Context, ap
 			return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "remote Gateway rule %q is read-only", id)
 		}
 	} else if object.Spec.ExternalRef != nil {
-		return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "Managed externalRef requires adoption.mode AdoptById")
+		return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "managed externalRef requires adoption.mode AdoptById")
 	}
 	if id == "" {
 		rules, err := api.ListGatewayRules(ctx)
@@ -269,7 +269,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) ensureManaged(ctx context.Context, ap
 				id = rule.ID
 				break
 			}
-			return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "Cloudflare Gateway rule %q exists without this object's ownership marker", object.Spec.Name)
+			return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "the Cloudflare Gateway rule %q exists without this object's ownership marker", object.Spec.Name)
 		}
 		if id == "" {
 			return api.CreateGatewayRule(ctx, input)
@@ -347,7 +347,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) checkSingleWriter(ctx context.Context
 		}
 		otherKey := client.ObjectKeyFromObject(other)
 		if globalObjectPrecedes(other.CreationTimestamp, otherKey, object.CreationTimestamp, key) {
-			return privateInvalid("Conflict", "ZeroTrustGatewayPolicy %s is the earlier authorized writer for Cloudflare account ID %q and the same remote rule", otherKey, accountID)
+			return privateInvalid("Conflict", "the ZeroTrustGatewayPolicy %s is the earlier authorized writer for Cloudflare account ID %q and the same remote rule", otherKey, accountID)
 		}
 	}
 	return nil

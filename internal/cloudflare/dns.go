@@ -18,7 +18,10 @@ package cloudflare
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 	"github.com/cloudflare/cloudflare-go/v7/dns"
@@ -32,33 +35,51 @@ type DNSAPI interface {
 	DeleteDNSRecord(ctx context.Context, zoneID, recordID string) error
 }
 
-// DNSRecordInput is the desired state for a proxied CNAME record. Empty tags are omitted.
-type DNSRecordInput struct {
-	Name    string
-	Content string
-	Comment string
-	Tags    []string
-	Proxied bool
+// DNSRecordSettings contains optional CNAME response-filtering settings.
+type DNSRecordSettings struct {
+	IPv4Only *bool
+	IPv6Only *bool
 }
 
-// DNSRecord is the remote record state used for ownership and conflict checks.
+// DNSRecordInput is the desired state for a CNAME record. Nil optional fields
+// are omitted from Cloudflare requests.
+type DNSRecordInput struct {
+	Name     string
+	Content  string
+	Comment  string
+	TTL      *int64
+	Proxied  *bool
+	Settings *DNSRecordSettings
+}
+
+// DNSRecord is the bounded remote record state used for ownership, drift, and
+// status observations.
 type DNSRecord struct {
-	ID      string
-	Name    string
-	Type    string
-	Content string
-	Comment string
-	Tags    []string
-	Proxied bool
+	ID                string
+	Name              string
+	Type              string
+	Content           string
+	Comment           string
+	TTL               int64
+	Proxied           bool
+	Proxiable         bool
+	Settings          *DNSRecordSettings
+	CreatedOn         time.Time
+	ModifiedOn        time.Time
+	CommentModifiedOn time.Time
 }
 
 // ListDNSRecords returns records of any type exactly matching name so callers
 // can detect collisions before attempting to create a CNAME.
 func (client *Client) ListDNSRecords(ctx context.Context, zoneID, name string) ([]DNSRecord, error) {
+	normalizedName, err := NormalizeDNSHostname(name)
+	if err != nil {
+		return nil, err
+	}
 	pager := client.sdk.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
 		ZoneID: cloudflaresdk.F(zoneID),
 		Name: cloudflaresdk.F(dns.RecordListParamsName{
-			Exact: cloudflaresdk.F(name),
+			Exact: cloudflaresdk.F(normalizedName),
 		}),
 		PerPage: cloudflaresdk.F(100.0),
 	})
@@ -76,9 +97,13 @@ func (client *Client) ListDNSRecords(ctx context.Context, zoneID, name string) (
 
 // CreateCNAME creates a complete CNAME record using cloudflare-go's typed union payload.
 func (client *Client) CreateCNAME(ctx context.Context, zoneID string, input DNSRecordInput) (DNSRecord, error) {
+	body, err := cnameParams(input)
+	if err != nil {
+		return DNSRecord{}, err
+	}
 	result, err := client.sdk.DNS.Records.New(ctx, dns.RecordNewParams{
 		ZoneID: cloudflaresdk.F(zoneID),
-		Body:   cnameParams(input),
+		Body:   body,
 	})
 	if err != nil {
 		return DNSRecord{}, fmt.Errorf("create Cloudflare DNS record: %w", err)
@@ -88,9 +113,13 @@ func (client *Client) CreateCNAME(ctx context.Context, zoneID string, input DNSR
 
 // UpdateCNAME updates the desired CNAME fields.
 func (client *Client) UpdateCNAME(ctx context.Context, zoneID, recordID string, input DNSRecordInput) (DNSRecord, error) {
+	body, err := cnameParams(input)
+	if err != nil {
+		return DNSRecord{}, err
+	}
 	result, err := client.sdk.DNS.Records.Update(ctx, recordID, dns.RecordUpdateParams{
 		ZoneID: cloudflaresdk.F(zoneID),
-		Body:   cnameParams(input),
+		Body:   body,
 	})
 	if err != nil {
 		return DNSRecord{}, fmt.Errorf("update Cloudflare DNS record: %w", err)
@@ -109,48 +138,113 @@ func (client *Client) DeleteDNSRecord(ctx context.Context, zoneID, recordID stri
 	return nil
 }
 
-func cnameParams(input DNSRecordInput) dns.CNAMERecordParam {
+func cnameParams(input DNSRecordInput) (dns.CNAMERecordParam, error) {
+	name, err := NormalizeDNSHostname(input.Name)
+	if err != nil {
+		return dns.CNAMERecordParam{}, err
+	}
+	content, err := NormalizeDNSHostname(input.Content)
+	if err != nil {
+		return dns.CNAMERecordParam{}, fmt.Errorf("normalize CNAME content: %w", err)
+	}
+	if err := validateCNAMEInput(input); err != nil {
+		return dns.CNAMERecordParam{}, err
+	}
+
 	body := dns.CNAMERecordParam{
-		Name:    cloudflaresdk.F(input.Name),
-		TTL:     cloudflaresdk.F(dns.TTL1),
+		Name:    cloudflaresdk.F(name),
 		Type:    cloudflaresdk.F(dns.CNAMERecordTypeCNAME),
-		Comment: cloudflaresdk.F(input.Comment),
-		Content: cloudflaresdk.F(input.Content),
-		Proxied: cloudflaresdk.F(input.Proxied),
+		Content: cloudflaresdk.F(content),
 	}
-	if len(input.Tags) > 0 {
-		tags := make([]dns.RecordTagsParam, len(input.Tags))
-		copy(tags, input.Tags)
-		body.Tags = cloudflaresdk.F(tags)
+	if input.Comment != "" {
+		body.Comment = cloudflaresdk.F(input.Comment)
 	}
-	return body
+	if input.TTL != nil {
+		body.TTL = cloudflaresdk.F(dns.TTL(*input.TTL))
+	}
+	if input.Proxied != nil {
+		body.Proxied = cloudflaresdk.F(*input.Proxied)
+	}
+	if settings, present := cnameSettingsParams(input.Settings); present {
+		body.Settings = cloudflaresdk.F(settings)
+	}
+	return body, nil
+}
+
+func validateCNAMEInput(input DNSRecordInput) error {
+	if input.TTL != nil && *input.TTL != 1 && (*input.TTL < 60 || *input.TTL > 86400) {
+		return fmt.Errorf("cloudflare DNS TTL must be 1 or between 60 and 86400 seconds")
+	}
+	if input.Proxied != nil && *input.Proxied && input.TTL != nil && *input.TTL != 1 {
+		return fmt.Errorf("proxied Cloudflare DNS records require automatic TTL 1")
+	}
+	if input.Settings == nil {
+		return nil
+	}
+	ipv4Only := input.Settings.IPv4Only != nil && *input.Settings.IPv4Only
+	ipv6Only := input.Settings.IPv6Only != nil && *input.Settings.IPv6Only
+	if ipv4Only && ipv6Only {
+		return fmt.Errorf("cloudflare DNS ipv4Only and ipv6Only settings are mutually exclusive")
+	}
+	if (ipv4Only || ipv6Only) && (input.Proxied == nil || !*input.Proxied) {
+		return fmt.Errorf("cloudflare DNS ipv4Only and ipv6Only settings require proxied=true")
+	}
+	return nil
+}
+
+func cnameSettingsParams(settings *DNSRecordSettings) (dns.CNAMERecordSettingsParam, bool) {
+	if settings == nil || (settings.IPv4Only == nil && settings.IPv6Only == nil) {
+		return dns.CNAMERecordSettingsParam{}, false
+	}
+	result := dns.CNAMERecordSettingsParam{}
+	if settings.IPv4Only != nil {
+		result.IPV4Only = cloudflaresdk.F(*settings.IPv4Only)
+	}
+	if settings.IPv6Only != nil {
+		result.IPV6Only = cloudflaresdk.F(*settings.IPv6Only)
+	}
+	return result, true
 }
 
 func dnsRecordFromSDK(record dns.RecordResponse) DNSRecord {
+	name := record.Name
+	if normalized, err := NormalizeDNSHostname(name); err == nil {
+		name = normalized
+	}
+	content := record.Content
+	if strings.EqualFold(string(record.Type), "CNAME") {
+		if normalized, err := NormalizeDNSHostname(content); err == nil {
+			content = normalized
+		}
+	}
 	return DNSRecord{
-		ID:      record.ID,
-		Name:    record.Name,
-		Type:    string(record.Type),
-		Content: record.Content,
-		Comment: record.Comment,
-		Tags:    dnsRecordTags(record.Tags),
-		Proxied: record.Proxied,
+		ID:                record.ID,
+		Name:              name,
+		Type:              string(record.Type),
+		Content:           content,
+		Comment:           record.Comment,
+		TTL:               int64(record.TTL),
+		Proxied:           record.Proxied,
+		Proxiable:         record.Proxiable,
+		Settings:          dnsRecordSettings(record),
+		CreatedOn:         record.CreatedOn,
+		ModifiedOn:        record.ModifiedOn,
+		CommentModifiedOn: record.CommentModifiedOn,
 	}
 }
 
-func dnsRecordTags(value any) []string {
-	switch tags := value.(type) {
-	case []string:
-		return append([]string(nil), tags...)
-	case []any:
-		result := make([]string, 0, len(tags))
-		for _, tag := range tags {
-			if text, ok := tag.(string); ok {
-				result = append(result, text)
-			}
-		}
-		return result
-	default:
+func dnsRecordSettings(record dns.RecordResponse) *DNSRecordSettings {
+	var wire struct {
+		Settings *struct {
+			IPv4Only *bool `json:"ipv4_only"`
+			IPv6Only *bool `json:"ipv6_only"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal([]byte(record.JSON.RawJSON()), &wire); err != nil || wire.Settings == nil {
 		return nil
+	}
+	return &DNSRecordSettings{
+		IPv4Only: wire.Settings.IPv4Only,
+		IPv6Only: wire.Settings.IPv6Only,
 	}
 }

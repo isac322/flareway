@@ -31,9 +31,12 @@ func TestCompilePrivateDestinationsResolvesAuthorizedRoutes(t *testing.T) {
 	application := &v1alpha1.AccessApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: "database", Namespace: "tenant"},
 		Spec: v1alpha1.AccessApplicationSpec{
-			PrivateDestinations: []v1alpha1.AccessPrivateDestinationSpec{
-				{NetworkRouteRef: &corev1.LocalObjectReference{Name: "services"}, CIDR: "10.96.12.34/32", PortRange: "5432", L4Protocol: v1alpha1.AccessL4ProtocolTCP},
-				{HostnameRouteRef: &corev1.LocalObjectReference{Name: "database"}, PortRange: "5432-5433", L4Protocol: v1alpha1.AccessL4ProtocolTCP},
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Destinations: []v1alpha1.AccessApplicationDestinationSpec{
+				privateDestination(v1alpha1.AccessPrivateDestinationSpec{NetworkRouteRef: &corev1.LocalObjectReference{Name: "services"}, CIDR: "10.96.12.34/32", PortRange: "5432", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP)}),
+				privateDestination(v1alpha1.AccessPrivateDestinationSpec{HostnameRouteRef: &corev1.LocalObjectReference{Name: "database"}, PortRange: "5432-5433", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP)}),
 			},
 		},
 	}
@@ -60,16 +63,21 @@ func TestCompilePrivateDestinationsCannotBypassRouteBoundary(t *testing.T) {
 	inputs := privateAccessInputs()
 	application := &v1alpha1.AccessApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: "database", Namespace: "tenant"},
-		Spec: v1alpha1.AccessApplicationSpec{PrivateDestinations: []v1alpha1.AccessPrivateDestinationSpec{{
-			NetworkRouteRef: &corev1.LocalObjectReference{Name: "services"}, CIDR: "10.97.0.1/32", PortRange: "5432",
-		}}},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Destinations: []v1alpha1.AccessApplicationDestinationSpec{privateDestination(v1alpha1.AccessPrivateDestinationSpec{
+				NetworkRouteRef: &corev1.LocalObjectReference{Name: "services"}, CIDR: "10.97.0.1/32", PortRange: "5432",
+			})},
+		},
 	}
 	compiled := CompilePrivateDestinations(inputs, application)
 	if compiled.Accepted || compiled.Reason != "RefNotPermitted" || !strings.Contains(compiled.Message, "not contained") {
 		t.Fatalf("out-of-route CIDR = %#v", compiled)
 	}
 
-	application.Spec.PrivateDestinations[0].NetworkRouteRef = nil
+	application.Spec.Destinations[0].Private.NetworkRouteRef = nil
 	compiled = CompilePrivateDestinations(inputs, application)
 	if compiled.Accepted || compiled.Reason != "Invalid" {
 		t.Fatalf("caller CIDR without route reference = %#v", compiled)
@@ -80,9 +88,14 @@ func TestCompilePrivateDestinationsRequiresBothNamespaceAndAccountGrants(t *test
 	inputs := privateAccessInputs()
 	application := &v1alpha1.AccessApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: "database", Namespace: "tenant"},
-		Spec: v1alpha1.AccessApplicationSpec{PrivateDestinations: []v1alpha1.AccessPrivateDestinationSpec{{
-			HostnameRouteRef: &corev1.LocalObjectReference{Name: "database"}, PortRange: "443",
-		}}},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Destinations: []v1alpha1.AccessApplicationDestinationSpec{privateDestination(v1alpha1.AccessPrivateDestinationSpec{
+				HostnameRouteRef: &corev1.LocalObjectReference{Name: "database"}, PortRange: "443",
+			})},
+		},
 	}
 
 	inputs.HostnameRoutes[0].Spec.AllowedNamespaces.From = v1alpha1.AllowedNamespaceFromSelector
@@ -97,6 +110,68 @@ func TestCompilePrivateDestinationsRequiresBothNamespaceAndAccountGrants(t *test
 	compiled = CompilePrivateDestinations(inputs, application)
 	if compiled.Accepted || !strings.Contains(compiled.Message, "labels are not granted") {
 		t.Fatalf("account selector denial = %#v", compiled)
+	}
+}
+
+func TestSoftDeletedTunnelBlocksPrivateRouteReadiness(t *testing.T) {
+	inputs := privateAccessInputs()
+	inputs.CloudflareTunnel = &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "tenant"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			Listeners: []v1alpha1.CloudflareTunnelListener{{
+				Name: "private", Exposure: v1alpha1.ExposurePrivate,
+				VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
+			}},
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{TunnelID: "tunnel", OwnershipVerified: true},
+	}
+	inputs.VirtualNetworks = []v1alpha1.VirtualNetwork{{
+		ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: "tenant", Generation: 1},
+		Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+		Status: v1alpha1.VirtualNetworkStatus{
+			VirtualNetworkID: "vnet-prod", ObservedGeneration: 1,
+			Conditions: []metav1.Condition{{
+				Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue, ObservedGeneration: 1,
+			}},
+		},
+	}}
+	if got := privateListenerVNetID(inputs, "private"); got != "vnet-prod" {
+		t.Fatalf("active Tunnel private listener VNet = %q", got)
+	}
+	if !privateRoutesRequireWARP(inputs) {
+		t.Fatal("active ownership-verified Tunnel with an applied private route did not require WARP routing")
+	}
+
+	deletedAt := metav1.Now()
+	inputs.CloudflareTunnel.Status.DeletedAt = &deletedAt
+	application := &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "database", Namespace: "tenant"},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Destinations: []v1alpha1.AccessApplicationDestinationSpec{privateDestination(v1alpha1.AccessPrivateDestinationSpec{
+				NetworkRouteRef: &corev1.LocalObjectReference{Name: "services"}, PortRange: "5432",
+			})},
+		},
+	}
+	compiled := CompilePrivateDestinations(inputs, application)
+	if compiled.Accepted || compiled.Reason != "TargetNotFound" || !strings.Contains(compiled.Message, "remotely deleted") {
+		t.Fatalf("soft-deleted Tunnel private compilation = %#v", compiled)
+	}
+	if got := privateListenerVNetID(inputs, "private"); got != "" {
+		t.Fatalf("soft-deleted Tunnel authorized private listener VNet %q", got)
+	}
+	if privateRoutesRequireWARP(inputs) {
+		t.Fatal("soft-deleted Tunnel authorized WARP routing")
+	}
+}
+
+func privateDestination(spec v1alpha1.AccessPrivateDestinationSpec) v1alpha1.AccessApplicationDestinationSpec {
+	return v1alpha1.AccessApplicationDestinationSpec{
+		Type: v1alpha1.AccessApplicationDestinationPrivate, Private: &spec,
 	}
 }
 

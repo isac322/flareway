@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,7 @@ func Build(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) (*cachev3.Snapshot,
 	if gw == nil {
 		return nil, errors.New("IR Gateway is nil")
 	}
+	gw = canonicalGateway(gw)
 	streamIdleTimeout := time.Hour
 	if cfg != nil && cfg.Spec.Proxy.StreamIdleTimeout.Duration != 0 {
 		streamIdleTimeout = cfg.Spec.Proxy.StreamIdleTimeout.Duration
@@ -204,6 +206,10 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 				continue
 			}
 			return nil, fmt.Errorf("protection domain %q references unknown listener %q", domain.Name, domain.ListenerName)
+		}
+		if domain.Protected && !domain.OriginJWTDisabled && domain.Guard != ir.GuardBlocked &&
+			(domain.Access == nil || len(domain.Access.AUDs) == 0) {
+			return nil, fmt.Errorf("protection domain %q requires at least one Access audience", domain.Name)
 		}
 		port := domain.EnvoyPort
 		if listener.Exposure == ir.ExposurePrivate {
@@ -459,15 +465,16 @@ func buildHTTPFilters(access *ir.AccessGuard) ([]*hcmv3.HttpFilter, string, stri
 	jwksName := ""
 	if access != nil {
 		jwksHost = normalizeAuthDomain(access.AuthDomain)
-		if jwksHost == "" || access.AUD == "" {
-			return nil, "", "", errors.New("protected domain requires authDomain and AUD")
+		audiences := access.AUDs
+		if jwksHost == "" || len(audiences) == 0 {
+			return nil, "", "", errors.New("protected domain requires authDomain and at least one AUD")
 		}
 		jwksName = "flareway-jwks-" + shortHash(jwksHost)
 		jwt := &jwtauthnv3.JwtAuthentication{
 			Providers: map[string]*jwtauthnv3.JwtProvider{
 				"cloudflare-access": {
 					Issuer:    "https://" + jwksHost,
-					Audiences: []string{access.AUD},
+					Audiences: audiences,
 					JwksSourceSpecifier: &jwtauthnv3.JwtProvider_RemoteJwks{RemoteJwks: &jwtauthnv3.RemoteJwks{
 						HttpUri: &corev3.HttpUri{
 							Uri:              "https://" + jwksHost + "/cdn-cgi/access/certs",
@@ -634,6 +641,20 @@ func jwtFailureLocalReplyConfig() *hcmv3.LocalReplyConfig {
 		},
 		StatusCode: wrapperspb.UInt32(401),
 	}}}
+}
+
+func canonicalGateway(gw *ir.Gateway) *ir.Gateway {
+	canonical := *gw
+	canonical.Domains = slices.Clone(gw.Domains)
+	for i := range canonical.Domains {
+		if canonical.Domains[i].Access == nil {
+			continue
+		}
+		access := *canonical.Domains[i].Access
+		access.AUDs = access.CanonicalAUDs()
+		canonical.Domains[i].Access = &access
+	}
+	return &canonical
 }
 
 func desiredVersion(gw *ir.Gateway, streamIdleTimeout time.Duration) (string, error) {

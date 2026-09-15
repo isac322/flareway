@@ -133,7 +133,7 @@ func (r *CloudflareAccountReconciler) Reconcile(ctx context.Context, request ctr
 		return strings.Compare(left.ID, right.ID)
 	})
 
-	base := client.MergeFrom(account.DeepCopy())
+	base := client.MergeFromWithOptions(account.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	account.Status.Verified = v1alpha1.CloudflareAccountVerifiedStatus{
 		AccountName: accountName,
 		AuthDomain:  authDomain,
@@ -163,7 +163,7 @@ func (r *CloudflareAccountReconciler) fail(ctx context.Context, account *v1alpha
 }
 
 func (r *CloudflareAccountReconciler) patchFailure(ctx context.Context, account *v1alpha1.CloudflareAccount, now metav1.Time, reason, message string, credentialsValid bool) error {
-	base := client.MergeFrom(account.DeepCopy())
+	base := client.MergeFromWithOptions(account.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	account.Status.Verified = v1alpha1.CloudflareAccountVerifiedStatus{}
 	credentialsStatus := metav1.ConditionFalse
 	credentialsReason := reason

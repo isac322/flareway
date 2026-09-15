@@ -77,8 +77,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -122,6 +124,7 @@ spec:
                 - ObserveOnly
                 type: string
               name:
+                maxLength: 100
                 minLength: 1
                 type: string
             required:
@@ -137,10 +140,10 @@ spec:
               rule: '!has(self.externalRef) || self.managementPolicy == ''ObserveOnly''
                 || self.adoption.mode == ''AdoptById'''
             - message: accountRef.name is required
-              rule: has(self.accountRef.name) && self.accountRef.name != ""
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
           status:
-            description: VirtualNetworkStatus records the remote virtual network identity
-              and observed state.
+            description: VirtualNetworkStatus records all actionable remote virtual-network
+              fields.
             properties:
               comment:
                 type: string
@@ -199,10 +202,17 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              createdAt:
+                format: date-time
+                type: string
+              deletedAt:
+                format: date-time
+                type: string
               isDefault:
                 type: boolean
               name:

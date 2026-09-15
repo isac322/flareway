@@ -54,13 +54,13 @@ The complete application examples in [`config/samples/`](../../config/samples/) 
 
 ## Controller groups
 
-All groups default to enabled. Disable a group only when another system owns every object in that area.
+All groups default to enabled. Disable a group only when another system owns every object in that area. The shared CloudflareAccount controller runs whenever any controller group is enabled.
 
 | Value | Controllers |
 |---|---|
-| `controllers.gateway` | GatewayClass, Gateway, CloudflareAccount, CloudflareTunnel |
-| `controllers.access` | AccessApplication, AccessPolicy, AccessGroup, IdentityProvider, DevicePostureRule, ServiceToken |
-| `controllers.privateNetwork` | VirtualNetwork, NetworkRoute, HostnameRoute |
+| `controllers.gateway` | GatewayClass, Gateway, CloudflareTunnel |
+| `controllers.access` | AccessApplication, AccessStandaloneApplication, AccessInfrastructureTarget, AccessCustomPage, AccessPolicy, AccessGroup, IdentityProvider, DevicePostureRule, DevicePostureIntegration, ServiceToken |
+| `controllers.privateNetwork` | VirtualNetwork, NetworkRoute, HostnameRoute, WARPConnector |
 | `controllers.device` | DeviceProfile, DeviceSettings |
 | `controllers.organization` | ZeroTrustOrganization, ZeroTrustGatewayPolicy, ZeroTrustList |
 

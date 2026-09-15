@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -105,12 +107,12 @@ func loadPrivateAccount(ctx context.Context, kube client.Client, accountName str
 	account := new(v1alpha1.CloudflareAccount)
 	if err := kube.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, privateInvalid("InvalidAccountRef", "CloudflareAccount %q was not found", accountName)
+			return nil, privateInvalid("InvalidAccountRef", "the CloudflareAccount %q was not found", accountName)
 		}
 		return nil, fmt.Errorf("get CloudflareAccount %q: %w", accountName, err)
 	}
 	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) || !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return nil, privateInvalid("Pending", "CloudflareAccount %q is not accepted with valid credentials", accountName)
+		return nil, privateInvalid("Pending", "the CloudflareAccount %q is not accepted with valid credentials", accountName)
 	}
 	return account, nil
 }
@@ -119,7 +121,7 @@ func authorizePrivateNamespace(ctx context.Context, kube client.Client, account 
 	namespace := new(corev1.Namespace)
 	if err := kube.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, privateInvalid("RefNotPermitted", "Namespace %q was not found", namespaceName)
+			return nil, privateInvalid("RefNotPermitted", "the Namespace %q was not found", namespaceName)
 		}
 		return nil, fmt.Errorf("get Namespace %q: %w", namespaceName, err)
 	}
@@ -155,7 +157,24 @@ func privateOwnerComment(ctx context.Context, kube client.Client, object client.
 	if err != nil {
 		return "", err
 	}
-	return flarecloudflare.PrivateResourceComment(clusterID, object.GetNamespace(), object.GetName(), comment), nil
+	owner := flarecloudflare.PrivateResourceComment(clusterID, object.GetNamespace(), object.GetName(), "")
+	if utf8.RuneCountInString(owner) > 100 {
+		sum := sha256.Sum256([]byte(owner))
+		owner = fmt.Sprintf("flareway sha256:%x", sum[:16])
+	}
+	if comment == "" {
+		return owner, nil
+	}
+	const separator = " | "
+	remaining := 100 - utf8.RuneCountInString(owner) - utf8.RuneCountInString(separator)
+	if remaining <= 0 {
+		return owner, nil
+	}
+	runes := []rune(comment)
+	if len(runes) > remaining {
+		runes = runes[:remaining]
+	}
+	return owner + separator + string(runes), nil
 }
 
 func privateCondition(generation int64, conditionType string, status metav1.ConditionStatus, reason, message string) metav1.Condition {
@@ -193,12 +212,19 @@ func effectivePrivateDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.Del
 	return policy
 }
 
-func namespacedReferenceKey(sourceNamespace string, ref v1alpha1.NamespacedObjectReference) types.NamespacedName {
+func namespacedReferenceKey(sourceNamespace string, ref v1alpha1.TunnelReference) types.NamespacedName {
 	namespace := ref.Namespace
 	if namespace == "" {
 		namespace = sourceNamespace
 	}
 	return types.NamespacedName{Namespace: namespace, Name: ref.Name}
+}
+
+func privateVirtualNetworkReferenceName(ref *corev1.LocalObjectReference) string {
+	if ref == nil {
+		return ""
+	}
+	return ref.Name
 }
 
 // privateRouteAllowsNamespace reports whether a route's consumer namespace is allowed.
@@ -227,12 +253,11 @@ func privateRouteAllowsNamespace(routeNamespace string, allowed v1alpha1.Allowed
 }
 
 type resolvedPrivateTunnel struct {
-	object    *v1alpha1.CloudflareTunnel
-	namespace *corev1.Namespace
-	id        string
+	id         string
+	tunnelType flarecloudflare.NetworkTunnelType
 }
 
-func resolvePrivateTunnel(ctx context.Context, kube client.Client, account *v1alpha1.CloudflareAccount, routeNamespace string, ref v1alpha1.NamespacedObjectReference, allowed v1alpha1.AllowedNamespaces, kind authz.PrivateRouteKind, routeLabels map[string]string, hostname string) (*resolvedPrivateTunnel, error) {
+func resolvePrivateTunnel(ctx context.Context, kube client.Client, account *v1alpha1.CloudflareAccount, routeNamespace string, ref v1alpha1.TunnelReference, allowed v1alpha1.AllowedNamespaces, routeKind authz.PrivateRouteKind, routeLabels map[string]string, hostname string) (*resolvedPrivateTunnel, error) {
 	key := namespacedReferenceKey(routeNamespace, ref)
 	if key.Name == "" {
 		return nil, privateInvalid("TargetNotFound", "tunnelRef.name is required")
@@ -240,7 +265,7 @@ func resolvePrivateTunnel(ctx context.Context, kube client.Client, account *v1al
 	namespace := new(corev1.Namespace)
 	if err := kube.Get(ctx, types.NamespacedName{Name: key.Namespace}, namespace); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, privateInvalid("TargetNotFound", "Tunnel Namespace %q was not found", key.Namespace)
+			return nil, privateInvalid("TargetNotFound", "the Tunnel Namespace %q was not found", key.Namespace)
 		}
 		return nil, err
 	}
@@ -249,33 +274,125 @@ func resolvePrivateTunnel(ctx context.Context, kube client.Client, account *v1al
 		return nil, privateInvalid("Invalid", "%v", err)
 	}
 	if !allowedNamespace {
-		return nil, privateInvalid("RefNotPermitted", "Namespace %q is not allowed by this route", namespace.Name)
+		return nil, privateInvalid("RefNotPermitted", "the Namespace %q is not allowed by this route", namespace.Name)
 	}
 	decision := authz.Evaluate(account, namespace, authz.Request{
 		Hostname:     hostname,
 		Exposure:     v1alpha1.ExposurePrivate,
-		PrivateRoute: &authz.PrivateRouteRequest{Kind: kind, Labels: routeLabels},
+		PrivateRoute: &authz.PrivateRouteRequest{Kind: routeKind, Labels: routeLabels},
 	})
 	if !decision.Allowed {
 		return nil, privateInvalid(decision.Reason, "%s", decision.Message)
 	}
-	tunnel := new(v1alpha1.CloudflareTunnel)
-	if err := kube.Get(ctx, key, tunnel); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, privateInvalid("TargetNotFound", "CloudflareTunnel %s was not found", key)
+	switch effectiveTunnelReferenceKind(ref.Kind) {
+	case v1alpha1.TunnelReferenceKindCloudflareTunnel:
+		tunnel := new(v1alpha1.CloudflareTunnel)
+		if err := kube.Get(ctx, key, tunnel); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, privateInvalid("TargetNotFound", "the CloudflareTunnel %s was not found", key)
+			}
+			return nil, err
 		}
-		return nil, err
+		if !tunnel.DeletionTimestamp.IsZero() {
+			return nil, privateInvalid("TargetNotFound", "the CloudflareTunnel %s is deleting", key)
+		}
+		if tunnel.Spec.AccountRef.Name != account.Name {
+			return nil, privateInvalid("RefNotPermitted", "the CloudflareTunnel %s uses CloudflareAccount %q, want %q", key, tunnel.Spec.AccountRef.Name, account.Name)
+		}
+		if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+			!metaConditionTrue(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted) ||
+			tunnel.Status.TunnelID == "" || !tunnel.Status.OwnershipVerified {
+			return nil, privateInvalid("Pending", "the CloudflareTunnel %s is not accepted with an ownership-verified remote tunnel ID", key)
+		}
+		return &resolvedPrivateTunnel{id: tunnel.Status.TunnelID, tunnelType: flarecloudflare.NetworkTunnelTypeCloudflareTunnel}, nil
+	case v1alpha1.TunnelReferenceKindWARPConnector:
+		tunnel := new(v1alpha1.WARPConnector)
+		if err := kube.Get(ctx, key, tunnel); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, privateInvalid("TargetNotFound", "the WARPConnector %s was not found", key)
+			}
+			return nil, err
+		}
+		if !tunnel.DeletionTimestamp.IsZero() {
+			return nil, privateInvalid("TargetNotFound", "the WARPConnector %s is deleting", key)
+		}
+		if tunnel.Spec.AccountRef.Name != account.Name {
+			return nil, privateInvalid("RefNotPermitted", "the WARPConnector %s uses CloudflareAccount %q, want %q", key, tunnel.Spec.AccountRef.Name, account.Name)
+		}
+		if !metaConditionTrue(tunnel.Status.Conditions, v1alpha1.WARPConnectorConditionAccepted) || tunnel.Status.TunnelID == "" {
+			return nil, privateInvalid("Pending", "the WARPConnector %s is not accepted with a remote tunnel ID", key)
+		}
+		return &resolvedPrivateTunnel{id: tunnel.Status.TunnelID, tunnelType: flarecloudflare.NetworkTunnelTypeWARPConnector}, nil
+	default:
+		return nil, privateInvalid("Invalid", "unsupported tunnelRef.kind %q", ref.Kind)
 	}
-	if !tunnel.DeletionTimestamp.IsZero() {
-		return nil, privateInvalid("TargetNotFound", "CloudflareTunnel %s is deleting", key)
+}
+
+func effectiveTunnelReferenceKind(kind v1alpha1.TunnelReferenceKind) v1alpha1.TunnelReferenceKind {
+	if kind == "" {
+		return v1alpha1.TunnelReferenceKindCloudflareTunnel
 	}
-	if tunnel.Spec.AccountRef.Name != account.Name {
-		return nil, privateInvalid("RefNotPermitted", "CloudflareTunnel %s uses CloudflareAccount %q, want %q", key, tunnel.Spec.AccountRef.Name, account.Name)
+	return kind
+}
+
+func privateTunnelTypeForReference(kind v1alpha1.TunnelReferenceKind) (flarecloudflare.NetworkTunnelType, error) {
+	switch effectiveTunnelReferenceKind(kind) {
+	case v1alpha1.TunnelReferenceKindCloudflareTunnel:
+		return flarecloudflare.NetworkTunnelTypeCloudflareTunnel, nil
+	case v1alpha1.TunnelReferenceKindWARPConnector:
+		return flarecloudflare.NetworkTunnelTypeWARPConnector, nil
+	default:
+		return "", privateInvalid("Invalid", "unsupported tunnelRef.kind %q", kind)
 	}
-	if !metaConditionTrue(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted) || tunnel.Status.TunnelID == "" {
-		return nil, privateInvalid("Pending", "CloudflareTunnel %s is not accepted with a remote tunnel ID", key)
+}
+
+func validatePrivateTunnelType(expected, observed flarecloudflare.NetworkTunnelType, resource, id string) string {
+	switch expected {
+	case flarecloudflare.NetworkTunnelTypeCloudflareTunnel, flarecloudflare.NetworkTunnelTypeWARPConnector:
+	default:
+		return fmt.Sprintf("resolved %s %q has unsupported expected tunnel type %q", resource, id, expected)
 	}
-	return &resolvedPrivateTunnel{object: tunnel, namespace: namespace, id: tunnel.Status.TunnelID}, nil
+	if observed != "" && observed != expected {
+		return fmt.Sprintf("remote %s %q has tunnel type %q, want %q", resource, id, observed, expected)
+	}
+	return ""
+}
+
+func privateTunnelRemoteType(value flarecloudflare.NetworkTunnelType) v1alpha1.TunnelRemoteType {
+	switch value {
+	case flarecloudflare.NetworkTunnelTypeCloudflareTunnel:
+		return v1alpha1.TunnelRemoteTypeCloudflareTunnel
+	case flarecloudflare.NetworkTunnelTypeWARPConnector:
+		return v1alpha1.TunnelRemoteTypeWARPConnector
+	case flarecloudflare.NetworkTunnelTypeWARP:
+		return v1alpha1.TunnelRemoteTypeWARP
+	case flarecloudflare.NetworkTunnelTypeMagic:
+		return v1alpha1.TunnelRemoteTypeMagic
+	case flarecloudflare.NetworkTunnelTypeIPSec:
+		return v1alpha1.TunnelRemoteTypeIPSec
+	case flarecloudflare.NetworkTunnelTypeGRE:
+		return v1alpha1.TunnelRemoteTypeGRE
+	case flarecloudflare.NetworkTunnelTypeCNI:
+		return v1alpha1.TunnelRemoteTypeCNI
+	default:
+		return ""
+	}
+}
+
+func privateMetaTime(value time.Time) *metav1.Time {
+	if value.IsZero() {
+		return nil
+	}
+	result := metav1.NewTime(value)
+	return &result
+}
+
+func privateMetaTimePointer(value *time.Time) *metav1.Time {
+	if value == nil {
+		return nil
+	}
+	result := metav1.NewTime(*value)
+	return &result
 }
 
 func resolvePrivateVirtualNetwork(ctx context.Context, kube client.Client, account *v1alpha1.CloudflareAccount, namespace, name string) (*v1alpha1.VirtualNetwork, error) {
@@ -286,18 +403,18 @@ func resolvePrivateVirtualNetwork(ctx context.Context, kube client.Client, accou
 	key := types.NamespacedName{Namespace: namespace, Name: name}
 	if err := kube.Get(ctx, key, object); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, privateInvalid("TargetNotFound", "VirtualNetwork %s was not found", key)
+			return nil, privateInvalid("TargetNotFound", "the VirtualNetwork %s was not found", key)
 		}
 		return nil, err
 	}
 	if !object.DeletionTimestamp.IsZero() {
-		return nil, privateInvalid("TargetNotFound", "VirtualNetwork %s is deleting", key)
+		return nil, privateInvalid("TargetNotFound", "the VirtualNetwork %s is deleting", key)
 	}
 	if object.Spec.AccountRef.Name != account.Name {
-		return nil, privateInvalid("RefNotPermitted", "VirtualNetwork %s uses CloudflareAccount %q, want %q", key, object.Spec.AccountRef.Name, account.Name)
+		return nil, privateInvalid("RefNotPermitted", "the VirtualNetwork %s uses CloudflareAccount %q, want %q", key, object.Spec.AccountRef.Name, account.Name)
 	}
 	if !metaConditionTrue(object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted) || object.Status.VirtualNetworkID == "" {
-		return nil, privateInvalid("Pending", "VirtualNetwork %s is not accepted with a remote ID", key)
+		return nil, privateInvalid("Pending", "the VirtualNetwork %s is not accepted with a remote ID", key)
 	}
 	return object, nil
 }

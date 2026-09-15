@@ -61,7 +61,9 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 					VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
 				}},
 			},
-			Status: v1alpha1.CloudflareTunnelStatus{TunnelID: "11111111-1111-1111-1111-111111111111"},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			},
 		}
 		vnet := v1alpha1.VirtualNetwork{
 			ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: namespaceName},
@@ -172,6 +174,63 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		var deniedRoute v1alpha1.HostnameRoute
 		deniedKey := types.NamespacedName{Namespace: dataplane.DefaultOperatorNamespace, Name: privateHostnameRouteName(deniedNamespaceName, deniedTunnel.Name, "private")}
 		gomega.Expect(apierrors.IsNotFound(testClient.Get(testContext, deniedKey, &deniedRoute))).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("blocks private prerequisites while a remotely deleted Tunnel drains", func() {
+		fixtureID := fixtureCounter.Add(1)
+		namespaceName := fmt.Sprintf("gateway-private-deleted-%d", fixtureID)
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName}}
+		gomega.Expect(testClient.Create(testContext, namespace)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(testContext, namespace) })
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
+			Data:       map[string][]byte{"token": []byte("secret")},
+		})).To(gomega.Succeed())
+
+		account := privatePrerequisiteAccount(namespaceName, true)
+		deletedAt := metav1.Now()
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: namespaceName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef: corev1.LocalObjectReference{Name: account.Name},
+				Listeners: []v1alpha1.CloudflareTunnelListener{{
+					Name: "private", Exposure: v1alpha1.ExposurePrivate,
+					VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
+				}},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true, DeletedAt: &deletedAt,
+			},
+		}
+		vnet := v1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: namespaceName},
+			Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}},
+			Status: v1alpha1.VirtualNetworkStatus{
+				VirtualNetworkID: "vnet-prod",
+				Conditions:       []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}},
+			},
+		}
+		gateway := privatePrerequisiteIR(namespaceName)
+		gateway.UID = "gateway-uid"
+		reconciler := &GatewayReconciler{
+			Client: testClient, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: &privatePrerequisiteAPI{}},
+		}
+
+		state, err := reconciler.reconcilePrivatePrerequisites(testContext, gateway, tunnel, account, gatewayInputsView{
+			Namespaces: []corev1.Namespace{*namespace}, VirtualNetworks: []v1alpha1.VirtualNetwork{vnet},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(state.Pending).To(gomega.ContainSubstring("remotely deleted"))
+		gomega.Expect(gateway.Domains[0].Guard).To(gomega.Equal(ir.GuardBlocked))
+		gomega.Expect(gateway.Domains[0].Access).To(gomega.BeNil())
+
+		routeKey := types.NamespacedName{
+			Namespace: dataplane.DefaultOperatorNamespace,
+			Name:      privateHostnameRouteName(namespaceName, tunnel.Name, "private"),
+		}
+		var route v1alpha1.HostnameRoute
+		gomega.Expect(apierrors.IsNotFound(testClient.Get(testContext, routeKey, &route))).To(gomega.BeTrue())
 	})
 
 	ginkgo.It("publishes Programmed Pending while a private JWT listener lacks the TLS decryption contract", func() {
@@ -299,6 +358,8 @@ func setDeviceSettingsStatus(ctx context.Context, object *v1alpha1.DeviceSetting
 	return testClient.Status().Update(ctx, &current)
 }
 
+var _ flarecloudflare.API = (*privatePrerequisiteAPI)(nil)
+
 type privatePrerequisiteAPI struct {
 	flarecloudflare.API
 	settings *flarecloudflare.DeviceSettings
@@ -340,7 +401,7 @@ func privatePrerequisiteIR(namespace string) *ir.Gateway {
 		}},
 		Domains: []ir.ProtectionDomain{{
 			Name: "private", ListenerName: "private", EnvoyPort: 443, Protected: true, Guard: ir.GuardForwarding,
-			Access: &ir.AccessGuard{AUD: "aud", AuthDomain: "team.cloudflareaccess.com", TeamName: "team"},
+			Access: &ir.AccessGuard{AUDs: []string{"aud"}, AuthDomain: "team.cloudflareaccess.com", TeamName: "team"},
 		}},
 	}
 }
@@ -348,11 +409,56 @@ func privatePrerequisiteIR(namespace string) *ir.Gateway {
 func (*privatePrerequisiteAPI) WithTunnelLock(_ context.Context, _ string, fn func() error) error {
 	return fn()
 }
-func (*privatePrerequisiteAPI) GetTunnelConfigurationVersion(context.Context, string) (int64, error) {
-	return 0, nil
+
+func (*privatePrerequisiteAPI) GetTunnel(_ context.Context, tunnelID string) (flarecloudflare.Tunnel, error) {
+	return flarecloudflare.Tunnel{
+		ID:           tunnelID,
+		AccountTag:   "0123456789abcdef0123456789abcdef",
+		Type:         flarecloudflare.TunnelTypeCloudflared,
+		ConfigSource: flarecloudflare.TunnelConfigSourceCloudflare,
+	}, nil
 }
-func (*privatePrerequisiteAPI) UpdateTunnelConfiguration(context.Context, string, zero_trust.TunnelCloudflaredConfigurationUpdateParams) (int64, error) {
-	return 1, nil
+
+func (api *privatePrerequisiteAPI) UpdateTunnelName(ctx context.Context, tunnelID, name string) (flarecloudflare.Tunnel, error) {
+	tunnel, err := api.GetTunnel(ctx, tunnelID)
+	if err != nil {
+		return flarecloudflare.Tunnel{}, err
+	}
+	tunnel.Name = name
+	return tunnel, nil
+}
+
+func (*privatePrerequisiteAPI) GetTunnelConfiguration(_ context.Context, tunnelID string) (flarecloudflare.TunnelConfiguration, error) {
+	return flarecloudflare.TunnelConfiguration{
+		AccountID: "0123456789abcdef0123456789abcdef",
+		TunnelID:  tunnelID,
+		Source:    flarecloudflare.TunnelConfigSourceCloudflare,
+	}, nil
+}
+
+func (*privatePrerequisiteAPI) UpdateTunnelConfiguration(_ context.Context, tunnelID string, _ zero_trust.TunnelCloudflaredConfigurationUpdateParams) (flarecloudflare.TunnelConfiguration, error) {
+	return flarecloudflare.TunnelConfiguration{
+		AccountID: "0123456789abcdef0123456789abcdef",
+		TunnelID:  tunnelID,
+		Version:   1,
+		Source:    flarecloudflare.TunnelConfigSourceCloudflare,
+	}, nil
+}
+
+func (*privatePrerequisiteAPI) IssueTunnelManagementToken(context.Context, string, []flarecloudflare.TunnelManagementResource) (string, error) {
+	return "test-management-token", nil
+}
+
+func (*privatePrerequisiteAPI) GetTunnelConnector(_ context.Context, _ string, connectorID string, _ int64) (flarecloudflare.TunnelConnector, error) {
+	return flarecloudflare.TunnelConnector{ID: connectorID}, nil
+}
+
+func (*privatePrerequisiteAPI) ListTunnelConnections(context.Context, string, int64) ([]flarecloudflare.TunnelConnector, bool, error) {
+	return nil, false, nil
+}
+
+func (*privatePrerequisiteAPI) EvictTunnelConnections(context.Context, string, *string) error {
+	return nil
 }
 
 func clientObjectKey(object metav1.Object) types.NamespacedName {

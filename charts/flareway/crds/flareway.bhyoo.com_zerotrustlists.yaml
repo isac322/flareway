@@ -81,8 +81,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:

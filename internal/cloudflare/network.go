@@ -19,15 +19,17 @@ package cloudflare
 import (
 	"context"
 	"fmt"
+	"time"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 	"github.com/cloudflare/cloudflare-go/v7/zero_trust"
 )
 
-// NetworkAPI is the complete M4 private-network Cloudflare surface.
+// NetworkAPI is the private-network surface shared by reconcilers.
 type NetworkAPI interface {
 	VirtualNetworkAPI
 	NetworkRouteAPI
+	NetworkRouteIPAPI
 	HostnameRouteAPI
 	DeviceSettingsAPI
 }
@@ -41,7 +43,7 @@ type VirtualNetworkAPI interface {
 	DeleteVirtualNetwork(context.Context, string) error
 }
 
-// NetworkRouteAPI manages CIDR routes through Cloudflare Tunnels.
+// NetworkRouteAPI manages CIDR routes through Cloudflare private-network connectors.
 type NetworkRouteAPI interface {
 	CreateNetworkRoute(context.Context, NetworkRouteInput) (NetworkRoute, error)
 	UpdateNetworkRoute(context.Context, string, NetworkRouteInput) (NetworkRoute, error)
@@ -50,7 +52,12 @@ type NetworkRouteAPI interface {
 	DeleteNetworkRoute(context.Context, string) error
 }
 
-// HostnameRouteAPI manages private hostname routes through Cloudflare Tunnels.
+// NetworkRouteIPAPI looks up the route containing an IP address.
+type NetworkRouteIPAPI interface {
+	LookupNetworkRoute(context.Context, NetworkRouteLookupInput) (NetworkRoute, error)
+}
+
+// HostnameRouteAPI manages private hostname routes through Cloudflare private-network connectors.
 type HostnameRouteAPI interface {
 	CreateHostnameRoute(context.Context, HostnameRouteInput) (HostnameRoute, error)
 	UpdateHostnameRoute(context.Context, string, HostnameRouteInput) (HostnameRoute, error)
@@ -72,53 +79,103 @@ type VirtualNetwork struct {
 	Name      string
 	IsDefault bool
 	Comment   string
+	CreatedAt time.Time
+	DeletedAt *time.Time
 	Deleted   bool
 }
+
+// NetworkTunnelType identifies the connector family serving a private route.
+type NetworkTunnelType string
+
+const (
+	// NetworkTunnelTypeCloudflareTunnel identifies a Cloudflare Tunnel connector.
+	NetworkTunnelTypeCloudflareTunnel NetworkTunnelType = "CloudflareTunnel"
+	// NetworkTunnelTypeWARPConnector identifies a WARP Connector tunnel.
+	NetworkTunnelTypeWARPConnector NetworkTunnelType = "WARPConnector"
+	// NetworkTunnelTypeWARP identifies a WARP device route.
+	NetworkTunnelTypeWARP NetworkTunnelType = "WARP"
+	// NetworkTunnelTypeMagic identifies a Magic WAN tunnel.
+	NetworkTunnelTypeMagic NetworkTunnelType = "Magic"
+	// NetworkTunnelTypeIPSec identifies an IPsec tunnel.
+	NetworkTunnelTypeIPSec NetworkTunnelType = "IPSec"
+	// NetworkTunnelTypeGRE identifies a GRE tunnel.
+	NetworkTunnelTypeGRE NetworkTunnelType = "GRE"
+	// NetworkTunnelTypeCNI identifies a Cloudflare Network Interconnect route.
+	NetworkTunnelTypeCNI NetworkTunnelType = "CNI"
+	// NetworkTunnelTypeUnknown records an unrecognized connector family.
+	NetworkTunnelTypeUnknown NetworkTunnelType = "Unknown"
+)
 
 // NetworkRouteInput is part of the Cloudflare adapter API.
 type NetworkRouteInput struct {
 	Network          string
 	TunnelID         string
+	TunnelType       NetworkTunnelType
 	VirtualNetworkID string
 	Comment          string
+}
+
+// NetworkRouteLookupInput selects the route containing one IP address.
+type NetworkRouteLookupInput struct {
+	IP                            string
+	VirtualNetworkID              string
+	DefaultVirtualNetworkFallback *bool
 }
 
 // NetworkRoute is part of the Cloudflare adapter API.
 type NetworkRoute struct {
-	ID               string
-	Network          string
-	TunnelID         string
-	VirtualNetworkID string
-	Comment          string
-	Deleted          bool
+	ID                 string
+	Network            string
+	TunnelID           string
+	TunnelType         NetworkTunnelType
+	TunnelName         string
+	VirtualNetworkID   string
+	VirtualNetworkName string
+	Comment            string
+	CreatedAt          time.Time
+	DeletedAt          *time.Time
+	Deleted            bool
 }
 
 // HostnameRouteInput is part of the Cloudflare adapter API.
 type HostnameRouteInput struct {
-	Hostname string
-	TunnelID string
-	Comment  string
+	Hostname   string
+	TunnelID   string
+	TunnelType NetworkTunnelType
+	Comment    string
 }
 
 // HostnameRoute is part of the Cloudflare adapter API.
 type HostnameRoute struct {
-	ID       string
-	Hostname string
-	TunnelID string
-	Comment  string
-	Deleted  bool
+	ID         string
+	Hostname   string
+	TunnelID   string
+	TunnelType NetworkTunnelType
+	TunnelName string
+	Comment    string
+	CreatedAt  time.Time
+	DeletedAt  *time.Time
+	Deleted    bool
 }
 
 // CreateVirtualNetwork is part of the Cloudflare adapter API.
 func (client *Client) CreateVirtualNetwork(ctx context.Context, input VirtualNetworkInput) (VirtualNetwork, error) {
-	remote, err := client.sdk.ZeroTrust.Networks.VirtualNetworks.New(ctx, zero_trust.NetworkVirtualNetworkNewParams{
-		AccountID:        cloudflaresdk.F(client.accountID),
-		Name:             cloudflaresdk.F(input.Name),
-		Comment:          cloudflaresdk.F(input.Comment),
-		IsDefaultNetwork: cloudflaresdk.F(input.IsDefault),
-	})
+	params := zero_trust.NetworkVirtualNetworkNewParams{
+		AccountID: cloudflaresdk.F(client.accountID),
+		Name:      cloudflaresdk.F(input.Name),
+	}
+	if input.Comment != "" {
+		params.Comment = cloudflaresdk.F(input.Comment)
+	}
+	if input.IsDefault {
+		params.IsDefaultNetwork = cloudflaresdk.F(true)
+	}
+	remote, err := client.sdk.ZeroTrust.Networks.VirtualNetworks.New(ctx, params)
 	if err != nil {
 		return VirtualNetwork{}, fmt.Errorf("create Cloudflare virtual network: %w", err)
+	}
+	if remote == nil || remote.ID == "" {
+		return VirtualNetwork{}, fmt.Errorf("create Cloudflare virtual network: response has no virtual network ID")
 	}
 	return virtualNetworkFromSDK(remote), nil
 }
@@ -134,6 +191,9 @@ func (client *Client) UpdateVirtualNetwork(ctx context.Context, id string, input
 	if err != nil {
 		return VirtualNetwork{}, fmt.Errorf("update Cloudflare virtual network: %w", err)
 	}
+	if remote == nil || remote.ID == "" {
+		return VirtualNetwork{}, fmt.Errorf("update Cloudflare virtual network: response has no virtual network ID")
+	}
 	return virtualNetworkFromSDK(remote), nil
 }
 
@@ -142,6 +202,9 @@ func (client *Client) GetVirtualNetwork(ctx context.Context, id string) (Virtual
 	remote, err := client.sdk.ZeroTrust.Networks.VirtualNetworks.Get(ctx, id, zero_trust.NetworkVirtualNetworkGetParams{AccountID: cloudflaresdk.F(client.accountID)})
 	if err != nil {
 		return VirtualNetwork{}, fmt.Errorf("get Cloudflare virtual network: %w", err)
+	}
+	if remote == nil || remote.ID == "" {
+		return VirtualNetwork{}, fmt.Errorf("get Cloudflare virtual network: response has no virtual network ID")
 	}
 	return virtualNetworkFromSDK(remote), nil
 }
@@ -174,32 +237,46 @@ func (client *Client) DeleteVirtualNetwork(ctx context.Context, id string) error
 
 // CreateNetworkRoute is part of the Cloudflare adapter API.
 func (client *Client) CreateNetworkRoute(ctx context.Context, input NetworkRouteInput) (NetworkRoute, error) {
-	remote, err := client.sdk.ZeroTrust.Networks.Routes.New(ctx, zero_trust.NetworkRouteNewParams{
-		AccountID:        cloudflaresdk.F(client.accountID),
-		Network:          cloudflaresdk.F(input.Network),
-		TunnelID:         cloudflaresdk.F(input.TunnelID),
-		VirtualNetworkID: cloudflaresdk.F(input.VirtualNetworkID),
-		Comment:          cloudflaresdk.F(input.Comment),
-	})
+	params := zero_trust.NetworkRouteNewParams{
+		AccountID: cloudflaresdk.F(client.accountID),
+		Network:   cloudflaresdk.F(input.Network),
+		TunnelID:  cloudflaresdk.F(input.TunnelID),
+	}
+	if input.VirtualNetworkID != "" {
+		params.VirtualNetworkID = cloudflaresdk.F(input.VirtualNetworkID)
+	}
+	if input.Comment != "" {
+		params.Comment = cloudflaresdk.F(input.Comment)
+	}
+	remote, err := client.sdk.ZeroTrust.Networks.Routes.New(ctx, params)
 	if err != nil {
 		return NetworkRoute{}, fmt.Errorf("create Cloudflare network route: %w", err)
 	}
-	return networkRouteFromSDK(remote), nil
+	if remote == nil || remote.ID == "" {
+		return NetworkRoute{}, fmt.Errorf("create Cloudflare network route: response has no route ID")
+	}
+	return client.GetNetworkRoute(ctx, remote.ID)
 }
 
 // UpdateNetworkRoute is part of the Cloudflare adapter API.
 func (client *Client) UpdateNetworkRoute(ctx context.Context, id string, input NetworkRouteInput) (NetworkRoute, error) {
-	remote, err := client.sdk.ZeroTrust.Networks.Routes.Edit(ctx, id, zero_trust.NetworkRouteEditParams{
-		AccountID:        cloudflaresdk.F(client.accountID),
-		Network:          cloudflaresdk.F(input.Network),
-		TunnelID:         cloudflaresdk.F(input.TunnelID),
-		VirtualNetworkID: cloudflaresdk.F(input.VirtualNetworkID),
-		Comment:          cloudflaresdk.F(input.Comment),
-	})
+	params := zero_trust.NetworkRouteEditParams{
+		AccountID: cloudflaresdk.F(client.accountID),
+		Network:   cloudflaresdk.F(input.Network),
+		TunnelID:  cloudflaresdk.F(input.TunnelID),
+		Comment:   cloudflaresdk.F(input.Comment),
+	}
+	if input.VirtualNetworkID != "" {
+		params.VirtualNetworkID = cloudflaresdk.F(input.VirtualNetworkID)
+	}
+	remote, err := client.sdk.ZeroTrust.Networks.Routes.Edit(ctx, id, params)
 	if err != nil {
 		return NetworkRoute{}, fmt.Errorf("update Cloudflare network route: %w", err)
 	}
-	return networkRouteFromSDK(remote), nil
+	if remote != nil && remote.ID != "" {
+		id = remote.ID
+	}
+	return client.GetNetworkRoute(ctx, id)
 }
 
 // GetNetworkRoute is part of the Cloudflare adapter API.
@@ -208,28 +285,66 @@ func (client *Client) GetNetworkRoute(ctx context.Context, id string) (NetworkRo
 	if err != nil {
 		return NetworkRoute{}, fmt.Errorf("get Cloudflare network route: %w", err)
 	}
-	return networkRouteFromSDK(remote), nil
+	if remote == nil {
+		return NetworkRoute{}, fmt.Errorf("get Cloudflare network route: response has no route")
+	}
+	result := networkRouteFromSDK(remote)
+	if result.Deleted {
+		return result, nil
+	}
+	params := zero_trust.NetworkRouteListParams{
+		AccountID: cloudflaresdk.F(client.accountID),
+		IsDeleted: cloudflaresdk.F(false),
+		RouteID:   cloudflaresdk.F(id),
+	}
+	remotes, listErr := client.listNetworkRoutes(ctx, params)
+	if listErr != nil {
+		return NetworkRoute{}, fmt.Errorf("get Cloudflare network route metadata: %w", listErr)
+	}
+	if len(remotes) != 1 {
+		return NetworkRoute{}, fmt.Errorf("get Cloudflare network route metadata: route %q matched %d active routes", id, len(remotes))
+	}
+	return remotes[0], nil
 }
 
-// ListNetworkRoutes is part of the Cloudflare adapter API.
+// ListNetworkRoutes returns all active CIDR routes.
 func (client *Client) ListNetworkRoutes(ctx context.Context) ([]NetworkRoute, error) {
-	pager := client.sdk.ZeroTrust.Networks.Routes.ListAutoPaging(ctx, zero_trust.NetworkRouteListParams{
+	return client.listNetworkRoutes(ctx, zero_trust.NetworkRouteListParams{
 		AccountID: cloudflaresdk.F(client.accountID),
 		IsDeleted: cloudflaresdk.F(false),
 	})
+}
+
+func (client *Client) listNetworkRoutes(ctx context.Context, params zero_trust.NetworkRouteListParams) ([]NetworkRoute, error) {
+	pager := client.sdk.ZeroTrust.Networks.Routes.ListAutoPaging(ctx, params)
 	result := make([]NetworkRoute, 0)
 	for pager.Next() {
 		remote := pager.Current()
-		result = append(result, NetworkRoute{
-			ID: remote.ID, Network: remote.Network, TunnelID: remote.TunnelID,
-			VirtualNetworkID: remote.VirtualNetworkID, Comment: remote.Comment,
-			Deleted: !remote.DeletedAt.IsZero(),
-		})
+		result = append(result, networkRouteFromTeamnetSDK(&remote))
 	}
 	if err := pager.Err(); err != nil {
 		return nil, fmt.Errorf("list Cloudflare network routes: %w", err)
 	}
 	return result, nil
+}
+
+// LookupNetworkRoute returns the route containing the requested IP address.
+func (client *Client) LookupNetworkRoute(ctx context.Context, input NetworkRouteLookupInput) (NetworkRoute, error) {
+	params := zero_trust.NetworkRouteIPGetParams{AccountID: cloudflaresdk.F(client.accountID)}
+	if input.VirtualNetworkID != "" {
+		params.VirtualNetworkID = cloudflaresdk.F(input.VirtualNetworkID)
+	}
+	if input.DefaultVirtualNetworkFallback != nil {
+		params.DefaultVirtualNetworkFallback = cloudflaresdk.F(*input.DefaultVirtualNetworkFallback)
+	}
+	remote, err := client.sdk.ZeroTrust.Networks.Routes.IPs.Get(ctx, input.IP, params)
+	if err != nil {
+		return NetworkRoute{}, fmt.Errorf("look up Cloudflare network route for IP %q: %w", input.IP, err)
+	}
+	if remote == nil {
+		return NetworkRoute{}, fmt.Errorf("look up Cloudflare network route for IP %q: response has no route", input.IP)
+	}
+	return networkRouteFromTeamnetSDK(remote), nil
 }
 
 // DeleteNetworkRoute is part of the Cloudflare adapter API.
@@ -243,16 +358,22 @@ func (client *Client) DeleteNetworkRoute(ctx context.Context, id string) error {
 
 // CreateHostnameRoute is part of the Cloudflare adapter API.
 func (client *Client) CreateHostnameRoute(ctx context.Context, input HostnameRouteInput) (HostnameRoute, error) {
-	remote, err := client.sdk.ZeroTrust.Networks.HostnameRoutes.New(ctx, zero_trust.NetworkHostnameRouteNewParams{
+	params := zero_trust.NetworkHostnameRouteNewParams{
 		AccountID: cloudflaresdk.F(client.accountID),
 		Hostname:  cloudflaresdk.F(input.Hostname),
 		TunnelID:  cloudflaresdk.F(input.TunnelID),
-		Comment:   cloudflaresdk.F(input.Comment),
-	})
+	}
+	if input.Comment != "" {
+		params.Comment = cloudflaresdk.F(input.Comment)
+	}
+	remote, err := client.sdk.ZeroTrust.Networks.HostnameRoutes.New(ctx, params)
 	if err != nil {
 		return HostnameRoute{}, fmt.Errorf("create Cloudflare hostname route: %w", err)
 	}
-	return hostnameRouteFromSDK(remote), nil
+	if remote == nil || remote.ID == "" {
+		return HostnameRoute{}, fmt.Errorf("create Cloudflare hostname route: response has no route ID")
+	}
+	return client.GetHostnameRoute(ctx, remote.ID)
 }
 
 // UpdateHostnameRoute is part of the Cloudflare adapter API.
@@ -266,7 +387,10 @@ func (client *Client) UpdateHostnameRoute(ctx context.Context, id string, input 
 	if err != nil {
 		return HostnameRoute{}, fmt.Errorf("update Cloudflare hostname route: %w", err)
 	}
-	return hostnameRouteFromSDK(remote), nil
+	if remote != nil && remote.ID != "" {
+		id = remote.ID
+	}
+	return client.GetHostnameRoute(ctx, id)
 }
 
 // GetHostnameRoute is part of the Cloudflare adapter API.
@@ -274,6 +398,9 @@ func (client *Client) GetHostnameRoute(ctx context.Context, id string) (Hostname
 	remote, err := client.sdk.ZeroTrust.Networks.HostnameRoutes.Get(ctx, id, zero_trust.NetworkHostnameRouteGetParams{AccountID: cloudflaresdk.F(client.accountID)})
 	if err != nil {
 		return HostnameRoute{}, fmt.Errorf("get Cloudflare hostname route: %w", err)
+	}
+	if remote == nil || remote.ID == "" {
+		return HostnameRoute{}, fmt.Errorf("get Cloudflare hostname route: response has no route ID")
 	}
 	return hostnameRouteFromSDK(remote), nil
 }
@@ -305,13 +432,83 @@ func (client *Client) DeleteHostnameRoute(ctx context.Context, id string) error 
 }
 
 func virtualNetworkFromSDK(remote *zero_trust.VirtualNetwork) VirtualNetwork {
-	return VirtualNetwork{ID: remote.ID, Name: remote.Name, IsDefault: remote.IsDefaultNetwork, Comment: remote.Comment, Deleted: !remote.DeletedAt.IsZero()}
+	if remote == nil {
+		return VirtualNetwork{}
+	}
+	result := VirtualNetwork{
+		ID: remote.ID, Name: remote.Name, IsDefault: remote.IsDefaultNetwork,
+		Comment: remote.Comment, CreatedAt: remote.CreatedAt, Deleted: !remote.DeletedAt.IsZero(),
+	}
+	result.DeletedAt = networkTimePointer(remote.DeletedAt)
+	return result
 }
 
 func networkRouteFromSDK(remote *zero_trust.Route) NetworkRoute {
-	return NetworkRoute{ID: remote.ID, Network: remote.Network, TunnelID: remote.TunnelID, VirtualNetworkID: remote.VirtualNetworkID, Comment: remote.Comment, Deleted: !remote.DeletedAt.IsZero()}
+	if remote == nil {
+		return NetworkRoute{}
+	}
+	result := NetworkRoute{
+		ID: remote.ID, Network: remote.Network, TunnelID: remote.TunnelID,
+		VirtualNetworkID: remote.VirtualNetworkID, Comment: remote.Comment,
+		CreatedAt: remote.CreatedAt, Deleted: !remote.DeletedAt.IsZero(),
+	}
+	result.DeletedAt = networkTimePointer(remote.DeletedAt)
+	return result
+}
+
+func networkRouteFromTeamnetSDK(remote *zero_trust.Teamnet) NetworkRoute {
+	if remote == nil {
+		return NetworkRoute{}
+	}
+	result := NetworkRoute{
+		ID: remote.ID, Network: remote.Network, TunnelID: remote.TunnelID,
+		TunnelType: networkTunnelTypeFromWire(string(remote.TunType)), TunnelName: remote.TunnelName,
+		VirtualNetworkID: remote.VirtualNetworkID, VirtualNetworkName: remote.VirtualNetworkName,
+		Comment: remote.Comment, CreatedAt: remote.CreatedAt, Deleted: !remote.DeletedAt.IsZero(),
+	}
+	result.DeletedAt = networkTimePointer(remote.DeletedAt)
+	return result
 }
 
 func hostnameRouteFromSDK(remote *zero_trust.HostnameRoute) HostnameRoute {
-	return HostnameRoute{ID: remote.ID, Hostname: remote.Hostname, TunnelID: remote.TunnelID, Comment: remote.Comment, Deleted: !remote.DeletedAt.IsZero()}
+	if remote == nil {
+		return HostnameRoute{}
+	}
+	result := HostnameRoute{
+		ID: remote.ID, Hostname: remote.Hostname, TunnelID: remote.TunnelID,
+		TunnelType: networkTunnelTypeFromWire(string(remote.TunType)), TunnelName: remote.TunnelName,
+		Comment: remote.Comment, CreatedAt: remote.CreatedAt, Deleted: !remote.DeletedAt.IsZero(),
+	}
+	result.DeletedAt = networkTimePointer(remote.DeletedAt)
+	return result
+}
+
+func networkTunnelTypeFromWire(value string) NetworkTunnelType {
+	switch value {
+	case "":
+		return ""
+	case "cfd_tunnel":
+		return NetworkTunnelTypeCloudflareTunnel
+	case "warp_connector":
+		return NetworkTunnelTypeWARPConnector
+	case "warp":
+		return NetworkTunnelTypeWARP
+	case "magic":
+		return NetworkTunnelTypeMagic
+	case "ip_sec":
+		return NetworkTunnelTypeIPSec
+	case "gre":
+		return NetworkTunnelTypeGRE
+	case "cni":
+		return NetworkTunnelTypeCNI
+	default:
+		return NetworkTunnelTypeUnknown
+	}
+}
+
+func networkTimePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
 }

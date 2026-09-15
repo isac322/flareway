@@ -6,6 +6,8 @@ metadata:
 spec:
   accountRef:
     name: runbear
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: Gateway
@@ -34,11 +36,16 @@ metadata:
 spec:
   accountRef:
     name: runbear
-  privateDestinations:
-  - networkRouteRef:
-      name: private-services
-    portRange: "443"
-    l4Protocol: tcp
+  type: SelfHosted
+  selfHosted: {}
+  destinations:
+  - type: Private
+    private:
+      networkRouteRef:
+        name: private-services
+      cidr: 10.20.0.0/16
+      portRange: "443"
+      l4Protocol: TCP
   application:
     name: cc-lb private L4
     sessionDuration: 720h

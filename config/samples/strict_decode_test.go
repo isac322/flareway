@@ -58,6 +58,9 @@ func TestAllSamplesStrictDecode(t *testing.T) {
 	}
 
 	for _, path := range paths {
+		if filepath.Base(path) == "kustomization.yaml" {
+			continue
+		}
 		path := path
 		t.Run(path, func(t *testing.T) {
 			strictDecodeFile(t, scheme, path)

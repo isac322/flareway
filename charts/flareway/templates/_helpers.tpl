@@ -55,3 +55,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: controller-manager
 control-plane: controller-manager
 {{- end -}}
+
+{{/* Controller-manager feature flags. New reconcilers stay in their owning controller group. */}}
+{{- define "flareway.controllerArgs" -}}
+- --enable-gateway-controllers={{ .Values.controllers.gateway }}
+- --enable-access-controllers={{ .Values.controllers.access }}
+- --enable-private-network-controllers={{ .Values.controllers.privateNetwork }}
+- --enable-device-controllers={{ .Values.controllers.device }}
+- --enable-organization-controllers={{ .Values.controllers.organization }}
+{{- end -}}

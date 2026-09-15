@@ -104,11 +104,11 @@ func main() {
 		"Enable leader election for the controller manager and xDS server.")
 	flag.StringVar(&xdsAddr, "xds-bind-address", xdsserver.DefaultAddress, "The address the Delta ADS and SDS server binds to.")
 	flag.BoolVar(&enableGatewayControllers, "enable-gateway-controllers", true,
-		"Enable GatewayClass, Gateway, CloudflareAccount, and CloudflareTunnel controllers.")
+		"Enable GatewayClass, Gateway, and CloudflareTunnel controllers. The shared CloudflareAccount controller runs while any controller group is enabled.")
 	flag.BoolVar(&enableAccessControllers, "enable-access-controllers", true,
-		"Enable AccessApplication, AccessPolicy, AccessGroup, IdentityProvider, DevicePostureRule, and ServiceToken controllers.")
+		"Enable AccessApplication, AccessStandaloneApplication, AccessInfrastructureTarget, AccessCustomPage, AccessPolicy, AccessGroup, IdentityProvider, DevicePostureRule, DevicePostureIntegration, and ServiceToken controllers.")
 	flag.BoolVar(&enablePrivateNetworkControllers, "enable-private-network-controllers", true,
-		"Enable VirtualNetwork, NetworkRoute, and HostnameRoute controllers.")
+		"Enable VirtualNetwork, NetworkRoute, HostnameRoute, and WARPConnector controllers.")
 	flag.BoolVar(&enableDeviceControllers, "enable-device-controllers", true,
 		"Enable DeviceProfile and DeviceSettings controllers.")
 	flag.BoolVar(&enableOrganizationControllers, "enable-organization-controllers", true,
@@ -312,6 +312,14 @@ func main() {
 			setupLog.Error(err, "Failed to set up HostnameRoute controller")
 			os.Exit(1)
 		}
+		if err := (&controller.WARPConnectorReconciler{
+			Client:              observedClient,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: controller.WARPConnectorClientFromFactory(cloudflareFactory),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to set up WARPConnector controller")
+			os.Exit(1)
+		}
 	}
 	if enableAccessControllers {
 		if err := (&controller.AccessPolicyReconciler{
@@ -362,6 +370,39 @@ func main() {
 			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessApplication controller")
+			os.Exit(1)
+		}
+		if err := (&controller.AccessStandaloneApplicationReconciler{
+			Client:              observedClient,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to set up AccessStandaloneApplication controller")
+			os.Exit(1)
+		}
+		if err := (&controller.AccessInfrastructureTargetReconciler{
+			Client:              observedClient,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to set up AccessInfrastructureTarget controller")
+			os.Exit(1)
+		}
+		if err := (&controller.AccessCustomPageReconciler{
+			Client:              observedClient,
+			Scheme:              mgr.GetScheme(),
+			Recorder:            mgr.GetEventRecorder("access-custom-page"),
+			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to set up AccessCustomPage controller")
+			os.Exit(1)
+		}
+		if err := (&controller.DevicePostureIntegrationReconciler{
+			Client:              observedClient,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to set up DevicePostureIntegration controller")
 			os.Exit(1)
 		}
 	}

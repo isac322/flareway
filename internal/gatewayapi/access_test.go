@@ -46,7 +46,8 @@ func TestTranslateAccessListenerTargetAndMissingAUD(t *testing.T) {
 	if protected == nil || protected.Guard != ir.GuardForwarding || protected.Access == nil {
 		t.Fatalf("protected domain = %#v", protected)
 	}
-	if protected.Access.AUD != "aud-admin" || protected.Access.TeamName != "team" || protected.Access.AuthDomain != "team.cloudflareaccess.com" {
+	if len(protected.Access.AUDs) != 1 || protected.Access.AUDs[0] != "aud-admin" ||
+		protected.Access.TeamName != "team" || protected.Access.AuthDomain != "team.cloudflareaccess.com" {
 		t.Fatalf("origin JWT guard = %#v", protected.Access)
 	}
 	if len(protected.IngressPaths) != 1 || protected.IngressPaths[0].Value != "/" {
@@ -179,7 +180,7 @@ func TestTranslatePrivateListenerPreparesJWTProtectionDomain(t *testing.T) {
 		t.Fatalf("private application compilation = %#v", compiled)
 	}
 	destination := compiled.Destinations[0]
-	if destination.Type != "private" || destination.Hostname != "api.example.com" || destination.PortRange != "443" || destination.L4Protocol != "tcp" || destination.VNetID != "vnet-private" {
+	if destination.Type != v1alpha1.AccessApplicationDestinationPrivate || destination.Hostname != "api.example.com" || destination.PortRange != "443" || destination.L4Protocol == nil || *destination.L4Protocol != v1alpha1.AccessL4ProtocolTCP || destination.VNetID != "vnet-private" {
 		t.Fatalf("private destination = %#v", destination)
 	}
 	protected := findAccessDomain(gateway.Domains, "default/private")
@@ -203,7 +204,13 @@ func TestOriginJWTDisabledStillRequiresReadyApplication(t *testing.T) {
 	}
 	in.AUDSecrets = map[types.NamespacedName]AUDSecret{{
 		Namespace: "default", Name: "disabled",
-	}: {ApplicationID: "app-disabled", Ready: true}}
+	}: {Ready: true}}
+	gateway, _ = Translate(in)
+	protected = findAccessDomain(gateway.Domains, "default/disabled")
+	if protected == nil || protected.Guard != ir.GuardBlocked {
+		t.Fatalf("originJWT Disabled forwarded without remote application ID: %#v", protected)
+	}
+	in.AUDSecrets[types.NamespacedName{Namespace: "default", Name: "disabled"}] = AUDSecret{ApplicationID: "app-disabled", Ready: true}
 	gateway, _ = Translate(in)
 	protected = findAccessDomain(gateway.Domains, "default/disabled")
 	if protected == nil || protected.Guard != ir.GuardForwarding || !protected.OriginJWTDisabled || protected.Access != nil {
@@ -246,6 +253,46 @@ func TestRouteSpecificAccessApplicationOverridesGatewayWideApplication(t *testin
 	if len(parentDomain.VirtualHosts[0].Routes) != 1 || parentDomain.VirtualHosts[0].Routes[0].Source.RuleName != "other" ||
 		len(childDomain.VirtualHosts[0].Routes) != 1 || childDomain.VirtualHosts[0].Routes[0].Source.RuleName != "admin" {
 		t.Fatalf("route-specific precedence failed: parent=%#v child=%#v", parentDomain.VirtualHosts, childDomain.VirtualHosts)
+	}
+}
+
+func TestPathScopeAccessApplicationShadowsParentRouteWithoutConsumingIt(t *testing.T) {
+	in := accessInputs(false)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "routes", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("redash", "/", "backend")},
+		},
+	}}
+	parent := accessApplication("parent", "Gateway", "gateway", "http")
+	parent.CreationTimestamp = metav1.NewTime(time.Unix(1, 0))
+	overlay := accessApplication("overlay", "HTTPRoute", "routes", "redash")
+	overlay.CreationTimestamp = metav1.NewTime(time.Unix(2, 0))
+	overlay.Spec.PathScope = &v1alpha1.AccessTargetPath{Type: gatewayv1.PathMatchPathPrefix, Value: "/api"}
+	in.AccessApplications = []v1alpha1.AccessApplication{parent, overlay}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{
+		{Namespace: "default", Name: "parent"}:  {AUD: "aud-parent", ApplicationID: "app-parent", Ready: true},
+		{Namespace: "default", Name: "overlay"}: {AUD: "aud-overlay", ApplicationID: "app-overlay", Ready: true},
+	}
+
+	gateway, statuses := Translate(in)
+	if !statuses.AccessApplications[types.NamespacedName{Namespace: "default", Name: "parent"}].Accepted ||
+		!statuses.AccessApplications[types.NamespacedName{Namespace: "default", Name: "overlay"}].Accepted {
+		t.Fatalf("pathScope overlay conflicted with parent: %#v", statuses.AccessApplications)
+	}
+	parentDomain := findAccessDomain(gateway.Domains, "default/parent")
+	overlayDomain := findAccessDomain(gateway.Domains, "default/overlay")
+	if parentDomain == nil || overlayDomain == nil {
+		t.Fatalf("pathScope protection domains = %#v", gateway.Domains)
+	}
+	if len(parentDomain.VirtualHosts[0].Routes) != 1 || parentDomain.VirtualHosts[0].Routes[0].Source.RuleName != "redash" ||
+		len(overlayDomain.VirtualHosts[0].Routes) != 1 || overlayDomain.VirtualHosts[0].Routes[0].Source.RuleName != "redash" {
+		t.Fatalf("pathScope did not shadow the existing backend: parent=%#v overlay=%#v", parentDomain.VirtualHosts, overlayDomain.VirtualHosts)
+	}
+	if len(parentDomain.IngressPaths) != 1 || parentDomain.IngressPaths[0].Value != "/" ||
+		len(overlayDomain.IngressPaths) != 1 || overlayDomain.IngressPaths[0].Value != "/api" {
+		t.Fatalf("pathScope ingress paths = parent %#v overlay %#v", parentDomain.IngressPaths, overlayDomain.IngressPaths)
 	}
 }
 
@@ -345,6 +392,9 @@ func accessApplication(name, kind, targetName, section string) v1alpha1.AccessAp
 	return v1alpha1.AccessApplication{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name + "-uid"), CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
 			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
 				LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: gatewayv1.Kind(kind), Name: gatewayv1.ObjectName(targetName)},
 				SectionName:                new(gatewayv1.SectionName(section)),

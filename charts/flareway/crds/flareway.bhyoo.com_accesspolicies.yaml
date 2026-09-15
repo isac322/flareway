@@ -77,8 +77,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -117,14 +119,44 @@ spec:
                   required:
                     type: boolean
                 type: object
+              connectionRules:
+                description: AccessPolicyConnectionRules configures protocol-specific
+                  connection behavior.
+                properties:
+                  rdp:
+                    description: AccessPolicyRDPConnectionRules configures clipboard
+                      behavior for RDP sessions.
+                    properties:
+                      allowedClipboardLocalToRemoteFormats:
+                        items:
+                          description: AccessPolicyClipboardFormat identifies an RDP
+                            clipboard payload type.
+                          enum:
+                          - Text
+                          - File
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedClipboardRemoteToLocalFormats:
+                        items:
+                          description: AccessPolicyClipboardFormat identifies an RDP
+                            clipboard payload type.
+                          enum:
+                          - Text
+                          - File
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                    type: object
+                type: object
               decision:
                 description: AccessPolicyDecision is the action taken for a matching
                   Access policy.
                 enum:
-                - allow
-                - deny
-                - nonIdentity
-                - bypass
+                - Allow
+                - Deny
+                - NonIdentity
+                - Bypass
                 type: string
               deletionPolicy:
                 default: Orphan
@@ -539,20 +571,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -979,20 +1013,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -1015,6 +1051,26 @@ spec:
                 - Managed
                 - ObserveOnly
                 type: string
+              mfaConfig:
+                description: AccessPolicyMFAConfig configures policy-level multi-factor
+                  authentication.
+                properties:
+                  allowedAuthenticators:
+                    items:
+                      description: AccessPolicyMFAAuthenticator identifies an allowed
+                        MFA method.
+                      enum:
+                      - TOTP
+                      - Biometrics
+                      - SecurityKey
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  mfaDisabled:
+                    type: boolean
+                  sessionDuration:
+                    type: string
+                type: object
               name:
                 minLength: 1
                 type: string
@@ -1432,20 +1488,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -1466,13 +1524,18 @@ spec:
             - name
             type: object
             x-kubernetes-validations:
+            - message: accountRef.name is required
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
             - message: ObserveOnly requires externalRef
               rule: self.managementPolicy != 'ObserveOnly' || has(self.externalRef)
             - message: AdoptById requires externalRef
               rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+            - message: Managed externalRef requires adoption.mode AdoptById
+              rule: '!has(self.externalRef) || self.managementPolicy == ''ObserveOnly''
+                || self.adoption.mode == ''AdoptById'''
           status:
-            description: AccessPolicyStatus records the remote policy identity and
-              references.
+            description: AccessPolicyStatus records the remote policy identity, mutable
+              state, and references.
             properties:
               conditions:
                 items:
@@ -1533,6 +1596,317 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observed:
+                description: AccessPolicyObservedState records mutable Cloudflare
+                  policy fields.
+                properties:
+                  approval:
+                    description: AccessPolicyApproval configures policy approval requirements.
+                    properties:
+                      groups:
+                        items:
+                          description: AccessPolicyApprovalGroup configures an approval
+                            group.
+                          properties:
+                            approvalsNeeded:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            emailAddresses:
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: set
+                            emailListId:
+                              type: string
+                          required:
+                          - approvalsNeeded
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      required:
+                        type: boolean
+                    type: object
+                  connectionRules:
+                    description: AccessPolicyConnectionRules configures protocol-specific
+                      connection behavior.
+                    properties:
+                      rdp:
+                        description: AccessPolicyRDPConnectionRules configures clipboard
+                          behavior for RDP sessions.
+                        properties:
+                          allowedClipboardLocalToRemoteFormats:
+                            items:
+                              description: AccessPolicyClipboardFormat identifies
+                                an RDP clipboard payload type.
+                              enum:
+                              - Text
+                              - File
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                          allowedClipboardRemoteToLocalFormats:
+                            items:
+                              description: AccessPolicyClipboardFormat identifies
+                                an RDP clipboard payload type.
+                              enum:
+                              - Text
+                              - File
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                        type: object
+                    type: object
+                  decision:
+                    description: AccessPolicyDecision is the action taken for a matching
+                      Access policy.
+                    enum:
+                    - Allow
+                    - Deny
+                    - NonIdentity
+                    - Bypass
+                    type: string
+                  exclude:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  include:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  isolationRequired:
+                    type: boolean
+                  mfaConfig:
+                    description: AccessPolicyMFAConfig configures policy-level multi-factor
+                      authentication.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: AccessPolicyMFAAuthenticator identifies an
+                            allowed MFA method.
+                          enum:
+                          - TOTP
+                          - Biometrics
+                          - SecurityKey
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        type: string
+                    type: object
+                  name:
+                    type: string
+                  purposeJustification:
+                    description: AccessPolicyPurposeJustification configures purpose
+                      justification prompts.
+                    properties:
+                      prompt:
+                        type: string
+                      required:
+                        type: boolean
+                    type: object
+                  require:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  sessionDuration:
+                    type: string
+                required:
+                - decision
+                - include
+                - name
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
@@ -1558,6 +1932,317 @@ spec:
                 - namespace
                 - name
                 x-kubernetes-list-type: map
+              wouldApply:
+                description: AccessPolicyObservedState records mutable Cloudflare
+                  policy fields.
+                properties:
+                  approval:
+                    description: AccessPolicyApproval configures policy approval requirements.
+                    properties:
+                      groups:
+                        items:
+                          description: AccessPolicyApprovalGroup configures an approval
+                            group.
+                          properties:
+                            approvalsNeeded:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            emailAddresses:
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: set
+                            emailListId:
+                              type: string
+                          required:
+                          - approvalsNeeded
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      required:
+                        type: boolean
+                    type: object
+                  connectionRules:
+                    description: AccessPolicyConnectionRules configures protocol-specific
+                      connection behavior.
+                    properties:
+                      rdp:
+                        description: AccessPolicyRDPConnectionRules configures clipboard
+                          behavior for RDP sessions.
+                        properties:
+                          allowedClipboardLocalToRemoteFormats:
+                            items:
+                              description: AccessPolicyClipboardFormat identifies
+                                an RDP clipboard payload type.
+                              enum:
+                              - Text
+                              - File
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                          allowedClipboardRemoteToLocalFormats:
+                            items:
+                              description: AccessPolicyClipboardFormat identifies
+                                an RDP clipboard payload type.
+                              enum:
+                              - Text
+                              - File
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                        type: object
+                    type: object
+                  decision:
+                    description: AccessPolicyDecision is the action taken for a matching
+                      Access policy.
+                    enum:
+                    - Allow
+                    - Deny
+                    - NonIdentity
+                    - Bypass
+                    type: string
+                  exclude:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  include:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  isolationRequired:
+                    type: boolean
+                  mfaConfig:
+                    description: AccessPolicyMFAConfig configures policy-level multi-factor
+                      authentication.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: AccessPolicyMFAAuthenticator identifies an
+                            allowed MFA method.
+                          enum:
+                          - TOTP
+                          - Biometrics
+                          - SecurityKey
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        type: string
+                    type: object
+                  name:
+                    type: string
+                  purposeJustification:
+                    description: AccessPolicyPurposeJustification configures purpose
+                      justification prompts.
+                    properties:
+                      prompt:
+                        type: string
+                      required:
+                        type: boolean
+                    type: object
+                  require:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  sessionDuration:
+                    type: string
+                required:
+                - decision
+                - include
+                - name
+                type: object
             type: object
         type: object
     served: true

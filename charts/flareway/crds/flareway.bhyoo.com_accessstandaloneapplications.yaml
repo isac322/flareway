@@ -1,0 +1,3081 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: accessstandaloneapplications.flareway.bhyoo.com
+spec:
+  group: flareway.bhyoo.com
+  names:
+    categories:
+    - flareway
+    kind: AccessStandaloneApplication
+    listKind: AccessStandaloneApplicationList
+    plural: accessstandaloneapplications
+    shortNames:
+    - cfasa
+    singular: accessstandaloneapplication
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .spec.type
+      name: Type
+      type: string
+    - jsonPath: .status.applicationId
+      name: Application
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AccessStandaloneApplication is a non-Gateway Cloudflare Access
+          application.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AccessStandaloneApplicationSpec defines a non-Gateway Access
+              application.
+            properties:
+              accountRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              adoption:
+                default: {}
+                description: AdoptionSpec configures explicit adoption of an existing
+                  remote object.
+                properties:
+                  expect:
+                    description: AdoptionExpect declares remote attributes that must
+                      match before adoption.
+                    properties:
+                      domain:
+                        maxLength: 253
+                        type: string
+                      name:
+                        maxLength: 100
+                        type: string
+                    type: object
+                  mode:
+                    default: None
+                    description: AdoptionMode controls explicit adoption of a remote
+                      resource.
+                    enum:
+                    - None
+                    - AdoptById
+                    type: string
+                type: object
+              appLauncher:
+                description: AccessAppLauncherApplicationSpec configures App Launcher
+                  presentation.
+                properties:
+                  appLauncherLogoUrl:
+                    type: string
+                  backgroundColor:
+                    type: string
+                  footerLinks:
+                    items:
+                      description: AccessAppLauncherFooterLink is one footer link.
+                      properties:
+                        name:
+                          minLength: 1
+                          type: string
+                        url:
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - url
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  headerBackgroundColor:
+                    type: string
+                  landingPageDesign:
+                    description: AccessAppLauncherLandingPageDesign configures the
+                      launcher landing page.
+                    properties:
+                      buttonColor:
+                        type: string
+                      buttonTextColor:
+                        type: string
+                      imageUrl:
+                        type: string
+                      message:
+                        type: string
+                      title:
+                        type: string
+                    type: object
+                  skipAppLauncherLoginPage:
+                    type: boolean
+                type: object
+              application:
+                description: AccessApplicationSettings contains fields shared by Access
+                  application variants.
+                properties:
+                  allowAuthenticateViaWarp:
+                    type: boolean
+                  allowIframe:
+                    type: boolean
+                  allowedIdpRefs:
+                    items:
+                      description: AccessIdentityProviderReference selects a managed
+                        IdP or an external IdP ID.
+                      properties:
+                        externalId:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of name or externalId is required
+                        rule: has(self.name) != has(self.externalId)
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  appLauncherVisible:
+                    type: boolean
+                  autoRedirectToIdentity:
+                    type: boolean
+                  corsHeaders:
+                    description: AccessCORSHeaders configures Access edge CORS handling.
+                    properties:
+                      allowAllHeaders:
+                        type: boolean
+                      allowAllMethods:
+                        type: boolean
+                      allowAllOrigins:
+                        type: boolean
+                      allowCredentials:
+                        type: boolean
+                      allowedHeaders:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedMethods:
+                        items:
+                          description: AccessCORSMethod is an HTTP method accepted
+                            by Cloudflare Access CORS settings.
+                          enum:
+                          - GET
+                          - POST
+                          - HEAD
+                          - PUT
+                          - DELETE
+                          - CONNECT
+                          - OPTIONS
+                          - TRACE
+                          - PATCH
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedOrigins:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      maxAge:
+                        format: int64
+                        type: integer
+                    type: object
+                  customDenyMessage:
+                    type: string
+                  customDenyUrl:
+                    type: string
+                  customNonIdentityDenyUrl:
+                    type: string
+                  customPageRefs:
+                    items:
+                      description: AccessCustomPageReference selects a managed AccessCustomPage
+                        or an external page ID.
+                      properties:
+                        externalId:
+                          minLength: 1
+                          type: string
+                        objectRef:
+                          description: NamespacedLocalObjectReference identifies a
+                            namespaced Flareway resource.
+                          properties:
+                            name:
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Namespace defaults to the referencing object's
+                                namespace.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of objectRef or externalId is required
+                        rule: has(self.objectRef) != has(self.externalId)
+                    maxItems: 25
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  eagerRedirectCookieSetting:
+                    type: boolean
+                  enableBindingCookie:
+                    type: boolean
+                  httpOnlyCookieAttribute:
+                    type: boolean
+                  logoUrl:
+                    type: string
+                  mfaConfig:
+                    description: AccessApplicationMFAConfig configures application-level
+                      MFA.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: AccessApplicationMFAAuthenticator is an application-level
+                            MFA method.
+                          enum:
+                          - TOTP
+                          - Biometrics
+                          - SecurityKey
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                        type: string
+                    type: object
+                  name:
+                    type: string
+                  oauthConfiguration:
+                    description: AccessApplicationOAuthConfiguration makes Access
+                      an OAuth authorization server.
+                    properties:
+                      dynamicClientRegistration:
+                        description: AccessOAuthDynamicClientRegistration configures
+                          OAuth dynamic clients.
+                        properties:
+                          allowAnyOnLocalhost:
+                            type: boolean
+                          allowAnyOnLoopback:
+                            type: boolean
+                          allowedUris:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: set
+                          enabled:
+                            type: boolean
+                        type: object
+                      enabled:
+                        type: boolean
+                      grant:
+                        description: AccessOAuthGrant configures OAuth token and session
+                          lifetimes.
+                        properties:
+                          accessTokenLifetime:
+                            pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                            type: string
+                          sessionDuration:
+                            pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                            type: string
+                        type: object
+                    type: object
+                  optionsPreflightBypass:
+                    type: boolean
+                  pathCookieAttribute:
+                    type: boolean
+                  readServiceTokensFromHeader:
+                    type: string
+                  sameSiteCookieAttribute:
+                    description: AccessSameSiteCookieAttribute configures the SameSite
+                      cookie attribute.
+                    enum:
+                    - Lax
+                    - Strict
+                    - None
+                    type: string
+                  scimConfig:
+                    description: AccessApplicationSCIMConfig configures outbound SCIM
+                      provisioning.
+                    properties:
+                      authentication:
+                        description: AccessSCIMAuthentication selects one authentication
+                          method or an ordered set.
+                        properties:
+                          accessServiceToken:
+                            description: AccessSCIMAccessServiceTokenAuthentication
+                              selects a managed ServiceToken.
+                            properties:
+                              serviceTokenRef:
+                                description: NamespacedLocalObjectReference identifies
+                                  a namespaced Flareway resource.
+                                properties:
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                  namespace:
+                                    description: Namespace defaults to the referencing
+                                      object's namespace.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                            required:
+                            - serviceTokenRef
+                            type: object
+                          httpBasic:
+                            description: AccessSCIMHTTPBasicAuthentication configures
+                              SCIM HTTP Basic authentication.
+                            properties:
+                              passwordSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                              user:
+                                minLength: 1
+                                type: string
+                            required:
+                            - passwordSecretRef
+                            - user
+                            type: object
+                          multiple:
+                            items:
+                              description: AccessSCIMAuthenticationMethod is one member
+                                of a multi-authentication list.
+                              properties:
+                                accessServiceToken:
+                                  description: AccessSCIMAccessServiceTokenAuthentication
+                                    selects a managed ServiceToken.
+                                  properties:
+                                    serviceTokenRef:
+                                      description: NamespacedLocalObjectReference
+                                        identifies a namespaced Flareway resource.
+                                      properties:
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                        namespace:
+                                          description: Namespace defaults to the referencing
+                                            object's namespace.
+                                          type: string
+                                      required:
+                                      - name
+                                      type: object
+                                  required:
+                                  - serviceTokenRef
+                                  type: object
+                                httpBasic:
+                                  description: AccessSCIMHTTPBasicAuthentication configures
+                                    SCIM HTTP Basic authentication.
+                                  properties:
+                                    passwordSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    user:
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - passwordSecretRef
+                                  - user
+                                  type: object
+                                oauth2:
+                                  description: AccessSCIMOAuth2Authentication configures
+                                    OAuth 2 client credentials for SCIM.
+                                  properties:
+                                    authorizationUrl:
+                                      minLength: 1
+                                      type: string
+                                    clientId:
+                                      minLength: 1
+                                      type: string
+                                    clientSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                    scopes:
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: set
+                                    tokenUrl:
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - authorizationUrl
+                                  - clientId
+                                  - clientSecretRef
+                                  - tokenUrl
+                                  type: object
+                                oauthBearerToken:
+                                  description: AccessSCIMOAuthBearerTokenAuthentication
+                                    configures a static bearer token.
+                                  properties:
+                                    tokenSecretRef:
+                                      description: AccessApplicationSecretKeyReference
+                                        identifies one key in a Secret in the same
+                                        namespace.
+                                      properties:
+                                        key:
+                                          minLength: 1
+                                          type: string
+                                        name:
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - key
+                                      - name
+                                      type: object
+                                  required:
+                                  - tokenSecretRef
+                                  type: object
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one SCIM authentication method is
+                                  required
+                                rule: (has(self.httpBasic)?1:0)+(has(self.oauthBearerToken)?1:0)+(has(self.oauth2)?1:0)+(has(self.accessServiceToken)?1:0)
+                                  == 1
+                            maxItems: 4
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          oauth2:
+                            description: AccessSCIMOAuth2Authentication configures
+                              OAuth 2 client credentials for SCIM.
+                            properties:
+                              authorizationUrl:
+                                minLength: 1
+                                type: string
+                              clientId:
+                                minLength: 1
+                                type: string
+                              clientSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                              scopes:
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              tokenUrl:
+                                minLength: 1
+                                type: string
+                            required:
+                            - authorizationUrl
+                            - clientId
+                            - clientSecretRef
+                            - tokenUrl
+                            type: object
+                          oauthBearerToken:
+                            description: AccessSCIMOAuthBearerTokenAuthentication
+                              configures a static bearer token.
+                            properties:
+                              tokenSecretRef:
+                                description: AccessApplicationSecretKeyReference identifies
+                                  one key in a Secret in the same namespace.
+                                properties:
+                                  key:
+                                    minLength: 1
+                                    type: string
+                                  name:
+                                    minLength: 1
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                            required:
+                            - tokenSecretRef
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one SCIM authentication variant is required
+                          rule: (has(self.httpBasic)?1:0)+(has(self.oauthBearerToken)?1:0)+(has(self.oauth2)?1:0)+(has(self.accessServiceToken)?1:0)+(has(self.multiple)?1:0)
+                            == 1
+                      deactivateOnDelete:
+                        type: boolean
+                      enabled:
+                        type: boolean
+                      idpRef:
+                        description: AccessIdentityProviderReference selects a managed
+                          IdP or an external IdP ID.
+                        properties:
+                          externalId:
+                            minLength: 1
+                            type: string
+                          name:
+                            minLength: 1
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of name or externalId is required
+                          rule: has(self.name) != has(self.externalId)
+                      mappings:
+                        items:
+                          description: AccessSCIMMapping transforms or filters one
+                            SCIM resource type.
+                          properties:
+                            enabled:
+                              type: boolean
+                            filter:
+                              type: string
+                            operations:
+                              description: AccessSCIMMappingOperations selects SCIM
+                                operations for one mapping.
+                              properties:
+                                create:
+                                  type: boolean
+                                delete:
+                                  type: boolean
+                                update:
+                                  type: boolean
+                              type: object
+                            schema:
+                              minLength: 1
+                              type: string
+                            strictness:
+                              description: AccessSCIMMappingStrictness controls handling
+                                of unknown SCIM values.
+                              enum:
+                              - Strict
+                              - Passthrough
+                              type: string
+                            transformJsonata:
+                              type: string
+                          required:
+                          - schema
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      remoteUri:
+                        minLength: 1
+                        type: string
+                    required:
+                    - idpRef
+                    - remoteUri
+                    type: object
+                  serviceAuth401Redirect:
+                    type: boolean
+                  sessionDuration:
+                    pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
+                    type: string
+                  skipInterstitial:
+                    type: boolean
+                  tags:
+                    items:
+                      maxLength: 35
+                      pattern: ^[A-Za-z0-9_-]+$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: tag names starting with flareway- are reserved by
+                          the operator
+                        rule: '!self.startsWith(''flareway-'')'
+                    maxItems: 23
+                    type: array
+                    x-kubernetes-list-type: set
+                  useClientlessIsolationAppLauncherUrl:
+                    type: boolean
+                type: object
+                x-kubernetes-validations:
+                - message: optionsPreflightBypass cannot be true when corsHeaders
+                    is set
+                  rule: '!has(self.optionsPreflightBypass) || !self.optionsPreflightBypass
+                    || !has(self.corsHeaders)'
+                - message: autoRedirectToIdentity requires exactly one allowedIdpRef
+                  rule: '!has(self.autoRedirectToIdentity) || !self.autoRedirectToIdentity
+                    || (has(self.allowedIdpRefs) && size(self.allowedIdpRefs) == 1)'
+              biso:
+                description: AccessBISOApplicationSpec selects the Browser Isolation
+                  request shape.
+                type: object
+              bookmark:
+                description: AccessBookmarkApplicationSpec configures a bookmark tile.
+                properties:
+                  logoUrl:
+                    type: string
+                  url:
+                    minLength: 1
+                    type: string
+                required:
+                - url
+                type: object
+              dashSso:
+                description: AccessDashSSOApplicationSpec configures the Gateway identity
+                  proxy endpoint.
+                properties:
+                  domain:
+                    minLength: 1
+                    type: string
+                required:
+                - domain
+                type: object
+              deletionPolicy:
+                default: Orphan
+                description: DeletionPolicy controls whether a managed remote resource
+                  is deleted or orphaned.
+                enum:
+                - Delete
+                - Orphan
+                type: string
+              externalRef:
+                description: AccessApplicationExternalReference identifies an existing
+                  Access application.
+                properties:
+                  applicationId:
+                    minLength: 1
+                    type: string
+                required:
+                - applicationId
+                type: object
+              infrastructure:
+                description: AccessInfrastructureApplicationSpec selects infrastructure
+                  targets and policies.
+                properties:
+                  mfaConfig:
+                    description: AccessInfrastructureMFAConfig configures infrastructure
+                      MFA.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: AccessInfrastructureMFAAuthenticator is an
+                            infrastructure MFA method.
+                          enum:
+                          - PIVKey
+                          - SSHFIDO2Key
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        pattern: ^([0-9]+(m|h))+$
+                        type: string
+                    type: object
+                  policies:
+                    items:
+                      description: AccessInfrastructureApplicationPolicy is an inline
+                        infrastructure policy.
+                      properties:
+                        connectionRules:
+                          description: AccessInfrastructureConnectionRules configures
+                            protocol-specific connection rules.
+                          properties:
+                            ssh:
+                              description: AccessInfrastructureSSHConnectionRules
+                                configures allowed SSH identities.
+                              properties:
+                                allowEmailAlias:
+                                  type: boolean
+                                usernames:
+                                  items:
+                                    type: string
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-type: set
+                              required:
+                              - usernames
+                              type: object
+                          type: object
+                        decision:
+                          default: Allow
+                          description: AccessPolicyDecision is the action taken for
+                            a matching Access policy.
+                          enum:
+                          - Allow
+                          - Deny
+                          - NonIdentity
+                          - Bypass
+                          type: string
+                        exclude:
+                          items:
+                            description: AccessRule is a typed union of every reusable
+                              Access rule supported by Cloudflare.
+                            maxProperties: 1
+                            minProperties: 1
+                            properties:
+                              anyValidServiceToken:
+                                description: AccessAnyValidServiceTokenRule is part
+                                  of the accessanyvalidservicetokenrule configuration.
+                                type: object
+                              authContext:
+                                description: AccessAuthContextRule is part of the
+                                  accessauthcontextrule configuration.
+                                properties:
+                                  acId:
+                                    type: string
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - acId
+                                - id
+                                - identityProviderRef
+                                type: object
+                              authMethod:
+                                description: AccessAuthMethodRule is part of the accessauthmethodrule
+                                  configuration.
+                                properties:
+                                  authMethod:
+                                    type: string
+                                required:
+                                - authMethod
+                                type: object
+                              azureAD:
+                                description: AccessAzureADRule is part of the accessazureadrule
+                                  configuration.
+                                properties:
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - id
+                                - identityProviderRef
+                                type: object
+                              certificate:
+                                description: AccessCertificateRule is part of the
+                                  accesscertificaterule configuration.
+                                type: object
+                              cloudflareAccountMember:
+                                description: AccessCloudflareAccountMemberRule is
+                                  part of the accesscloudflareaccountmemberrule configuration.
+                                properties:
+                                  accountId:
+                                    type: string
+                                type: object
+                              commonName:
+                                description: AccessCommonNameRule is part of the accesscommonnamerule
+                                  configuration.
+                                properties:
+                                  commonName:
+                                    type: string
+                                required:
+                                - commonName
+                                type: object
+                              devicePosture:
+                                description: AccessDevicePostureRuleReference is part
+                                  of the accessdeviceposturerulereference configuration.
+                                properties:
+                                  ruleRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - ruleRef
+                                type: object
+                              email:
+                                description: AccessEmailRule matches one email address.
+                                properties:
+                                  email:
+                                    type: string
+                                required:
+                                - email
+                                type: object
+                              emailDomain:
+                                description: AccessEmailDomainRule matches an email
+                                  domain.
+                                properties:
+                                  domain:
+                                    type: string
+                                required:
+                                - domain
+                                type: object
+                              emailList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              everyone:
+                                description: AccessEveryoneRule matches everyone.
+                                type: object
+                              externalEvaluation:
+                                description: AccessExternalEvaluationRule is part
+                                  of the accessexternalevaluationrule configuration.
+                                properties:
+                                  evaluateUrl:
+                                    type: string
+                                  keysUrl:
+                                    type: string
+                                required:
+                                - evaluateUrl
+                                - keysUrl
+                                type: object
+                              geo:
+                                description: AccessGeoRule is part of the accessgeorule
+                                  configuration.
+                                properties:
+                                  countryCode:
+                                    type: string
+                                required:
+                                - countryCode
+                                type: object
+                              githubOrganization:
+                                description: AccessGitHubOrganizationRule is part
+                                  of the accessgithuborganizationrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                  team:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              group:
+                                description: AccessGroupRule is part of the accessgrouprule
+                                  configuration.
+                                properties:
+                                  groupRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - groupRef
+                                type: object
+                              gsuite:
+                                description: AccessGSuiteRule is part of the accessgsuiterule
+                                  configuration.
+                                properties:
+                                  email:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - email
+                                - identityProviderRef
+                                type: object
+                              ip:
+                                description: AccessIPRule is part of the accessiprule
+                                  configuration.
+                                properties:
+                                  ip:
+                                    type: string
+                                required:
+                                - ip
+                                type: object
+                              ipList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              linkedAppToken:
+                                description: AccessLinkedAppTokenRule is part of the
+                                  accesslinkedapptokenrule configuration.
+                                properties:
+                                  appId:
+                                    type: string
+                                required:
+                                - appId
+                                type: object
+                              loginMethod:
+                                description: AccessLoginMethodRule is part of the
+                                  accessloginmethodrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - identityProviderRef
+                                type: object
+                              oidc:
+                                description: AccessOIDCRule is part of the accessoidcrule
+                                  configuration.
+                                properties:
+                                  claimName:
+                                    type: string
+                                  claimValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - claimName
+                                - claimValue
+                                - identityProviderRef
+                                type: object
+                              okta:
+                                description: AccessOktaRule is part of the accessoktarule
+                                  configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              saml:
+                                description: AccessSAMLRule is part of the accesssamlrule
+                                  configuration.
+                                properties:
+                                  attributeName:
+                                    type: string
+                                  attributeValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - attributeName
+                                - attributeValue
+                                - identityProviderRef
+                                type: object
+                              serviceToken:
+                                description: AccessServiceTokenRule is part of the
+                                  accessservicetokenrule configuration.
+                                properties:
+                                  tokenRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - tokenRef
+                                type: object
+                              userRiskScore:
+                                description: AccessUserRiskScoreRule matches one or
+                                  more user risk levels.
+                                properties:
+                                  levels:
+                                    items:
+                                      description: AccessUserRiskLevel identifies
+                                        a user risk level.
+                                      enum:
+                                      - Low
+                                      - Medium
+                                      - High
+                                      - Unscored
+                                      type: string
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                required:
+                                - levels
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one Access rule field is required
+                              rule: (has(self.email)?1:0)+(has(self.emailDomain)?1:0)+(has(self.emailList)?1:0)+(has(self.everyone)?1:0)+(has(self.ip)?1:0)+(has(self.ipList)?1:0)+(has(self.certificate)?1:0)+(has(self.commonName)?1:0)+(has(self.group)?1:0)+(has(self.azureAD)?1:0)+(has(self.githubOrganization)?1:0)+(has(self.gsuite)?1:0)+(has(self.okta)?1:0)+(has(self.saml)?1:0)+(has(self.oidc)?1:0)+(has(self.serviceToken)?1:0)+(has(self.anyValidServiceToken)?1:0)+(has(self.externalEvaluation)?1:0)+(has(self.geo)?1:0)+(has(self.authMethod)?1:0)+(has(self.devicePosture)?1:0)+(has(self.loginMethod)?1:0)+(has(self.authContext)?1:0)+(has(self.linkedAppToken)?1:0)+(has(self.userRiskScore)?1:0)+(has(self.cloudflareAccountMember)?1:0)
+                                == 1
+                          maxItems: 32
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        include:
+                          items:
+                            description: AccessRule is a typed union of every reusable
+                              Access rule supported by Cloudflare.
+                            maxProperties: 1
+                            minProperties: 1
+                            properties:
+                              anyValidServiceToken:
+                                description: AccessAnyValidServiceTokenRule is part
+                                  of the accessanyvalidservicetokenrule configuration.
+                                type: object
+                              authContext:
+                                description: AccessAuthContextRule is part of the
+                                  accessauthcontextrule configuration.
+                                properties:
+                                  acId:
+                                    type: string
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - acId
+                                - id
+                                - identityProviderRef
+                                type: object
+                              authMethod:
+                                description: AccessAuthMethodRule is part of the accessauthmethodrule
+                                  configuration.
+                                properties:
+                                  authMethod:
+                                    type: string
+                                required:
+                                - authMethod
+                                type: object
+                              azureAD:
+                                description: AccessAzureADRule is part of the accessazureadrule
+                                  configuration.
+                                properties:
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - id
+                                - identityProviderRef
+                                type: object
+                              certificate:
+                                description: AccessCertificateRule is part of the
+                                  accesscertificaterule configuration.
+                                type: object
+                              cloudflareAccountMember:
+                                description: AccessCloudflareAccountMemberRule is
+                                  part of the accesscloudflareaccountmemberrule configuration.
+                                properties:
+                                  accountId:
+                                    type: string
+                                type: object
+                              commonName:
+                                description: AccessCommonNameRule is part of the accesscommonnamerule
+                                  configuration.
+                                properties:
+                                  commonName:
+                                    type: string
+                                required:
+                                - commonName
+                                type: object
+                              devicePosture:
+                                description: AccessDevicePostureRuleReference is part
+                                  of the accessdeviceposturerulereference configuration.
+                                properties:
+                                  ruleRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - ruleRef
+                                type: object
+                              email:
+                                description: AccessEmailRule matches one email address.
+                                properties:
+                                  email:
+                                    type: string
+                                required:
+                                - email
+                                type: object
+                              emailDomain:
+                                description: AccessEmailDomainRule matches an email
+                                  domain.
+                                properties:
+                                  domain:
+                                    type: string
+                                required:
+                                - domain
+                                type: object
+                              emailList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              everyone:
+                                description: AccessEveryoneRule matches everyone.
+                                type: object
+                              externalEvaluation:
+                                description: AccessExternalEvaluationRule is part
+                                  of the accessexternalevaluationrule configuration.
+                                properties:
+                                  evaluateUrl:
+                                    type: string
+                                  keysUrl:
+                                    type: string
+                                required:
+                                - evaluateUrl
+                                - keysUrl
+                                type: object
+                              geo:
+                                description: AccessGeoRule is part of the accessgeorule
+                                  configuration.
+                                properties:
+                                  countryCode:
+                                    type: string
+                                required:
+                                - countryCode
+                                type: object
+                              githubOrganization:
+                                description: AccessGitHubOrganizationRule is part
+                                  of the accessgithuborganizationrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                  team:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              group:
+                                description: AccessGroupRule is part of the accessgrouprule
+                                  configuration.
+                                properties:
+                                  groupRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - groupRef
+                                type: object
+                              gsuite:
+                                description: AccessGSuiteRule is part of the accessgsuiterule
+                                  configuration.
+                                properties:
+                                  email:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - email
+                                - identityProviderRef
+                                type: object
+                              ip:
+                                description: AccessIPRule is part of the accessiprule
+                                  configuration.
+                                properties:
+                                  ip:
+                                    type: string
+                                required:
+                                - ip
+                                type: object
+                              ipList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              linkedAppToken:
+                                description: AccessLinkedAppTokenRule is part of the
+                                  accesslinkedapptokenrule configuration.
+                                properties:
+                                  appId:
+                                    type: string
+                                required:
+                                - appId
+                                type: object
+                              loginMethod:
+                                description: AccessLoginMethodRule is part of the
+                                  accessloginmethodrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - identityProviderRef
+                                type: object
+                              oidc:
+                                description: AccessOIDCRule is part of the accessoidcrule
+                                  configuration.
+                                properties:
+                                  claimName:
+                                    type: string
+                                  claimValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - claimName
+                                - claimValue
+                                - identityProviderRef
+                                type: object
+                              okta:
+                                description: AccessOktaRule is part of the accessoktarule
+                                  configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              saml:
+                                description: AccessSAMLRule is part of the accesssamlrule
+                                  configuration.
+                                properties:
+                                  attributeName:
+                                    type: string
+                                  attributeValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - attributeName
+                                - attributeValue
+                                - identityProviderRef
+                                type: object
+                              serviceToken:
+                                description: AccessServiceTokenRule is part of the
+                                  accessservicetokenrule configuration.
+                                properties:
+                                  tokenRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - tokenRef
+                                type: object
+                              userRiskScore:
+                                description: AccessUserRiskScoreRule matches one or
+                                  more user risk levels.
+                                properties:
+                                  levels:
+                                    items:
+                                      description: AccessUserRiskLevel identifies
+                                        a user risk level.
+                                      enum:
+                                      - Low
+                                      - Medium
+                                      - High
+                                      - Unscored
+                                      type: string
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                required:
+                                - levels
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one Access rule field is required
+                              rule: (has(self.email)?1:0)+(has(self.emailDomain)?1:0)+(has(self.emailList)?1:0)+(has(self.everyone)?1:0)+(has(self.ip)?1:0)+(has(self.ipList)?1:0)+(has(self.certificate)?1:0)+(has(self.commonName)?1:0)+(has(self.group)?1:0)+(has(self.azureAD)?1:0)+(has(self.githubOrganization)?1:0)+(has(self.gsuite)?1:0)+(has(self.okta)?1:0)+(has(self.saml)?1:0)+(has(self.oidc)?1:0)+(has(self.serviceToken)?1:0)+(has(self.anyValidServiceToken)?1:0)+(has(self.externalEvaluation)?1:0)+(has(self.geo)?1:0)+(has(self.authMethod)?1:0)+(has(self.devicePosture)?1:0)+(has(self.loginMethod)?1:0)+(has(self.authContext)?1:0)+(has(self.linkedAppToken)?1:0)+(has(self.userRiskScore)?1:0)+(has(self.cloudflareAccountMember)?1:0)
+                                == 1
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        mfaConfig:
+                          description: AccessInfrastructureMFAConfig configures infrastructure
+                            MFA.
+                          properties:
+                            allowedAuthenticators:
+                              items:
+                                description: AccessInfrastructureMFAAuthenticator
+                                  is an infrastructure MFA method.
+                                enum:
+                                - PIVKey
+                                - SSHFIDO2Key
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: set
+                            mfaDisabled:
+                              type: boolean
+                            sessionDuration:
+                              pattern: ^([0-9]+(m|h))+$
+                              type: string
+                          type: object
+                        name:
+                          minLength: 1
+                          type: string
+                        require:
+                          items:
+                            description: AccessRule is a typed union of every reusable
+                              Access rule supported by Cloudflare.
+                            maxProperties: 1
+                            minProperties: 1
+                            properties:
+                              anyValidServiceToken:
+                                description: AccessAnyValidServiceTokenRule is part
+                                  of the accessanyvalidservicetokenrule configuration.
+                                type: object
+                              authContext:
+                                description: AccessAuthContextRule is part of the
+                                  accessauthcontextrule configuration.
+                                properties:
+                                  acId:
+                                    type: string
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - acId
+                                - id
+                                - identityProviderRef
+                                type: object
+                              authMethod:
+                                description: AccessAuthMethodRule is part of the accessauthmethodrule
+                                  configuration.
+                                properties:
+                                  authMethod:
+                                    type: string
+                                required:
+                                - authMethod
+                                type: object
+                              azureAD:
+                                description: AccessAzureADRule is part of the accessazureadrule
+                                  configuration.
+                                properties:
+                                  id:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - id
+                                - identityProviderRef
+                                type: object
+                              certificate:
+                                description: AccessCertificateRule is part of the
+                                  accesscertificaterule configuration.
+                                type: object
+                              cloudflareAccountMember:
+                                description: AccessCloudflareAccountMemberRule is
+                                  part of the accesscloudflareaccountmemberrule configuration.
+                                properties:
+                                  accountId:
+                                    type: string
+                                type: object
+                              commonName:
+                                description: AccessCommonNameRule is part of the accesscommonnamerule
+                                  configuration.
+                                properties:
+                                  commonName:
+                                    type: string
+                                required:
+                                - commonName
+                                type: object
+                              devicePosture:
+                                description: AccessDevicePostureRuleReference is part
+                                  of the accessdeviceposturerulereference configuration.
+                                properties:
+                                  ruleRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - ruleRef
+                                type: object
+                              email:
+                                description: AccessEmailRule matches one email address.
+                                properties:
+                                  email:
+                                    type: string
+                                required:
+                                - email
+                                type: object
+                              emailDomain:
+                                description: AccessEmailDomainRule matches an email
+                                  domain.
+                                properties:
+                                  domain:
+                                    type: string
+                                required:
+                                - domain
+                                type: object
+                              emailList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              everyone:
+                                description: AccessEveryoneRule matches everyone.
+                                type: object
+                              externalEvaluation:
+                                description: AccessExternalEvaluationRule is part
+                                  of the accessexternalevaluationrule configuration.
+                                properties:
+                                  evaluateUrl:
+                                    type: string
+                                  keysUrl:
+                                    type: string
+                                required:
+                                - evaluateUrl
+                                - keysUrl
+                                type: object
+                              geo:
+                                description: AccessGeoRule is part of the accessgeorule
+                                  configuration.
+                                properties:
+                                  countryCode:
+                                    type: string
+                                required:
+                                - countryCode
+                                type: object
+                              githubOrganization:
+                                description: AccessGitHubOrganizationRule is part
+                                  of the accessgithuborganizationrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                  team:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              group:
+                                description: AccessGroupRule is part of the accessgrouprule
+                                  configuration.
+                                properties:
+                                  groupRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - groupRef
+                                type: object
+                              gsuite:
+                                description: AccessGSuiteRule is part of the accessgsuiterule
+                                  configuration.
+                                properties:
+                                  email:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - email
+                                - identityProviderRef
+                                type: object
+                              ip:
+                                description: AccessIPRule is part of the accessiprule
+                                  configuration.
+                                properties:
+                                  ip:
+                                    type: string
+                                required:
+                                - ip
+                                type: object
+                              ipList:
+                                description: AccessListRule matches members of a Cloudflare
+                                  Access list.
+                                properties:
+                                  listId:
+                                    type: string
+                                  listRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                type: object
+                                x-kubernetes-validations:
+                                - message: exactly one of listRef or listId is required
+                                  rule: has(self.listRef) != has(self.listId)
+                              linkedAppToken:
+                                description: AccessLinkedAppTokenRule is part of the
+                                  accesslinkedapptokenrule configuration.
+                                properties:
+                                  appId:
+                                    type: string
+                                required:
+                                - appId
+                                type: object
+                              loginMethod:
+                                description: AccessLoginMethodRule is part of the
+                                  accessloginmethodrule configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - identityProviderRef
+                                type: object
+                              oidc:
+                                description: AccessOIDCRule is part of the accessoidcrule
+                                  configuration.
+                                properties:
+                                  claimName:
+                                    type: string
+                                  claimValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - claimName
+                                - claimValue
+                                - identityProviderRef
+                                type: object
+                              okta:
+                                description: AccessOktaRule is part of the accessoktarule
+                                  configuration.
+                                properties:
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                  name:
+                                    type: string
+                                required:
+                                - identityProviderRef
+                                - name
+                                type: object
+                              saml:
+                                description: AccessSAMLRule is part of the accesssamlrule
+                                  configuration.
+                                properties:
+                                  attributeName:
+                                    type: string
+                                  attributeValue:
+                                    type: string
+                                  identityProviderRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - attributeName
+                                - attributeValue
+                                - identityProviderRef
+                                type: object
+                              serviceToken:
+                                description: AccessServiceTokenRule is part of the
+                                  accessservicetokenrule configuration.
+                                properties:
+                                  tokenRef:
+                                    description: AccessObjectReference selects a local
+                                      managed object or a remote object ID.
+                                    properties:
+                                      externalId:
+                                        type: string
+                                      name:
+                                        type: string
+                                      namespace:
+                                        type: string
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly one of name or externalId is
+                                        required
+                                      rule: has(self.name) != has(self.externalId)
+                                required:
+                                - tokenRef
+                                type: object
+                              userRiskScore:
+                                description: AccessUserRiskScoreRule matches one or
+                                  more user risk levels.
+                                properties:
+                                  levels:
+                                    items:
+                                      description: AccessUserRiskLevel identifies
+                                        a user risk level.
+                                      enum:
+                                      - Low
+                                      - Medium
+                                      - High
+                                      - Unscored
+                                      type: string
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                required:
+                                - levels
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one Access rule field is required
+                              rule: (has(self.email)?1:0)+(has(self.emailDomain)?1:0)+(has(self.emailList)?1:0)+(has(self.everyone)?1:0)+(has(self.ip)?1:0)+(has(self.ipList)?1:0)+(has(self.certificate)?1:0)+(has(self.commonName)?1:0)+(has(self.group)?1:0)+(has(self.azureAD)?1:0)+(has(self.githubOrganization)?1:0)+(has(self.gsuite)?1:0)+(has(self.okta)?1:0)+(has(self.saml)?1:0)+(has(self.oidc)?1:0)+(has(self.serviceToken)?1:0)+(has(self.anyValidServiceToken)?1:0)+(has(self.externalEvaluation)?1:0)+(has(self.geo)?1:0)+(has(self.authMethod)?1:0)+(has(self.devicePosture)?1:0)+(has(self.loginMethod)?1:0)+(has(self.authContext)?1:0)+(has(self.linkedAppToken)?1:0)+(has(self.userRiskScore)?1:0)+(has(self.cloudflareAccountMember)?1:0)
+                                == 1
+                          maxItems: 32
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - include
+                      - name
+                      type: object
+                      x-kubernetes-validations:
+                      - message: infrastructure application policies only support
+                          Allow
+                        rule: self.decision == 'Allow'
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  targetCriteria:
+                    items:
+                      description: AccessTargetCriterion selects infrastructure targets
+                        by port, protocol and attributes.
+                      properties:
+                        port:
+                          format: int32
+                          maximum: 65535
+                          minimum: 1
+                          type: integer
+                        protocol:
+                          description: AccessTargetProtocol is a target criterion
+                            protocol.
+                          enum:
+                          - SSH
+                          - TCP
+                          - RDP
+                          type: string
+                        targetAttributes:
+                          additionalProperties:
+                            items:
+                              type: string
+                            type: array
+                          minProperties: 1
+                          type: object
+                      required:
+                      - port
+                      - protocol
+                      - targetAttributes
+                      type: object
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - policies
+                - targetCriteria
+                type: object
+                x-kubernetes-validations:
+                - message: infrastructure target criteria require SSH protocol
+                  rule: self.targetCriteria.all(c, c.protocol == 'SSH')
+              managementPolicy:
+                default: Managed
+                description: ManagementPolicy controls whether Flareway mutates a
+                  remote resource.
+                enum:
+                - Managed
+                - ObserveOnly
+                type: string
+              mcpPortal:
+                description: AccessMCPPortalApplicationSpec configures an MCP server
+                  portal application.
+                properties:
+                  destinations:
+                    items:
+                      description: AccessApplicationDestinationSpec is a discriminated
+                        destination union.
+                      properties:
+                        allPreviewWorkers:
+                          description: AccessAllPreviewWorkersDestinationSpec selects
+                            all Worker previews.
+                          type: object
+                        allWorkers:
+                          description: AccessAllWorkersDestinationSpec selects all
+                            production Workers.
+                          type: object
+                        previewWorker:
+                          description: AccessWorkerDestinationSpec selects a Cloudflare
+                            Worker.
+                          properties:
+                            workerId:
+                              minLength: 1
+                              type: string
+                          required:
+                          - workerId
+                          type: object
+                        private:
+                          description: AccessPrivateDestinationSpec selects one managed
+                            private route.
+                          properties:
+                            cidr:
+                              type: string
+                            hostnameRouteRef:
+                              description: |-
+                                LocalObjectReference contains enough information to let you locate the
+                                referenced object inside the same namespace.
+                              properties:
+                                name:
+                                  default: ""
+                                  description: |-
+                                    Name of the referent.
+                                    This field is effectively required, but due to backwards compatibility is
+                                    allowed to be empty. Instances of this type with an empty value here are
+                                    almost certainly wrong.
+                                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                  type: string
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            l4Protocol:
+                              description: AccessL4Protocol selects a private destination
+                                transport protocol. Omission matches both.
+                              enum:
+                              - TCP
+                              - UDP
+                              type: string
+                            networkRouteRef:
+                              description: |-
+                                LocalObjectReference contains enough information to let you locate the
+                                referenced object inside the same namespace.
+                              properties:
+                                name:
+                                  default: ""
+                                  description: |-
+                                    Name of the referent.
+                                    This field is effectively required, but due to backwards compatibility is
+                                    allowed to be empty. Instances of this type with an empty value here are
+                                    almost certainly wrong.
+                                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                  type: string
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            portRange:
+                              pattern: ^[0-9]+(-[0-9]+)?$
+                              type: string
+                          type: object
+                          x-kubernetes-validations:
+                          - message: exactly one of networkRouteRef or hostnameRouteRef
+                              is required
+                            rule: has(self.networkRouteRef) != has(self.hostnameRouteRef)
+                        public:
+                          description: AccessPublicDestinationSpec directly identifies
+                            a public hostname or path.
+                          properties:
+                            uri:
+                              minLength: 1
+                              type: string
+                          required:
+                          - uri
+                          type: object
+                        type:
+                          description: AccessApplicationDestinationType selects a
+                            Cloudflare Access destination variant.
+                          enum:
+                          - Public
+                          - Private
+                          - ViaMCPServerPortal
+                          - Worker
+                          - PreviewWorker
+                          - AllWorkers
+                          - AllPreviewWorkers
+                          type: string
+                        viaMcpServerPortal:
+                          description: AccessMCPServerPortalDestinationSpec selects
+                            an AI Controls MCP server.
+                          properties:
+                            mcpServerId:
+                              minLength: 1
+                              type: string
+                          required:
+                          - mcpServerId
+                          type: object
+                        worker:
+                          description: AccessWorkerDestinationSpec selects a Cloudflare
+                            Worker.
+                          properties:
+                            workerId:
+                              minLength: 1
+                              type: string
+                          required:
+                          - workerId
+                          type: object
+                      required:
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one destination variant is required
+                        rule: (has(self.public)?1:0)+(has(self.private)?1:0)+(has(self.viaMcpServerPortal)?1:0)+(has(self.worker)?1:0)+(has(self.previewWorker)?1:0)+(has(self.allWorkers)?1:0)+(has(self.allPreviewWorkers)?1:0)
+                          == 1
+                      - message: public is required if and only if type is Public
+                        rule: (self.type == 'Public') == has(self.public)
+                      - message: private is required if and only if type is Private
+                        rule: (self.type == 'Private') == has(self.private)
+                      - message: viaMcpServerPortal is required if and only if type
+                          is ViaMCPServerPortal
+                        rule: (self.type == 'ViaMCPServerPortal') == has(self.viaMcpServerPortal)
+                      - message: worker is required if and only if type is Worker
+                        rule: (self.type == 'Worker') == has(self.worker)
+                      - message: previewWorker is required if and only if type is
+                          PreviewWorker
+                        rule: (self.type == 'PreviewWorker') == has(self.previewWorker)
+                      - message: allWorkers is required if and only if type is AllWorkers
+                        rule: (self.type == 'AllWorkers') == has(self.allWorkers)
+                      - message: allPreviewWorkers is required if and only if type
+                          is AllPreviewWorkers
+                        rule: (self.type == 'AllPreviewWorkers') == has(self.allPreviewWorkers)
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  domain:
+                    minLength: 1
+                    type: string
+                required:
+                - destinations
+                - domain
+                type: object
+              policies:
+                items:
+                  description: |-
+                    AccessApplicationPolicyReference selects a managed policy or an external policy ID.
+                    Slice order defines remote policy precedence.
+                  properties:
+                    externalRef:
+                      description: AccessApplicationPolicyExternalReference identifies
+                        a reusable Access policy.
+                      properties:
+                        policyId:
+                          minLength: 1
+                          type: string
+                      required:
+                      - policyId
+                      type: object
+                    policyRef:
+                      description: NamespacedLocalObjectReference identifies a namespaced
+                        Flareway resource.
+                      properties:
+                        name:
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Namespace defaults to the referencing object's
+                            namespace.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of policyRef or externalRef is required
+                    rule: has(self.policyRef) != has(self.externalRef)
+                maxItems: 100
+                type: array
+                x-kubernetes-list-type: atomic
+              saas:
+                description: AccessSaaSApplicationSpec is a discriminated OIDC or
+                  SAML configuration.
+                properties:
+                  authType:
+                    description: AccessSaaSAuthenticationType selects the SaaS federation
+                      protocol.
+                    enum:
+                    - OIDC
+                    - SAML
+                    type: string
+                    x-kubernetes-validations:
+                    - message: authType is immutable
+                      rule: self == oldSelf
+                  oidc:
+                    description: AccessSaaSOIDCSpec configures an OIDC SaaS application.
+                    properties:
+                      accessTokenLifetime:
+                        pattern: ^([0-9]+(m|h))+$
+                        type: string
+                      allowPkceWithoutClientSecret:
+                        type: boolean
+                      appLauncherUrl:
+                        type: string
+                      customClaims:
+                        items:
+                          description: AccessSaaSOIDCCustomClaim configures one custom
+                            OIDC claim.
+                          properties:
+                            name:
+                              minLength: 1
+                              type: string
+                            required:
+                              type: boolean
+                            scope:
+                              description: AccessSaaSOIDCScope is an OIDC scope emitted
+                                by Access.
+                              enum:
+                              - OpenID
+                              - Groups
+                              - Email
+                              - Profile
+                              type: string
+                            source:
+                              description: AccessSaaSAttributeSource selects a default
+                                source or per-IdP sources.
+                              properties:
+                                name:
+                                  minLength: 1
+                                  type: string
+                                nameByIdp:
+                                  items:
+                                    description: AccessSaaSAttributeSourceByIDP maps
+                                      an IdP to one source attribute.
+                                    properties:
+                                      idpRef:
+                                        description: AccessIdentityProviderReference
+                                          selects a managed IdP or an external IdP
+                                          ID.
+                                        properties:
+                                          externalId:
+                                            minLength: 1
+                                            type: string
+                                          name:
+                                            minLength: 1
+                                            type: string
+                                        type: object
+                                        x-kubernetes-validations:
+                                        - message: exactly one of name or externalId
+                                            is required
+                                          rule: has(self.name) != has(self.externalId)
+                                      sourceName:
+                                        minLength: 1
+                                        type: string
+                                    required:
+                                    - idpRef
+                                    - sourceName
+                                    type: object
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one of name or nameByIdp is required
+                                rule: has(self.name) != has(self.nameByIdp)
+                          required:
+                          - name
+                          - scope
+                          - source
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      grantTypes:
+                        items:
+                          description: AccessSaaSOIDCGrantType selects an enabled
+                            OIDC flow.
+                          enum:
+                          - AuthorizationCode
+                          - AuthorizationCodeWithPKCE
+                          - RefreshTokens
+                          - Hybrid
+                          - Implicit
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      groupFilterRegex:
+                        type: string
+                      hybridAndImplicitOptions:
+                        description: AccessSaaSOIDCHybridAndImplicitOptions configures
+                          token return behavior.
+                        properties:
+                          returnAccessTokenFromAuthorizationEndpoint:
+                            type: boolean
+                          returnIdTokenFromAuthorizationEndpoint:
+                            type: boolean
+                        type: object
+                      publicKey:
+                        type: string
+                      redirectUris:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      refreshTokenOptions:
+                        description: AccessSaaSOIDCRefreshTokenOptions configures
+                          refresh token lifetime.
+                        properties:
+                          lifetime:
+                            pattern: ^([0-9]+(m|h|d))+$
+                            type: string
+                        type: object
+                      scopes:
+                        items:
+                          description: AccessSaaSOIDCScope is an OIDC scope emitted
+                            by Access.
+                          enum:
+                          - OpenID
+                          - Groups
+                          - Email
+                          - Profile
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                    type: object
+                  saml:
+                    description: AccessSaaSSAMLSpec configures a SAML SaaS application.
+                    properties:
+                      consumerServiceUrl:
+                        type: string
+                      customAttributes:
+                        items:
+                          description: AccessSaaSSAMLCustomAttribute configures one
+                            custom SAML attribute.
+                          properties:
+                            friendlyName:
+                              type: string
+                            name:
+                              minLength: 1
+                              type: string
+                            nameFormat:
+                              description: AccessSaaSSAMLAttributeNameFormat configures
+                                a custom attribute name format.
+                              enum:
+                              - Unspecified
+                              - Basic
+                              - URI
+                              type: string
+                            required:
+                              type: boolean
+                            source:
+                              description: AccessSaaSAttributeSource selects a default
+                                source or per-IdP sources.
+                              properties:
+                                name:
+                                  minLength: 1
+                                  type: string
+                                nameByIdp:
+                                  items:
+                                    description: AccessSaaSAttributeSourceByIDP maps
+                                      an IdP to one source attribute.
+                                    properties:
+                                      idpRef:
+                                        description: AccessIdentityProviderReference
+                                          selects a managed IdP or an external IdP
+                                          ID.
+                                        properties:
+                                          externalId:
+                                            minLength: 1
+                                            type: string
+                                          name:
+                                            minLength: 1
+                                            type: string
+                                        type: object
+                                        x-kubernetes-validations:
+                                        - message: exactly one of name or externalId
+                                            is required
+                                          rule: has(self.name) != has(self.externalId)
+                                      sourceName:
+                                        minLength: 1
+                                        type: string
+                                    required:
+                                    - idpRef
+                                    - sourceName
+                                    type: object
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one of name or nameByIdp is required
+                                rule: has(self.name) != has(self.nameByIdp)
+                          required:
+                          - name
+                          - source
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      defaultRelayState:
+                        type: string
+                      idpEntityId:
+                        type: string
+                      nameIdFormat:
+                        description: AccessSaaSNameIDFormat configures the SAML NameID
+                          format.
+                        enum:
+                        - ID
+                        - Email
+                        type: string
+                      nameIdTransformJsonata:
+                        type: string
+                      publicKey:
+                        type: string
+                      samlAttributeTransformJsonata:
+                        type: string
+                      spEntityId:
+                        type: string
+                      ssoEndpoint:
+                        type: string
+                    type: object
+                required:
+                - authType
+                type: object
+                x-kubernetes-validations:
+                - message: exactly one SaaS protocol variant is required
+                  rule: (has(self.oidc)?1:0)+(has(self.saml)?1:0) == 1
+                - message: oidc is required if and only if authType is OIDC
+                  rule: (self.authType == 'OIDC') == has(self.oidc)
+                - message: saml is required if and only if authType is SAML
+                  rule: (self.authType == 'SAML') == has(self.saml)
+              type:
+                description: AccessStandaloneApplicationType selects a non-Gateway
+                  Access application variant.
+                enum:
+                - SaaS
+                - Bookmark
+                - Infrastructure
+                - AppLauncher
+                - WARP
+                - BISO
+                - DashSSO
+                - MCPPortal
+                type: string
+                x-kubernetes-validations:
+                - message: type is immutable
+                  rule: self == oldSelf
+              warp:
+                description: AccessWARPApplicationSpec selects the WARP enrollment
+                  request shape.
+                type: object
+              zone:
+                description: Zone is an optional DNS zone name resolved through CloudflareAccount
+                  status.
+                minLength: 1
+                type: string
+            required:
+            - accountRef
+            - application
+            - type
+            type: object
+            x-kubernetes-validations:
+            - message: accountRef.name is required
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: exactly one standalone application variant is required
+              rule: (has(self.saas)?1:0)+(has(self.bookmark)?1:0)+(has(self.infrastructure)?1:0)+(has(self.appLauncher)?1:0)+(has(self.warp)?1:0)+(has(self.biso)?1:0)+(has(self.dashSso)?1:0)+(has(self.mcpPortal)?1:0)
+                == 1
+            - message: saas is required if and only if type is SaaS
+              rule: (self.type == 'SaaS') == has(self.saas)
+            - message: bookmark is required if and only if type is Bookmark
+              rule: (self.type == 'Bookmark') == has(self.bookmark)
+            - message: infrastructure is required if and only if type is Infrastructure
+              rule: (self.type == 'Infrastructure') == has(self.infrastructure)
+            - message: appLauncher is required if and only if type is AppLauncher
+              rule: (self.type == 'AppLauncher') == has(self.appLauncher)
+            - message: warp is required if and only if type is WARP
+              rule: (self.type == 'WARP') == has(self.warp)
+            - message: biso is required if and only if type is BISO
+              rule: (self.type == 'BISO') == has(self.biso)
+            - message: dashSso is required if and only if type is DashSSO
+              rule: (self.type == 'DashSSO') == has(self.dashSso)
+            - message: mcpPortal is required if and only if type is MCPPortal
+              rule: (self.type == 'MCPPortal') == has(self.mcpPortal)
+            - message: Infrastructure policies must be declared in infrastructure.policies
+              rule: self.type != 'Infrastructure' || !has(self.policies) || size(self.policies)
+                == 0
+            - message: application.tags is unsupported for this standalone application
+                type
+              rule: self.type in ['SaaS', 'Bookmark', 'MCPPortal'] || !has(self.application.tags)
+                || size(self.application.tags) == 0
+            - message: WARP application.name is unsupported; use adoption.expect.name
+                to identify an existing enrollment
+              rule: self.type != 'WARP' || !has(self.application.name)
+            - message: WARP ObserveOnly and AdoptById require adoption.expect.name
+              rule: self.type != 'WARP' || (self.managementPolicy != 'ObserveOnly'
+                && self.adoption.mode != 'AdoptById') || (has(self.adoption.expect)
+                && has(self.adoption.expect.name) && size(self.adoption.expect.name)
+                > 0)
+            - message: ObserveOnly requires externalRef
+              rule: self.managementPolicy != 'ObserveOnly' || has(self.externalRef)
+            - message: AdoptById requires externalRef
+              rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+          status:
+            description: AccessStandaloneApplicationStatus defines the observed non-secret
+              state.
+            properties:
+              appLauncher:
+                description: AccessAppLauncherApplicationStatus records observed launcher
+                  presentation.
+                properties:
+                  appLauncherLogoUrl:
+                    type: string
+                  backgroundColor:
+                    type: string
+                  footerLinks:
+                    items:
+                      description: AccessAppLauncherFooterLinkStatus records one observed
+                        footer link.
+                      properties:
+                        name:
+                          type: string
+                        url:
+                          type: string
+                      type: object
+                    type: array
+                  headerBackgroundColor:
+                    type: string
+                  landingPageDesign:
+                    description: AccessAppLauncherLandingPageDesignStatus records
+                      observed landing-page design.
+                    properties:
+                      buttonColor:
+                        type: string
+                      buttonTextColor:
+                        type: string
+                      imageUrl:
+                        type: string
+                      message:
+                        type: string
+                      title:
+                        type: string
+                    type: object
+                  skipAppLauncherLoginPage:
+                    type: boolean
+                type: object
+              applicationId:
+                type: string
+              bookmark:
+                description: AccessBookmarkApplicationStatus records observed bookmark
+                  values.
+                properties:
+                  logoUrl:
+                    type: string
+                  url:
+                    type: string
+                type: object
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              dashSso:
+                description: AccessDashSSOApplicationStatus records the observed identity
+                  proxy domain.
+                properties:
+                  domain:
+                    type: string
+                type: object
+              domain:
+                type: string
+              infrastructure:
+                description: AccessInfrastructureApplicationStatus records observed
+                  infrastructure settings.
+                properties:
+                  mfaConfig:
+                    description: AccessInfrastructureMFAStatus records observed infrastructure
+                      MFA settings.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          type: string
+                        type: array
+                      mfaDisabled:
+                        type: boolean
+                      sessionDuration:
+                        type: string
+                    type: object
+                  targetCriteria:
+                    items:
+                      description: AccessTargetCriterionStatus records one observed
+                        target criterion.
+                      properties:
+                        port:
+                          format: int32
+                          type: integer
+                        protocol:
+                          type: string
+                        targetAttributes:
+                          additionalProperties:
+                            items:
+                              type: string
+                            type: array
+                          type: object
+                      type: object
+                    type: array
+                type: object
+              mcpPortal:
+                description: AccessMCPPortalApplicationStatus records observed MCP
+                  portal routing.
+                properties:
+                  destinations:
+                    items:
+                      description: AccessApplicationDestinationStatus records a compiled
+                        Access destination.
+                      properties:
+                        cidr:
+                          type: string
+                        hostname:
+                          type: string
+                        l4Protocol:
+                          description: AccessL4Protocol selects a private destination
+                            transport protocol. Omission matches both.
+                          enum:
+                          - TCP
+                          - UDP
+                          type: string
+                        mcpServerId:
+                          type: string
+                        portRange:
+                          type: string
+                        type:
+                          description: AccessApplicationDestinationType selects a
+                            Cloudflare Access destination variant.
+                          enum:
+                          - Public
+                          - Private
+                          - ViaMCPServerPortal
+                          - Worker
+                          - PreviewWorker
+                          - AllWorkers
+                          - AllPreviewWorkers
+                          type: string
+                        uri:
+                          type: string
+                        vnetId:
+                          type: string
+                        workerId:
+                          type: string
+                      required:
+                      - type
+                      type: object
+                    type: array
+                  domain:
+                    type: string
+                type: object
+              name:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              ownershipVerified:
+                type: boolean
+              saas:
+                description: AccessSaaSApplicationStatus records non-secret SaaS values.
+                properties:
+                  authType:
+                    type: string
+                  clientId:
+                    type: string
+                  clientSecretRef:
+                    description: ClientSecretRef names the controller-owned Secret
+                      containing the create-only client secret.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  oidc:
+                    description: AccessSaaSOIDCStatus records observed non-secret
+                      OIDC settings.
+                    properties:
+                      accessTokenLifetime:
+                        type: string
+                      allowPkceWithoutClientSecret:
+                        type: boolean
+                      appLauncherUrl:
+                        type: string
+                      customClaims:
+                        items:
+                          description: AccessSaaSOIDCCustomClaimStatus records an
+                            observed custom OIDC claim.
+                          properties:
+                            name:
+                              type: string
+                            required:
+                              type: boolean
+                            scope:
+                              type: string
+                            source:
+                              description: AccessSaaSAttributeSourceStatus records
+                                resolved SaaS claim sources.
+                              properties:
+                                name:
+                                  type: string
+                                nameByIdp:
+                                  additionalProperties:
+                                    type: string
+                                  type: object
+                              type: object
+                          type: object
+                        type: array
+                      grantTypes:
+                        items:
+                          type: string
+                        type: array
+                      groupFilterRegex:
+                        type: string
+                      publicKey:
+                        type: string
+                      redirectUris:
+                        items:
+                          type: string
+                        type: array
+                      refreshTokenLifetime:
+                        type: string
+                      returnAccessTokenFromAuthorizationEndpoint:
+                        type: boolean
+                      returnIdTokenFromAuthorizationEndpoint:
+                        type: boolean
+                      scopes:
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  saml:
+                    description: AccessSaaSSAMLStatus records observed non-secret
+                      SAML settings.
+                    properties:
+                      consumerServiceUrl:
+                        type: string
+                      customAttributes:
+                        items:
+                          description: AccessSaaSSAMLCustomAttributeStatus records
+                            an observed custom SAML attribute.
+                          properties:
+                            friendlyName:
+                              type: string
+                            name:
+                              type: string
+                            nameFormat:
+                              type: string
+                            required:
+                              type: boolean
+                            source:
+                              description: AccessSaaSAttributeSourceStatus records
+                                resolved SaaS claim sources.
+                              properties:
+                                name:
+                                  type: string
+                                nameByIdp:
+                                  additionalProperties:
+                                    type: string
+                                  type: object
+                              type: object
+                          type: object
+                        type: array
+                      defaultRelayState:
+                        type: string
+                      idpEntityId:
+                        type: string
+                      nameIdFormat:
+                        type: string
+                      nameIdTransformJsonata:
+                        type: string
+                      publicKey:
+                        type: string
+                      samlAttributeTransformJsonata:
+                        type: string
+                      spEntityId:
+                        type: string
+                      ssoEndpoint:
+                        type: string
+                    type: object
+                type: object
+              tags:
+                items:
+                  type: string
+                type: array
+              type:
+                description: AccessStandaloneApplicationType selects a non-Gateway
+                  Access application variant.
+                enum:
+                - SaaS
+                - Bookmark
+                - Infrastructure
+                - AppLauncher
+                - WARP
+                - BISO
+                - DashSSO
+                - MCPPortal
+                type: string
+              zoneId:
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

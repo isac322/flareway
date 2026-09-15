@@ -51,6 +51,12 @@ func Hostname(runID string, ordinal int, zone string) string {
 	return fmt.Sprintf("e2e-%s-%d.%s", runID, ordinal, strings.Trim(zone, "."))
 }
 
+// BackendCluster returns the xDS identity for a Kubernetes Service port.
+// Kubernetes namespaces and Service names cannot contain '/' or ':'.
+func BackendCluster(namespace, service string, port int32) string {
+	return fmt.Sprintf("k8s://%s/%s:%d", namespace, service, port)
+}
+
 // BelongsToRun reports whether text contains this run's ownership prefix.
 func BelongsToRun(text, runID string) bool {
 	return strings.Contains(strings.ToLower(text), strings.ToLower(OwnerPrefix+runID))

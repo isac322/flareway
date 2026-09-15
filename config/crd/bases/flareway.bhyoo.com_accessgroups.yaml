@@ -76,8 +76,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -502,20 +504,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -942,20 +946,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -968,6 +974,10 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: atomic
+              isDefault:
+                description: IsDefault requests that Cloudflare make this the default
+                  Access group.
+                type: boolean
               managementPolicy:
                 default: Managed
                 description: ManagementPolicy controls whether Flareway mutates a
@@ -1384,20 +1394,22 @@ spec:
                       - tokenRef
                       type: object
                     userRiskScore:
-                      description: AccessUserRiskScoreRule is part of the accessuserriskscorerule
-                        configuration.
+                      description: AccessUserRiskScoreRule matches one or more user
+                        risk levels.
                       properties:
                         levels:
                           items:
                             description: AccessUserRiskLevel identifies a user risk
                               level.
                             enum:
-                            - low
-                            - medium
-                            - high
-                            - unscored
+                            - Low
+                            - Medium
+                            - High
+                            - Unscored
                             type: string
+                          minItems: 1
                           type: array
+                          x-kubernetes-list-type: set
                       required:
                       - levels
                       type: object
@@ -1409,6 +1421,12 @@ spec:
                 maxItems: 100
                 type: array
                 x-kubernetes-list-type: atomic
+              zone:
+                description: |-
+                  Zone optionally scopes the group to the verified Cloudflare zone with this DNS name.
+                  When omitted, the group is account scoped.
+                minLength: 1
+                type: string
             required:
             - accountRef
             - include
@@ -1483,11 +1501,296 @@ spec:
                 x-kubernetes-list-type: map
               groupId:
                 type: string
+              observed:
+                description: |-
+                  AccessGroupObservedState records the remote group state returned by Cloudflare.
+
+                  Cloudflare's Access group response schema exposes is_default inconsistently:
+                  some responses contain a boolean while others contain a rule array. IsDefault
+                  and Default preserve both forms without guessing.
+                properties:
+                  default:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  exclude:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  include:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  isDefault:
+                    type: boolean
+                  name:
+                    type: string
+                  require:
+                    items:
+                      description: |-
+                        AccessRuleObservation is a compact, resolved Access rule representation used
+                        in status. It intentionally has no cross-field CEL validation.
+                      properties:
+                        accountId:
+                          maxLength: 256
+                          type: string
+                        id:
+                          maxLength: 256
+                          type: string
+                        identityProviderId:
+                          maxLength: 256
+                          type: string
+                        kind:
+                          enum:
+                          - email
+                          - emailDomain
+                          - emailList
+                          - everyone
+                          - ip
+                          - ipList
+                          - certificate
+                          - commonName
+                          - group
+                          - azureAD
+                          - githubOrganization
+                          - gsuite
+                          - okta
+                          - saml
+                          - oidc
+                          - serviceToken
+                          - anyValidServiceToken
+                          - externalEvaluation
+                          - geo
+                          - authMethod
+                          - devicePosture
+                          - loginMethod
+                          - authContext
+                          - linkedAppToken
+                          - userRiskScore
+                          - cloudflareAccountMember
+                          maxLength: 32
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                        value2:
+                          maxLength: 1024
+                          type: string
+                        value3:
+                          maxLength: 1024
+                          type: string
+                        values:
+                          items:
+                            maxLength: 16
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - kind
+                      type: object
+                    maxItems: 100
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - name
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
               ownershipVerified:
                 type: boolean
+              zoneId:
+                type: string
             type: object
         type: object
     served: true

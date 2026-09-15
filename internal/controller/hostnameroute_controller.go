@@ -48,7 +48,7 @@ type HostnameRouteReconciler struct {
 	Now                 func() time.Time
 }
 
-// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=hostnameroutes;cloudflaretunnels;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=hostnameroutes;cloudflaretunnels;warpconnectors;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=hostnameroutes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=hostnameroutes/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=secrets;namespaces,verbs=get;list;watch
@@ -98,22 +98,29 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishError(ctx, object, err)
 	}
 
-	input := flarecloudflare.HostnameRouteInput{Hostname: cloudflarePrivateHostname(hostname), TunnelID: tunnel.id, Comment: ownerComment}
+	input := flarecloudflare.HostnameRouteInput{
+		Hostname: cloudflarePrivateHostname(hostname), TunnelID: tunnel.id,
+		TunnelType: tunnel.tunnelType, Comment: ownerComment,
+	}
 	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.RouteID == "" {
-			return r.finishError(ctx, object, privateInvalid("Invalid", "ObserveOnly requires externalRef.routeId"))
+			return r.finishError(ctx, object, privateInvalid("Invalid", "management policy ObserveOnly requires externalRef.routeId"))
 		}
 		remote, getErr := api.GetHostnameRoute(ctx, object.Spec.ExternalRef.RouteID)
 		if getErr != nil {
 			return r.finishRemoteError(ctx, object, getErr)
 		}
 		if conflict := validateObservedHostnameRoute(input, remote); conflict != "" {
-			return r.finishError(ctx, object, privateInvalid("Conflict", "%s", conflict))
+			return ctrl.Result{}, r.patchStatus(ctx, object, remote, hostname, false, metav1.ConditionFalse, "Conflict", conflict)
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, object, remote, hostname, false, metav1.ConditionTrue, "Observed", "Hostname route is observed without mutation")
 	}
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
+		if privateIsValidationError(err) && remote.ID != "" {
+			owned := object.Status.OwnershipVerified || privateCommentOwnedBy(remote.Comment, input.Comment)
+			return ctrl.Result{}, r.patchStatus(ctx, object, remote, hostname, owned, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
+		}
 		if privateIsValidationError(err) {
 			return r.finishError(ctx, object, err)
 		}
@@ -152,16 +159,20 @@ func (r *HostnameRouteReconciler) validateGeneratedRoute(ctx context.Context, ob
 	if sourceNamespace == "" {
 		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute requires label %s", generatedSourceNamespaceLabel)
 	}
-	if object.Spec.TunnelRef.Namespace != sourceNamespace || object.Spec.TunnelRef.Name == "" {
-		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute tunnelRef must explicitly target its source namespace")
+	if effectiveTunnelReferenceKind(object.Spec.TunnelRef.Kind) != v1alpha1.TunnelReferenceKindCloudflareTunnel ||
+		object.Spec.TunnelRef.Namespace != sourceNamespace || object.Spec.TunnelRef.Name == "" {
+		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute tunnelRef must explicitly target its source CloudflareTunnel namespace")
 	}
 	tunnelKey := types.NamespacedName{Namespace: sourceNamespace, Name: object.Spec.TunnelRef.Name}
 	tunnel := new(v1alpha1.CloudflareTunnel)
 	if err := r.Get(ctx, tunnelKey, tunnel); err != nil {
 		return "", true, privateInvalid("RefNotPermitted", "resolve generated HostnameRoute CloudflareTunnel %s: %v", tunnelKey, err)
 	}
-	if !tunnel.DeletionTimestamp.IsZero() || tunnel.Spec.AccountRef.Name != account.Name || tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "" {
-		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute source Tunnel is not a current Gateway-owned Tunnel for CloudflareAccount %q", account.Name)
+	if !tunnel.DeletionTimestamp.IsZero() || tunnel.Spec.AccountRef.Name != account.Name ||
+		tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+		tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "" ||
+		tunnel.Status.GatewayUID == "" || !tunnel.Status.OwnershipVerified {
+		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute source Tunnel is not an ownership-verified, UID-bound Gateway Tunnel for CloudflareAccount %q", account.Name)
 	}
 	gatewayKey := types.NamespacedName{Namespace: sourceNamespace, Name: tunnel.Status.GatewayRef.Name}
 	gateway := new(gatewayv1.Gateway)
@@ -170,6 +181,9 @@ func (r *HostnameRouteReconciler) validateGeneratedRoute(ctx context.Context, ob
 	}
 	if gateway.GetDeletionTimestamp() != nil {
 		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute source Gateway %s is deleting", gatewayKey)
+	}
+	if gateway.UID != tunnel.Status.GatewayUID {
+		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute source Gateway UID does not match the Tunnel ownership checkpoint")
 	}
 	if object.Annotations[sourceGatewayUIDAnnotation] == "" || object.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
 		return "", true, privateInvalid("RefNotPermitted", "generated HostnameRoute source Gateway UID proof is missing or stale")
@@ -233,7 +247,7 @@ func (r *HostnameRouteReconciler) ensureManaged(ctx context.Context, api flarecl
 		switch {
 		case object.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID:
 			if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.RouteID == "" {
-				return flarecloudflare.HostnameRoute{}, privateInvalid("Invalid", "AdoptById requires externalRef.routeId")
+				return flarecloudflare.HostnameRoute{}, privateInvalid("Invalid", "adoption mode AdoptById requires externalRef.routeId")
 			}
 			id = object.Spec.ExternalRef.RouteID
 			observed, err := api.GetHostnameRoute(ctx, id)
@@ -241,11 +255,11 @@ func (r *HostnameRouteReconciler) ensureManaged(ctx context.Context, api flarecl
 				return flarecloudflare.HostnameRoute{}, err
 			}
 			if conflict := validateObservedHostnameRoute(input, observed); conflict != "" {
-				return flarecloudflare.HostnameRoute{}, privateInvalid("Conflict", "%s", conflict)
+				return observed, privateInvalid("Conflict", "%s", conflict)
 			}
 			remote = observed
 		case object.Spec.ExternalRef != nil:
-			return flarecloudflare.HostnameRoute{}, privateInvalid("Conflict", "Managed externalRef requires adoption.mode AdoptById")
+			return flarecloudflare.HostnameRoute{}, privateInvalid("Conflict", "managed externalRef requires adoption.mode AdoptById")
 		default:
 			recovered, found, err := findOwnedHostnameRoute(ctx, api, input.Comment)
 			if err != nil {
@@ -253,9 +267,13 @@ func (r *HostnameRouteReconciler) ensureManaged(ctx context.Context, api flarecl
 			}
 			if found {
 				id, remote = recovered.ID, recovered
-			} else {
-				return api.CreateHostnameRoute(ctx, input)
+				break
 			}
+			created, createErr := api.CreateHostnameRoute(ctx, input)
+			if createErr != nil {
+				return flarecloudflare.HostnameRoute{}, createErr
+			}
+			id, remote = created.ID, created
 		}
 	} else {
 		if !object.Status.OwnershipVerified {
@@ -265,10 +283,22 @@ func (r *HostnameRouteReconciler) ensureManaged(ctx context.Context, api flarecl
 		if err != nil {
 			return flarecloudflare.HostnameRoute{}, err
 		}
+		if !privateCommentOwnedBy(observed.Comment, input.Comment) {
+			return observed, privateInvalid("Conflict", "remote hostname route %q no longer carries this object's ownership comment", id)
+		}
 		remote = observed
 	}
+	if id == "" || remote.ID == "" {
+		return remote, privateInvalid("Conflict", "the Cloudflare service returned a hostname route without an ID")
+	}
 	if remote.Deleted {
-		return flarecloudflare.HostnameRoute{}, privateInvalid("Conflict", "remote hostname route %q is deleted", id)
+		return remote, privateInvalid("Conflict", "remote hostname route %q is deleted", id)
+	}
+	if conflict := validatePrivateTunnelType(input.TunnelType, remote.TunnelType, "hostname route", remote.ID); conflict != "" {
+		return remote, privateInvalid("Conflict", "%s", conflict)
+	}
+	if !hostnameRouteNeedsUpdate(input, remote) {
+		return remote, nil
 	}
 	return api.UpdateHostnameRoute(ctx, id, input)
 }
@@ -295,10 +325,17 @@ func validateObservedHostnameRoute(input flarecloudflare.HostnameRouteInput, rem
 	if remote.Deleted {
 		return fmt.Sprintf("remote hostname route %q is deleted", remote.ID)
 	}
+	if conflict := validatePrivateTunnelType(input.TunnelType, remote.TunnelType, "hostname route", remote.ID); conflict != "" {
+		return conflict
+	}
 	if remote.Hostname != input.Hostname || remote.TunnelID != input.TunnelID {
 		return fmt.Sprintf("remote hostname route target (%s, %s) does not match resolved target (%s, %s)", remote.Hostname, remote.TunnelID, input.Hostname, input.TunnelID)
 	}
 	return ""
+}
+
+func hostnameRouteNeedsUpdate(input flarecloudflare.HostnameRouteInput, remote flarecloudflare.HostnameRoute) bool {
+	return remote.Hostname != input.Hostname || remote.TunnelID != input.TunnelID || remote.Comment != input.Comment
 }
 
 func (r *HostnameRouteReconciler) checkOverlap(ctx context.Context, object *v1alpha1.HostnameRoute, hostname string) error {
@@ -344,7 +381,9 @@ func (r *HostnameRouteReconciler) reconcileDelete(ctx context.Context, object *v
 	if !controllerutil.ContainsFinalizer(object, v1alpha1.HostnameRouteFinalizer) {
 		return nil
 	}
-	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly && effectivePrivateDeletionPolicy(object.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete && object.Status.RouteID != "" && object.Status.OwnershipVerified {
+	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly &&
+		effectivePrivateDeletionPolicy(object.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete &&
+		object.Status.RouteID != "" && object.Status.OwnershipVerified {
 		account, err := loadPrivateAccount(ctx, r.Client, object.Spec.AccountRef.Name)
 		if err != nil {
 			return err
@@ -364,12 +403,40 @@ func (r *HostnameRouteReconciler) reconcileDelete(ctx context.Context, object *v
 		}); err != nil {
 			return err
 		}
+		ownerComment, err := privateOwnerComment(ctx, r.Client, object, object.Spec.Comment)
+		if err != nil {
+			return err
+		}
 		api, err := privateNetworkClient(ctx, r.Client, account, r.NewCloudflareClient)
 		if err != nil {
 			return err
 		}
-		if err = ignoreRemoteNotFound(api.DeleteHostnameRoute(ctx, object.Status.RouteID)); err != nil {
-			return err
+		remote, err := api.GetHostnameRoute(ctx, object.Status.RouteID)
+		if err != nil {
+			if !flarecloudflare.IsNotFound(err) {
+				return err
+			}
+		} else if !remote.Deleted {
+			if !privateCommentOwnedBy(remote.Comment, ownerComment) {
+				return privateInvalid("Conflict", "refusing to delete hostname route %q without this object's ownership comment", remote.ID)
+			}
+			expectedTunnelType, typeErr := privateTunnelTypeForReference(object.Spec.TunnelRef.Kind)
+			if typeErr != nil {
+				return typeErr
+			}
+			if appliedType := object.Status.Applied.TunnelType; appliedType != "" && appliedType != privateTunnelRemoteType(expectedTunnelType) {
+				return privateInvalid("Conflict", "refusing to delete hostname route after tunnelRef.kind changed from %q to %q", appliedType, privateTunnelRemoteType(expectedTunnelType))
+			}
+			expected := flarecloudflare.HostnameRouteInput{
+				Hostname: cloudflarePrivateHostname(object.Status.Applied.Hostname),
+				TunnelID: object.Status.Applied.TunnelID, TunnelType: expectedTunnelType,
+			}
+			if conflict := validateObservedHostnameRoute(expected, remote); conflict != "" {
+				return privateInvalid("Conflict", "refusing to delete changed hostname route: %s", conflict)
+			}
+			if err = ignoreRemoteNotFound(api.DeleteHostnameRoute(ctx, object.Status.RouteID)); err != nil {
+				return err
+			}
 		}
 	}
 	base := client.MergeFrom(object.DeepCopy())
@@ -393,8 +460,7 @@ func (r *HostnameRouteReconciler) deletionManagementNamespace(object *v1alpha1.H
 }
 
 func (r *HostnameRouteReconciler) finishError(ctx context.Context, object *v1alpha1.HostnameRoute, err error) (ctrl.Result, error) {
-	applied := object.Status.Applied
-	patchErr := r.patchStatus(ctx, object, flarecloudflare.HostnameRoute{ID: object.Status.RouteID, Hostname: cloudflarePrivateHostname(applied.Hostname), TunnelID: applied.TunnelID, Comment: object.Status.Comment}, applied.Hostname, object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
+	patchErr := r.patchStatus(ctx, object, hostnameRouteFromStatus(object), object.Status.Applied.Hostname, object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
 	if patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
@@ -408,7 +474,7 @@ func (r *HostnameRouteReconciler) finishError(ctx context.Context, object *v1alp
 }
 
 func (r *HostnameRouteReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.HostnameRoute, err error) (ctrl.Result, error) {
-	if patchErr := r.patchStatus(ctx, object, flarecloudflare.HostnameRoute{ID: object.Status.RouteID}, object.Status.Applied.Hostname, object.Status.OwnershipVerified, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, hostnameRouteFromStatus(object), object.Status.Applied.Hostname, object.Status.OwnershipVerified, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
@@ -416,19 +482,46 @@ func (r *HostnameRouteReconciler) finishRemoteError(ctx context.Context, object 
 
 func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alpha1.HostnameRoute, remote flarecloudflare.HostnameRoute, hostname string, owned bool, status metav1.ConditionStatus, reason, message string) error {
 	base := client.MergeFrom(object.DeepCopy())
-	if remote.ID != "" {
+	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
+	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
+	if persistIdentity {
 		object.Status.RouteID = remote.ID
+		object.Status.Hostname = remote.Hostname
+		object.Status.TunnelID = remote.TunnelID
+		object.Status.TunnelName = remote.TunnelName
+		object.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
+		object.Status.Comment = remote.Comment
+		object.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+		object.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+		object.Status.OwnershipVerified = owned
 	}
 	if status == metav1.ConditionTrue {
 		object.Status.Applied = v1alpha1.HostnameRouteAppliedStatus{
-			Hostname: hostname, TunnelID: remote.TunnelID, ObservedGeneration: object.Generation,
+			Hostname: hostname, TunnelID: remote.TunnelID,
+			TunnelType: privateTunnelRemoteType(remote.TunnelType), ObservedGeneration: object.Generation,
 		}
-		object.Status.Comment = remote.Comment
-		object.Status.OwnershipVerified = owned
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
 	return r.Status().Patch(ctx, object, base)
+}
+
+func hostnameRouteFromStatus(object *v1alpha1.HostnameRoute) flarecloudflare.HostnameRoute {
+	remote := flarecloudflare.HostnameRoute{
+		ID: object.Status.RouteID, Hostname: object.Status.Hostname,
+		TunnelID: object.Status.TunnelID, TunnelName: object.Status.TunnelName,
+		TunnelType: flarecloudflare.NetworkTunnelType(object.Status.TunnelType),
+		Comment:    object.Status.Comment,
+	}
+	if object.Status.CreatedAt != nil {
+		remote.CreatedAt = object.Status.CreatedAt.Time
+	}
+	if object.Status.DeletedAt != nil {
+		deletedAt := object.Status.DeletedAt.Time
+		remote.DeletedAt = &deletedAt
+		remote.Deleted = true
+	}
+	return remote
 }
 
 func (r *HostnameRouteReconciler) now() time.Time {
@@ -468,6 +561,7 @@ func (r *HostnameRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
 		For(&v1alpha1.HostnameRoute{}).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForAccount)).
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
+		Watches(&v1alpha1.WARPConnector{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForGateway)).
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutePeers)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allHostnameRoutes)).

@@ -18,6 +18,11 @@ package controller
 
 import (
 	"context"
+	"net/http"
+	"slices"
+	"strconv"
+
+	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 	"testing"
 	"time"
 
@@ -27,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -60,6 +66,64 @@ func TestCanonicalListItemsSortsAndDeduplicates(t *testing.T) {
 	got := canonicalListItems([]string{"b.example", "a.example", "b.example"})
 	if len(got) != 2 || got[0] != "a.example" || got[1] != "b.example" {
 		t.Fatalf("canonicalListItems() = %#v", got)
+	}
+}
+
+func TestOrganizationNestedRemovalAndObservedStatusBounds(t *testing.T) {
+	empty := ""
+	diff := organizationDiff(flarecloudflare.OrganizationInput{
+		LoginDesign: &flarecloudflare.OrganizationLoginDesignInput{HeaderText: &empty},
+	}, flarecloudflare.Organization{LoginDesign: flarecloudflare.OrganizationLoginDesign{HeaderText: "remove me"}})
+	if diff == nil || diff.LoginDesign == nil || diff.LoginDesign.HeaderText == nil || *diff.LoginDesign.HeaderText != "" {
+		t.Fatalf("organizationDiff() did not preserve explicit nested removal: %#v", diff)
+	}
+	zones := make([]string, organizationStatusListLimit+25)
+	for i := range zones {
+		zones[i] = "zone-" + strconv.Itoa(i) + ".example"
+	}
+	authenticators := make([]flarecloudflare.OrganizationMFAAuthenticator, 10)
+	for i := range authenticators {
+		authenticators[i] = flarecloudflare.OrganizationMFAAuthenticator("Method" + strconv.Itoa(i))
+	}
+	keyTypes := make([]flarecloudflare.OrganizationPIVSSHKeyType, 10)
+	for i := range keyTypes {
+		keyTypes[i] = flarecloudflare.OrganizationPIVSSHKeyType("Key" + strconv.Itoa(i))
+	}
+	observed := organizationObserved(flarecloudflare.Organization{
+		DenyUnmatchedRequestsExemptedZoneNames: zones,
+		MFAConfig:                              flarecloudflare.OrganizationMFAConfig{AllowedAuthenticators: authenticators},
+		MFAPIVKeyRequirements: flarecloudflare.OrganizationMFAPIVKeyRequirements{
+			SSHKeySizes: []int64{1, 2, 3, 4, 5, 6, 7}, SSHKeyTypes: keyTypes,
+		},
+	}, nil)
+	if observed.DenyUnmatchedRequestsExemptedZoneNames == nil || len(*observed.DenyUnmatchedRequestsExemptedZoneNames) != organizationStatusListLimit ||
+		observed.MFAConfig == nil || observed.MFAConfig.AllowedAuthenticators == nil || len(*observed.MFAConfig.AllowedAuthenticators) != 5 ||
+		observed.MFAPIVKeyRequirements == nil || observed.MFAPIVKeyRequirements.SSHKeySizes == nil || len(*observed.MFAPIVKeyRequirements.SSHKeySizes) != 6 ||
+		observed.MFAPIVKeyRequirements.SSHKeyTypes == nil || len(*observed.MFAPIVKeyRequirements.SSHKeyTypes) != 3 {
+		t.Fatalf("organizationObserved() was not bounded: %#v", observed)
+	}
+}
+
+func TestOrganizationUserRevocationRequestsAdvanceMonotonically(t *testing.T) {
+	observed := metav1.NewTime(time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC))
+	older := metav1.NewTime(observed.Add(-time.Second))
+	equal := observed.DeepCopy()
+	newer := metav1.NewTime(observed.Add(time.Second))
+
+	if organizationUserRevocationRequested(nil, &observed) {
+		t.Fatal("nil revocation request was treated as pending")
+	}
+	if organizationUserRevocationRequested(&v1alpha1.ZeroTrustOrganizationUserRevocation{Email: "user@example.com"}, &observed) {
+		t.Fatal("revocation request without requestedAt was treated as pending")
+	}
+	if organizationUserRevocationRequested(&v1alpha1.ZeroTrustOrganizationUserRevocation{Email: "user@example.com", RequestedAt: &older}, &observed) {
+		t.Fatal("older revocation request was treated as pending")
+	}
+	if organizationUserRevocationRequested(&v1alpha1.ZeroTrustOrganizationUserRevocation{Email: "user@example.com", RequestedAt: equal}, &observed) {
+		t.Fatal("already observed revocation request was treated as pending")
+	}
+	if !organizationUserRevocationRequested(&v1alpha1.ZeroTrustOrganizationUserRevocation{Email: "user@example.com", RequestedAt: &newer}, &observed) {
+		t.Fatal("newer revocation request was not treated as pending")
 	}
 }
 
@@ -146,6 +210,258 @@ func (r *globalArbitrationReader) List(_ context.Context, list client.ObjectList
 	return nil
 }
 
+var globalOrganizationZoneState map[string]flarecloudflare.Organization
+var globalOrganizationDOHState flarecloudflare.OrganizationDOHSettings
+var globalOrganizationDOHExists bool
+var globalOrganizationRevocationScope flarecloudflare.AccessScope
+var globalOrganizationRevocationInput flarecloudflare.OrganizationUserRevocationInput
+var globalOrganizationRevocationExists bool
+
+func globalOrganizationNotFound() error {
+	request, _ := http.NewRequest(http.MethodGet, "https://api.cloudflare.test/resource", nil)
+	return &cloudflaresdk.Error{
+		StatusCode: http.StatusNotFound,
+		Request:    request,
+		Response:   &http.Response{StatusCode: http.StatusNotFound},
+	}
+}
+
+func (f *fakeGlobalOrganizationCloudflare) GetAccessOrganization(_ context.Context, scope flarecloudflare.AccessScope) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessOrganization")
+	if scope.ZoneID == "" {
+		if f.organization.AuthDomain == "" {
+			return flarecloudflare.Organization{}, globalOrganizationNotFound()
+		}
+		return f.organization, nil
+	}
+	organization, found := globalOrganizationZoneState[scope.ZoneID]
+	if !found {
+		return flarecloudflare.Organization{}, globalOrganizationNotFound()
+	}
+	return organization, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) CreateAccessOrganization(_ context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.OrganizationCreateInput) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "CreateAccessOrganization")
+	organization := flarecloudflare.Organization{AuthDomain: input.AuthDomain}
+	applyFakeOrganizationInput(&organization, input.OrganizationInput)
+	if scope.ZoneID == "" {
+		f.organization = organization
+	} else {
+		if globalOrganizationZoneState == nil {
+			globalOrganizationZoneState = map[string]flarecloudflare.Organization{}
+		}
+		globalOrganizationZoneState[scope.ZoneID] = organization
+	}
+	return organization, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) UpdateAccessOrganization(_ context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.OrganizationInput) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "UpdateAccessOrganization")
+	organization := f.organization
+	if scope.ZoneID != "" {
+		organization = globalOrganizationZoneState[scope.ZoneID]
+	}
+	applyFakeOrganizationInput(&organization, input)
+	if scope.ZoneID == "" {
+		f.organization = organization
+	} else {
+		globalOrganizationZoneState[scope.ZoneID] = organization
+	}
+	return organization, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) RevokeAccessOrganizationUser(_ context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.OrganizationUserRevocationInput) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "RevokeAccessOrganizationUser")
+	globalOrganizationRevocationScope = scope
+	globalOrganizationRevocationInput = cloneOrganizationUserRevocationInput(input)
+	globalOrganizationRevocationExists = true
+	return true, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) GetAccessOrganizationDOH(context.Context) (flarecloudflare.OrganizationDOHSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessOrganizationDOH")
+	if !globalOrganizationDOHExists {
+		return flarecloudflare.OrganizationDOHSettings{}, globalOrganizationNotFound()
+	}
+	return globalOrganizationDOHState, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) UpdateAccessOrganizationDOH(_ context.Context, input flarecloudflare.OrganizationDOHInput) (flarecloudflare.OrganizationDOHSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "UpdateAccessOrganizationDOH")
+	globalOrganizationDOHState.ServiceTokenID = input.ServiceTokenID
+	if input.JWTDuration != nil {
+		globalOrganizationDOHState.JWTDuration = *input.JWTDuration
+	}
+	globalOrganizationDOHExists = true
+	return globalOrganizationDOHState, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) GetAccessCustomPage(context.Context, string) (flarecloudflare.AccessCustomPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessCustomPage")
+	return flarecloudflare.AccessCustomPage{}, nil
+}
+
+func (f *fakeGlobalOrganizationCloudflare) GetServiceToken(context.Context, flarecloudflare.AccessScope, string) (flarecloudflare.ServiceToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetServiceToken")
+	return flarecloudflare.ServiceToken{}, nil
+}
+
+func cloneOrganizationUserRevocationInput(input flarecloudflare.OrganizationUserRevocationInput) flarecloudflare.OrganizationUserRevocationInput {
+	result := input
+	if input.UserUID != nil {
+		value := *input.UserUID
+		result.UserUID = &value
+	}
+	if input.Devices != nil {
+		value := *input.Devices
+		result.Devices = &value
+	}
+	if input.WARPSessionReauth != nil {
+		value := *input.WARPSessionReauth
+		result.WARPSessionReauth = &value
+	}
+	return result
+}
+
+func (f *fakeGlobalOrganizationCloudflare) revocation() (flarecloudflare.AccessScope, flarecloudflare.OrganizationUserRevocationInput, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return globalOrganizationRevocationScope, cloneOrganizationUserRevocationInput(globalOrganizationRevocationInput), globalOrganizationRevocationExists
+}
+
+func applyFakeOrganizationInput(organization *flarecloudflare.Organization, input flarecloudflare.OrganizationInput) {
+	if input.Name != nil {
+		organization.Name = *input.Name
+	}
+	if input.SessionDuration != nil {
+		organization.SessionDuration = *input.SessionDuration
+	}
+	if input.WARPAuthSessionDuration != nil {
+		organization.WARPAuthSessionDuration = *input.WARPAuthSessionDuration
+	}
+	if input.AllowAuthenticateViaWARP != nil {
+		organization.AllowAuthenticateViaWARP = *input.AllowAuthenticateViaWARP
+	}
+	if input.AutoRedirectToIdentity != nil {
+		organization.AutoRedirectToIdentity = *input.AutoRedirectToIdentity
+	}
+	if input.IsUIReadOnly != nil {
+		organization.IsUIReadOnly = *input.IsUIReadOnly
+	}
+	if input.UIReadOnlyToggleReason != nil {
+		organization.UIReadOnlyToggleReason = *input.UIReadOnlyToggleReason
+	}
+	if input.DenyUnmatchedRequests != nil {
+		organization.DenyUnmatchedRequests = *input.DenyUnmatchedRequests
+	}
+	if input.DenyUnmatchedRequestsExemptedZoneNames != nil {
+		organization.DenyUnmatchedRequestsExemptedZoneNames = slices.Clone(*input.DenyUnmatchedRequestsExemptedZoneNames)
+	}
+	if input.WARPAuthNonBrowser401 != nil {
+		organization.WARPAuthNonBrowser401 = *input.WARPAuthNonBrowser401
+	}
+	if input.UserSeatExpirationInactiveTime != nil {
+		organization.UserSeatExpirationInactiveTime = *input.UserSeatExpirationInactiveTime
+	}
+	if input.MFARequiredForAllApps != nil {
+		organization.MFARequiredForAllApps = *input.MFARequiredForAllApps
+	}
+	if input.CustomPages != nil {
+		organization.CustomPages = flarecloudflare.OrganizationCustomPages{}
+		if input.CustomPages.Forbidden != nil {
+			organization.CustomPages.Forbidden = *input.CustomPages.Forbidden
+		}
+		if input.CustomPages.IdentityDenied != nil {
+			organization.CustomPages.IdentityDenied = *input.CustomPages.IdentityDenied
+		}
+	}
+	if input.LoginDesign != nil {
+		if input.LoginDesign.BackgroundColor != nil {
+			organization.LoginDesign.BackgroundColor = *input.LoginDesign.BackgroundColor
+		}
+		if input.LoginDesign.FooterText != nil {
+			organization.LoginDesign.FooterText = *input.LoginDesign.FooterText
+		}
+		if input.LoginDesign.HeaderText != nil {
+			organization.LoginDesign.HeaderText = *input.LoginDesign.HeaderText
+		}
+		if input.LoginDesign.LogoPath != nil {
+			organization.LoginDesign.LogoPath = *input.LoginDesign.LogoPath
+		}
+		if input.LoginDesign.TextColor != nil {
+			organization.LoginDesign.TextColor = *input.LoginDesign.TextColor
+		}
+	}
+	if input.MFAConfig != nil {
+		if input.MFAConfig.AllowedAuthenticators != nil {
+			organization.MFAConfig.AllowedAuthenticators = slices.Clone(*input.MFAConfig.AllowedAuthenticators)
+		}
+		if input.MFAConfig.AMRMatchingSessionDuration != nil {
+			organization.MFAConfig.AMRMatchingSessionDuration = *input.MFAConfig.AMRMatchingSessionDuration
+		}
+		if input.MFAConfig.RequiredAAGUIDs != nil {
+			organization.MFAConfig.RequiredAAGUIDs = *input.MFAConfig.RequiredAAGUIDs
+		}
+		if input.MFAConfig.SessionDuration != nil {
+			organization.MFAConfig.SessionDuration = *input.MFAConfig.SessionDuration
+		}
+	}
+	if input.MFAPIVKeyRequirements != nil {
+		if input.MFAPIVKeyRequirements.PinPolicy != nil {
+			organization.MFAPIVKeyRequirements.PinPolicy = *input.MFAPIVKeyRequirements.PinPolicy
+		}
+		if input.MFAPIVKeyRequirements.RequireFIPSDevice != nil {
+			organization.MFAPIVKeyRequirements.RequireFIPSDevice = *input.MFAPIVKeyRequirements.RequireFIPSDevice
+		}
+		if input.MFAPIVKeyRequirements.SSHKeySizes != nil {
+			organization.MFAPIVKeyRequirements.SSHKeySizes = slices.Clone(*input.MFAPIVKeyRequirements.SSHKeySizes)
+		}
+		if input.MFAPIVKeyRequirements.SSHKeyTypes != nil {
+			organization.MFAPIVKeyRequirements.SSHKeyTypes = slices.Clone(*input.MFAPIVKeyRequirements.SSHKeyTypes)
+		}
+		if input.MFAPIVKeyRequirements.TouchPolicy != nil {
+			organization.MFAPIVKeyRequirements.TouchPolicy = *input.MFAPIVKeyRequirements.TouchPolicy
+		}
+	}
+}
+
+func resetGlobalOrganizationParityState() {
+	testGlobalOrganizationCloudflare.mu.Lock()
+	defer testGlobalOrganizationCloudflare.mu.Unlock()
+	globalOrganizationZoneState = map[string]flarecloudflare.Organization{}
+	globalOrganizationDOHState = flarecloudflare.OrganizationDOHSettings{}
+	globalOrganizationDOHExists = false
+	globalOrganizationRevocationScope = flarecloudflare.AccessScope{}
+	globalOrganizationRevocationInput = flarecloudflare.OrganizationUserRevocationInput{}
+	globalOrganizationRevocationExists = false
+}
+
+func (f *fakeGlobalOrganizationCloudflare) putZone(zoneID string, organization flarecloudflare.Organization) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if globalOrganizationZoneState == nil {
+		globalOrganizationZoneState = map[string]flarecloudflare.Organization{}
+	}
+	globalOrganizationZoneState[zoneID] = organization
+}
+
 var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 	ginkgo.BeforeEach(func() {
 		testGlobalDeviceCloudflare.reset(flarecloudflare.DeviceSettings{
@@ -155,6 +471,7 @@ var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 		testGlobalOrganizationCloudflare.reset(flarecloudflare.Organization{
 			Name: "team", AuthDomain: "team.cloudflareaccess.com", SessionDuration: "12h", WARPAuthSessionDuration: "24h",
 		})
+		resetGlobalOrganizationParityState()
 		testGlobalGatewayCloudflare.reset()
 	})
 
@@ -201,7 +518,7 @@ var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 			g.Expect(current.Status.WouldApply).NotTo(gomega.BeNil())
 			g.Expect(current.Status.WouldApply.WARPAuthSessionDuration).NotTo(gomega.BeNil())
 		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
-		gomega.Expect(testGlobalOrganizationCloudflare.count("UpdateOrganization")).To(gomega.BeZero())
+		gomega.Expect(testGlobalOrganizationCloudflare.count("UpdateAccessOrganization")).To(gomega.BeZero())
 	})
 
 	ginkgo.It("updates Managed singleton settings and records Cloudflare read-back", func() {
@@ -250,7 +567,183 @@ var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 			g.Expect(*current.Status.Observed.SessionDuration).To(gomega.Equal(session))
 			g.Expect(current.Status.WouldApply).To(gomega.BeNil())
 		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
-		gomega.Expect(testGlobalOrganizationCloudflare.count("UpdateOrganization")).To(gomega.BeNumerically(">=", 1))
+		gomega.Expect(testGlobalOrganizationCloudflare.count("UpdateAccessOrganization")).To(gomega.BeNumerically(">=", 1))
+	})
+
+	ginkgo.It("creates an absent Managed account organization with create-only authDomain", func() {
+		fixture := newDeviceProfileFixture("global-create-organization")
+		fixture.create()
+		ginkgo.DeferCleanup(func() { cleanupGlobalFixture(fixture) })
+		testGlobalOrganizationCloudflare.reset(flarecloudflare.Organization{})
+		resetGlobalOrganizationParityState()
+		authDomain, name, session := "new-team.cloudflareaccess.com", "new-team", "24h"
+		organization := &v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: fixture.namespace},
+			Spec: v1alpha1.ZeroTrustOrganizationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
+				AuthDomain: &authDomain, Name: &name, SessionDuration: &session,
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, organization)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.ZeroTrustOrganization
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &current)).To(gomega.Succeed())
+			g.Expect(metaConditionTrue(current.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionReady)).To(gomega.BeTrue())
+			g.Expect(current.Status.AuthDomain).To(gomega.Equal(authDomain))
+			g.Expect(current.Status.Observed.Name).NotTo(gomega.BeNil())
+			g.Expect(*current.Status.Observed.Name).To(gomega.Equal(name))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testGlobalOrganizationCloudflare.count("CreateAccessOrganization")).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("resolves a zone DNS name to the verified zone-scoped organization", func() {
+		fixture := newDeviceProfileFixture("global-zone-organization")
+		fixture.create()
+		ginkgo.DeferCleanup(func() { cleanupGlobalFixture(fixture) })
+		testAccountCloudflare.mu.Lock()
+		testAccountCloudflare.zones = []flarecloudflare.Zone{{ID: "zone-example", Name: "example.test", AccountID: fixture.accountID}}
+		testAccountCloudflare.mu.Unlock()
+		gomega.Eventually(func() error {
+			var account v1alpha1.CloudflareAccount
+			if err := testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account); err != nil {
+				return err
+			}
+			before := account.DeepCopy()
+			account.Status.Verified.Zones = []v1alpha1.CloudflareVerifiedZone{{ID: "zone-example", Name: "example.test"}}
+			return testClient.Status().Patch(testContext, &account, client.MergeFrom(before))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		testGlobalOrganizationCloudflare.putZone("zone-example", flarecloudflare.Organization{AuthDomain: "zone-team.cloudflareaccess.com", Name: "zone-team", SessionDuration: "12h"})
+		session := "36h"
+		organization := &v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: fixture.namespace},
+			Spec: v1alpha1.ZeroTrustOrganizationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: fixture.accountName}, Zone: "EXAMPLE.TEST.",
+				SessionDuration: &session, ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, organization)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.ZeroTrustOrganization
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &current)).To(gomega.Succeed())
+			g.Expect(metaConditionTrue(current.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionReady)).To(gomega.BeTrue())
+			g.Expect(current.Status.AuthDomain).To(gomega.Equal("zone-team.cloudflareaccess.com"))
+			g.Expect(current.Status.Observed.SessionDuration).NotTo(gomega.BeNil())
+			g.Expect(*current.Status.Observed.SessionDuration).To(gomega.Equal(session))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("applies account DoH and a user revocation once without exposing secrets", func() {
+		fixture := newDeviceProfileFixture("global-doh-revocation")
+		fixture.create()
+		ginkgo.DeferCleanup(func() { cleanupGlobalFixture(fixture) })
+
+		gomega.Eventually(func() error {
+			var account v1alpha1.CloudflareAccount
+			if err := testClient.Get(testContext, client.ObjectKey{Name: fixture.accountName}, &account); err != nil {
+				return err
+			}
+			account.Spec.Grants[0].AccessPolicyRefs = v1alpha1.GrantPermissionAllowed
+			return testClient.Update(testContext, &account)
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		tokenNamespace := fixture.namespace + "-tokens"
+		gomega.Expect(testClient.Create(testContext, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: tokenNamespace, Labels: map[string]string{"profile": fixture.name}},
+		})).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			var token v1alpha1.ServiceToken
+			if err := testClient.Get(testContext, client.ObjectKey{Namespace: tokenNamespace, Name: "doh"}, &token); err == nil {
+				clearFinalizers(testContext, &token)
+				_ = testClient.Delete(testContext, &token)
+			}
+			_ = testClient.Delete(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tokenNamespace}})
+			testResourceAccessCloudflare.mu.Lock()
+			delete(testResourceAccessCloudflare.tokens, "doh-service-token")
+			testResourceAccessCloudflare.mu.Unlock()
+		})
+
+		testResourceAccessCloudflare.mu.Lock()
+		testResourceAccessCloudflare.tokens["doh-service-token"] = flarecloudflare.ServiceToken{
+			ID: "doh-service-token", ClientID: "doh-client-id", Name: "doh", Duration: "8760h", Enabled: true,
+			ExpiresAt: time.Now().Add(365 * 24 * time.Hour),
+		}
+		testResourceAccessCloudflare.mu.Unlock()
+		serviceToken := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Name: "doh", Namespace: tokenNamespace},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: fixture.accountName},
+				Name:             "doh",
+				Enabled:          true,
+				Duration:         "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "unused-observe-only-credentials"},
+				ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+				ExternalRef:      &v1alpha1.ServiceTokenExternalReference{TokenID: "doh-service-token"},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, serviceToken)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.ServiceToken
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(serviceToken), &current)).To(gomega.Succeed())
+			g.Expect(metaConditionTrue(current.Status.Conditions, "Accepted")).To(gomega.BeTrue())
+			g.Expect(current.Status.TokenID).To(gomega.Equal("doh-service-token"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		requestedAt := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+		jwtDuration := "12h"
+		organization := &v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: fixture.namespace},
+			Spec: v1alpha1.ZeroTrustOrganizationSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: fixture.accountName},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DOH: &v1alpha1.ZeroTrustOrganizationDOH{
+					ServiceTokenRef: v1alpha1.AccessObjectReference{Name: serviceToken.Name, Namespace: serviceToken.Namespace},
+					JWTDuration:     &jwtDuration,
+				},
+				UserRevocation: &v1alpha1.ZeroTrustOrganizationUserRevocation{
+					Email: "user@example.com", RequestedAt: &requestedAt,
+				},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, organization)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.ZeroTrustOrganization
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &current)).To(gomega.Succeed())
+			g.Expect(metaConditionTrue(current.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionReady)).To(gomega.BeTrue())
+			g.Expect(current.Status.ObservedUserRevocationRequest).NotTo(gomega.BeNil())
+			g.Expect(current.Status.ObservedUserRevocationRequest.Equal(&requestedAt)).To(gomega.BeTrue())
+			g.Expect(current.Status.Observed.DOH).NotTo(gomega.BeNil())
+			g.Expect(current.Status.Observed.DOH.ServiceTokenID).NotTo(gomega.BeNil())
+			g.Expect(*current.Status.Observed.DOH.ServiceTokenID).To(gomega.Equal("doh-service-token"))
+			g.Expect(current.Status.Observed.DOH.JWTDuration).NotTo(gomega.BeNil())
+			g.Expect(*current.Status.Observed.DOH.JWTDuration).To(gomega.Equal(jwtDuration))
+			g.Expect(current.Status.WouldApply).To(gomega.BeNil())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		scope, revocation, exists := testGlobalOrganizationCloudflare.revocation()
+		gomega.Expect(exists).To(gomega.BeTrue())
+		gomega.Expect(scope).To(gomega.Equal(flarecloudflare.AccessScope{}))
+		gomega.Expect(revocation.Email).To(gomega.Equal("user@example.com"))
+
+		staleRequest := metav1.NewTime(requestedAt.Add(-time.Second))
+		var current v1alpha1.ZeroTrustOrganization
+		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &current)).To(gomega.Succeed())
+		current.Spec.UserRevocation.RequestedAt = &staleRequest
+		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var reconciled v1alpha1.ZeroTrustOrganization
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &reconciled)).To(gomega.Succeed())
+			g.Expect(reconciled.Status.ObservedGeneration).To(gomega.Equal(reconciled.Generation))
+			g.Expect(reconciled.Status.ObservedUserRevocationRequest).NotTo(gomega.BeNil())
+			g.Expect(reconciled.Status.ObservedUserRevocationRequest.Equal(&requestedAt)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Consistently(func() []int {
+			return []int{
+				testGlobalOrganizationCloudflare.count("RevokeAccessOrganizationUser"),
+				testGlobalOrganizationCloudflare.count("UpdateAccessOrganizationDOH"),
+			}
+		}).WithTimeout(750 * time.Millisecond).WithPolling(100 * time.Millisecond).Should(gomega.Equal([]int{1, 1}))
 	})
 
 	ginkgo.It("arbitrates singleton writers by resolved account ID and ignores ineligible contenders", func() {

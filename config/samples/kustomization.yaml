@@ -1,0 +1,35 @@
+## Append samples of your project ##
+resources:
+- flareway_v1alpha1_accessapplication_cc_lb.yaml
+- flareway_v1alpha1_accessapplication_codex_carveout.yaml
+- flareway_v1alpha1_accessapplication_private.yaml
+- flareway_v1alpha1_accesscustompage.yaml
+- flareway_v1alpha1_accessgroup_observeonly.yaml
+- flareway_v1alpha1_accessinfrastructuretarget.yaml
+- flareway_v1alpha1_accesspolicies_observeonly.yaml
+- flareway_v1alpha1_accessstandaloneapplication.yaml
+- flareway_v1alpha1_cloudflareaccount.yaml
+- flareway_v1alpha1_cloudflaretunnel.yaml
+- flareway_v1alpha1_cloudflaretunnel_direct.yaml
+- flareway_v1alpha1_devicepostureintegration.yaml
+- flareway_v1alpha1_deviceposturerule_observeonly.yaml
+- flareway_v1alpha1_deviceprofile.yaml
+- flareway_v1alpha1_devicesettings.yaml
+- flareway_v1alpha1_gatewayclassconfig.yaml
+- flareway_v1alpha1_gatewayclassconfig_conformance.yaml
+- flareway_v1alpha1_hostnameroute.yaml
+- flareway_v1alpha1_identityprovider_observeonly.yaml
+- flareway_v1alpha1_networkroute.yaml
+- flareway_v1alpha1_servicetoken.yaml
+- flareway_v1alpha1_virtualnetwork.yaml
+- flareway_v1alpha1_warpconnector.yaml
+- flareway_v1alpha1_zerotrustgatewaypolicy.yaml
+- flareway_v1alpha1_zerotrustlist.yaml
+- flareway_v1alpha1_zerotrustorganization.yaml
+- gateway_v1_gateway.yaml
+- gateway_v1_httproute.yaml
+- gateway_v1_private_gateway.yaml
+- workload_cc_lb.yaml
+- workload_cliproxyapi.yaml
+- workload_codex_lb.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

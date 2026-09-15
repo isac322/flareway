@@ -34,8 +34,18 @@ import (
 // NetworkRoute and can never create an independent destination.
 func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
 	result := AccessApplicationCompilation{Accepted: true, Reason: "Accepted", Message: "Private destinations are valid"}
-	if application == nil || len(application.Spec.PrivateDestinations) == 0 {
+	if application == nil {
 		return result
+	}
+	hasPrivate := false
+	for _, destination := range application.Spec.Destinations {
+		hasPrivate = hasPrivate || destination.Type == v1alpha1.AccessApplicationDestinationPrivate
+	}
+	if !hasPrivate {
+		return result
+	}
+	if in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt != nil {
+		return accessFailure("TargetNotFound", "CloudflareTunnel is remotely deleted and private destinations are unavailable while it drains")
 	}
 	if in.CloudflareAccount == nil {
 		return accessFailure("TargetNotFound", "CloudflareAccount is required for private destinations")
@@ -46,16 +56,19 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 	}
 	seenDestination := make(map[string]struct{})
 	seenAncestor := make(map[string]struct{})
-	for index, private := range application.Spec.PrivateDestinations {
-		if (private.NetworkRouteRef == nil) == (private.HostnameRouteRef == nil) {
-			return accessFailure("Invalid", fmt.Sprintf("privateDestinations[%d] must reference exactly one route", index))
+	for index, destination := range application.Spec.Destinations {
+		if destination.Type != v1alpha1.AccessApplicationDestinationPrivate {
+			continue
 		}
-		protocol := private.L4Protocol
-		if protocol == "" {
-			protocol = v1alpha1.AccessL4ProtocolTCP
+		if destination.Private == nil {
+			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private is required", index))
+		}
+		private := destination.Private
+		if (private.NetworkRouteRef == nil) == (private.HostnameRouteRef == nil) {
+			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private must reference exactly one route", index))
 		}
 		if private.PortRange == "" {
-			return accessFailure("Invalid", fmt.Sprintf("privateDestinations[%d].portRange is required", index))
+			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private.portRange is required", index))
 		}
 
 		if private.NetworkRouteRef != nil {
@@ -74,8 +87,8 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 				return accessFailure("RefNotPermitted", fmt.Sprintf("NetworkRoute %s/%s: %v", route.Namespace, route.Name, err))
 			}
 			appendCompiledDestination(&result, seenDestination, AccessDestination{
-				Type: "private", CIDR: cidr, PortRange: private.PortRange,
-				L4Protocol: string(protocol), VNetID: route.Status.Applied.VirtualNetworkID,
+				Type: v1alpha1.AccessApplicationDestinationPrivate, CIDR: cidr, PortRange: private.PortRange,
+				L4Protocol: cloneAccessL4Protocol(private.L4Protocol), VNetID: route.Status.Applied.VirtualNetworkID,
 			})
 			appendAccessAncestor(&result, seenAncestor, AccessAncestor{Group: v1alpha1.Group, Kind: "NetworkRoute", Namespace: route.Namespace, Name: route.Name})
 			continue
@@ -92,14 +105,22 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 			return accessFailure("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s is not ready", route.Namespace, route.Name))
 		}
 		appendCompiledDestination(&result, seenDestination, AccessDestination{
-			Type: "private", Hostname: normalizePrivateHostname(route.Status.Applied.Hostname), PortRange: private.PortRange,
-			L4Protocol: string(protocol),
+			Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: normalizePrivateHostname(route.Status.Applied.Hostname), PortRange: private.PortRange,
+			L4Protocol: cloneAccessL4Protocol(private.L4Protocol),
 		})
 		appendAccessAncestor(&result, seenAncestor, AccessAncestor{Group: v1alpha1.Group, Kind: "HostnameRoute", Namespace: route.Namespace, Name: route.Name})
 	}
 	result.OriginJWTEnforced = false
 	sortAccessCompilation(&result)
 	return result
+}
+
+func cloneAccessL4Protocol(value *v1alpha1.AccessL4Protocol) *v1alpha1.AccessL4Protocol {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func authorizePrivateRoute(
@@ -115,7 +136,7 @@ func authorizePrivateRoute(
 		failure := accessFailure("RefNotPermitted", fmt.Sprintf("%s accountRef %q does not match AccessApplication account %q", kind, routeAccount, in.CloudflareAccount.Name))
 		return &failure
 	}
-	if application.Spec.AccountRef != nil && application.Spec.AccountRef.Name != routeAccount {
+	if application.Spec.AccountRef.Name != routeAccount {
 		failure := accessFailure("RefNotPermitted", fmt.Sprintf("AccessApplication accountRef %q does not match %s account %q", application.Spec.AccountRef.Name, kind, routeAccount))
 		return &failure
 	}
@@ -176,7 +197,7 @@ func resolvedPrivateCIDR(routeCIDR, requestedCIDR string) (string, error) {
 }
 
 func privateListenerVNetID(in Inputs, listenerName string) string {
-	if in.CloudflareTunnel == nil {
+	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.DeletedAt != nil {
 		return ""
 	}
 	vnetName := ""
@@ -227,7 +248,9 @@ func acceptedForGeneration(conditions []metav1.Condition, generation int64) bool
 }
 
 func privateRoutesRequireWARP(in Inputs) bool {
-	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.TunnelID == "" {
+	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+		in.CloudflareTunnel.Status.DeletedAt != nil ||
+		in.CloudflareTunnel.Status.TunnelID == "" || !in.CloudflareTunnel.Status.OwnershipVerified {
 		return false
 	}
 	tunnelID := in.CloudflareTunnel.Status.TunnelID

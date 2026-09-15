@@ -53,9 +53,16 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 	inputs gatewayInputsView,
 ) (privatePrerequisiteResult, error) {
 	hasPrivate := hasPrivateIRListener(gateway)
+	if tunnel != nil && tunnel.Status.DeletedAt != nil {
+		if hasPrivate {
+			blockPrivateDomains(gateway)
+			return privatePrerequisiteResult{Pending: "Private listeners are blocked while the remotely deleted CloudflareTunnel drains"}, nil
+		}
+		return privatePrerequisiteResult{}, nil
+	}
 	if tunnel != nil && (!hasPrivate || account != nil) {
 		if !tunnel.DeletionTimestamp.IsZero() && tunnel.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true" {
-			if err := r.deletePlatformHostnameRoutes(ctx, tunnel, inputs.HostnameRoutes); err != nil {
+			if err := r.deletePlatformHostnameRoutes(ctx, gateway, tunnel, inputs.HostnameRoutes); err != nil {
 				return privatePrerequisiteResult{}, err
 			}
 			blockPrivateDomains(gateway)
@@ -71,9 +78,10 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 	if !hasPrivate {
 		return privatePrerequisiteResult{}, nil
 	}
-	if tunnel == nil || account == nil || tunnel.Status.TunnelID == "" {
+	if tunnel == nil || account == nil || tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+		tunnel.Status.DeletedAt != nil || tunnel.Status.TunnelID == "" || !tunnel.Status.OwnershipVerified {
 		blockPrivateDomains(gateway)
-		return privatePrerequisiteResult{Pending: "Private listeners require a ready CloudflareTunnel and CloudflareAccount"}, nil
+		return privatePrerequisiteResult{Pending: "Private listeners require an ownership-verified CloudflareTunnel and CloudflareAccount"}, nil
 	}
 
 	settings, message, err := r.privateDeviceSettings(ctx, account)
@@ -210,6 +218,9 @@ func (r *GatewayReconciler) ensurePrivateHostnameRoute(
 	account *v1alpha1.CloudflareAccount,
 	inputs gatewayInputsView,
 ) (ready, created bool, err error) {
+	if tunnel.Status.DeletedAt != nil {
+		return false, false, nil
+	}
 	for index := range inputs.HostnameRoutes {
 		route := &inputs.HostnameRoutes[index]
 		if normalizePrivateName(route.Spec.Hostname) != normalizePrivateName(listener.Hostname) ||
@@ -254,7 +265,11 @@ func (r *GatewayReconciler) ensurePrivateHostnameRoute(
 		Spec: v1alpha1.HostnameRouteSpec{
 			AccountRef: corev1.LocalObjectReference{Name: account.Name},
 			Hostname:   listener.Hostname,
-			TunnelRef:  v1alpha1.NamespacedObjectReference{Name: tunnel.Name, Namespace: tunnel.Namespace},
+			TunnelRef: v1alpha1.TunnelReference{
+				Kind:      v1alpha1.TunnelReferenceKindCloudflareTunnel,
+				Name:      tunnel.Name,
+				Namespace: tunnel.Namespace,
+			},
 			AllowedNamespaces: v1alpha1.AllowedNamespaces{
 				From: v1alpha1.AllowedNamespaceFromSelector,
 				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
@@ -272,12 +287,24 @@ func (r *GatewayReconciler) ensurePrivateHostnameRoute(
 	return false, true, nil
 }
 
-func (r *GatewayReconciler) deletePlatformHostnameRoutes(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, routes []v1alpha1.HostnameRoute) error {
+func (r *GatewayReconciler) deletePlatformHostnameRoutes(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, routes []v1alpha1.HostnameRoute) error {
 	for index := range routes {
 		route := &routes[index]
-		if route.Labels["flareway.bhyoo.com/platform-object"] != "true" ||
+		if route.Labels[generatedPlatformObjectLabel] != "true" ||
+			route.Labels[generatedSourceNamespaceLabel] != tunnel.Namespace ||
+			route.Labels[generatedGatewayLabel] != tunnel.Namespace+"--"+tunnel.Name ||
 			!privateRouteTargetsTunnel(route.Spec.TunnelRef, route.Namespace, tunnel) {
 			continue
+		}
+		if route.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
+			before := route.DeepCopy()
+			if route.Annotations == nil {
+				route.Annotations = map[string]string{}
+			}
+			route.Annotations[sourceGatewayUIDAnnotation] = string(gateway.UID)
+			if err := r.Patch(ctx, route, client.MergeFrom(before)); err != nil {
+				return fmt.Errorf("bind platform HostnameRoute %s/%s to current Gateway UID before teardown: %w", route.Namespace, route.Name, err)
+			}
 		}
 		if err := r.Delete(ctx, route); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete platform HostnameRoute %s/%s: %w", route.Namespace, route.Name, err)
@@ -287,6 +314,9 @@ func (r *GatewayReconciler) deletePlatformHostnameRoutes(ctx context.Context, tu
 }
 
 func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1.CloudflareAccount, routes []v1alpha1.HostnameRoute) (bool, error) {
+	if tunnel.Status.DeletedAt != nil {
+		return false, nil
+	}
 	platformNamespace := r.OperatorNamespace
 	if platformNamespace == "" {
 		platformNamespace = dataplane.DefaultOperatorNamespace
@@ -300,12 +330,28 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 	changed := false
 	for index := range routes {
 		route := &routes[index]
-		if route.Namespace != platformNamespace || route.Labels["flareway.bhyoo.com/platform-object"] != "true" || route.Annotations["flareway.bhyoo.com/source-gateway-uid"] != string(gateway.UID) {
+		if route.Namespace != platformNamespace ||
+			route.Labels[generatedPlatformObjectLabel] != "true" ||
+			route.Labels[generatedSourceNamespaceLabel] != tunnel.Namespace ||
+			route.Labels[generatedGatewayLabel] != tunnel.Namespace+"--"+tunnel.Name ||
+			!privateRouteTargetsTunnel(route.Spec.TunnelRef, route.Namespace, tunnel) {
 			continue
 		}
 		key := client.ObjectKeyFromObject(route)
 		listener, retained := desired[key]
 		if !retained {
+			if route.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
+				before := route.DeepCopy()
+				if route.Annotations == nil {
+					route.Annotations = map[string]string{}
+				}
+				route.Annotations[sourceGatewayUIDAnnotation] = string(gateway.UID)
+				if err := r.Patch(ctx, route, client.MergeFrom(before)); err != nil {
+					return false, fmt.Errorf("bind obsolete generated HostnameRoute %s to current Gateway UID before deletion: %w", key, err)
+				}
+				changed = true
+				continue
+			}
 			if err := r.Delete(ctx, route); err != nil && !apierrors.IsNotFound(err) {
 				return false, fmt.Errorf("delete obsolete generated HostnameRoute %s: %w", key, err)
 			}
@@ -325,7 +371,11 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 		route.Annotations["flareway.bhyoo.com/source-gateway-uid"] = string(gateway.UID)
 		route.Spec.AccountRef = corev1.LocalObjectReference{Name: account.Name}
 		route.Spec.Hostname = listener.Hostname
-		route.Spec.TunnelRef = v1alpha1.NamespacedObjectReference{Name: tunnel.Name, Namespace: tunnel.Namespace}
+		route.Spec.TunnelRef = v1alpha1.TunnelReference{
+			Kind:      v1alpha1.TunnelReferenceKindCloudflareTunnel,
+			Name:      tunnel.Name,
+			Namespace: tunnel.Namespace,
+		}
 		route.Spec.AllowedNamespaces = v1alpha1.AllowedNamespaces{From: v1alpha1.AllowedNamespaceFromSelector, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": tunnel.Namespace}}}
 		route.Spec.Comment = fmt.Sprintf("flareway private listener %s/%s/%s", tunnel.Namespace, tunnel.Name, listener.Name)
 		route.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
@@ -425,6 +475,9 @@ func effectivePrivateOriginJWTMode(application *v1alpha1.AccessApplication) v1al
 }
 
 func privateListenerHasReadyVNet(listenerName string, tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1.CloudflareAccount, vnets []v1alpha1.VirtualNetwork) bool {
+	if tunnel.Status.DeletedAt != nil {
+		return false
+	}
 	name := ""
 	for _, listener := range tunnel.Spec.Listeners {
 		if string(listener.Name) == listenerName && listener.VirtualNetworkRef != nil {
@@ -446,6 +499,9 @@ func privateListenerHasReadyVNet(listenerName string, tunnel *v1alpha1.Cloudflar
 }
 
 func hostnameRouteCreationEnabled(tunnel *v1alpha1.CloudflareTunnel, listenerName string) bool {
+	if tunnel.Status.DeletedAt != nil {
+		return false
+	}
 	for _, listener := range tunnel.Spec.Listeners {
 		if string(listener.Name) != listenerName {
 			continue
@@ -455,12 +511,19 @@ func hostnameRouteCreationEnabled(tunnel *v1alpha1.CloudflareTunnel, listenerNam
 	return true
 }
 
-func privateRouteTargetsTunnel(ref v1alpha1.NamespacedObjectReference, routeNamespace string, tunnel *v1alpha1.CloudflareTunnel) bool {
+func privateRouteTargetsTunnel(ref v1alpha1.TunnelReference, routeNamespace string, tunnel *v1alpha1.CloudflareTunnel) bool {
+	if !cloudflareTunnelReference(ref) {
+		return false
+	}
 	namespace := ref.Namespace
 	if namespace == "" {
 		namespace = routeNamespace
 	}
 	return namespace == tunnel.Namespace && ref.Name == tunnel.Name
+}
+
+func cloudflareTunnelReference(ref v1alpha1.TunnelReference) bool {
+	return ref.Kind == "" || ref.Kind == v1alpha1.TunnelReferenceKindCloudflareTunnel
 }
 
 func privateUsesPodIPBinding(gateway *ir.Gateway) bool {
@@ -486,13 +549,16 @@ func privateHostnameRouteName(namespace, tunnel, listener string) string {
 }
 
 func (r *GatewayReconciler) mapPrivateRouteToGateways(ctx context.Context, object client.Object) []reconcile.Request {
-	var ref v1alpha1.NamespacedObjectReference
+	var ref v1alpha1.TunnelReference
 	switch route := object.(type) {
 	case *v1alpha1.NetworkRoute:
 		ref = route.Spec.TunnelRef
 	case *v1alpha1.HostnameRoute:
 		ref = route.Spec.TunnelRef
 	default:
+		return nil
+	}
+	if !cloudflareTunnelReference(ref) {
 		return nil
 	}
 	namespace := ref.Namespace

@@ -29,10 +29,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -63,11 +61,6 @@ const (
 	accessApplicationPrivateTunnelsKey    = "tunnels"
 	accessApplicationAUDReadyKey          = "ready"
 
-	accessTagNameMaxLength = 35
-	accessManagedTag       = "flareway-managed"
-	accessOwnerTagPrefix   = "flareway-owner-"
-	accessBypassTagPrefix  = "flareway-bypass-"
-
 	accessApplicationConditionAccepted       = "Accepted"
 	accessApplicationConditionProgrammed     = "Programmed"
 	accessApplicationConditionCleanupBlocked = "CleanupBlocked"
@@ -77,6 +70,7 @@ const (
 type AccessApplicationCloudflareClient interface {
 	flarecloudflare.AccessApplicationAPI
 	flarecloudflare.AccessTagAPI
+	flarecloudflare.AccessCustomPageAPI
 	GetAccessPolicy(context.Context, string) (flarecloudflare.AccessPolicy, error)
 	GetIdentityProvider(context.Context, string) (flarecloudflare.IdentityProvider, error)
 }
@@ -100,7 +94,8 @@ type AccessApplicationReconciler struct {
 	Now                 func() time.Time
 }
 
-// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications;accesspolicies;identityproviders;cloudflareaccounts;cloudflaretunnels,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesspolicies;identityproviders;accesscustompages;servicetokens;cloudflareaccounts;cloudflaretunnels,verbs=get;list;watch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=networkroutes;hostnameroutes;virtualnetworks,verbs=get;list;watch
@@ -130,6 +125,7 @@ func (r *AccessApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 type accessApplicationContext struct {
 	account     *v1alpha1.CloudflareAccount
+	scope       flarecloudflare.AccessScope
 	compilation gatewayapi.AccessApplicationCompilation
 	gateways    []types.NamespacedName
 }
@@ -142,8 +138,8 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if !resolved.compilation.Accepted {
 		return r.reconcileInvalidation(ctx, application, resolved.compilation)
 	}
-	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly && len(resolved.compilation.Bypass) > 0 {
-		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Invalid", "ObserveOnly AccessApplication cannot own mixed-hostname bypass applications"))
+	if invalid := validateBypassDeclarations(application, resolved.compilation); invalid != nil {
+		return r.reconcileInvalidation(ctx, application, *invalid)
 	}
 	if application.Spec.Application.CORSHeaders != nil {
 		conflict, err := r.targetUsesHTTPCORS(ctx, application)
@@ -167,6 +163,14 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
+	customPageIDs, err := r.resolveCustomPages(ctx, application, resolved.account, remote)
+	if err != nil {
+		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
+	}
+	scimConfig, err := r.resolveApplicationSCIMConfig(ctx, application, resolved.account, remote)
+	if err != nil {
+		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
+	}
 
 	if _, latched := application.Annotations[accessApplicationRevocationAnnotation]; latched {
 		acknowledged, message, err := r.revocationAcknowledged(ctx, application)
@@ -177,6 +181,9 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
 			setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "RevocationPending", message, r.now())
 			return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
+		}
+		if err := r.revokeApplicationTokensWithClient(ctx, remote, resolved.scope, application); err != nil {
+			return ctrl.Result{}, err
 		}
 		if err := r.clearRevocationLatch(ctx, application); err != nil {
 			return ctrl.Result{}, err
@@ -207,8 +214,8 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	input := remoteApplicationInput(application, resolved.compilation.Destinations, policyIDs, idpIDs, ownerTag)
-	observed, err := r.reconcileRemoteApplication(ctx, remote, application, input, ownerTag)
+	input := remoteApplicationInput(application, resolved.compilation.Destinations, policyIDs, idpIDs, customPageIDs, scimConfig, ownerTag)
+	observed, err := r.reconcileRemoteApplication(ctx, remote, resolved.scope, application, input, ownerTag)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Pending", "Remote Access application reconciliation failed: "+err.Error()))
 	}
@@ -218,7 +225,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		}
 		application.Status.ApplicationID = observed.ID
 	}
-	children, err := r.reconcileBypassApplications(ctx, remote, application, resolved.compilation.Bypass, ownerTag, clusterID)
+	children, err := r.reconcileBypassApplications(ctx, remote, resolved.scope, application, resolved.compilation.Bypass, ownerTag, clusterID)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Pending", "Remote bypass application reconciliation failed: "+err.Error()))
 	}
@@ -233,6 +240,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		return ctrl.Result{}, err
 	}
 	status := r.desiredStatus(application, resolved.compilation, observed.ID, children, programmed)
+	applyObservedApplicationStatus(&status, application, resolved.scope, observed, ownerTag)
 	if err := r.patchStatus(ctx, application, status); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -277,6 +285,9 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 		setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, metav1.ConditionFalse, "RevocationPending", message, r.now())
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 	}
+	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
+		return ctrl.Result{}, err
+	}
 	if targetInfrastructureUnavailable(invalid) &&
 		effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
 		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
@@ -320,7 +331,8 @@ func statusCompilation(application *v1alpha1.AccessApplication, reason, message 
 	for _, destination := range application.Status.Destinations {
 		compilation.Destinations = append(compilation.Destinations, gatewayapi.AccessDestination{
 			Type: destination.Type, URI: destination.URI, Hostname: destination.Hostname, CIDR: destination.CIDR,
-			PortRange: destination.PortRange, L4Protocol: string(destination.L4Protocol), VNetID: destination.VNetID,
+			PortRange: destination.PortRange, L4Protocol: cloneAccessL4Protocol(destination.L4Protocol),
+			VNetID: destination.VNetID, MCPServerID: destination.MCPServerID, WorkerID: destination.WorkerID,
 		})
 	}
 	for _, dataPlane := range application.Status.DataPlanes {
@@ -365,44 +377,60 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		return accessApplicationContext{}, fmt.Errorf("list AccessApplications: %w", err)
 	}
 
+	var account v1alpha1.CloudflareAccount
+	if err := r.Get(ctx, types.NamespacedName{Name: application.Spec.AccountRef.Name}, &account); err != nil {
+		if apierrors.IsNotFound(err) {
+			return accessApplicationContext{
+				compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareAccount %q was not found", application.Spec.AccountRef.Name)),
+			}, nil
+		}
+		return accessApplicationContext{}, fmt.Errorf("get CloudflareAccount %q: %w", application.Spec.AccountRef.Name, err)
+	}
+	if !gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
+		!gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
+		return accessApplicationContext{
+			account:     &account,
+			compilation: rejectedCompilation("RefNotPermitted", fmt.Sprintf("CloudflareAccount %q is not accepted with valid credentials", account.Name)),
+		}, nil
+	}
+	scope, err := accessApplicationScope(application, &account)
+	if err != nil {
+		return accessApplicationContext{
+			account:     &account,
+			compilation: rejectedCompilation("RefNotPermitted", err.Error()),
+		}, nil
+	}
+
 	gatewayKeys, err := r.targetGatewayKeys(ctx, application)
 	if err != nil {
-		return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", err.Error())}, nil
+		return accessApplicationContext{
+			account: &account, scope: scope,
+			compilation: rejectedCompilation("TargetNotFound", err.Error()),
+		}, nil
 	}
 	result := accessApplicationContext{
-		compilation: gatewayapi.AccessApplicationCompilation{Accepted: true, Reason: "Accepted", Message: "Access application targets are valid"},
-		gateways:    gatewayKeys,
+		account: &account,
+		scope:   scope,
+		compilation: gatewayapi.AccessApplicationCompilation{
+			Accepted: true, Reason: "Accepted", Message: "Access application targets are valid",
+		},
+		gateways: gatewayKeys,
 	}
-	accountNames := make(map[string]struct{})
-	if len(application.Spec.PrivateDestinations) > 0 {
-		inputs, account, err := r.privateAccessInputs(ctx, application)
+
+	privateInputs := gatewayapi.Inputs{CloudflareAccount: &account}
+	if len(accessApplicationPrivateDestinations(application)) > 0 {
+		privateInputs, err = r.privateAccessInputs(ctx, application, &account)
 		if err != nil {
 			return accessApplicationContext{}, err
 		}
-		if invalid := validatePrivateRouteLifecycle(inputs, application); invalid != nil {
-			return accessApplicationContext{account: account, compilation: *invalid, gateways: gatewayKeys}, nil
+		if invalid := validatePrivateRouteLifecycle(privateInputs, application); invalid != nil {
+			result.compilation = *invalid
+			return result, nil
 		}
-		if account != nil &&
-			(!gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
-				!gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid)) {
-			return accessApplicationContext{
-				account:     account,
-				compilation: rejectedCompilation("RefNotPermitted", fmt.Sprintf("CloudflareAccount %q is not accepted with valid credentials", account.Name)),
-				gateways:    gatewayKeys,
-			}, nil
-		}
-		compiled := gatewayapi.CompilePrivateDestinations(inputs, application)
-		if !compiled.Accepted {
-			return accessApplicationContext{account: account, compilation: compiled, gateways: gatewayKeys}, nil
-		}
-		result.account = account
-		accountNames[account.Name] = struct{}{}
-		mergeAccessCompilation(&result.compilation, compiled)
 	}
 	if len(gatewayKeys) == 0 {
-		if len(application.Spec.PrivateDestinations) == 0 {
-			return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", "no targetRef resolves to a Gateway")}, nil
-		}
+		compiled := gatewayapi.CompileAccessApplication(privateInputs, application)
+		result.compilation = compiled
 		return result, nil
 	}
 
@@ -410,28 +438,33 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		var gateway gatewayv1.Gateway
 		if err := r.Get(ctx, gatewayKey, &gateway); err != nil {
 			if apierrors.IsNotFound(err) {
-				return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s was not found", gatewayKey))}, nil
+				result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s was not found", gatewayKey))
+				return result, nil
 			}
 			return accessApplicationContext{}, fmt.Errorf("get target Gateway %s: %w", gatewayKey, err)
 		}
 		if !gateway.DeletionTimestamp.IsZero() {
-			return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is deleting", gatewayKey))}, nil
+			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is deleting", gatewayKey))
+			return result, nil
 		}
 		var gatewayClass gatewayv1.GatewayClass
 		if err := r.Get(ctx, types.NamespacedName{Name: string(gateway.Spec.GatewayClassName)}, &gatewayClass); err != nil {
 			if apierrors.IsNotFound(err) {
-				return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("GatewayClass %q was not found", gateway.Spec.GatewayClassName))}, nil
+				result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("GatewayClass %q was not found", gateway.Spec.GatewayClassName))
+				return result, nil
 			}
 			return accessApplicationContext{}, fmt.Errorf("get GatewayClass: %w", err)
 		}
 		if gatewayClass.Spec.ControllerName != gatewayapi.ControllerName {
-			return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is not managed by Flareway", gatewayKey))}, nil
+			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is not managed by Flareway", gatewayKey))
+			return result, nil
 		}
 		collector := &GatewayReconciler{Client: r.Client, Now: r.Now}
 		config, err := collector.loadGatewayClassConfig(ctx, &gatewayClass)
 		if err != nil {
 			return accessApplicationContext{}, err
 		}
+		revocationCeiling := collector.revocationState().ceiling()
 		inputs, _, err := collector.collectInputs(ctx, &gateway, &gatewayClass, config)
 		if err != nil {
 			return accessApplicationContext{}, err
@@ -441,30 +474,17 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			return accessApplicationContext{}, err
 		}
 		if tunnel == nil {
-			return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel for Gateway %s was not found", gatewayKey))}, nil
+			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel for Gateway %s was not found", gatewayKey))
+			return result, nil
 		}
 		if !tunnel.DeletionTimestamp.IsZero() {
-			return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel %s/%s is deleting", tunnel.Namespace, tunnel.Name))}, nil
+			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel %s/%s is deleting", tunnel.Namespace, tunnel.Name))
+			return result, nil
 		}
-		var account v1alpha1.CloudflareAccount
-		if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account); err != nil {
-			if apierrors.IsNotFound(err) {
-				return accessApplicationContext{compilation: rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareAccount %q was not found", tunnel.Spec.AccountRef.Name))}, nil
-			}
-			return accessApplicationContext{}, fmt.Errorf("get CloudflareAccount: %w", err)
+		if tunnel.Spec.AccountRef.Name != account.Name {
+			result.compilation = rejectedCompilation("RefNotPermitted", fmt.Sprintf("AccessApplication accountRef %q does not match target account %q", account.Name, tunnel.Spec.AccountRef.Name))
+			return result, nil
 		}
-		if !gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
-			!gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-			return accessApplicationContext{compilation: rejectedCompilation("RefNotPermitted", fmt.Sprintf("CloudflareAccount %q is not accepted with valid credentials", account.Name))}, nil
-		}
-		if application.Spec.AccountRef != nil && application.Spec.AccountRef.Name != account.Name {
-			return accessApplicationContext{compilation: rejectedCompilation("RefNotPermitted", fmt.Sprintf("AccessApplication accountRef %q does not match target account %q", application.Spec.AccountRef.Name, account.Name))}, nil
-		}
-		accountNames[account.Name] = struct{}{}
-		if len(accountNames) > 1 {
-			return accessApplicationContext{compilation: rejectedCompilation("RefNotPermitted", "all AccessApplication targets must use the same CloudflareAccount")}, nil
-		}
-		result.account = account.DeepCopy()
 		inputs.CloudflareTunnel = tunnel
 		inputs.CloudflareAccount = &account
 		inputs.AccessApplications = slices.Clone(applications.Items)
@@ -472,6 +492,7 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		if err != nil {
 			return accessApplicationContext{}, err
 		}
+		collector.applyAUDRevocationLatches(&gateway, tunnel, &inputs, revocationCeiling)
 		_, statuses := gatewayapi.Translate(inputs)
 		compiled, found := statuses.AccessApplications[client.ObjectKeyFromObject(application)]
 		if !found {
@@ -484,68 +505,67 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		}
 	}
 	if len(result.compilation.Destinations) == 0 && result.compilation.Accepted {
-		result.compilation = rejectedCompilation("TargetNotFound", "no targetRef or private route resolves to an Access destination")
+		result.compilation = rejectedCompilation("TargetNotFound", "no targetRef or destination resolves to an Access destination")
 	}
 	return result, nil
 }
 
-func (r *AccessApplicationReconciler) privateAccessInputs(ctx context.Context, application *v1alpha1.AccessApplication) (gatewayapi.Inputs, *v1alpha1.CloudflareAccount, error) {
+func (r *AccessApplicationReconciler) privateAccessInputs(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount) (gatewayapi.Inputs, error) {
 	var namespaces corev1.NamespaceList
 	if err := r.List(ctx, &namespaces); err != nil {
-		return gatewayapi.Inputs{}, nil, fmt.Errorf("list Namespaces for private destinations: %w", err)
+		return gatewayapi.Inputs{}, fmt.Errorf("list Namespaces for private destinations: %w", err)
 	}
 	var networkRoutes v1alpha1.NetworkRouteList
 	if err := r.List(ctx, &networkRoutes, client.InNamespace(application.Namespace)); err != nil {
-		return gatewayapi.Inputs{}, nil, fmt.Errorf("list NetworkRoutes for private destinations: %w", err)
+		return gatewayapi.Inputs{}, fmt.Errorf("list NetworkRoutes for private destinations: %w", err)
 	}
 	var hostnameRoutes v1alpha1.HostnameRouteList
 	if err := r.List(ctx, &hostnameRoutes, client.InNamespace(application.Namespace)); err != nil {
-		return gatewayapi.Inputs{}, nil, fmt.Errorf("list HostnameRoutes for private destinations: %w", err)
-	}
-	accountName := ""
-	if application.Spec.AccountRef != nil {
-		accountName = application.Spec.AccountRef.Name
-	}
-	for _, private := range application.Spec.PrivateDestinations {
-		routeAccount := ""
-		if private.NetworkRouteRef != nil {
-			for index := range networkRoutes.Items {
-				if networkRoutes.Items[index].Name == private.NetworkRouteRef.Name {
-					routeAccount = networkRoutes.Items[index].Spec.AccountRef.Name
-					break
-				}
-			}
-		}
-		if private.HostnameRouteRef != nil {
-			for index := range hostnameRoutes.Items {
-				if hostnameRoutes.Items[index].Name == private.HostnameRouteRef.Name {
-					routeAccount = hostnameRoutes.Items[index].Spec.AccountRef.Name
-					break
-				}
-			}
-		}
-		if routeAccount == "" {
-			continue
-		}
-		if accountName == "" {
-			accountName = routeAccount
-		}
-	}
-	if accountName == "" {
-		return gatewayapi.Inputs{Namespaces: namespaces.Items, NetworkRoutes: networkRoutes.Items, HostnameRoutes: hostnameRoutes.Items}, nil, nil
-	}
-	var account v1alpha1.CloudflareAccount
-	if err := r.Get(ctx, types.NamespacedName{Name: accountName}, &account); err != nil {
-		return gatewayapi.Inputs{}, nil, fmt.Errorf("get CloudflareAccount %q for private destinations: %w", accountName, err)
+		return gatewayapi.Inputs{}, fmt.Errorf("list HostnameRoutes for private destinations: %w", err)
 	}
 	return gatewayapi.Inputs{
-		CloudflareAccount: &account, Namespaces: namespaces.Items,
-		NetworkRoutes: networkRoutes.Items, HostnameRoutes: hostnameRoutes.Items,
-	}, &account, nil
+		CloudflareAccount: account,
+		Namespaces:        namespaces.Items,
+		NetworkRoutes:     networkRoutes.Items,
+		HostnameRoutes:    hostnameRoutes.Items,
+	}, nil
+}
+
+func accessApplicationScope(application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount) (flarecloudflare.AccessScope, error) {
+	if application.Spec.Zone == "" {
+		return flarecloudflare.AccessScope{}, nil
+	}
+	zoneName := strings.ToLower(strings.TrimSuffix(application.Spec.Zone, "."))
+	for _, zone := range account.Status.Verified.Zones {
+		if strings.ToLower(strings.TrimSuffix(zone.Name, ".")) == zoneName {
+			if zone.ID == "" {
+				break
+			}
+			return flarecloudflare.AccessScope{ZoneID: zone.ID}, nil
+		}
+	}
+	return flarecloudflare.AccessScope{}, fmt.Errorf("zone %q is not verified for CloudflareAccount %q", application.Spec.Zone, account.Name)
+}
+
+func accessApplicationScopeForDeletion(application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount) (flarecloudflare.AccessScope, error) {
+	if application.Status.ZoneID != "" {
+		return flarecloudflare.AccessScope{ZoneID: application.Status.ZoneID}, nil
+	}
+	return accessApplicationScope(application, account)
+}
+
+func accessApplicationPrivateDestinations(application *v1alpha1.AccessApplication) []v1alpha1.AccessPrivateDestinationSpec {
+	result := make([]v1alpha1.AccessPrivateDestinationSpec, 0)
+	for _, destination := range application.Spec.Destinations {
+		if destination.Type == v1alpha1.AccessApplicationDestinationPrivate && destination.Private != nil {
+			result = append(result, *destination.Private)
+		}
+	}
+	return result
 }
 
 func validatePrivateRouteLifecycle(inputs gatewayapi.Inputs, application *v1alpha1.AccessApplication) *gatewayapi.AccessApplicationCompilation {
-	for _, destination := range application.Spec.PrivateDestinations {
+	for _, destination := range accessApplicationPrivateDestinations(application) {
 		if destination.NetworkRouteRef != nil {
 			var route *v1alpha1.NetworkRoute
 			for index := range inputs.NetworkRoutes {
@@ -620,33 +640,41 @@ func (r *AccessApplicationReconciler) deletePrivateTunnelLedger(ctx context.Cont
 }
 
 func (r *AccessApplicationReconciler) currentPrivateTunnelKeys(ctx context.Context, application *v1alpha1.AccessApplication) ([]string, error) {
-	keys := make([]string, 0, len(application.Spec.PrivateDestinations))
-	for _, destination := range application.Spec.PrivateDestinations {
+	privateDestinations := accessApplicationPrivateDestinations(application)
+	keys := make([]string, 0, len(privateDestinations))
+	for _, destination := range privateDestinations {
 		if destination.NetworkRouteRef != nil {
 			var route v1alpha1.NetworkRoute
 			if err := r.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: destination.NetworkRouteRef.Name}, &route); err != nil {
 				return nil, fmt.Errorf("get NetworkRoute for private tunnel ledger: %w", err)
 			}
-			keys = append(keys, privateRouteTunnelKey(route.Namespace, route.Spec.TunnelRef))
+			if key, ok := privateRouteTunnelKey(route.Namespace, route.Spec.TunnelRef); ok {
+				keys = append(keys, key)
+			}
 		}
 		if destination.HostnameRouteRef != nil {
 			var route v1alpha1.HostnameRoute
 			if err := r.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: destination.HostnameRouteRef.Name}, &route); err != nil {
 				return nil, fmt.Errorf("get HostnameRoute for private tunnel ledger: %w", err)
 			}
-			keys = append(keys, privateRouteTunnelKey(route.Namespace, route.Spec.TunnelRef))
+			if key, ok := privateRouteTunnelKey(route.Namespace, route.Spec.TunnelRef); ok {
+				keys = append(keys, key)
+			}
 		}
 	}
 	slices.Sort(keys)
 	return slices.Compact(keys), nil
 }
 
-func privateRouteTunnelKey(routeNamespace string, reference v1alpha1.NamespacedObjectReference) string {
+func privateRouteTunnelKey(routeNamespace string, reference v1alpha1.TunnelReference) (string, bool) {
+	if reference.Kind != "" && reference.Kind != v1alpha1.TunnelReferenceKindCloudflareTunnel {
+		return "", false
+	}
 	namespace := reference.Namespace
 	if namespace == "" {
 		namespace = routeNamespace
 	}
-	return namespace + "/" + reference.Name
+	return namespace + "/" + reference.Name, true
 }
 
 func (r *AccessApplicationReconciler) privateTunnelLedger(ctx context.Context, application *v1alpha1.AccessApplication) ([]string, error) {
@@ -761,7 +789,7 @@ func (r *AccessApplicationReconciler) targetGatewayKeys(ctx context.Context, app
 			var route gatewayv1.HTTPRoute
 			key := types.NamespacedName{Namespace: application.Namespace, Name: string(target.Name)}
 			if err := r.Get(ctx, key, &route); err != nil {
-				return nil, fmt.Errorf("HTTPRoute %s was not found", key)
+				return nil, fmt.Errorf("the HTTPRoute %s was not found", key)
 			}
 			for _, parent := range route.Spec.ParentRefs {
 				parentGroup := "gateway.networking.k8s.io"
@@ -889,600 +917,24 @@ func routeParentUsesSection(route *gatewayv1.HTTPRoute, gatewayName string, sect
 	return false
 }
 
-func (r *AccessApplicationReconciler) loadAUDSecrets(ctx context.Context, applications []v1alpha1.AccessApplication, gateway types.NamespacedName) (map[types.NamespacedName]gatewayapi.AUDSecret, error) {
-	var secrets corev1.SecretList
-	if err := r.List(ctx, &secrets,
-		client.InNamespace(r.operatorNamespace()),
-		client.MatchingLabels{v1alpha1.AccessApplicationGatewayAUDLabel: gateway.Namespace + "--" + gateway.Name},
-	); err != nil {
-		return nil, fmt.Errorf("list Access AUD Secrets for Gateway %s: %w", gateway, err)
+func (r *AccessApplicationReconciler) loadAUDSecrets(ctx context.Context, applications []v1alpha1.AccessApplication, gatewayKey types.NamespacedName) (map[types.NamespacedName]gatewayapi.AUDSecret, error) {
+	var gateway gatewayv1.Gateway
+	if err := r.Get(ctx, gatewayKey, &gateway); err != nil {
+		return nil, fmt.Errorf("get Gateway %s for Access AUD Secrets: %w", gatewayKey, err)
 	}
-	applicationByLabel := make(map[string]types.NamespacedName, len(applications))
-	for index := range applications {
-		application := &applications[index]
-		applicationByLabel[application.Namespace+"--"+application.Name] = client.ObjectKeyFromObject(application)
-	}
-	result := make(map[types.NamespacedName]gatewayapi.AUDSecret)
-	for index := range secrets.Items {
-		secret := &secrets.Items[index]
-		key, found := applicationByLabel[secret.Labels[v1alpha1.AccessApplicationAUDSecretLabel]]
-		if !found {
-			continue
-		}
-		result[key] = gatewayapi.AUDSecret{
-			AUD:           string(secret.Data[v1alpha1.AccessApplicationAUDSecretKey]),
-			ApplicationID: string(secret.Data[v1alpha1.AccessApplicationIDSecretKey]),
-			Ready:         string(secret.Data[accessApplicationAUDReadyKey]) == "true",
-		}
-	}
-	return result, nil
-}
-
-func (r *AccessApplicationReconciler) resolvePolicies(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient) ([]string, error) {
-	ids := make([]string, 0, len(application.Spec.Policies))
-	var namespace corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: application.Namespace}, &namespace); err != nil {
-		return nil, fmt.Errorf("get AccessApplication namespace: %w", err)
-	}
-	for _, reference := range application.Spec.Policies {
-		if reference.ExternalRef != nil {
-			policy, err := remote.GetAccessPolicy(ctx, reference.ExternalRef.PolicyID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external Access policy %q could not be resolved: %v", reference.ExternalRef.PolicyID, err)}
-			}
-			if policy.Decision == "bypass" {
-				return nil, accessValidationError{reason: "Invalid", message: "bypass policies are operator-managed; make the route rule public instead"}
-			}
-			ids = append(ids, policy.ID)
-			continue
-		}
-		if reference.PolicyRef == nil {
-			return nil, accessValidationError{reason: "Invalid", message: "policy reference is empty"}
-		}
-		policyNamespace := reference.PolicyRef.Namespace
-		if policyNamespace == "" {
-			policyNamespace = application.Namespace
-		}
-		var policy v1alpha1.AccessPolicy
-		if err := r.Get(ctx, types.NamespacedName{Namespace: policyNamespace, Name: reference.PolicyRef.Name}, &policy); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("AccessPolicy %s/%s was not found", policyNamespace, reference.PolicyRef.Name)}
-			}
-			return nil, fmt.Errorf("get AccessPolicy %s/%s: %w", policyNamespace, reference.PolicyRef.Name, err)
-		}
-		if policy.Spec.Decision == v1alpha1.AccessPolicyDecisionBypass {
-			return nil, accessValidationError{reason: "Invalid", message: "bypass policies are operator-managed; make the route rule public instead"}
-		}
-		if policy.Spec.AccountRef.Name != account.Name {
-			return nil, fmt.Errorf("AccessPolicy %s/%s uses CloudflareAccount %q, want %q", policyNamespace, policy.Name, policy.Spec.AccountRef.Name, account.Name)
-		}
-		if policyNamespace != application.Namespace {
-			allowed := false
-			for _, grant := range account.Spec.Grants {
-				selector, err := metav1.LabelSelectorAsSelector(&grant.NamespaceSelector)
-				if err == nil && selector.Matches(labels.Set(namespace.Labels)) && grant.AccessPolicyRefs == v1alpha1.GrantPermissionAllowed {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				return nil, fmt.Errorf("AccessPolicy %s/%s is not permitted by CloudflareAccount grants", policyNamespace, policy.Name)
-			}
-		}
-		if policy.Status.PolicyID == "" || !gatewaystatus.ConditionTrue(policy.Status.Conditions, accessApplicationConditionAccepted) || !policy.DeletionTimestamp.IsZero() {
-			return nil, fmt.Errorf("AccessPolicy %s/%s is not accepted", policyNamespace, policy.Name)
-		}
-		policyID := policy.Status.PolicyID
-		if effectiveManagementPolicy(policy.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
-			observed, err := remote.GetAccessPolicy(ctx, policyID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("AccessPolicy %s/%s remote policy could not be resolved: %v", policyNamespace, policy.Name, err)}
-			}
-			if observed.Decision == "bypass" {
-				return nil, accessValidationError{reason: "Invalid", message: "bypass policies are operator-managed; make the route rule public instead"}
-			}
-			policyID = observed.ID
-		}
-		ids = append(ids, policyID)
-	}
-	return ids, nil
-}
-func (r *AccessApplicationReconciler) resolveIdentityProviders(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient) ([]string, error) {
-	ids := make([]string, 0, len(application.Spec.Application.AllowedIDPRefs))
-	for _, reference := range application.Spec.Application.AllowedIDPRefs {
-		if reference.ExternalID != "" {
-			provider, err := remote.GetIdentityProvider(ctx, reference.ExternalID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q could not be resolved: %v", reference.ExternalID, err)}
-			}
-			ids = append(ids, provider.ID)
-			continue
-		}
-		var provider v1alpha1.IdentityProvider
-		if err := r.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: reference.Name}, &provider); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("IdentityProvider %s/%s was not found", application.Namespace, reference.Name)}
-			}
-			return nil, fmt.Errorf("get IdentityProvider %s/%s: %w", application.Namespace, reference.Name, err)
-		}
-		if !provider.DeletionTimestamp.IsZero() {
-			return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("IdentityProvider %s/%s is deleting", application.Namespace, provider.Name)}
-		}
-		if provider.Spec.AccountRef.Name != account.Name {
-			return nil, fmt.Errorf("IdentityProvider %s/%s uses CloudflareAccount %q, want %q", application.Namespace, provider.Name, provider.Spec.AccountRef.Name, account.Name)
-		}
-		if provider.Status.IDPID == "" || !gatewaystatus.ConditionTrue(provider.Status.Conditions, accessApplicationConditionAccepted) {
-			return nil, fmt.Errorf("IdentityProvider %s/%s is not accepted", application.Namespace, provider.Name)
-		}
-		providerID := provider.Status.IDPID
-		if effectiveManagementPolicy(provider.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
-			observed, err := remote.GetIdentityProvider(ctx, providerID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("IdentityProvider %s/%s remote provider could not be resolved: %v", application.Namespace, provider.Name, err)}
-			}
-			providerID = observed.ID
-		}
-		ids = append(ids, providerID)
-	}
-	return ids, nil
-}
-
-type accessValidationError struct {
-	reason  string
-	message string
-}
-
-func (err accessValidationError) Error() string { return err.message }
-
-func accessValidationReason(err error) string {
-	var validation accessValidationError
-	if errors.As(err, &validation) {
-		return validation.reason
-	}
-	return "RefNotPermitted"
-}
-
-func remoteApplicationInput(application *v1alpha1.AccessApplication, destinations []gatewayapi.AccessDestination, policyIDs, idpIDs []string, ownerTag string) flarecloudflare.AccessApplicationInput {
-	remoteDestinations := make([]flarecloudflare.AccessApplicationDestination, 0, len(destinations))
-	domain := ""
-	for _, destination := range destinations {
-		remoteDestinations = append(remoteDestinations, flarecloudflare.AccessApplicationDestination{
-			Type: destination.Type, URI: destination.URI, Hostname: destination.Hostname, CIDR: destination.CIDR,
-			PortRange: destination.PortRange, L4Protocol: destination.L4Protocol, VNetID: destination.VNetID,
-		})
-		if domain == "" && destination.Type == "public" {
-			domain = destination.URI
-			if index := strings.IndexByte(domain, '/'); index >= 0 {
-				domain = domain[:index]
-			}
-		}
-	}
-	policies := make([]flarecloudflare.AccessApplicationPolicyAttachment, len(policyIDs))
-	for index, id := range policyIDs {
-		policies[index] = flarecloudflare.AccessApplicationPolicyAttachment{ID: id, Precedence: int64(index + 1)}
-	}
-	name := accessApplicationRemoteName(application)
-	tags := append([]string(nil), application.Spec.Application.Tags...)
-	tags = append(tags, ownerTag, accessManagedTag)
-	slices.Sort(tags)
-	tags = slices.Compact(tags)
-	settings := application.Spec.Application
-	return flarecloudflare.AccessApplicationInput{
-		Domain: domain, Name: name, Destinations: remoteDestinations, Policies: policies, AllowedIDPs: slices.Clone(idpIDs),
-		SessionDuration: settings.SessionDuration, AllowAuthenticateViaWARP: settings.AllowAuthenticateViaWARP,
-		SkipInterstitial: settings.SkipInterstitial, AutoRedirectToIdentity: settings.AutoRedirectToIdentity,
-		AppLauncherVisible: settings.AppLauncherVisible, ServiceAuth401Redirect: settings.ServiceAuth401Redirect,
-		EnableBindingCookie: settings.EnableBindingCookie, HTTPOnlyCookieAttribute: settings.HTTPOnlyCookieAttribute,
-		SameSiteCookieAttribute: settings.SameSiteCookieAttribute, PathCookieAttribute: settings.PathCookieAttribute,
-		OptionsPreflightBypass: settings.OptionsPreflightBypass, CORSHeaders: settings.CORSHeaders,
-		ReadServiceTokensFromHeader: settings.ReadServiceTokensFromHeader,
-		CustomDenyMessage:           settings.CustomDenyMessage,
-		CustomDenyURL:               settings.CustomDenyURL, CustomNonIdentityDenyURL: settings.CustomNonIdentityDenyURL,
-		CustomPages: slices.Clone(settings.CustomPages), Tags: tags,
-	}
-}
-
-func (r *AccessApplicationReconciler) reconcileRemoteApplication(ctx context.Context, remote AccessApplicationCloudflareClient, application *v1alpha1.AccessApplication, input flarecloudflare.AccessApplicationInput, ownerTag string) (flarecloudflare.AccessApplication, error) {
-	policy := effectiveManagementPolicy(application.Spec.ManagementPolicy)
-	if policy == v1alpha1.ManagementPolicyObserveOnly {
-		if application.Spec.ExternalRef == nil {
-			return flarecloudflare.AccessApplication{}, errors.New("ObserveOnly AccessApplication requires externalRef")
-		}
-		return remote.GetAccessApplication(ctx, application.Spec.ExternalRef.ApplicationID)
-	}
-	internalTags := []string{accessManagedTag, ownerTag}
-	if application.Status.ApplicationID != "" {
-		current, err := remote.GetAccessApplication(ctx, application.Status.ApplicationID)
-		if err == nil {
-			if !hasAccessTag(current.Tags, ownerTag) || !hasAccessTag(current.Tags, accessManagedTag) {
-				return flarecloudflare.AccessApplication{}, fmt.Errorf("ownership conflict: Access application %q is not owned by this resource", application.Status.ApplicationID)
-			}
-			if err := ensureAccessTags(ctx, remote, internalTags...); err != nil {
-				return flarecloudflare.AccessApplication{}, err
-			}
-			return remote.UpdateAccessApplication(ctx, current.ID, input)
-		}
-		if !isRemoteNotFound(err) {
-			return flarecloudflare.AccessApplication{}, err
-		}
-	}
-	if application.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
-		if application.Spec.ExternalRef == nil {
-			return flarecloudflare.AccessApplication{}, errors.New("AdoptById AccessApplication requires externalRef")
-		}
-		observed, err := remote.GetAccessApplication(ctx, application.Spec.ExternalRef.ApplicationID)
-		if err != nil {
-			return flarecloudflare.AccessApplication{}, err
-		}
-		managedRecovery := observed.Name == input.Name &&
-			hasAccessTag(observed.Tags, accessManagedTag) &&
-			hasAccessTag(observed.Tags, ownerTag)
-		if !managedRecovery {
-			if expected := application.Spec.Adoption.Expect.Name; expected != "" && observed.Name != expected {
-				return flarecloudflare.AccessApplication{}, fmt.Errorf("adoption conflict: Access application name %q does not match expected %q", observed.Name, expected)
-			}
-		}
-		if err := ensureAccessTags(ctx, remote, internalTags...); err != nil {
-			return flarecloudflare.AccessApplication{}, err
-		}
-		return remote.UpdateAccessApplication(ctx, observed.ID, input)
-	}
-	if application.Spec.ExternalRef != nil {
-		return flarecloudflare.AccessApplication{}, errors.New("managed AccessApplication externalRef requires adoption.mode AdoptById")
-	}
-	recovered, found, err := findOwnedParentApplication(ctx, remote, ownerTag, input.Name)
+	secrets, err := listAUDSecretsForGateway(ctx, r.Client, r.operatorNamespace(), &gateway)
 	if err != nil {
-		return flarecloudflare.AccessApplication{}, err
+		return nil, fmt.Errorf("list Access AUD Secrets for Gateway %s: %w", gatewayKey, err)
 	}
-	if found {
-		if err := ensureAccessTags(ctx, remote, internalTags...); err != nil {
-			return flarecloudflare.AccessApplication{}, err
-		}
-		return remote.UpdateAccessApplication(ctx, recovered.ID, input)
+	if err := migrateLegacyAUDSecrets(ctx, r.Client, secrets, applications, &gateway); err != nil {
+		return nil, fmt.Errorf("migrate Access AUD Secrets for Gateway %s: %w", gatewayKey, err)
 	}
-	if err := ensureAccessTags(ctx, remote, internalTags...); err != nil {
-		return flarecloudflare.AccessApplication{}, err
-	}
-	created, createErr := remote.CreateAccessApplication(ctx, input)
-	if createErr == nil {
-		return created, nil
-	}
-	recovered, found, recoveryErr := findOwnedParentApplication(ctx, remote, ownerTag, input.Name)
-	if recoveryErr != nil {
-		return flarecloudflare.AccessApplication{}, errors.Join(createErr, recoveryErr)
-	}
-	if found {
-		return recovered, nil
-	}
-	return flarecloudflare.AccessApplication{}, createErr
-}
-
-func findOwnedParentApplication(ctx context.Context, remote AccessApplicationCloudflareClient, ownerTag, name string) (flarecloudflare.AccessApplication, bool, error) {
-	applications, err := remote.ListAccessApplications(ctx)
-	if err != nil {
-		return flarecloudflare.AccessApplication{}, false, fmt.Errorf("list Access applications for ownership recovery: %w", err)
-	}
-	var found flarecloudflare.AccessApplication
-	for _, application := range applications {
-		if !hasAccessTag(application.Tags, ownerTag) ||
-			!hasAccessTag(application.Tags, accessManagedTag) ||
-			application.Name != name {
-			continue
-		}
-		if found.ID != "" && found.ID != application.ID {
-			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry owner tag %q and name %q", ownerTag, name)
-		}
-		found = application
-	}
-	return found, found.ID != "", nil
-}
-
-func ensureAccessTags(ctx context.Context, remote AccessApplicationCloudflareClient, names ...string) error {
-	for _, name := range names {
-		tag, err := remote.GetAccessTag(ctx, name)
-		if err == nil {
-			if tag.Name != name {
-				return fmt.Errorf("get Access tag %q returned name %q", name, tag.Name)
-			}
-			continue
-		}
-		if !isRemoteNotFound(err) {
-			return fmt.Errorf("get Access tag %q: %w", name, err)
-		}
-		created, createErr := remote.CreateAccessTag(ctx, name)
-		if createErr == nil {
-			if created.Name != name {
-				return fmt.Errorf("create Access tag %q returned name %q", name, created.Name)
-			}
-			continue
-		}
-		if !flarecloudflare.IsConflict(createErr) {
-			return fmt.Errorf("create Access tag %q: %w", name, createErr)
-		}
-		confirmed, getErr := remote.GetAccessTag(ctx, name)
-		if getErr != nil {
-			return errors.Join(
-				fmt.Errorf("create Access tag %q raced: %w", name, createErr),
-				fmt.Errorf("confirm Access tag %q after conflict: %w", name, getErr),
-			)
-		}
-		if confirmed.Name != name {
-			return fmt.Errorf("confirm Access tag %q after conflict returned name %q", name, confirmed.Name)
-		}
-	}
-	return nil
-}
-
-func hasAccessTag(tags []string, expected string) bool {
-	return slices.Contains(tags, expected)
-}
-
-func accessApplicationRemoteName(application *v1alpha1.AccessApplication) string {
-	if application.Spec.Application.Name != "" {
-		return application.Spec.Application.Name
-	}
-	return application.Namespace + "/" + application.Name
-}
-
-func (r *AccessApplicationReconciler) reconcileBypassApplications(
-	ctx context.Context,
-	remote AccessApplicationCloudflareClient,
-	application *v1alpha1.AccessApplication,
-	bypasses []gatewayapi.AccessBypass,
-	ownerTag string,
-	clusterID string,
-) ([]v1alpha1.AccessBypassApplicationStatus, error) {
-	parentName := accessApplicationRemoteName(application)
-	ownedRemote, err := listOwnedBypassApplications(ctx, remote, ownerTag, parentName)
-	if err != nil {
-		return nil, err
-	}
-	existing := make(map[string]string, len(application.Status.BypassApplications))
-	for _, child := range application.Status.BypassApplications {
-		existing[bypassStatusKey(child.Hostname, child.Path)] = child.ApplicationID
-	}
-	var bypassPolicy flarecloudflare.AccessPolicy
-	if len(bypasses) > 0 {
-		bypassPolicy, err = remote.EnsureBypassPolicy(ctx, "flareway/"+clusterID+"/bypass-everyone")
-		if err != nil {
-			return nil, fmt.Errorf("ensure account bypass policy: %w", err)
-		}
-	}
-	falseValue := false
-	result := make([]v1alpha1.AccessBypassApplicationStatus, 0, len(bypasses))
-	desiredKeys := make(map[string]struct{}, len(bypasses))
-	desiredTags := make(map[string]struct{}, len(bypasses))
-	for _, bypass := range bypasses {
-		key := bypassStatusKey(bypass.Hostname, bypass.Path)
-		desiredKeys[key] = struct{}{}
-		childName := bypassChildApplicationName(parentName, bypass.Hostname, bypass.Path)
-		tagName := accessBypassTag(ownerTag, childName)
-		desiredTags[tagName] = struct{}{}
-		uri := strings.TrimSuffix(bypass.Hostname, "/") + bypass.Path
-		tags := []string{accessManagedTag, ownerTag, tagName}
-		slices.Sort(tags)
-		input := flarecloudflare.AccessApplicationInput{
-			Domain:                 bypass.Hostname,
-			Name:                   childName,
-			Destinations:           []flarecloudflare.AccessApplicationDestination{{Type: "public", URI: uri}},
-			Policies:               []flarecloudflare.AccessApplicationPolicyAttachment{{ID: bypassPolicy.ID, Precedence: 1}},
-			SessionDuration:        "0s",
-			AppLauncherVisible:     &falseValue,
-			AutoRedirectToIdentity: &falseValue,
-			AllowedIDPs:            []string{},
-			Tags:                   tags,
-		}
-		if err := ensureAccessTags(ctx, remote, accessManagedTag, ownerTag, tagName); err != nil {
-			return nil, fmt.Errorf("ensure bypass Access tags for %s%s: %w", bypass.Hostname, bypass.Path, err)
-		}
-		var child flarecloudflare.AccessApplication
-		if id := existing[key]; id != "" {
-			child, err = remote.UpdateAccessApplication(ctx, id, input)
-		} else if recovered, found := ownedRemote[tagName]; found {
-			if recovered.Name != childName {
-				return nil, fmt.Errorf("ownership conflict: bypass tag %q belongs to Access application name %q, want %q", tagName, recovered.Name, childName)
-			}
-			child, err = remote.UpdateAccessApplication(ctx, recovered.ID, input)
-		} else {
-			child, err = remote.CreateAccessApplication(ctx, input)
-			if err != nil {
-				createErr := err
-				recovered, found, recoveryErr := findOwnedBypassApplication(ctx, remote, ownerTag, tagName, childName)
-				switch {
-				case recoveryErr != nil:
-					err = errors.Join(createErr, recoveryErr)
-				case found:
-					child = recovered
-					err = nil
-				default:
-					err = createErr
-				}
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("reconcile bypass Access application for %s%s: %w", bypass.Hostname, bypass.Path, err)
-		}
-		status := v1alpha1.AccessBypassApplicationStatus{Hostname: bypass.Hostname, Path: bypass.Path, ApplicationID: child.ID}
-		if existing[key] != child.ID {
-			if err := r.persistChildID(ctx, application, status); err != nil {
-				return nil, err
-			}
-			upsertLocalBypassStatus(application, status)
-			existing[key] = child.ID
-		}
-		result = append(result, status)
-	}
-	deleteIDs := make(map[string]struct{})
-	deleteTags := make(map[string]struct{})
-	for tagName, child := range ownedRemote {
-		if _, retained := desiredTags[tagName]; retained {
-			continue
-		}
-		deleteIDs[child.ID] = struct{}{}
-		deleteTags[tagName] = struct{}{}
-	}
-	for _, child := range application.Status.BypassApplications {
-		if _, retained := desiredKeys[bypassStatusKey(child.Hostname, child.Path)]; retained {
-			continue
-		}
-		childName := bypassChildApplicationName(parentName, child.Hostname, child.Path)
-		tagName := accessBypassTag(ownerTag, childName)
-		if child.ApplicationID != "" {
-			deleteIDs[child.ApplicationID] = struct{}{}
-		}
-		deleteTags[tagName] = struct{}{}
-	}
-	for _, id := range sortedStringKeys(deleteIDs) {
-		if err := remote.DeleteAccessApplication(ctx, id); err != nil && !isRemoteNotFound(err) {
-			return nil, fmt.Errorf("delete obsolete bypass Access application %s: %w", id, err)
-		}
-	}
-	for _, tagName := range sortedStringKeys(deleteTags) {
-		if err := remote.DeleteAccessTag(ctx, tagName); err != nil && !isRemoteNotFound(err) {
-			return nil, fmt.Errorf("delete obsolete bypass Access tag %q: %w", tagName, err)
-		}
-	}
-	slices.SortFunc(result, func(left, right v1alpha1.AccessBypassApplicationStatus) int {
-		return strings.Compare(bypassStatusKey(left.Hostname, left.Path), bypassStatusKey(right.Hostname, right.Path))
-	})
-	return result, nil
-}
-
-func listOwnedBypassApplications(ctx context.Context, remote AccessApplicationCloudflareClient, ownerTag, parentName string) (map[string]flarecloudflare.AccessApplication, error) {
-	applications, err := remote.ListAccessApplications(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list bypass Access applications for ownership recovery: %w", err)
-	}
-	result := make(map[string]flarecloudflare.AccessApplication)
-	for _, application := range applications {
-		tagName, owned := ownedBypassApplicationTag(application, ownerTag, parentName)
-		if !owned {
-			continue
-		}
-		if existing, found := result[tagName]; found && existing.ID != application.ID {
-			return nil, fmt.Errorf("multiple Access applications carry bypass tag %q", tagName)
-		}
-		result[tagName] = application
-	}
-	return result, nil
-}
-
-func findOwnedBypassApplication(ctx context.Context, remote AccessApplicationCloudflareClient, ownerTag, bypassTag, expectedName string) (flarecloudflare.AccessApplication, bool, error) {
-	applications, err := remote.ListAccessApplications(ctx)
-	if err != nil {
-		return flarecloudflare.AccessApplication{}, false, fmt.Errorf("list bypass Access applications for ownership recovery: %w", err)
-	}
-	var found flarecloudflare.AccessApplication
-	for _, application := range applications {
-		if application.Name != expectedName ||
-			!hasAccessTag(application.Tags, accessManagedTag) ||
-			!hasAccessTag(application.Tags, ownerTag) ||
-			!hasAccessTag(application.Tags, bypassTag) {
-			continue
-		}
-		if found.ID != "" && found.ID != application.ID {
-			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry bypass tag %q and name %q", bypassTag, expectedName)
-		}
-		found = application
-	}
-	return found, found.ID != "", nil
-}
-
-func ownedBypassApplicationTag(application flarecloudflare.AccessApplication, ownerTag, parentName string) (string, bool) {
-	if !hasAccessTag(application.Tags, accessManagedTag) ||
-		!hasAccessTag(application.Tags, ownerTag) ||
-		!strings.HasPrefix(application.Name, parentName+"/bypass/") {
-		return "", false
-	}
-	tagName := accessBypassTag(ownerTag, application.Name)
-	return tagName, hasAccessTag(application.Tags, tagName)
-}
-
-func upsertLocalBypassStatus(application *v1alpha1.AccessApplication, child v1alpha1.AccessBypassApplicationStatus) {
-	key := bypassStatusKey(child.Hostname, child.Path)
-	for index := range application.Status.BypassApplications {
-		if bypassStatusKey(application.Status.BypassApplications[index].Hostname, application.Status.BypassApplications[index].Path) == key {
-			application.Status.BypassApplications[index] = child
-			return
-		}
-	}
-	application.Status.BypassApplications = append(application.Status.BypassApplications, child)
-}
-
-func bypassStatusKey(hostname, path string) string {
-	return strings.ToLower(strings.TrimSuffix(hostname, ".")) + "\x00" + path
-}
-
-func accessBypassTag(ownerTag, childName string) string {
-	return accessDigestTag(accessBypassTagPrefix, ownerTag+"\x00"+childName)
-}
-
-func accessDigestTag(prefix, identity string) string {
-	digest := sha256.Sum256([]byte(identity))
-	hexDigest := fmt.Sprintf("%x", digest)
-	return prefix + hexDigest[:accessTagNameMaxLength-len(prefix)]
-}
-
-func validInternalDigestTag(tag, prefix string) bool {
-	if len(tag) != accessTagNameMaxLength || !strings.HasPrefix(tag, prefix) {
-		return false
-	}
-	for index := len(prefix); index < len(tag); index++ {
-		if !strings.ContainsRune("0123456789abcdef", rune(tag[index])) {
-			return false
-		}
-	}
-	return true
-}
-
-func bypassChildApplicationName(parentName, hostname, path string) string {
-	pathName := strings.Trim(strings.ReplaceAll(path, "/", "-"), "-")
-	if pathName == "" {
-		pathName = "root"
-	}
-	hostName := strings.NewReplacer(".", "-", "*", "wildcard").Replace(hostname)
-	identity := sha256.Sum256([]byte(bypassStatusKey(hostname, path)))
-	return fmt.Sprintf("%s/bypass/%s-%s-%x", parentName, hostName, pathName, identity[:6])
-}
-
-func (r *AccessApplicationReconciler) persistParentID(ctx context.Context, application *v1alpha1.AccessApplication, id string) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		var current v1alpha1.AccessApplication
-		if err := r.Get(ctx, client.ObjectKeyFromObject(application), &current); err != nil {
-			return err
-		}
-		before := current.DeepCopy()
-		current.Status.ApplicationID = id
-		return r.Status().Patch(ctx, &current, client.MergeFrom(before))
-	})
-}
-
-func (r *AccessApplicationReconciler) persistChildID(ctx context.Context, application *v1alpha1.AccessApplication, child v1alpha1.AccessBypassApplicationStatus) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		var current v1alpha1.AccessApplication
-		if err := r.Get(ctx, client.ObjectKeyFromObject(application), &current); err != nil {
-			return err
-		}
-		before := current.DeepCopy()
-		key := bypassStatusKey(child.Hostname, child.Path)
-		replaced := false
-		for index := range current.Status.BypassApplications {
-			if bypassStatusKey(current.Status.BypassApplications[index].Hostname, current.Status.BypassApplications[index].Path) == key {
-				current.Status.BypassApplications[index] = child
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			current.Status.BypassApplications = append(current.Status.BypassApplications, child)
-		}
-		return r.Status().Patch(ctx, &current, client.MergeFrom(before))
-	})
+	return verifiedAUDSecrets(secrets, applications, &gateway), nil
 }
 
 func (r *AccessApplicationReconciler) cloudflareClient(ctx context.Context, namespace string, account *v1alpha1.CloudflareAccount) (AccessApplicationCloudflareClient, error) {
 	if account == nil {
-		return nil, errors.New("AccessApplication has no resolved CloudflareAccount")
+		return nil, errors.New("the AccessApplication has no resolved CloudflareAccount")
 	}
 	remote, _, err := accessClientForAccount(ctx, r.Client, namespace, account.Name, authz.Request{}, r.NewCloudflareClient)
 	if err != nil {
@@ -1491,50 +943,60 @@ func (r *AccessApplicationReconciler) cloudflareClient(ctx context.Context, name
 	return remote, nil
 }
 
-func (r *AccessApplicationReconciler) accessIdentity(ctx context.Context, application *v1alpha1.AccessApplication) (string, string, error) {
-	var namespace corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: "kube-system"}, &namespace); err != nil {
-		return "", "", fmt.Errorf("get kube-system namespace: %w", err)
-	}
-	clusterID := string(namespace.UID)
-	identity := flarecloudflare.OwnerTag(clusterID, application.Namespace, application.Name, application.UID)
-	return accessDigestTag(accessOwnerTagPrefix, identity), clusterID, nil
-}
-
-func (r *AccessApplicationReconciler) ensureAUDSecrets(ctx context.Context, application *v1alpha1.AccessApplication, remote flarecloudflare.AccessApplication, gateways []types.NamespacedName) error {
-	if len(gateways) > 0 && application.Spec.OriginJWT.Mode != v1alpha1.AccessOriginJWTModeDisabled && remote.AUD == "" {
+func (r *AccessApplicationReconciler) ensureAUDSecrets(ctx context.Context, application *v1alpha1.AccessApplication, remote flarecloudflare.AccessApplication, gatewayKeys []types.NamespacedName) error {
+	if len(gatewayKeys) > 0 && application.Spec.OriginJWT.Mode != v1alpha1.AccessOriginJWTModeDisabled && remote.AUD == "" {
 		return errors.New("cloudflare Access application response did not include an AUD")
 	}
-	desiredRecipients := make(map[string]struct{}, len(gateways))
-	for _, gateway := range gateways {
-		desiredRecipients[gateway.Namespace+"--"+gateway.Name] = struct{}{}
+	if len(gatewayKeys) > 0 && (application.UID == "" || remote.ID == "") {
+		return errors.New("cannot publish Access AUD Secrets without application UID and application ID")
 	}
-	var existing corev1.SecretList
-	if err := r.List(ctx, &existing, client.InNamespace(r.operatorNamespace()), client.MatchingLabels{
-		v1alpha1.AccessApplicationAUDSecretLabel: application.Namespace + "--" + application.Name,
-	}); err != nil {
+	gateways := make([]gatewayv1.Gateway, len(gatewayKeys))
+	desiredNames := make(map[string]struct{}, len(gatewayKeys))
+	for index, gatewayKey := range gatewayKeys {
+		if err := r.Get(ctx, gatewayKey, &gateways[index]); err != nil {
+			return fmt.Errorf("get Gateway %s for Access AUD Secret: %w", gatewayKey, err)
+		}
+		if gateways[index].UID == "" {
+			return fmt.Errorf("cannot publish Access AUD Secret for Gateway %s without a UID", gatewayKey)
+		}
+		desiredNames[accessAUDSecretName(application, gatewayKey)] = struct{}{}
+	}
+	existing, err := r.listApplicationAUDSecrets(ctx, application)
+	if err != nil {
 		return fmt.Errorf("list existing Access AUD Secrets: %w", err)
 	}
-	for index := range existing.Items {
-		if _, retained := desiredRecipients[existing.Items[index].Labels[v1alpha1.AccessApplicationGatewayAUDLabel]]; retained {
+	for index := range existing {
+		secret := &existing[index]
+		if !audSecretOwnedByApplication(secret, application) {
 			continue
 		}
-		if err := r.Delete(ctx, &existing.Items[index]); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete stale Access AUD Secret %s: %w", existing.Items[index].Name, err)
+		if _, retained := desiredNames[secret.Name]; retained {
+			continue
+		}
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete stale Access AUD Secret %s: %w", secret.Name, err)
 		}
 	}
-	for _, gateway := range gateways {
+	applicationKey := client.ObjectKeyFromObject(application)
+	for index := range gateways {
+		gateway := &gateways[index]
+		gatewayKey := client.ObjectKeyFromObject(gateway)
 		labels := map[string]string{
-			v1alpha1.AccessApplicationAUDSecretLabel:  application.Namespace + "--" + application.Name,
-			v1alpha1.AccessApplicationGatewayAUDLabel: gateway.Namespace + "--" + gateway.Name,
+			v1alpha1.AccessApplicationAUDSecretLabel:  applicationAUDIdentityLabel(application),
+			v1alpha1.AccessApplicationGatewayAUDLabel: gatewayAUDIdentityLabel(gateway),
 		}
+		secretKey := accessAUDSecretKey(r.operatorNamespace(), application, gatewayKey)
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: accessAUDSecretName(application, gateway), Namespace: r.operatorNamespace(), Labels: labels},
+			ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: secretKey.Namespace, Labels: labels},
 			Type:       corev1.SecretTypeOpaque,
 			Data: map[string][]byte{
-				v1alpha1.AccessApplicationAUDSecretKey: []byte(remote.AUD),
-				v1alpha1.AccessApplicationIDSecretKey:  []byte(remote.ID),
-				accessApplicationAUDReadyKey:           []byte("true"),
+				v1alpha1.AccessApplicationAUDSecretKey:                   []byte(remote.AUD),
+				v1alpha1.AccessApplicationIDSecretKey:                    []byte(remote.ID),
+				v1alpha1.AccessApplicationNamespacedNameSecretKey:        []byte(applicationKey.String()),
+				v1alpha1.AccessApplicationUIDSecretKey:                   []byte(application.UID),
+				v1alpha1.AccessApplicationGatewayNamespacedNameSecretKey: []byte(gatewayKey.String()),
+				v1alpha1.AccessApplicationGatewayUIDSecretKey:            []byte(gateway.UID),
+				accessApplicationAUDReadyKey:                             []byte("true"),
 			},
 		}
 		var current corev1.Secret
@@ -1542,18 +1004,21 @@ func (r *AccessApplicationReconciler) ensureAUDSecrets(ctx context.Context, appl
 		if err := r.Get(ctx, key, &current); err != nil {
 			if apierrors.IsNotFound(err) {
 				if err := r.Create(ctx, secret); err != nil {
-					return fmt.Errorf("create Access AUD Secret for Gateway %s: %w", gateway, err)
+					return fmt.Errorf("create Access AUD Secret for Gateway %s: %w", gatewayKey, err)
 				}
 				continue
 			}
-			return fmt.Errorf("get Access AUD Secret for Gateway %s: %w", gateway, err)
+			return fmt.Errorf("get Access AUD Secret for Gateway %s: %w", gatewayKey, err)
+		}
+		if !audSecretOwnedByApplication(&current, application) {
+			return fmt.Errorf("access AUD Secret %s is not owned by AccessApplication %s", key, applicationKey)
 		}
 		before := current.DeepCopy()
 		current.Labels = labels
 		current.Type = secret.Type
 		current.Data = secret.Data
 		if err := r.Patch(ctx, &current, client.MergeFrom(before)); err != nil {
-			return fmt.Errorf("update Access AUD Secret for Gateway %s: %w", gateway, err)
+			return fmt.Errorf("update Access AUD Secret for Gateway %s: %w", gatewayKey, err)
 		}
 	}
 	return nil
@@ -1564,22 +1029,83 @@ func accessAUDSecretName(application *v1alpha1.AccessApplication, gateway types.
 	return fmt.Sprintf("aud-%s-%x", application.UID, sum[:6])
 }
 
-func (r *AccessApplicationReconciler) audHandoffsPresent(ctx context.Context, application *v1alpha1.AccessApplication, gateways []types.NamespacedName) (bool, error) {
-	var secrets corev1.SecretList
-	if err := r.List(ctx, &secrets, client.InNamespace(r.operatorNamespace()), client.MatchingLabels{
-		v1alpha1.AccessApplicationAUDSecretLabel: application.Namespace + "--" + application.Name,
-	}); err != nil {
-		return false, fmt.Errorf("list Access AUD handoffs: %w", err)
+func accessAUDSecretKey(operatorNamespace string, application *v1alpha1.AccessApplication, gateway types.NamespacedName) types.NamespacedName {
+	return types.NamespacedName{
+		Namespace: operatorNamespace,
+		Name:      accessAUDSecretName(application, gateway),
 	}
-	ready := make(map[string]bool, len(secrets.Items))
-	for index := range secrets.Items {
-		secret := &secrets.Items[index]
-		ready[secret.Labels[v1alpha1.AccessApplicationGatewayAUDLabel]] =
-			string(secret.Data[accessApplicationAUDReadyKey]) == "true" &&
-				string(secret.Data[v1alpha1.AccessApplicationIDSecretKey]) == application.Status.ApplicationID
+}
+
+func (r *AccessApplicationReconciler) listApplicationAUDSecrets(ctx context.Context, application *v1alpha1.AccessApplication) ([]corev1.Secret, error) {
+	labelValues := []string{applicationAUDIdentityLabel(application)}
+	legacyLabel := application.Namespace + "--" + application.Name
+	if len(legacyLabel) <= 63 {
+		labelValues = append(labelValues, legacyLabel)
 	}
-	for _, gateway := range gateways {
-		if !ready[gateway.Namespace+"--"+gateway.Name] {
+	secrets := make([]corev1.Secret, 0)
+	seen := make(map[types.NamespacedName]struct{})
+	for _, labelValue := range labelValues {
+		var listed corev1.SecretList
+		if err := r.List(ctx, &listed,
+			client.InNamespace(r.operatorNamespace()),
+			client.MatchingLabels{v1alpha1.AccessApplicationAUDSecretLabel: labelValue},
+		); err != nil {
+			return nil, err
+		}
+		for index := range listed.Items {
+			key := client.ObjectKeyFromObject(&listed.Items[index])
+			if _, found := seen[key]; found {
+				continue
+			}
+			seen[key] = struct{}{}
+			secrets = append(secrets, listed.Items[index])
+		}
+	}
+	return secrets, nil
+}
+
+func audSecretOwnedByApplication(secret *corev1.Secret, application *v1alpha1.AccessApplication) bool {
+	if secret == nil || application == nil || application.UID == "" ||
+		!strings.HasPrefix(secret.Name, "aud-"+string(application.UID)+"-") {
+		return false
+	}
+	label := secret.Labels[v1alpha1.AccessApplicationAUDSecretLabel]
+	if label != applicationAUDIdentityLabel(application) && label != application.Namespace+"--"+application.Name {
+		return false
+	}
+	applicationKey := client.ObjectKeyFromObject(application).String()
+	if boundKey := string(secret.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey]); boundKey != "" && boundKey != applicationKey {
+		return false
+	}
+	if boundUID := string(secret.Data[v1alpha1.AccessApplicationUIDSecretKey]); boundUID != "" && boundUID != string(application.UID) {
+		return false
+	}
+	return true
+}
+
+func (r *AccessApplicationReconciler) audHandoffsPresent(ctx context.Context, application *v1alpha1.AccessApplication, gatewayKeys []types.NamespacedName) (bool, error) {
+	for _, gatewayKey := range gatewayKeys {
+		var gateway gatewayv1.Gateway
+		if err := r.Get(ctx, gatewayKey, &gateway); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("get Gateway %s for Access AUD handoff: %w", gatewayKey, err)
+		}
+		var secret corev1.Secret
+		key := accessAUDSecretKey(r.operatorNamespace(), application, gatewayKey)
+		if err := r.Get(ctx, key, &secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("get Access AUD handoff %s: %w", key, err)
+		}
+		secrets := []corev1.Secret{secret}
+		if err := migrateLegacyAUDSecrets(ctx, r.Client, secrets, []v1alpha1.AccessApplication{*application}, &gateway); err != nil {
+			return false, fmt.Errorf("migrate Access AUD handoff %s: %w", key, err)
+		}
+		if !audSecretIdentityMatches(&secrets[0], application, &gateway) ||
+			string(secrets[0].Data[accessApplicationAUDReadyKey]) != "true" {
 			return false, nil
 		}
 	}
@@ -1587,22 +1113,24 @@ func (r *AccessApplicationReconciler) audHandoffsPresent(ctx context.Context, ap
 }
 
 func (r *AccessApplicationReconciler) deleteAUDSecrets(ctx context.Context, application *v1alpha1.AccessApplication) error {
-	var secrets corev1.SecretList
-	if err := r.List(ctx, &secrets, client.InNamespace(r.operatorNamespace()), client.MatchingLabels{
-		v1alpha1.AccessApplicationAUDSecretLabel: application.Namespace + "--" + application.Name,
-	}); err != nil {
+	secrets, err := r.listApplicationAUDSecrets(ctx, application)
+	if err != nil {
 		return fmt.Errorf("list Access AUD Secrets for deletion: %w", err)
 	}
-	for index := range secrets.Items {
-		if err := r.Delete(ctx, &secrets.Items[index]); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete Access AUD Secret %s: %w", secrets.Items[index].Name, err)
+	for index := range secrets {
+		if !audSecretOwnedByApplication(&secrets[index], application) {
+			continue
+		}
+		if err := r.Delete(ctx, &secrets[index]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete Access AUD Secret %s: %w", secrets[index].Name, err)
 		}
 	}
 	return nil
 }
 
 type accessRevocationLatch struct {
-	Claims []accessRevocationClaim `json:"claims"`
+	Claims        []accessRevocationClaim `json:"claims"`
+	TokensRevoked bool                    `json:"tokensRevoked,omitempty"`
 }
 
 type accessRevocationClaim struct {
@@ -1691,14 +1219,13 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
 		return false, "", fmt.Errorf("decode Access revocation latch: %w", err)
 	}
-	var handoffs corev1.SecretList
-	if err := r.List(ctx, &handoffs, client.InNamespace(r.operatorNamespace()), client.MatchingLabels{
-		v1alpha1.AccessApplicationAUDSecretLabel: application.Namespace + "--" + application.Name,
-	}); err != nil {
+	handoffs, err := r.listApplicationAUDSecrets(ctx, application)
+	if err != nil {
 		return false, "", fmt.Errorf("list Access handoffs while waiting for revocation: %w", err)
 	}
-	for index := range handoffs.Items {
-		if string(handoffs.Items[index].Data[accessApplicationAUDReadyKey]) == "true" {
+	for index := range handoffs {
+		if audSecretOwnedByApplication(&handoffs[index], application) &&
+			string(handoffs[index].Data[accessApplicationAUDReadyKey]) == "true" {
 			return false, "Waiting for the Access AUD handoff to remain absent", nil
 		}
 	}
@@ -1740,6 +1267,108 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 		}
 	}
 	return true, "Every Access protection domain acknowledged a fresh Blocked version", nil
+}
+
+func revokeAccessApplicationTokens(
+	ctx context.Context,
+	remote AccessApplicationCloudflareClient,
+	scope flarecloudflare.AccessScope,
+	application *v1alpha1.AccessApplication,
+) error {
+	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		return nil
+	}
+	ids := make(map[string]struct{}, len(application.Status.BypassApplications)+1)
+	if application.Status.ApplicationID != "" {
+		ids[application.Status.ApplicationID] = struct{}{}
+	}
+	for _, child := range application.Status.BypassApplications {
+		if child.ApplicationID != "" {
+			ids[child.ApplicationID] = struct{}{}
+		}
+	}
+	for _, id := range sortedStringKeys(ids) {
+		if err := remote.RevokeAccessApplicationTokens(ctx, scope, id); err != nil && !isRemoteNotFound(err) {
+			return fmt.Errorf("revoke Access application %s tokens: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func (r *AccessApplicationReconciler) revokeApplicationTokensAfterHandoff(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		return nil
+	}
+	revoked, err := revocationTokensAlreadyRevoked(application)
+	if err != nil || revoked {
+		return err
+	}
+	account, err := r.accountForDeletion(ctx, application)
+	if err != nil {
+		return err
+	}
+	scope, err := accessApplicationScopeForDeletion(application, account)
+	if err != nil {
+		return err
+	}
+	remote, err := r.cloudflareClient(ctx, application.Namespace, account)
+	if err != nil {
+		return err
+	}
+	return r.revokeApplicationTokensWithClient(ctx, remote, scope, application)
+}
+
+func (r *AccessApplicationReconciler) revokeApplicationTokensWithClient(
+	ctx context.Context,
+	remote AccessApplicationCloudflareClient,
+	scope flarecloudflare.AccessScope,
+	application *v1alpha1.AccessApplication,
+) error {
+	revoked, err := revocationTokensAlreadyRevoked(application)
+	if err != nil || revoked {
+		return err
+	}
+	if err := revokeAccessApplicationTokens(ctx, remote, scope, application); err != nil {
+		return err
+	}
+	return r.markRevocationTokensRevoked(ctx, application)
+}
+
+func revocationTokensAlreadyRevoked(application *v1alpha1.AccessApplication) (bool, error) {
+	raw := application.Annotations[accessApplicationRevocationAnnotation]
+	if raw == "" {
+		return false, nil
+	}
+	var latch accessRevocationLatch
+	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
+		return false, fmt.Errorf("decode Access revocation latch: %w", err)
+	}
+	return latch.TokensRevoked, nil
+}
+
+func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	raw := application.Annotations[accessApplicationRevocationAnnotation]
+	if raw == "" {
+		return errors.New("cannot mark Access tokens revoked without a revocation latch")
+	}
+	var latch accessRevocationLatch
+	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
+		return fmt.Errorf("decode Access revocation latch: %w", err)
+	}
+	if latch.TokensRevoked {
+		return nil
+	}
+	latch.TokensRevoked = true
+	payload, err := json.Marshal(latch)
+	if err != nil {
+		return fmt.Errorf("encode Access revocation latch: %w", err)
+	}
+	before := application.DeepCopy()
+	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
+	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("persist Access token revocation: %w", err)
+	}
+	return nil
 }
 
 func (r *AccessApplicationReconciler) clearRevocationLatch(ctx context.Context, application *v1alpha1.AccessApplication) error {
@@ -1788,6 +1417,9 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		}
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
+	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
+		return ctrl.Result{}, err
+	}
 	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
 		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
 		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
@@ -1808,7 +1440,7 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 func accessStatusHostnames(destinations []v1alpha1.AccessApplicationDestinationStatus) []string {
 	seen := make(map[string]struct{})
 	for _, destination := range destinations {
-		if destination.Type != "public" {
+		if destination.Type != v1alpha1.AccessApplicationDestinationPublic {
 			continue
 		}
 		hostname := destination.URI
@@ -1841,7 +1473,11 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 	if err != nil {
 		return err
 	}
-	applications, err := remote.ListAccessApplications(ctx)
+	scope, err := accessApplicationScopeForDeletion(application, account)
+	if err != nil {
+		return err
+	}
+	applications, err := remote.ListAccessApplications(ctx, scope)
 	if err != nil {
 		return fmt.Errorf("list Access applications for deletion recovery: %w", err)
 	}
@@ -1849,13 +1485,47 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 	if err != nil {
 		return err
 	}
+	if application.Spec.Type == v1alpha1.AccessApplicationTypeProxyEndpoint {
+		clear(parentIDs)
+	}
+	statusByID := make(map[string]v1alpha1.AccessBypassApplicationStatus, len(application.Status.BypassApplications))
+	for _, status := range application.Status.BypassApplications {
+		statusByID[status.ApplicationID] = status
+	}
 	for _, id := range sortedStringKeys(childIDs) {
-		if err := remote.DeleteAccessApplication(ctx, id); err != nil && !isRemoteNotFound(err) {
+		if status, found := statusByID[id]; found && effectiveBypassDeletionPolicy(status.DeletionPolicy) == v1alpha1.DeletionPolicyOrphan {
+			child, err := remote.GetAccessApplication(ctx, scope, id)
+			if isRemoteNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("get bypass Access application %s for orphaning: %w", id, err)
+			}
+			childName := status.Name
+			if childName == "" {
+				childName = bypassChildApplicationName(accessApplicationRemoteName(application), status.Hostname, status.Path)
+			}
+			tagName := accessBypassTag(ownerTag, childName)
+			input := accessApplicationInputFromObserved(child)
+			input.Tags = removeAccessTags(input.Tags, accessManagedTag, ownerTag, tagName)
+			if !accessApplicationMatchesInput(child, input) {
+				if _, err := remote.UpdateAccessApplication(ctx, scope, id, input); err != nil {
+					return fmt.Errorf("orphan bypass Access application %s: %w", id, err)
+				}
+			}
+			continue
+		}
+		if err := remote.DeleteAccessApplication(ctx, scope, id); err != nil && !isRemoteNotFound(err) {
 			return fmt.Errorf("delete bypass Access application %s: %w", id, err)
 		}
 	}
+	if application.Spec.Type == v1alpha1.AccessApplicationTypeProxyEndpoint {
+		if err := r.deleteManagedProxyEndpointApplication(ctx, remote, scope, application); err != nil {
+			return err
+		}
+	}
 	for _, id := range sortedStringKeys(parentIDs) {
-		if err := remote.DeleteAccessApplication(ctx, id); err != nil && !isRemoteNotFound(err) {
+		if err := remote.DeleteAccessApplication(ctx, scope, id); err != nil && !isRemoteNotFound(err) {
 			return fmt.Errorf("delete Access application %s: %w", id, err)
 		}
 	}
@@ -1870,51 +1540,6 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 	return nil
 }
 
-func accessApplicationDeletionTargets(
-	application *v1alpha1.AccessApplication,
-	ownerTag string,
-	applications []flarecloudflare.AccessApplication,
-) (map[string]struct{}, map[string]struct{}, map[string]struct{}, error) {
-	parentIDs := make(map[string]struct{})
-	childIDs := make(map[string]struct{})
-	bypassTags := make(map[string]struct{})
-	if application.Status.ApplicationID != "" {
-		parentIDs[application.Status.ApplicationID] = struct{}{}
-	}
-	for _, child := range application.Status.BypassApplications {
-		if child.ApplicationID != "" {
-			childIDs[child.ApplicationID] = struct{}{}
-		}
-	}
-	parentName := accessApplicationRemoteName(application)
-	for _, candidate := range applications {
-		_, knownParent := parentIDs[candidate.ID]
-		_, knownChild := childIDs[candidate.ID]
-		if knownParent && knownChild {
-			return nil, nil, nil, fmt.Errorf("access application %s is recorded as both parent and bypass child", candidate.ID)
-		}
-		if !hasAccessTag(candidate.Tags, accessManagedTag) || !hasAccessTag(candidate.Tags, ownerTag) {
-			continue
-		}
-		if knownParent || candidate.Name == parentName {
-			parentIDs[candidate.ID] = struct{}{}
-			continue
-		}
-		tagName, ownedBypass := ownedBypassApplicationTag(candidate, ownerTag, parentName)
-		if knownChild || ownedBypass {
-			childIDs[candidate.ID] = struct{}{}
-			if ownedBypass {
-				bypassTags[tagName] = struct{}{}
-			}
-		}
-	}
-	for _, child := range application.Status.BypassApplications {
-		childName := bypassChildApplicationName(parentName, child.Hostname, child.Path)
-		bypassTags[accessBypassTag(ownerTag, childName)] = struct{}{}
-	}
-	return parentIDs, childIDs, bypassTags, nil
-}
-
 func sortedStringKeys(values map[string]struct{}) []string {
 	result := make([]string, 0, len(values))
 	for value := range values {
@@ -1926,11 +1551,6 @@ func sortedStringKeys(values map[string]struct{}) []string {
 
 func (r *AccessApplicationReconciler) forwardingApplied(ctx context.Context, application *v1alpha1.AccessApplication, compilation gatewayapi.AccessApplicationCompilation) (bool, error) {
 	if len(compilation.DataPlanes) == 0 {
-		for _, destination := range compilation.Destinations {
-			if destination.Type != "private" {
-				return false, nil
-			}
-		}
 		return len(compilation.Destinations) > 0, nil
 	}
 	applicationKey := application.Namespace + "/" + application.Name
@@ -1967,55 +1587,9 @@ func (r *AccessApplicationReconciler) forwardingApplied(ctx context.Context, app
 }
 
 func (r *AccessApplicationReconciler) accountForDeletion(ctx context.Context, application *v1alpha1.AccessApplication) (*v1alpha1.CloudflareAccount, error) {
-	name := ""
-	if application.Spec.AccountRef != nil {
-		name = application.Spec.AccountRef.Name
-	}
-	if name == "" {
-		for _, dataPlane := range application.Status.DataPlanes {
-			if dataPlane.Tunnel == "" {
-				continue
-			}
-			var tunnel v1alpha1.CloudflareTunnel
-			if err := r.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: dataPlane.Tunnel}, &tunnel); err == nil {
-				if name != "" && name != tunnel.Spec.AccountRef.Name {
-					return nil, errors.New("AccessApplication data planes reference multiple CloudflareAccounts")
-				}
-				name = tunnel.Spec.AccountRef.Name
-			} else if !apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("get target CloudflareTunnel for account: %w", err)
-			}
-		}
-	}
-	if name == "" {
-		var namespace corev1.Namespace
-		if err := r.Get(ctx, types.NamespacedName{Name: application.Namespace}, &namespace); err != nil {
-			return nil, fmt.Errorf("get AccessApplication namespace for account resolution: %w", err)
-		}
-		var accounts v1alpha1.CloudflareAccountList
-		if err := r.List(ctx, &accounts); err != nil {
-			return nil, fmt.Errorf("list CloudflareAccounts for Access deletion: %w", err)
-		}
-		for index := range accounts.Items {
-			account := &accounts.Items[index]
-			for _, grant := range account.Spec.Grants {
-				selector, err := metav1.LabelSelectorAsSelector(&grant.NamespaceSelector)
-				if err == nil && selector.Matches(labels.Set(namespace.Labels)) {
-					if name != "" && name != account.Name {
-						return nil, errors.New("cannot uniquely resolve CloudflareAccount for Access application deletion")
-					}
-					name = account.Name
-					break
-				}
-			}
-		}
-		if name == "" {
-			return nil, errors.New("cannot resolve CloudflareAccount for Access application deletion")
-		}
-	}
 	var account v1alpha1.CloudflareAccount
-	if err := r.Get(ctx, types.NamespacedName{Name: name}, &account); err != nil {
-		return nil, fmt.Errorf("get CloudflareAccount for Access deletion: %w", err)
+	if err := r.Get(ctx, types.NamespacedName{Name: application.Spec.AccountRef.Name}, &account); err != nil {
+		return nil, fmt.Errorf("get CloudflareAccount %q for Access deletion: %w", application.Spec.AccountRef.Name, err)
 	}
 	return &account, nil
 }
@@ -2024,6 +1598,7 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 	now := metav1.NewTime(r.now())
 	status := *application.Status.DeepCopy()
 	status.ApplicationID = applicationID
+	status.ObservedGeneration = application.Generation
 	status.Destinations = accessDestinationStatuses(compilation.Destinations)
 	status.DataPlanes = make([]v1alpha1.AccessApplicationDataPlaneStatus, 0, len(compilation.DataPlanes))
 	for _, dataPlane := range compilation.DataPlanes {
@@ -2079,12 +1654,21 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 	return status
 }
 
-func accessDestinationStatuses(destinations []gatewayapi.AccessDestination) []v1alpha1.AccessApplicationDestinationStatus {
-	result := make([]v1alpha1.AccessApplicationDestinationStatus, 0, len(destinations))
-	for _, destination := range destinations {
-		result = append(result, v1alpha1.AccessApplicationDestinationStatus{Type: destination.Type, URI: destination.URI, Hostname: destination.Hostname, CIDR: destination.CIDR, PortRange: destination.PortRange, L4Protocol: v1alpha1.AccessL4Protocol(destination.L4Protocol), VNetID: destination.VNetID})
-	}
-	return result
+func applyObservedApplicationStatus(
+	status *v1alpha1.AccessApplicationStatus,
+	application *v1alpha1.AccessApplication,
+	scope flarecloudflare.AccessScope,
+	observed flarecloudflare.AccessApplication,
+	ownerTag string,
+) {
+	status.Type = v1alpha1.AccessApplicationType(observed.Type)
+	status.Domain = observed.Domain
+	status.ZoneID = scope.ZoneID
+	status.OwnershipVerified = effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly ||
+		observed.Type == flarecloudflare.AccessApplicationTypeProxyEndpoint ||
+		hasAccessTag(observed.Tags, accessManagedTag) && hasAccessTag(observed.Tags, ownerTag)
+	status.Tags = canonicalStrings(observed.Tags)
+	status.ObservedGeneration = application.Generation
 }
 
 func originConditionMessage(compilation gatewayapi.AccessApplicationCompilation) string {
@@ -2099,53 +1683,6 @@ func originConditionMessage(compilation gatewayapi.AccessApplicationCompilation)
 
 func rejectedCompilation(reason, message string) gatewayapi.AccessApplicationCompilation {
 	return gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: reason, Message: message}
-}
-
-func mergeAccessCompilation(target *gatewayapi.AccessApplicationCompilation, source gatewayapi.AccessApplicationCompilation) {
-	target.Destinations = append(target.Destinations, source.Destinations...)
-	target.DataPlanes = append(target.DataPlanes, source.DataPlanes...)
-	target.Bypass = append(target.Bypass, source.Bypass...)
-	target.Ancestors = append(target.Ancestors, source.Ancestors...)
-	target.OriginJWTEnforced = target.OriginJWTEnforced || source.OriginJWTEnforced
-	if !source.Accepted {
-		target.Accepted = false
-		target.Reason = source.Reason
-		target.Message = source.Message
-	}
-	dedupeAccessCompilation(target)
-}
-
-func dedupeAccessCompilation(compilation *gatewayapi.AccessApplicationCompilation) {
-	slices.SortFunc(compilation.Destinations, func(left, right gatewayapi.AccessDestination) int {
-		return strings.Compare(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", left.Type, left.URI, left.Hostname, left.CIDR, left.PortRange, left.L4Protocol, left.VNetID), fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", right.Type, right.URI, right.Hostname, right.CIDR, right.PortRange, right.L4Protocol, right.VNetID))
-	})
-	compilation.Destinations = slices.Compact(compilation.Destinations)
-	slices.SortFunc(compilation.DataPlanes, func(left, right gatewayapi.AccessDataPlane) int {
-		return strings.Compare(fmt.Sprintf("%s\x00%s\x00%s\x00%d", left.Tunnel, left.Listener, left.ProtectionDomain, left.EnvoyPort), fmt.Sprintf("%s\x00%s\x00%s\x00%d", right.Tunnel, right.Listener, right.ProtectionDomain, right.EnvoyPort))
-	})
-	compilation.DataPlanes = slices.Compact(compilation.DataPlanes)
-	slices.SortFunc(compilation.Bypass, func(left, right gatewayapi.AccessBypass) int {
-		return strings.Compare(left.Hostname+"\x00"+left.Path, right.Hostname+"\x00"+right.Path)
-	})
-	compilation.Bypass = slices.Compact(compilation.Bypass)
-	slices.SortFunc(compilation.Ancestors, func(left, right gatewayapi.AccessAncestor) int {
-		return strings.Compare(strings.Join([]string{left.Group, left.Kind, left.Namespace, left.Name}, "\x00"), strings.Join([]string{right.Group, right.Kind, right.Namespace, right.Name}, "\x00"))
-	})
-	compilation.Ancestors = slices.Compact(compilation.Ancestors)
-}
-
-func effectiveManagementPolicy(policy v1alpha1.ManagementPolicy) v1alpha1.ManagementPolicy {
-	if policy == "" {
-		return v1alpha1.ManagementPolicyManaged
-	}
-	return policy
-}
-
-func effectiveDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionPolicy {
-	if policy == "" {
-		return v1alpha1.DeletionPolicyDelete
-	}
-	return policy
 }
 
 func (r *AccessApplicationReconciler) patchStatus(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) error {
@@ -2192,9 +1729,6 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index AccessApplication policyRefs: %w", err)
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.AccessApplication{}, accessApplicationAccountIndex, func(object client.Object) []string {
-		if object.(*v1alpha1.AccessApplication).Spec.AccountRef == nil {
-			return nil
-		}
 		return []string{object.(*v1alpha1.AccessApplication).Spec.AccountRef.Name}
 	}); err != nil {
 		return fmt.Errorf("index AccessApplication accountRef: %w", err)
@@ -2207,6 +1741,8 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&v1alpha1.AccessPolicy{}, handler.EnqueueRequestsFromMapFunc(r.mapPolicyToApplications)).
 		Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.mapIdentityProviderToApplications)).
+		Watches(&v1alpha1.AccessCustomPage{}, handler.EnqueueRequestsFromMapFunc(r.mapCustomPageToApplications)).
+		Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.mapServiceTokenToApplications)).
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToApplications)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.mapAccountToApplications)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToApplications)).
@@ -2216,7 +1752,8 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func accessApplicationIndexTargetKeys(application *v1alpha1.AccessApplication) []string {
-	keys := make([]string, 0, len(application.Spec.TargetRefs)+len(application.Spec.PrivateDestinations))
+	privateDestinations := accessApplicationPrivateDestinations(application)
+	keys := make([]string, 0, len(application.Spec.TargetRefs)+len(privateDestinations))
 	for _, target := range application.Spec.TargetRefs {
 		group := string(target.Group)
 		if group == "" {
@@ -2228,7 +1765,7 @@ func accessApplicationIndexTargetKeys(application *v1alpha1.AccessApplication) [
 		}
 		keys = append(keys, strings.Join([]string{group, kind, application.Namespace, string(target.Name)}, "/"))
 	}
-	for _, destination := range application.Spec.PrivateDestinations {
+	for _, destination := range privateDestinations {
 		if destination.NetworkRouteRef != nil {
 			keys = append(keys, strings.Join([]string{v1alpha1.Group, "NetworkRoute", application.Namespace, destination.NetworkRouteRef.Name}, "/"))
 		}
@@ -2240,18 +1777,24 @@ func accessApplicationIndexTargetKeys(application *v1alpha1.AccessApplication) [
 }
 
 func accessApplicationPolicyKeys(application *v1alpha1.AccessApplication) []string {
-	keys := make([]string, 0, len(application.Spec.Policies))
-	for _, policy := range application.Spec.Policies {
-		if policy.PolicyRef == nil {
-			continue
+	keys := make([]string, 0, len(application.Spec.Policies)+len(application.Spec.Bypass.Children))
+	appendReference := func(reference *v1alpha1.AccessApplicationPolicyReference) {
+		if reference == nil || reference.PolicyRef == nil {
+			return
 		}
-		namespace := policy.PolicyRef.Namespace
+		namespace := reference.PolicyRef.Namespace
 		if namespace == "" {
 			namespace = application.Namespace
 		}
-		keys = append(keys, namespace+"/"+policy.PolicyRef.Name)
+		keys = append(keys, namespace+"/"+reference.PolicyRef.Name)
 	}
-	return keys
+	for index := range application.Spec.Policies {
+		appendReference(&application.Spec.Policies[index])
+	}
+	for index := range application.Spec.Bypass.Children {
+		appendReference(application.Spec.Bypass.Children[index].PolicyRef)
+	}
+	return uniqueStrings(keys)
 }
 
 func (r *AccessApplicationReconciler) mapTargetToApplications(ctx context.Context, object client.Object) []reconcile.Request {
@@ -2303,15 +1846,85 @@ func (r *AccessApplicationReconciler) mapIdentityProviderToApplications(ctx cont
 		return nil
 	}
 	result := make([]v1alpha1.AccessApplication, 0)
-	for i := range applications.Items {
-		for _, ref := range applications.Items[i].Spec.Application.AllowedIDPRefs {
-			if ref.Name == object.GetName() {
-				result = append(result, applications.Items[i])
+	for index := range applications.Items {
+		application := &applications.Items[index]
+		matches := false
+		for _, reference := range application.Spec.Application.AllowedIDPRefs {
+			matches = matches || reference.Name == object.GetName()
+		}
+		if application.Spec.Application.SCIMConfig != nil {
+			matches = matches || application.Spec.Application.SCIMConfig.IDPRef.Name == object.GetName()
+		}
+		if matches {
+			result = append(result, *application)
+		}
+	}
+	return accessApplicationRequests(result)
+}
+
+func (r *AccessApplicationReconciler) mapCustomPageToApplications(ctx context.Context, object client.Object) []reconcile.Request {
+	var applications v1alpha1.AccessApplicationList
+	if err := r.List(ctx, &applications); err != nil {
+		return nil
+	}
+	result := make([]v1alpha1.AccessApplication, 0)
+	for index := range applications.Items {
+		application := &applications.Items[index]
+		for _, reference := range application.Spec.Application.CustomPageRefs {
+			if reference.ObjectRef == nil {
+				continue
+			}
+			namespace := reference.ObjectRef.Namespace
+			if namespace == "" {
+				namespace = application.Namespace
+			}
+			if namespace == object.GetNamespace() && reference.ObjectRef.Name == object.GetName() {
+				result = append(result, *application)
 				break
 			}
 		}
 	}
 	return accessApplicationRequests(result)
+}
+
+func (r *AccessApplicationReconciler) mapServiceTokenToApplications(ctx context.Context, object client.Object) []reconcile.Request {
+	var applications v1alpha1.AccessApplicationList
+	if err := r.List(ctx, &applications); err != nil {
+		return nil
+	}
+	result := make([]v1alpha1.AccessApplication, 0)
+	for index := range applications.Items {
+		application := &applications.Items[index]
+		config := application.Spec.Application.SCIMConfig
+		if config == nil || config.Authentication == nil {
+			continue
+		}
+		if scimAuthenticationReferencesServiceToken(config.Authentication, application.Namespace, object.GetNamespace(), object.GetName()) {
+			result = append(result, *application)
+		}
+	}
+	return accessApplicationRequests(result)
+}
+
+func scimAuthenticationReferencesServiceToken(authentication *v1alpha1.AccessSCIMAuthentication, defaultNamespace, namespace, name string) bool {
+	references := make([]*v1alpha1.AccessSCIMAccessServiceTokenAuthentication, 0, len(authentication.Multiple)+1)
+	references = append(references, authentication.AccessServiceToken)
+	for index := range authentication.Multiple {
+		references = append(references, authentication.Multiple[index].AccessServiceToken)
+	}
+	for _, reference := range references {
+		if reference == nil || reference.ServiceTokenRef.Name != name {
+			continue
+		}
+		referenceNamespace := reference.ServiceTokenRef.Namespace
+		if referenceNamespace == "" {
+			referenceNamespace = defaultNamespace
+		}
+		if referenceNamespace == namespace {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AccessApplicationReconciler) mapTunnelToApplications(ctx context.Context, object client.Object) []reconcile.Request {
@@ -2333,21 +1946,11 @@ func (r *AccessApplicationReconciler) mapTunnelToApplications(ctx context.Contex
 }
 
 func (r *AccessApplicationReconciler) mapAccountToApplications(ctx context.Context, object client.Object) []reconcile.Request {
-	var explicit v1alpha1.AccessApplicationList
-	if err := r.List(ctx, &explicit, client.MatchingFields{accessApplicationAccountIndex: object.GetName()}); err != nil {
+	var applications v1alpha1.AccessApplicationList
+	if err := r.List(ctx, &applications, client.MatchingFields{accessApplicationAccountIndex: object.GetName()}); err != nil {
 		return nil
 	}
-	var all v1alpha1.AccessApplicationList
-	if err := r.List(ctx, &all); err != nil {
-		return accessApplicationRequests(explicit.Items)
-	}
-	requests := accessApplicationRequests(explicit.Items)
-	for index := range all.Items {
-		if len(all.Items[index].Spec.PrivateDestinations) > 0 {
-			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&all.Items[index])})
-		}
-	}
-	return compactReconcileRequests(requests)
+	return accessApplicationRequests(applications.Items)
 }
 
 func (r *AccessApplicationReconciler) mapNamespaceToApplications(ctx context.Context, object client.Object) []reconcile.Request {
@@ -2358,13 +1961,16 @@ func (r *AccessApplicationReconciler) mapNamespaceToApplications(ctx context.Con
 	return accessApplicationRequests(applications.Items)
 }
 
-func (r *AccessApplicationReconciler) mapAUDSecretToApplication(_ context.Context, object client.Object) []reconcile.Request {
-	value := object.GetLabels()[v1alpha1.AccessApplicationAUDSecretLabel]
-	namespace, name, found := strings.Cut(value, "--")
-	if !found || namespace == "" || name == "" {
+func (r *AccessApplicationReconciler) mapAUDSecretToApplication(ctx context.Context, object client.Object) []reconcile.Request {
+	secret, ok := object.(*corev1.Secret)
+	if !ok {
 		return nil
 	}
-	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
+	_, application, trusted := liveAUDSecretBinding(ctx, r.Client, r.operatorNamespace(), secret)
+	if !trusted {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(application)}}
 }
 
 func accessApplicationRequests(applications []v1alpha1.AccessApplication) []reconcile.Request {

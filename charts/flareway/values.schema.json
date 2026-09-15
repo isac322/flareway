@@ -136,7 +136,7 @@
               "properties": {
                 "image": {"type": "string", "minLength": 1},
                 "replicas": {"type": "integer", "minimum": 1},
-                "protocol": {"type": "string", "enum": ["auto", "quic", "http2"]},
+                "protocol": {"type": "string", "enum": ["Auto", "QUIC", "HTTP2"]},
                 "gracePeriod": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
                 "resources": {"type": "object"}
               }

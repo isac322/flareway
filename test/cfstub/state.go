@@ -59,15 +59,41 @@ type Organization struct {
 
 // Tunnel is a stateful Cloudflare Tunnel resource.
 type Tunnel struct {
-	ID          string           `json:"id"`
-	AccountID   string           `json:"-"`
-	AccountTag  string           `json:"account_tag"`
-	Name        string           `json:"name"`
-	Status      string           `json:"status"`
-	ConfigSrc   string           `json:"config_src,omitempty"`
-	CreatedAt   time.Time        `json:"created_at"`
-	DeletedAt   *time.Time       `json:"deleted_at,omitempty"`
-	Connections []map[string]any `json:"connections,omitempty"`
+	ID              string           `json:"id"`
+	AccountID       string           `json:"-"`
+	AccountTag      string           `json:"account_tag"`
+	Name            string           `json:"name"`
+	Status          string           `json:"status"`
+	TunType         string           `json:"tun_type"`
+	ConfigSrc       string           `json:"config_src,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	DeletedAt       *time.Time       `json:"deleted_at,omitempty"`
+	ConnsActiveAt   *time.Time       `json:"conns_active_at,omitempty"`
+	ConnsInactiveAt *time.Time       `json:"conns_inactive_at,omitempty"`
+	Connections     []map[string]any `json:"connections,omitempty"`
+}
+
+// TunnelConnector is a cloudflared client and its active edge connections.
+type TunnelConnector struct {
+	ID            string             `json:"id"`
+	Arch          string             `json:"arch"`
+	ConfigVersion int64              `json:"config_version"`
+	Conns         []TunnelConnection `json:"conns"`
+	Features      []string           `json:"features"`
+	RunAt         time.Time          `json:"run_at"`
+	Version       string             `json:"version"`
+}
+
+// TunnelConnection is one edge connection held by a cloudflared connector.
+type TunnelConnection struct {
+	ID                 string    `json:"id"`
+	ClientID           string    `json:"client_id"`
+	ClientVersion      string    `json:"client_version"`
+	ColoName           string    `json:"colo_name"`
+	IsPendingReconnect bool      `json:"is_pending_reconnect"`
+	OpenedAt           time.Time `json:"opened_at"`
+	OriginIP           string    `json:"origin_ip"`
+	UUID               string    `json:"uuid"`
 }
 
 // TunnelConfiguration records the last whole-object configuration and version.
@@ -126,58 +152,62 @@ type AccessTag struct {
 type State struct {
 	mu sync.RWMutex
 
-	values                map[string]any
-	token                 TokenVerification
-	zones                 map[string]Zone
-	organizations         map[string]Organization
-	tunnels               map[string]map[string]Tunnel
-	configs               map[string]TunnelConfiguration
-	tunnelTokens          map[string]string
-	dnsRecords            map[string]map[string]DNSRecord
-	accessApps            map[string]map[string]AccessResource
-	accessTags            map[string]map[string]AccessTag
-	accessPolicies        map[string]map[string]AccessResource
-	accessGroups          map[string]map[string]AccessResource
-	identityProviders     map[string]map[string]AccessResource
-	postureRules          map[string]map[string]AccessResource
-	serviceTokens         map[string]map[string]AccessServiceToken
-	virtualNetworks       map[string]map[string]VirtualNetwork
-	networkRoutes         map[string]map[string]NetworkRoute
-	hostnameRoutes        map[string]map[string]HostnameRoute
-	deviceSettings        map[string]DeviceSettings
-	defaultDevicePolicies map[string]DevicePolicy
-	customDevicePolicies  map[string]map[string]DevicePolicy
-	gatewayRules          map[string]map[string]GatewayRule
-	gatewayLists          map[string]map[string]GatewayList
-	nextID                uint64
+	values                 map[string]any
+	token                  TokenVerification
+	zones                  map[string]Zone
+	organizations          map[string]Organization
+	tunnels                map[string]map[string]Tunnel
+	configs                map[string]TunnelConfiguration
+	tunnelTokens           map[string]string
+	tunnelManagementTokens map[string]string
+	tunnelConnectors       map[string]map[string]TunnelConnector
+	dnsRecords             map[string]map[string]DNSRecord
+	accessApps             map[string]map[string]AccessResource
+	accessTags             map[string]map[string]AccessTag
+	accessPolicies         map[string]map[string]AccessResource
+	accessGroups           map[string]map[string]AccessResource
+	identityProviders      map[string]map[string]AccessResource
+	postureRules           map[string]map[string]AccessResource
+	serviceTokens          map[string]map[string]AccessServiceToken
+	virtualNetworks        map[string]map[string]VirtualNetwork
+	networkRoutes          map[string]map[string]NetworkRoute
+	hostnameRoutes         map[string]map[string]HostnameRoute
+	deviceSettings         map[string]DeviceSettings
+	defaultDevicePolicies  map[string]DevicePolicy
+	customDevicePolicies   map[string]map[string]DevicePolicy
+	gatewayRules           map[string]map[string]GatewayRule
+	gatewayLists           map[string]map[string]GatewayList
+	nextID                 uint64
 }
 
 // NewState returns empty synchronized state with a valid active API token.
 func NewState() *State {
 	return &State{
-		values:                make(map[string]any),
-		token:                 TokenVerification{ID: "stub-token", Status: "active"},
-		zones:                 make(map[string]Zone),
-		organizations:         make(map[string]Organization),
-		tunnels:               make(map[string]map[string]Tunnel),
-		configs:               make(map[string]TunnelConfiguration),
-		tunnelTokens:          make(map[string]string),
-		dnsRecords:            make(map[string]map[string]DNSRecord),
-		accessApps:            make(map[string]map[string]AccessResource),
-		accessTags:            make(map[string]map[string]AccessTag),
-		accessPolicies:        make(map[string]map[string]AccessResource),
-		accessGroups:          make(map[string]map[string]AccessResource),
-		identityProviders:     make(map[string]map[string]AccessResource),
-		postureRules:          make(map[string]map[string]AccessResource),
-		serviceTokens:         make(map[string]map[string]AccessServiceToken),
-		virtualNetworks:       make(map[string]map[string]VirtualNetwork),
-		networkRoutes:         make(map[string]map[string]NetworkRoute),
-		hostnameRoutes:        make(map[string]map[string]HostnameRoute),
-		deviceSettings:        make(map[string]DeviceSettings),
-		defaultDevicePolicies: make(map[string]DevicePolicy),
-		customDevicePolicies:  make(map[string]map[string]DevicePolicy),
-		gatewayRules:          make(map[string]map[string]GatewayRule),
-		gatewayLists:          make(map[string]map[string]GatewayList),
+		values:                 make(map[string]any),
+		token:                  TokenVerification{ID: "stub-token", Status: "active"},
+		zones:                  make(map[string]Zone),
+		organizations:          make(map[string]Organization),
+		tunnels:                make(map[string]map[string]Tunnel),
+		configs:                make(map[string]TunnelConfiguration),
+		tunnelTokens:           make(map[string]string),
+		tunnelManagementTokens: make(map[string]string),
+		tunnelConnectors:       make(map[string]map[string]TunnelConnector),
+		dnsRecords:             make(map[string]map[string]DNSRecord),
+		accessApps:             make(map[string]map[string]AccessResource),
+		accessTags:             make(map[string]map[string]AccessTag),
+		accessPolicies:         make(map[string]map[string]AccessResource),
+		accessGroups:           make(map[string]map[string]AccessResource),
+		identityProviders:      make(map[string]map[string]AccessResource),
+		postureRules:           make(map[string]map[string]AccessResource),
+		serviceTokens:          make(map[string]map[string]AccessServiceToken),
+		virtualNetworks:        make(map[string]map[string]VirtualNetwork),
+		networkRoutes:          make(map[string]map[string]NetworkRoute),
+		hostnameRoutes:         make(map[string]map[string]HostnameRoute),
+		deviceSettings:         make(map[string]DeviceSettings),
+		defaultDevicePolicies:  make(map[string]DevicePolicy),
+		customDevicePolicies:   make(map[string]map[string]DevicePolicy),
+		gatewayRules:           make(map[string]map[string]GatewayRule),
+		gatewayLists:           make(map[string]map[string]GatewayList),
 	}
 }
 
@@ -248,6 +278,35 @@ func (s *State) SetTunnelToken(tunnelID, token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tunnelTokens[tunnelID] = token
+}
+
+// SetTunnelManagementToken replaces the management token returned for tunnelID.
+func (s *State) SetTunnelManagementToken(tunnelID, token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tunnelManagementTokens[tunnelID] = token
+}
+
+// AddTunnelConnector seeds or replaces one connector for a tunnel.
+func (s *State) AddTunnelConnector(tunnelID string, connector TunnelConnector) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tunnelConnectors[tunnelID] == nil {
+		s.tunnelConnectors[tunnelID] = make(map[string]TunnelConnector)
+	}
+	s.tunnelConnectors[tunnelID][connector.ID] = cloneTunnelConnector(connector)
+}
+
+// TunnelConnectors returns a tunnel's connectors sorted by ID.
+func (s *State) TunnelConnectors(tunnelID string) []TunnelConnector {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	connectors := make([]TunnelConnector, 0, len(s.tunnelConnectors[tunnelID]))
+	for _, connector := range s.tunnelConnectors[tunnelID] {
+		connectors = append(connectors, cloneTunnelConnector(connector))
+	}
+	sort.Slice(connectors, func(i, j int) bool { return connectors[i].ID < connectors[j].ID })
+	return connectors
 }
 
 // SetTunnelConfiguration seeds a tunnel configuration at an explicit version.
@@ -429,6 +488,18 @@ func (s *State) nextIdentifierLocked(kind string) string {
 }
 
 func (s *State) putTunnelLocked(tunnel Tunnel) {
+	if tunnel.AccountTag == "" {
+		tunnel.AccountTag = tunnel.AccountID
+	}
+	if tunnel.Status == "" {
+		tunnel.Status = "inactive"
+	}
+	if tunnel.TunType == "" {
+		tunnel.TunType = "cfd_tunnel"
+	}
+	if tunnel.ConfigSrc == "" {
+		tunnel.ConfigSrc = "cloudflare"
+	}
 	if s.tunnels[tunnel.AccountID] == nil {
 		s.tunnels[tunnel.AccountID] = make(map[string]Tunnel)
 	}
@@ -487,4 +558,10 @@ func cloneConnections(value []map[string]any) []map[string]any {
 	var cloned []map[string]any
 	_ = json.Unmarshal(encoded, &cloned)
 	return cloned
+}
+
+func cloneTunnelConnector(value TunnelConnector) TunnelConnector {
+	value.Features = append([]string(nil), value.Features...)
+	value.Conns = append([]TunnelConnection(nil), value.Conns...)
+	return value
 }

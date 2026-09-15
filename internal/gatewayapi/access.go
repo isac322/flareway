@@ -46,13 +46,15 @@ type AUDSecret struct {
 
 // AccessDestination is a Cloudflare Access destination compiled from a target.
 type AccessDestination struct {
-	Type       string
-	URI        string
-	Hostname   string
-	CIDR       string
-	PortRange  string
-	L4Protocol string
-	VNetID     string
+	Type        v1alpha1.AccessApplicationDestinationType
+	URI         string
+	Hostname    string
+	CIDR        string
+	PortRange   string
+	L4Protocol  *v1alpha1.AccessL4Protocol
+	VNetID      string
+	MCPServerID string
+	WorkerID    string
 }
 
 // AccessDataPlane identifies one isolated protection domain used by an app.
@@ -99,6 +101,7 @@ type accessClaim struct {
 	routeName   string
 	region      accessRegion
 	wholeHost   bool
+	shadow      bool
 	specificity int
 }
 
@@ -123,10 +126,10 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 	base.AUDSecrets = nil
 	gateway, _ := Translate(base)
 	if gateway == nil {
-		if len(application.Spec.PrivateDestinations) > 0 {
-			return CompilePrivateDestinations(in, application)
+		if len(application.Spec.TargetRefs) > 0 {
+			return accessFailure("TargetNotFound", "Gateway target was not found")
 		}
-		return accessFailure("TargetNotFound", "Gateway target was not found")
+		return compileDeclaredAccessDestinations(in, application)
 	}
 	return compileAccessApplicationAgainstIR(in, gateway, application)
 }
@@ -140,7 +143,7 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 	if application.Namespace != gateway.Key.Namespace {
 		return accessFailure("RefNotPermitted", "AccessApplication targets must be in the Gateway namespace")
 	}
-	if application.Spec.AccountRef != nil && in.CloudflareAccount != nil && application.Spec.AccountRef.Name != in.CloudflareAccount.Name {
+	if in.CloudflareAccount != nil && application.Spec.AccountRef.Name != in.CloudflareAccount.Name {
 		return accessFailure("RefNotPermitted", fmt.Sprintf("AccessApplication accountRef %q does not match Gateway account %q", application.Spec.AccountRef.Name, in.CloudflareAccount.Name))
 	}
 	if effectiveOriginJWTMode(application) == v1alpha1.AccessOriginJWTModeDisabled {
@@ -150,6 +153,10 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		}
 	}
 
+	pathScope, scoped, err := accessApplicationPathScope(application)
+	if err != nil {
+		return accessFailure("Invalid", err.Error())
+	}
 	seenDestination := make(map[string]struct{})
 	seenAncestor := make(map[string]struct{})
 	seenClaim := make(map[string]struct{})
@@ -172,6 +179,13 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 			if target.SectionName != nil {
 				specificity = 15
 			}
+			region := accessRegion{kind: accessRegionPrefix, path: "/"}
+			wholeHost := true
+			if scoped {
+				region = pathScope
+				wholeHost = false
+				specificity += 5
+			}
 			for _, domain := range gateway.Domains {
 				if target.SectionName != nil && string(*target.SectionName) != domain.ListenerName {
 					continue
@@ -181,14 +195,14 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 						continue
 					}
 					matched = true
-					if err := appendAccessDestination(&result, seenDestination, in, gateway, domain.ListenerName, virtualHost.Hostname, accessRegion{kind: accessRegionPrefix, path: "/"}); err != nil {
+					if err := appendAccessDestination(&result, seenDestination, in, gateway, domain.ListenerName, virtualHost.Hostname, region); err != nil {
 						return accessFailure("TargetNotFound", err.Error())
 					}
 					if len(virtualHost.Routes) == 0 {
-						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, region: accessRegion{kind: accessRegionPrefix, path: "/"}, wholeHost: true, specificity: specificity})
+						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, region: region, wholeHost: wholeHost, shadow: scoped, specificity: specificity})
 					}
 					for _, route := range virtualHost.Routes {
-						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: accessRegion{kind: accessRegionPrefix, path: "/"}, wholeHost: true, specificity: specificity})
+						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: region, wholeHost: wholeHost, shadow: scoped, specificity: specificity})
 					}
 				}
 			}
@@ -215,10 +229,14 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 						if target.SectionName != nil {
 							specificity = 25
 						}
+						if scoped {
+							region = pathScope
+							specificity += 5
+						}
 						if err := appendAccessDestination(&result, seenDestination, in, gateway, domain.ListenerName, virtualHost.Hostname, region); err != nil {
 							return accessFailure("TargetNotFound", err.Error())
 						}
-						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: region, specificity: specificity})
+						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: region, shadow: scoped, specificity: specificity})
 					}
 				}
 			}
@@ -230,18 +248,88 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		}
 	}
 
-	privateCompilation := CompilePrivateDestinations(in, application)
-	if !privateCompilation.Accepted {
-		return privateCompilation
+	declared := compileDeclaredAccessDestinations(in, application)
+	if !declared.Accepted {
+		return declared
 	}
-	for _, destination := range privateCompilation.Destinations {
+	for _, destination := range declared.Destinations {
 		appendCompiledDestination(&result, seenDestination, destination)
 	}
-	result.Ancestors = append(result.Ancestors, privateCompilation.Ancestors...)
-	if len(result.claims) == 0 && len(application.Spec.PrivateDestinations) == 0 {
-		return accessFailure("TargetNotFound", "no targetRef resolves to this Gateway")
+	result.Ancestors = append(result.Ancestors, declared.Ancestors...)
+	if len(result.claims) == 0 && len(result.Destinations) == 0 {
+		return accessFailure("TargetNotFound", "no targetRef or destination resolves to this Gateway")
 	}
 	result.OriginJWTEnforced = len(result.claims) > 0 && effectiveOriginJWTMode(application) == v1alpha1.AccessOriginJWTModeRequired
+	sortAccessCompilation(&result)
+	return result
+}
+
+func accessApplicationPathScope(application *v1alpha1.AccessApplication) (accessRegion, bool, error) {
+	if application.Spec.PathScope == nil {
+		return accessRegion{}, false, nil
+	}
+	path, err := normalizeAccessPath(application.Spec.PathScope.Value)
+	if err != nil {
+		return accessRegion{}, false, fmt.Errorf("normalize pathScope: %w", err)
+	}
+	matchType := application.Spec.PathScope.Type
+	if matchType == "" {
+		matchType = gatewayv1.PathMatchPathPrefix
+	}
+	switch matchType {
+	case gatewayv1.PathMatchExact:
+		return accessRegion{kind: accessRegionExact, path: path}, true, nil
+	case gatewayv1.PathMatchPathPrefix:
+		return accessRegion{kind: accessRegionPrefix, path: path}, true, nil
+	default:
+		return accessRegion{}, false, fmt.Errorf("pathScope uses unsupported match type %q", matchType)
+	}
+}
+
+func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
+	result := CompilePrivateDestinations(in, application)
+	if !result.Accepted {
+		return result
+	}
+	seen := make(map[string]struct{}, len(result.Destinations))
+	for _, destination := range result.Destinations {
+		seen[accessDestinationKey(destination)] = struct{}{}
+	}
+	for index, destination := range application.Spec.Destinations {
+		switch destination.Type {
+		case v1alpha1.AccessApplicationDestinationPrivate:
+			continue
+		case v1alpha1.AccessApplicationDestinationPublic:
+			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] cannot declare a public destination", index))
+		case v1alpha1.AccessApplicationDestinationViaMCPServerPortal:
+			if destination.ViaMCPServerPortal == nil {
+				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].viaMcpServerPortal is required", index))
+			}
+			appendCompiledDestination(&result, seen, AccessDestination{
+				Type: v1alpha1.AccessApplicationDestinationViaMCPServerPortal, MCPServerID: destination.ViaMCPServerPortal.MCPServerID,
+			})
+		case v1alpha1.AccessApplicationDestinationWorker:
+			if destination.Worker == nil {
+				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].worker is required", index))
+			}
+			appendCompiledDestination(&result, seen, AccessDestination{
+				Type: v1alpha1.AccessApplicationDestinationWorker, WorkerID: destination.Worker.WorkerID,
+			})
+		case v1alpha1.AccessApplicationDestinationPreviewWorker:
+			if destination.PreviewWorker == nil {
+				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].previewWorker is required", index))
+			}
+			appendCompiledDestination(&result, seen, AccessDestination{
+				Type: v1alpha1.AccessApplicationDestinationPreviewWorker, WorkerID: destination.PreviewWorker.WorkerID,
+			})
+		case v1alpha1.AccessApplicationDestinationAllWorkers:
+			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllWorkers})
+		case v1alpha1.AccessApplicationDestinationAllPreviewWorkers:
+			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllPreviewWorkers})
+		default:
+			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] uses unsupported type %q", index, destination.Type))
+		}
+	}
 	sortAccessCompilation(&result)
 	return result
 }
@@ -317,43 +405,53 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 	wholeHost := make(map[string]bool)
 	regions := make(map[string][]accessRegion)
 	for _, route := range host.Routes {
-		owner := ""
-		var selected accessClaim
-		bestSpecificity := -1
+		selectedByOwner := make(map[string]accessClaim)
 		for key, compilation := range statuses.AccessApplications {
 			if !compilation.Accepted {
 				continue
 			}
+			owner := key.String()
 			for _, claim := range compilation.claims {
 				if claim.listener != base.ListenerName || claim.hostname != host.Hostname ||
 					claim.routeName != route.Name && !claim.wholeHost {
 					continue
 				}
-				candidateOwner := key.String()
-				if claim.specificity > bestSpecificity || claim.specificity == bestSpecificity && (owner == "" || candidateOwner < owner) {
-					owner = candidateOwner
-					selected = claim
-					bestSpecificity = claim.specificity
+				selected, found := selectedByOwner[owner]
+				if !found || claim.specificity > selected.specificity {
+					selectedByOwner[owner] = claim
 				}
 			}
 		}
-		if owner == "" {
+		if len(selectedByOwner) == 0 {
 			public = append(public, route)
-		} else {
+			continue
+		}
+		consumingSpecificity := -1
+		for _, selected := range selectedByOwner {
+			if !selected.shadow && selected.specificity > consumingSpecificity {
+				consumingSpecificity = selected.specificity
+			}
+		}
+		for owner, selected := range selectedByOwner {
+			if !selected.shadow && selected.specificity < consumingSpecificity {
+				continue
+			}
 			wholeHost[owner] = wholeHost[owner] || selected.wholeHost
 			regions[owner] = appendUniqueAccessRegion(regions[owner], selected.region)
 			claimed[owner] = append(claimed[owner], route)
 		}
 	}
-	for key, compilation := range statuses.AccessApplications {
-		if !compilation.Accepted {
-			continue
-		}
-		for _, claim := range compilation.claims {
-			if claim.listener == base.ListenerName && claim.hostname == host.Hostname && claim.wholeHost {
-				owner := key.String()
-				wholeHost[owner] = true
-				regions[owner] = appendUniqueAccessRegion(regions[owner], claim.region)
+	if len(host.Routes) == 0 {
+		for key, compilation := range statuses.AccessApplications {
+			if !compilation.Accepted {
+				continue
+			}
+			for _, claim := range compilation.claims {
+				if claim.listener == base.ListenerName && claim.hostname == host.Hostname && claim.wholeHost {
+					owner := key.String()
+					wholeHost[owner] = true
+					regions[owner] = appendUniqueAccessRegion(regions[owner], claim.region)
+				}
 			}
 		}
 	}
@@ -477,26 +575,30 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		if application != nil {
 			mode = effectiveOriginJWTMode(application)
 		}
-		handoff := in.AUDSecrets[key]
-		switch {
-		case !handoff.Ready || handoff.ApplicationID == "":
-			protected.Access = nil
-			protected.Guard = ir.GuardBlocked
-		case mode == v1alpha1.AccessOriginJWTModeDisabled:
+		switch mode {
+		case v1alpha1.AccessOriginJWTModeDisabled:
 			protected.OriginJWTDisabled = true
-			protected.Guard = ir.GuardForwarding
-		case handoff.AUD != "" && in.CloudflareAccount != nil &&
-			in.CloudflareAccount.Status.Verified.TeamName != "" && in.CloudflareAccount.Status.Verified.AuthDomain != "":
-			protected.Access = &ir.AccessGuard{
-				AUD: handoff.AUD, TeamName: in.CloudflareAccount.Status.Verified.TeamName, AuthDomain: in.CloudflareAccount.Status.Verified.AuthDomain,
-			}
-			if application != nil && application.Spec.Application.OptionsPreflightBypass != nil {
-				protected.Access.OptionsPreflightBypass = *application.Spec.Application.OptionsPreflightBypass
-			}
-			protected.Guard = ir.GuardForwarding
-		default:
 			protected.Access = nil
-			protected.Guard = ir.GuardBlocked
+			if accessApplicationReady(in, key) {
+				protected.Guard = ir.GuardForwarding
+			} else {
+				protected.Guard = ir.GuardBlocked
+			}
+		default:
+			audiences, ready := accessAudiencesForDomain(in, statuses, key, base.ListenerName, host.Hostname)
+			if ready && in.CloudflareAccount != nil &&
+				in.CloudflareAccount.Status.Verified.TeamName != "" && in.CloudflareAccount.Status.Verified.AuthDomain != "" {
+				protected.Access = &ir.AccessGuard{
+					AUDs: audiences, TeamName: in.CloudflareAccount.Status.Verified.TeamName, AuthDomain: in.CloudflareAccount.Status.Verified.AuthDomain,
+				}
+				if application != nil && application.Spec.Application.OptionsPreflightBypass != nil {
+					protected.Access.OptionsPreflightBypass = *application.Spec.Application.OptionsPreflightBypass
+				}
+				protected.Guard = ir.GuardForwarding
+			} else {
+				protected.Access = nil
+				protected.Guard = ir.GuardBlocked
+			}
 		}
 		gateway.Domains = append(gateway.Domains, protected)
 		compilation.DataPlanes = append(compilation.DataPlanes, AccessDataPlane{
@@ -510,6 +612,45 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		})
 		statuses.AccessApplications[key] = compilation
 	}
+}
+
+func accessApplicationReady(in Inputs, applicationKey types.NamespacedName) bool {
+	handoff := in.AUDSecrets[applicationKey]
+	return handoff.Ready && handoff.ApplicationID != ""
+}
+
+func accessAudiencesForDomain(in Inputs, statuses *Statuses, applicationKey types.NamespacedName, listener, hostname string) ([]string, bool) {
+	application := accessApplicationByKey(in.AccessApplications, applicationKey)
+	if application == nil || effectiveOriginJWTAudienceScope(application) == v1alpha1.AccessOriginJWTAudienceScopeApplication {
+		handoff := in.AUDSecrets[applicationKey]
+		if !accessApplicationReady(in, applicationKey) || handoff.AUD == "" {
+			return nil, false
+		}
+		return []string{handoff.AUD}, true
+	}
+	audiences := make([]string, 0)
+	for key, compilation := range statuses.AccessApplications {
+		if !compilation.Accepted || !compilationClaimsHostname(compilation, listener, hostname) {
+			continue
+		}
+		handoff := in.AUDSecrets[key]
+		if !accessApplicationReady(in, key) || handoff.AUD == "" {
+			return nil, false
+		}
+		audiences = append(audiences, handoff.AUD)
+	}
+	slices.Sort(audiences)
+	audiences = slices.Compact(audiences)
+	return audiences, len(audiences) > 0
+}
+
+func compilationClaimsHostname(compilation AccessApplicationCompilation, listener, hostname string) bool {
+	for _, claim := range compilation.claims {
+		if claim.listener == listener && claim.hostname == hostname {
+			return true
+		}
+	}
+	return false
 }
 
 var reservedAccessHeaders = []string{
@@ -691,9 +832,10 @@ func appendAccessDestination(result *AccessApplicationCompilation, seen map[stri
 		if vnetID == "" {
 			return fmt.Errorf("private listener %q has no ready VirtualNetwork", listenerName)
 		}
+		protocol := v1alpha1.AccessL4ProtocolTCP
 		appendCompiledDestination(result, seen, AccessDestination{
-			Type: "private", Hostname: hostname, PortRange: fmt.Sprint(listener.Port),
-			L4Protocol: string(v1alpha1.AccessL4ProtocolTCP), VNetID: vnetID,
+			Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: hostname, PortRange: fmt.Sprint(listener.Port),
+			L4Protocol: &protocol, VNetID: vnetID,
 		})
 		return nil
 	}
@@ -701,21 +843,31 @@ func appendAccessDestination(result *AccessApplicationCompilation, seen map[stri
 	if region.path != "" && region.path != "/" {
 		uri += region.path
 	}
-	appendCompiledDestination(result, seen, AccessDestination{Type: "public", URI: uri})
+	appendCompiledDestination(result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationPublic, URI: uri})
 	return nil
 }
-
 func appendCompiledDestination(result *AccessApplicationCompilation, seen map[string]struct{}, destination AccessDestination) {
-	key := strings.Join([]string{destination.Type, destination.URI, destination.Hostname, destination.CIDR, destination.PortRange, destination.L4Protocol, destination.VNetID}, "\x00")
+	key := accessDestinationKey(destination)
 	if _, exists := seen[key]; exists {
 		return
 	}
 	seen[key] = struct{}{}
 	result.Destinations = append(result.Destinations, destination)
 }
+
+func accessDestinationKey(destination AccessDestination) string {
+	protocol := ""
+	if destination.L4Protocol != nil {
+		protocol = string(*destination.L4Protocol)
+	}
+	return strings.Join([]string{
+		string(destination.Type), destination.URI, destination.Hostname, destination.CIDR, destination.PortRange,
+		protocol, destination.VNetID, destination.MCPServerID, destination.WorkerID,
+	}, "\x00")
+}
 func appendAccessClaim(result *AccessApplicationCompilation, seen map[string]struct{}, claim accessClaim) {
 	claim.hostname = strings.ToLower(strings.TrimSuffix(claim.hostname, "."))
-	key := strings.Join([]string{claim.listener, claim.hostname, claim.routeName, claim.region.kind, claim.region.path, fmt.Sprint(claim.wholeHost)}, "\x00")
+	key := strings.Join([]string{claim.listener, claim.hostname, claim.routeName, claim.region.kind, claim.region.path, fmt.Sprint(claim.wholeHost), fmt.Sprint(claim.shadow)}, "\x00")
 	if _, exists := seen[key]; exists {
 		return
 	}
@@ -791,6 +943,13 @@ func effectiveOriginJWTMode(application *v1alpha1.AccessApplication) v1alpha1.Ac
 	return application.Spec.OriginJWT.Mode
 }
 
+func effectiveOriginJWTAudienceScope(application *v1alpha1.AccessApplication) v1alpha1.AccessOriginJWTAudienceScope {
+	if application.Spec.OriginJWT.AudienceScope == "" {
+		return v1alpha1.AccessOriginJWTAudienceScopeApplication
+	}
+	return application.Spec.OriginJWT.AudienceScope
+}
+
 func accessApplicationByKey(applications []v1alpha1.AccessApplication, key types.NamespacedName) *v1alpha1.AccessApplication {
 	for index := range applications {
 		if applications[index].Namespace == key.Namespace && applications[index].Name == key.Name {
@@ -828,8 +987,9 @@ func uniqueStrings(values []string) []string {
 func sortAccessCompilation(result *AccessApplicationCompilation) {
 	result.Destinations = minimizeAccessDestinations(result.Destinations)
 	slices.SortFunc(result.Destinations, func(left, right AccessDestination) int {
-		return strings.Compare(strings.Join([]string{left.Type, left.URI, left.Hostname, left.CIDR, left.PortRange, left.L4Protocol, left.VNetID}, "\x00"), strings.Join([]string{right.Type, right.URI, right.Hostname, right.CIDR, right.PortRange, right.L4Protocol, right.VNetID}, "\x00"))
+		return strings.Compare(accessDestinationKey(left), accessDestinationKey(right))
 	})
+	result.Destinations = compactAccessDestinations(result.Destinations)
 	slices.SortFunc(result.DataPlanes, func(left, right AccessDataPlane) int {
 		return strings.Compare(strings.Join([]string{left.Tunnel, left.Listener, left.ProtectionDomain, fmt.Sprint(left.EnvoyPort)}, "\x00"), strings.Join([]string{right.Tunnel, right.Listener, right.ProtectionDomain, fmt.Sprint(right.EnvoyPort)}, "\x00"))
 	})
@@ -841,11 +1001,27 @@ func sortAccessCompilation(result *AccessApplicationCompilation) {
 	})
 }
 
+func compactAccessDestinations(values []AccessDestination) []AccessDestination {
+	if len(values) < 2 {
+		return values
+	}
+	result := values[:0]
+	lastKey := ""
+	for index, value := range values {
+		key := accessDestinationKey(value)
+		if index == 0 || key != lastKey {
+			result = append(result, value)
+			lastKey = key
+		}
+	}
+	return result
+}
+
 func minimizeAccessDestinations(destinations []AccessDestination) []AccessDestination {
 	public := make([]AccessDestination, 0, len(destinations))
 	result := make([]AccessDestination, 0, len(destinations))
 	for _, destination := range destinations {
-		if destination.Type == "public" {
+		if destination.Type == v1alpha1.AccessApplicationDestinationPublic {
 			public = append(public, destination)
 		} else {
 			result = append(result, destination)
@@ -860,7 +1036,7 @@ func minimizeAccessDestinations(destinations []AccessDestination) []AccessDestin
 	for _, candidate := range public {
 		covered := false
 		for _, existing := range result {
-			if existing.Type == "public" && accessURIContains(existing.URI, candidate.URI) {
+			if existing.Type == v1alpha1.AccessApplicationDestinationPublic && accessURIContains(existing.URI, candidate.URI) {
 				covered = true
 				break
 			}

@@ -148,16 +148,53 @@ type AccessLinkedAppTokenRule struct {
 }
 
 // AccessUserRiskLevel identifies a user risk level.
-// +kubebuilder:validation:Enum=low;medium;high;unscored
+// +kubebuilder:validation:Enum=Low;Medium;High;Unscored
 type AccessUserRiskLevel string
 
-// AccessUserRiskScoreRule is part of the accessuserriskscorerule configuration.
+const (
+	// AccessUserRiskLevelLow matches low-risk users.
+	AccessUserRiskLevelLow AccessUserRiskLevel = "Low"
+	// AccessUserRiskLevelMedium matches medium-risk users.
+	AccessUserRiskLevelMedium AccessUserRiskLevel = "Medium"
+	// AccessUserRiskLevelHigh matches high-risk users.
+	AccessUserRiskLevelHigh AccessUserRiskLevel = "High"
+	// AccessUserRiskLevelUnscored matches users without a risk score.
+	AccessUserRiskLevelUnscored AccessUserRiskLevel = "Unscored"
+)
+
+// AccessUserRiskScoreRule matches one or more user risk levels.
 type AccessUserRiskScoreRule struct {
+	// +kubebuilder:validation:MinItems=1
+	// +listType=set
 	Levels []AccessUserRiskLevel `json:"levels"`
 }
 
 // AccessCloudflareAccountMemberRule is part of the accesscloudflareaccountmemberrule configuration.
 type AccessCloudflareAccountMemberRule struct {
+	AccountID string `json:"accountId,omitempty"`
+}
+
+// AccessRuleObservation is a compact, resolved Access rule representation used
+// in status. It intentionally has no cross-field CEL validation.
+type AccessRuleObservation struct {
+	// +kubebuilder:validation:Enum=email;emailDomain;emailList;everyone;ip;ipList;certificate;commonName;group;azureAD;githubOrganization;gsuite;okta;saml;oidc;serviceToken;anyValidServiceToken;externalEvaluation;geo;authMethod;devicePosture;loginMethod;authContext;linkedAppToken;userRiskScore;cloudflareAccountMember
+	// +kubebuilder:validation:MaxLength=32
+	Kind string `json:"kind"`
+	// +kubebuilder:validation:MaxLength=1024
+	Value string `json:"value,omitempty"`
+	// +kubebuilder:validation:MaxLength=1024
+	Value2 string `json:"value2,omitempty"`
+	// +kubebuilder:validation:MaxLength=1024
+	Value3 string `json:"value3,omitempty"`
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=16
+	// +listType=atomic
+	Values []string `json:"values,omitempty"`
+	// +kubebuilder:validation:MaxLength=256
+	ID string `json:"id,omitempty"`
+	// +kubebuilder:validation:MaxLength=256
+	IdentityProviderID string `json:"identityProviderId,omitempty"`
+	// +kubebuilder:validation:MaxLength=256
 	AccountID string `json:"accountId,omitempty"`
 }
 

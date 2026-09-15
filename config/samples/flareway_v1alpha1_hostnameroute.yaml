@@ -10,6 +10,7 @@ spec:
     name: runbear
   hostname: admin.cc-lb.internal
   tunnelRef:
+    kind: CloudflareTunnel
     name: cc-lb
     namespace: llm-proxy
   allowedNamespaces:
@@ -17,6 +18,30 @@ spec:
     selector:
       matchLabels:
         flareway.bhyoo.com/tenant: llm-proxy
-  comment: Private admin hostname
+  comment: Private admin hostname through the Gateway tunnel
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: HostnameRoute
+metadata:
+  name: branch-dns
+  namespace: flareway-system
+  labels:
+    flareway.bhyoo.com/tenant: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  hostname: printer.branch.internal
+  tunnelRef:
+    kind: WARPConnector
+    name: branch-local
+    namespace: llm-proxy
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        flareway.bhyoo.com/tenant: llm-proxy
+  comment: Private DNS hostname through the local-HA WARP Connector
   managementPolicy: Managed
   deletionPolicy: Delete

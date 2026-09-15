@@ -28,8 +28,20 @@ const (
 	ServiceTokenClientIDKey = "CF-Access-Client-Id"
 	// ServiceTokenClientSecretKey is a supported API value.
 	ServiceTokenClientSecretKey = "CF-Access-Client-Secret"
-	// ServiceTokenIDAnnotation is a supported API value.
+	// ServiceTokenPreviousClientIDKey exposes the client ID accepted during a rotation grace period.
+	ServiceTokenPreviousClientIDKey = "CF-Access-Client-Id-Previous"
+	// ServiceTokenPreviousClientSecretKey exposes the client secret accepted during a rotation grace period.
+	ServiceTokenPreviousClientSecretKey = "CF-Access-Client-Secret-Previous"
+	// ServiceTokenIDAnnotation records the remote token identifier on its Secret.
 	ServiceTokenIDAnnotation = "flareway.bhyoo.com/service-token-id"
+	// ServiceTokenPreviousClientSecretExpiresAtAnnotation records when previous credentials must be removed.
+	ServiceTokenPreviousClientSecretExpiresAtAnnotation = "flareway.bhyoo.com/previous-client-secret-expires-at"
+	// ServiceTokenRotationRequestAnnotation records the rotation request applied to a Secret.
+	ServiceTokenRotationRequestAnnotation = "flareway.bhyoo.com/rotation-requested-at"
+	// ServiceTokenRotatedAtAnnotation records when the Secret's current credential was rotated.
+	ServiceTokenRotatedAtAnnotation = "flareway.bhyoo.com/rotated-at"
+	// ServiceTokenRefreshExpiresAtAnnotation records a successfully refreshed remote expiry.
+	ServiceTokenRefreshExpiresAtAnnotation = "flareway.bhyoo.com/refreshed-expires-at"
 )
 
 // ServiceTokenRotationMode controls automatic service-token secret rotation.
@@ -63,10 +75,17 @@ type ServiceTokenExternalReference struct {
 // +kubebuilder:validation:XValidation:rule="self.adoption.mode != 'AdoptById' || has(self.externalRef)",message="AdoptById requires externalRef"
 type ServiceTokenSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
+	// Zone selects a zone-scoped endpoint by exact DNS zone name. Empty uses the account endpoint.
+	// +kubebuilder:validation:MinLength=1
+	Zone string `json:"zone,omitempty"`
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
+	// Enabled controls whether Cloudflare accepts the token credentials.
+	// +kubebuilder:default=true
+	Enabled bool `json:"enabled"`
 	// +kubebuilder:default="8760h"
-	Duration  string                      `json:"duration,omitempty"`
+	Duration string `json:"duration,omitempty"`
+	// SecretRef names the credential Secret. An existing Secret must already be controlled by this ServiceToken.
 	SecretRef corev1.LocalObjectReference `json:"secretRef"`
 	// +kubebuilder:default={}
 	Rotation ServiceTokenRotationSpec `json:"rotation,omitempty"`
@@ -83,10 +102,18 @@ type ServiceTokenSpec struct {
 type ServiceTokenStatus struct {
 	TokenID                 string       `json:"tokenId,omitempty"`
 	ClientID                string       `json:"clientId,omitempty"`
+	ZoneID                  string       `json:"zoneId,omitempty"`
 	OwnershipVerified       bool         `json:"ownershipVerified,omitempty"`
 	ExpiresAt               *metav1.Time `json:"expiresAt,omitempty"`
 	RotatedAt               *metav1.Time `json:"rotatedAt,omitempty"`
 	ObservedRotationRequest *metav1.Time `json:"observedRotationRequest,omitempty"`
+	// ObservedName is the bounded remote name retained for drift visibility.
+	ObservedName string `json:"observedName,omitempty"`
+	// ObservedDuration is the bounded remote validity duration retained for drift visibility.
+	ObservedDuration string `json:"observedDuration,omitempty"`
+	// ObservedEnabled is the bounded remote enabled state retained for drift visibility.
+	// +optional
+	ObservedEnabled bool `json:"observedEnabled"`
 	// +listType=map
 	// +listMapKey=type
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`

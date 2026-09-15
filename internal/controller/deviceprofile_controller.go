@@ -221,14 +221,14 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 			}
 			allowed, err := privateRouteAllowsNamespace(route.Namespace, route.Spec.AllowedNamespaces, namespace)
 			if err != nil {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "NetworkRoute %s/%s allowedNamespaces: %v", route.Namespace, route.Name, err)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "the NetworkRoute %s/%s allowedNamespaces: %v", route.Namespace, route.Name, err)
 			}
 			if !allowed {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid("RefNotPermitted", "NetworkRoute %s/%s does not allow namespace %q", route.Namespace, route.Name, namespace.Name)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid("RefNotPermitted", "the NetworkRoute %s/%s does not allow namespace %q", route.Namespace, route.Name, namespace.Name)
 			}
 			decision := authz.Evaluate(account, namespace, authz.Request{Exposure: v1alpha1.ExposurePrivate, PrivateRoute: &authz.PrivateRouteRequest{Kind: authz.PrivateRouteNetwork, Labels: route.Labels}})
 			if !decision.Allowed {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "NetworkRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "the NetworkRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
 			}
 			value := route.Spec.Network
 			candidates = append(candidates, splitCandidate{entry: v1alpha1.DeviceProfileSplitTunnelEntry{Address: &value, Description: "NetworkRoute " + route.Namespace + "/" + route.Name}, provenance: "NetworkRoute/" + route.Namespace + "/" + route.Name, priority: 1})
@@ -250,14 +250,14 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 			}
 			allowed, err := privateRouteAllowsNamespace(route.Namespace, route.Spec.AllowedNamespaces, namespace)
 			if err != nil {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "HostnameRoute %s/%s allowedNamespaces: %v", route.Namespace, route.Name, err)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "the HostnameRoute %s/%s allowedNamespaces: %v", route.Namespace, route.Name, err)
 			}
 			if !allowed {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid("RefNotPermitted", "HostnameRoute %s/%s does not allow namespace %q", route.Namespace, route.Name, namespace.Name)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid("RefNotPermitted", "the HostnameRoute %s/%s does not allow namespace %q", route.Namespace, route.Name, namespace.Name)
 			}
 			decision := authz.Evaluate(account, namespace, authz.Request{Hostname: route.Spec.Hostname, Exposure: v1alpha1.ExposurePrivate, PrivateRoute: &authz.PrivateRouteRequest{Kind: authz.PrivateRouteHostname, Labels: route.Labels}})
 			if !decision.Allowed {
-				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "HostnameRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
+				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "the HostnameRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
 			}
 			value := route.Spec.Hostname
 			candidates = append(candidates, splitCandidate{entry: v1alpha1.DeviceProfileSplitTunnelEntry{Host: &value, Description: "HostnameRoute " + route.Namespace + "/" + route.Name}, provenance: "HostnameRoute/" + route.Namespace + "/" + route.Name, priority: 1})
@@ -274,7 +274,7 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 	}
 	if sources.AccessApplications != nil {
 		if profile.Spec.SplitTunnel.Mode != v1alpha1.DeviceProfileSplitTunnelModeInclude {
-			return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "AccessApplication sources require Include mode")
+			return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "the AccessApplication sources require Include mode")
 		}
 		selector, err := metav1.LabelSelectorAsSelector(&sources.AccessApplications.NamespaceSelector)
 		if err != nil {
@@ -292,20 +292,20 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 			}
 			for j := range applications.Items {
 				application := &applications.Items[j]
-				if application.DeletionTimestamp != nil || application.Spec.AccountRef == nil || application.Spec.AccountRef.Name != account.Name || !metaConditionTrue(application.Status.Conditions, "Accepted") {
+				if application.DeletionTimestamp != nil || application.Spec.AccountRef.Name != account.Name || !metaConditionTrue(application.Status.Conditions, "Accepted") {
 					continue
 				}
 				for _, destination := range application.Status.Destinations {
-					if destination.Type != "public" || destination.URI == "" {
+					if destination.Type != v1alpha1.AccessApplicationDestinationPublic || destination.URI == "" {
 						continue
 					}
 					hostname, err := publicDestinationHostname(destination.URI)
 					if err != nil {
-						return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "AccessApplication %s/%s destination %q: %v", application.Namespace, application.Name, destination.URI, err)
+						return aggregatedDeviceProfile{}, deviceProfileInvalid("Invalid", "the AccessApplication %s/%s destination %q: %v", application.Namespace, application.Name, destination.URI, err)
 					}
 					decision := authz.Evaluate(account, &namespaces.Items[i], authz.Request{Hostname: hostname, Exposure: v1alpha1.ExposurePublic})
 					if !decision.Allowed {
-						return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "AccessApplication %s/%s hostname %q: %s", application.Namespace, application.Name, hostname, decision.Message)
+						return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "the AccessApplication %s/%s hostname %q: %s", application.Namespace, application.Name, hostname, decision.Message)
 					}
 					value := hostname
 					candidates = append(candidates, splitCandidate{entry: v1alpha1.DeviceProfileSplitTunnelEntry{Host: &value, Description: "AccessApplication " + application.Namespace + "/" + application.Name}, provenance: "AccessApplication/" + application.Namespace + "/" + application.Name, priority: 1})
@@ -534,10 +534,10 @@ func (r *DeviceProfileReconciler) profileInput(ctx context.Context, object *v1al
 	for _, suffix := range object.Spec.DNSSearchSuffixes {
 		suffix.Suffix = normalizeDomain(suffix.Suffix)
 		if suffix.Suffix == "" {
-			return flarecloudflare.DeviceProfileInput{}, deviceProfileInvalid("Invalid", "DNS search suffix is empty")
+			return flarecloudflare.DeviceProfileInput{}, deviceProfileInvalid("Invalid", "the DNS search suffix is empty")
 		}
 		if _, found := seen[suffix.Suffix]; found {
-			return flarecloudflare.DeviceProfileInput{}, deviceProfileInvalid("Invalid", "DNS search suffix %q is duplicated", suffix.Suffix)
+			return flarecloudflare.DeviceProfileInput{}, deviceProfileInvalid("Invalid", "the DNS search suffix %q is duplicated", suffix.Suffix)
 		}
 		seen[suffix.Suffix] = struct{}{}
 		suffixes = append(suffixes, flarecloudflare.DNSSearchSuffix{Suffix: suffix.Suffix, Description: strings.TrimSpace(suffix.Description)})
@@ -553,10 +553,10 @@ func (r *DeviceProfileReconciler) resolveProfileVirtualNetworks(ctx context.Cont
 			return "", deviceProfileInvalid("TargetNotFound", "resolve VirtualNetwork %s/%s: %v", object.Namespace, name, err)
 		}
 		if network.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
-			return "", deviceProfileInvalid("RefNotPermitted", "VirtualNetwork %s/%s uses CloudflareAccount %q", object.Namespace, name, network.Spec.AccountRef.Name)
+			return "", deviceProfileInvalid("RefNotPermitted", "the VirtualNetwork %s/%s uses CloudflareAccount %q", object.Namespace, name, network.Spec.AccountRef.Name)
 		}
 		if !metaConditionTrue(network.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted) || network.Status.VirtualNetworkID == "" {
-			return "", deviceProfileInvalid("Pending", "VirtualNetwork %s/%s is not accepted with a remote ID", object.Namespace, name)
+			return "", deviceProfileInvalid("Pending", "the VirtualNetwork %s/%s is not accepted with a remote ID", object.Namespace, name)
 		}
 		return network.Status.VirtualNetworkID, nil
 	}
@@ -591,7 +591,7 @@ func (r *DeviceProfileReconciler) resolveRemoteProfile(ctx context.Context, api 
 	case v1alpha1.DeviceProfileKindDefault:
 		remote, err := api.GetDefaultDeviceProfile(ctx)
 		if err == nil && !remote.Default {
-			return flarecloudflare.DeviceProfile{}, false, deviceProfileInvalid("Conflict", "Cloudflare returned a custom profile from the default profile endpoint")
+			return flarecloudflare.DeviceProfile{}, false, deviceProfileInvalid("Conflict", "the Cloudflare service returned a custom profile from the default profile endpoint")
 		}
 		return remote, false, err
 	case v1alpha1.DeviceProfileKindCustom:
@@ -605,7 +605,7 @@ func (r *DeviceProfileReconciler) resolveRemoteProfile(ctx context.Context, api 
 		}
 		if managementPolicy == v1alpha1.ManagementPolicyManaged && object.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
 			if externalID == "" {
-				return flarecloudflare.DeviceProfile{}, false, deviceProfileInvalid("Invalid", "AdoptById requires externalRef.profileId")
+				return flarecloudflare.DeviceProfile{}, false, deviceProfileInvalid("Invalid", "adoption mode AdoptById requires externalRef.profileId")
 			}
 			remote, err := api.GetCustomDeviceProfile(ctx, externalID)
 			acquired := err == nil && (!object.Status.OwnershipVerified || object.Status.ProfileID != externalID)
@@ -1040,7 +1040,7 @@ func (r *DeviceProfileReconciler) clientForProfile(ctx context.Context, object *
 		return nil, nil, nil, fmt.Errorf("get CloudflareAccount %q: %w", object.Spec.AccountRef.Name, err)
 	}
 	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) || !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return nil, nil, nil, fmt.Errorf("CloudflareAccount %q is not ready", account.Name)
+		return nil, nil, nil, fmt.Errorf("the CloudflareAccount %q is not ready", account.Name)
 	}
 	namespace := new(corev1.Namespace)
 	if err := r.Get(ctx, types.NamespacedName{Name: object.Namespace}, namespace); err != nil {
@@ -1328,7 +1328,7 @@ func (r *DeviceProfileReconciler) profilesForAccessApplication(ctx context.Conte
 	}
 	return r.listProfileRequests(ctx, nil, func(profile *v1alpha1.DeviceProfile) bool {
 		source := profile.Spec.SplitTunnel.RouteSources.AccessApplications
-		return source != nil && (application.Spec.AccountRef == nil || application.Spec.AccountRef.Name == profile.Spec.AccountRef.Name) && labelSelectorMatches(source.NamespaceSelector, namespace.Labels)
+		return source != nil && application.Spec.AccountRef.Name == profile.Spec.AccountRef.Name && labelSelectorMatches(source.NamespaceSelector, namespace.Labels)
 	})
 }
 

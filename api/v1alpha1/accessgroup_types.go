@@ -35,6 +35,10 @@ type AccessGroupExternalReference struct {
 // +kubebuilder:validation:XValidation:rule="self.adoption.mode != 'AdoptById' || has(self.externalRef)",message="AdoptById requires externalRef"
 type AccessGroupSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
+	// Zone optionally scopes the group to the verified Cloudflare zone with this DNS name.
+	// When omitted, the group is account scoped.
+	// +kubebuilder:validation:MinLength=1
+	Zone string `json:"zone,omitempty"`
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 	// +kubebuilder:validation:MinItems=1
@@ -47,6 +51,8 @@ type AccessGroupSpec struct {
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=100
 	Exclude []AccessRule `json:"exclude,omitempty"`
+	// IsDefault requests that Cloudflare make this the default Access group.
+	IsDefault bool `json:"isDefault,omitempty"`
 	// +kubebuilder:default=Managed
 	ManagementPolicy ManagementPolicy              `json:"managementPolicy,omitempty"`
 	ExternalRef      *AccessGroupExternalReference `json:"externalRef,omitempty"`
@@ -56,10 +62,34 @@ type AccessGroupSpec struct {
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
+// AccessGroupObservedState records the remote group state returned by Cloudflare.
+//
+// Cloudflare's Access group response schema exposes is_default inconsistently:
+// some responses contain a boolean while others contain a rule array. IsDefault
+// and Default preserve both forms without guessing.
+type AccessGroupObservedState struct {
+	Name string `json:"name"`
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	Include []AccessRuleObservation `json:"include,omitempty"`
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	Require []AccessRuleObservation `json:"require,omitempty"`
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	Exclude   []AccessRuleObservation `json:"exclude,omitempty"`
+	IsDefault *bool                   `json:"isDefault,omitempty"`
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	Default []AccessRuleObservation `json:"default,omitempty"`
+}
+
 // AccessGroupStatus records the remote group identity and conditions.
 type AccessGroupStatus struct {
-	GroupID           string `json:"groupId,omitempty"`
-	OwnershipVerified bool   `json:"ownershipVerified,omitempty"`
+	GroupID           string                    `json:"groupId,omitempty"`
+	ZoneID            string                    `json:"zoneId,omitempty"`
+	OwnershipVerified bool                      `json:"ownershipVerified,omitempty"`
+	Observed          *AccessGroupObservedState `json:"observed,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`

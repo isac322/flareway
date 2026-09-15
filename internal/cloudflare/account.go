@@ -54,14 +54,23 @@ type Zone struct {
 
 // Organization is the non-secret Zero Trust organization state returned by Cloudflare.
 type Organization struct {
-	Name                     string
-	AuthDomain               string
-	SessionDuration          string
-	WARPAuthSessionDuration  string
-	AllowAuthenticateViaWARP bool
-	IsUIReadOnly             bool
-	DenyUnmatchedRequests    bool
-	WARPAuthNonBrowser401    bool
+	Name                                   string
+	AuthDomain                             string
+	SessionDuration                        string
+	WARPAuthSessionDuration                string
+	AllowAuthenticateViaWARP               bool
+	AutoRedirectToIdentity                 bool
+	IsUIReadOnly                           bool
+	UIReadOnlyToggleReason                 string
+	DenyUnmatchedRequests                  bool
+	DenyUnmatchedRequestsExemptedZoneNames []string
+	WARPAuthNonBrowser401                  bool
+	UserSeatExpirationInactiveTime         string
+	CustomPages                            OrganizationCustomPages
+	LoginDesign                            OrganizationLoginDesign
+	MFAConfig                              OrganizationMFAConfig
+	MFAPIVKeyRequirements                  OrganizationMFAPIVKeyRequirements
+	MFARequiredForAllApps                  bool
 }
 
 // VerifyToken verifies the configured API token without returning its value.

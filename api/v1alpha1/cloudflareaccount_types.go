@@ -140,6 +140,18 @@ type CloudflareAccountGrant struct {
 	// +kubebuilder:default=Denied
 	AccessPolicyRefs GrantPermission `json:"accessPolicyRefs,omitempty"`
 
+	// AccessCustomPageRefs permits references to managed AccessCustomPage objects.
+	// +kubebuilder:default=Denied
+	AccessCustomPageRefs GrantPermission `json:"accessCustomPageRefs,omitempty"`
+
+	// DevicePostureIntegrationRefs permits references to managed DevicePostureIntegration objects.
+	// +kubebuilder:default=Denied
+	DevicePostureIntegrationRefs GrantPermission `json:"devicePostureIntegrationRefs,omitempty"`
+
+	// AccessStandaloneApplicationRefs permits references to managed standalone applications.
+	// +kubebuilder:default=Denied
+	AccessStandaloneApplicationRefs GrantPermission `json:"accessStandaloneApplicationRefs,omitempty"`
+
 	// PrivateRoutes selects platform private-route objects this namespace may reference.
 	PrivateRoutes *CloudflarePrivateRouteGrant `json:"privateRoutes,omitempty"`
 

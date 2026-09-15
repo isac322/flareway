@@ -200,7 +200,7 @@ metadata:
 spec:
   accountRef:
     name: cliproxyapi-example
-  type: google
+  type: Google
   name: Google
   managementPolicy: ObserveOnly
   externalRef:
@@ -216,7 +216,7 @@ spec:
   accountRef:
     name: cliproxyapi-example
   name: allow-developers-warp
-  decision: allow
+  decision: Allow
   include:
   - emailDomain:
       domain: example.com
@@ -239,7 +239,7 @@ spec:
   accountRef:
     name: cliproxyapi-example
   name: deny-everyone
-  decision: deny
+  decision: Deny
   include:
   - everyone: {}
   managementPolicy: ObserveOnly
@@ -255,11 +255,16 @@ metadata:
 spec:
   accountRef:
     name: cliproxyapi-example
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: HTTPRoute
     name: cliproxyapi
     sectionName: dashboard
+  pathScope:
+    type: PathPrefix
+    value: /
   application:
     name: cliproxyapi example dashboard
     sessionDuration: 720h
@@ -276,6 +281,24 @@ spec:
       name: deny-everyone
   originJWT:
     mode: Required
+  bypass:
+    children:
+    - hostname: cliproxyapi.example.com
+      path: /v1
+      name: cliproxyapi example public v1
+      deletionPolicy: Delete
+    - hostname: cliproxyapi.example.com
+      path: /v1beta
+      name: cliproxyapi example public v1beta
+      deletionPolicy: Delete
+    - hostname: cliproxyapi.example.com
+      path: /openai/v1
+      name: cliproxyapi example public OpenAI API
+      deletionPolicy: Delete
+    - hostname: cliproxyapi.example.com
+      path: /backend-api/codex
+      name: cliproxyapi example public Codex API
+      deletionPolicy: Delete
   managementPolicy: Managed
   deletionPolicy: Delete
 ---
@@ -287,6 +310,8 @@ metadata:
 spec:
   accountRef:
     name: cliproxyapi-example
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: Gateway

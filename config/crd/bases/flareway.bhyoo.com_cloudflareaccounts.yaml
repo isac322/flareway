@@ -92,10 +92,26 @@ spec:
                   description: CloudflareAccountGrant authorizes one set of tenant
                     operations.
                   properties:
+                    accessCustomPageRefs:
+                      default: Denied
+                      description: AccessCustomPageRefs permits references to managed
+                        AccessCustomPage objects.
+                      enum:
+                      - Allowed
+                      - Denied
+                      type: string
                     accessPolicyRefs:
                       default: Denied
                       description: AccessPolicyRefs permits references to platform
                         Access policy objects.
+                      enum:
+                      - Allowed
+                      - Denied
+                      type: string
+                    accessStandaloneApplicationRefs:
+                      default: Denied
+                      description: AccessStandaloneApplicationRefs permits references
+                        to managed standalone applications.
                       enum:
                       - Allowed
                       - Denied
@@ -176,6 +192,14 @@ spec:
                       x-kubernetes-validations:
                       - message: selector is required when namespaces is Selector
                         rule: self.namespaces != 'Selector' || has(self.selector)
+                    devicePostureIntegrationRefs:
+                      default: Denied
+                      description: DevicePostureIntegrationRefs permits references
+                        to managed DevicePostureIntegration objects.
+                      enum:
+                      - Allowed
+                      - Denied
+                      type: string
                     exposures:
                       description: Exposures lists permitted listener exposures.
                       items:

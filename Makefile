@@ -74,6 +74,10 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+.PHONY: parity
+parity: ## Verify Cloudflare SDK schema parity and ledger ownership.
+	go run ./hack/parity
+
 .PHONY: gateway-api-crds
 gateway-api-crds: ## Print the Gateway API standard CRD directory from the module cache.
 	@printf '%s/config/crd/standard\n' "$$(go list -m -f '{{.Dir}}' sigs.k8s.io/gateway-api)"

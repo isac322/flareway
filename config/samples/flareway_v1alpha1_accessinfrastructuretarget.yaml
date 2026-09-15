@@ -1,0 +1,22 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessInfrastructureTarget
+metadata:
+  labels:
+    app.kubernetes.io/name: flareway
+    app.kubernetes.io/managed-by: kustomize
+  name: accessinfrastructuretarget-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example
+  hostname: bastion.internal.example.com
+  ip:
+    ipv4:
+      ipAddr: 192.0.2.10
+      virtualNetworkRef:
+        name: production
+    ipv6:
+      ipAddr: 2001:db8::10
+      virtualNetworkId: replace-with-existing-virtual-network-id
+  managementPolicy: Managed
+  deletionPolicy: Orphan

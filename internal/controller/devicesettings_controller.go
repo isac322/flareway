@@ -123,7 +123,7 @@ func (r *DeviceSettingsReconciler) checkSingleWriter(ctx context.Context, object
 		}
 		otherKey := client.ObjectKeyFromObject(other)
 		if globalObjectPrecedes(other.CreationTimestamp, otherKey, object.CreationTimestamp, key) {
-			return privateInvalid("Conflict", "DeviceSettings %s is the earlier authorized writer for Cloudflare account ID %q", otherKey, accountID)
+			return privateInvalid("Conflict", "the DeviceSettings %s is the earlier authorized writer for Cloudflare account ID %q", otherKey, accountID)
 		}
 	}
 	return nil

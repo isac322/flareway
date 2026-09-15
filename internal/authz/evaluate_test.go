@@ -25,6 +25,27 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 )
 
+func TestEvaluateRequiresNamespaceGrantForEmptyRequest(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "app", Labels: map[string]string{"tenant": "blue"}}}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{{
+			NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "green"}},
+		}}},
+	}
+
+	decision := Evaluate(account, namespace, Request{})
+	if decision.Allowed || decision.Reason != ReasonRefNotPermitted {
+		t.Fatalf("expected an empty request without a namespace grant to be denied, got %#v", decision)
+	}
+
+	account.Spec.Grants[0].NamespaceSelector = metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}}
+	decision = Evaluate(account, namespace, Request{})
+	if !decision.Allowed || decision.GrantIndex != 0 {
+		t.Fatalf("expected an empty request with a namespace grant to be allowed, got %#v", decision)
+	}
+}
+
 func TestEvaluateRequiresOneGrantToAllowEveryGate(t *testing.T) {
 	account := &v1alpha1.CloudflareAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "account"},
@@ -36,24 +57,69 @@ func TestEvaluateRequiresOneGrantToAllowEveryGate(t *testing.T) {
 				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
 			},
 			{
-				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
-				Hostnames:         []string{"other.example.com"},
-				Zones:             []string{"example.com"},
-				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
-				AccessPolicyRefs:  v1alpha1.GrantPermissionAllowed,
+				NamespaceSelector:            metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
+				Hostnames:                    []string{"other.example.com"},
+				Zones:                        []string{"example.com"},
+				Exposures:                    []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				AccessPolicyRefs:             v1alpha1.GrantPermissionAllowed,
+				AccessCustomPageRefs:         v1alpha1.GrantPermissionAllowed,
+				DevicePostureIntegrationRefs: v1alpha1.GrantPermissionAllowed,
 			},
 		}},
 	}
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "app", Labels: map[string]string{"tenant": "blue"}}}
 
 	decision := Evaluate(account, namespace, Request{
-		Hostname:        "api.example.com",
-		Zone:            "example.com",
-		Exposure:        v1alpha1.ExposurePublic,
-		AccessPolicyRef: true,
+		Hostname:                    "api.example.com",
+		Zone:                        "example.com",
+		Exposure:                    v1alpha1.ExposurePublic,
+		AccessPolicyRef:             true,
+		AccessCustomPageRef:         true,
+		DevicePostureIntegrationRef: true,
 	})
 	if decision.Allowed {
 		t.Fatalf("expected split grants to deny request, got %#v", decision)
+	}
+}
+
+func TestEvaluateRequiresOneGrantForManagedReferenceGates(t *testing.T) {
+	tests := []struct {
+		name      string
+		request   Request
+		authorize func(*v1alpha1.CloudflareAccountGrant)
+	}{
+		{
+			name:    "Access custom page",
+			request: Request{AccessCustomPageRef: true, PlatformObject: true},
+			authorize: func(grant *v1alpha1.CloudflareAccountGrant) {
+				grant.AccessCustomPageRefs = v1alpha1.GrantPermissionAllowed
+			},
+		},
+		{
+			name:    "device posture integration",
+			request: Request{DevicePostureIntegrationRef: true, PlatformObject: true},
+			authorize: func(grant *v1alpha1.CloudflareAccountGrant) {
+				grant.DevicePostureIntegrationRefs = v1alpha1.GrantPermissionAllowed
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			account := &v1alpha1.CloudflareAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "account"},
+				Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{
+					{NamespaceSelector: metav1.LabelSelector{}, PlatformObjects: v1alpha1.GrantPermissionAllowed},
+					{NamespaceSelector: metav1.LabelSelector{}},
+				}},
+			}
+			test.authorize(&account.Spec.Grants[1])
+			namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "app"}}
+
+			decision := Evaluate(account, namespace, test.request)
+			if decision.Allowed {
+				t.Fatalf("expected split %s and platform-object grants to deny request, got %#v", test.name, decision)
+			}
+		})
 	}
 }
 
@@ -63,13 +129,15 @@ func TestEvaluateAllGrantGates(t *testing.T) {
 	account := &v1alpha1.CloudflareAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "account"},
 		Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{{
-			NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
-			Hostnames:            []string{"*.example.com"},
-			Zones:                []string{"example.com"},
-			Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
-			UnprotectedHostnames: []string{"public.example.com"},
-			AccessPolicyRefs:     v1alpha1.GrantPermissionAllowed,
-			PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			NamespaceSelector:            metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
+			Hostnames:                    []string{"*.example.com"},
+			Zones:                        []string{"example.com"},
+			Exposures:                    []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+			UnprotectedHostnames:         []string{"public.example.com"},
+			AccessPolicyRefs:             v1alpha1.GrantPermissionAllowed,
+			AccessCustomPageRefs:         v1alpha1.GrantPermissionAllowed,
+			DevicePostureIntegrationRefs: v1alpha1.GrantPermissionAllowed,
+			PlatformObjects:              v1alpha1.GrantPermissionAllowed,
 			PrivateRoutes: &v1alpha1.CloudflarePrivateRouteGrant{
 				NetworkRouteSelector:  emptySelector,
 				HostnameRouteSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
@@ -85,29 +153,34 @@ func TestEvaluateAllGrantGates(t *testing.T) {
 	backendNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "backend", Labels: map[string]string{"backend-for": "blue"}}}
 
 	decision := Evaluate(account, namespace, Request{
-		Hostname:        "public.example.com",
-		Zone:            "example.com",
-		Exposure:        v1alpha1.ExposurePublic,
-		Unprotected:     true,
-		AccessPolicyRef: true,
-		PlatformObject:  true,
-		PrivateRoute:    &PrivateRouteRequest{Kind: PrivateRouteHostname, Labels: map[string]string{"tenant": "blue"}},
-		Backend:         &BackendRequest{Namespace: backendNamespace, Kind: v1alpha1.BackendKindService},
+		Hostname:                    "public.example.com",
+		Zone:                        "example.com",
+		Exposure:                    v1alpha1.ExposurePublic,
+		Unprotected:                 true,
+		AccessPolicyRef:             true,
+		AccessCustomPageRef:         true,
+		DevicePostureIntegrationRef: true,
+		PlatformObject:              true,
+		PrivateRoute:                &PrivateRouteRequest{Kind: PrivateRouteHostname, Labels: map[string]string{"tenant": "blue"}},
+		Backend:                     &BackendRequest{Namespace: backendNamespace, Kind: v1alpha1.BackendKindService},
 	})
 	if !decision.Allowed || decision.GrantIndex != 0 {
 		t.Fatalf("expected request to be allowed by grant 0, got %#v", decision)
 	}
 }
+
 func TestEvaluateDeniesEachAccountBoundary(t *testing.T) {
 	newGrant := func() v1alpha1.CloudflareAccountGrant {
 		return v1alpha1.CloudflareAccountGrant{
-			NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
-			Hostnames:            []string{"public.example.com"},
-			Zones:                []string{"example.com"},
-			Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
-			UnprotectedHostnames: []string{"public.example.com"},
-			AccessPolicyRefs:     v1alpha1.GrantPermissionAllowed,
-			PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			NamespaceSelector:            metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "blue"}},
+			Hostnames:                    []string{"public.example.com"},
+			Zones:                        []string{"example.com"},
+			Exposures:                    []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+			UnprotectedHostnames:         []string{"public.example.com"},
+			AccessPolicyRefs:             v1alpha1.GrantPermissionAllowed,
+			AccessCustomPageRefs:         v1alpha1.GrantPermissionAllowed,
+			DevicePostureIntegrationRefs: v1alpha1.GrantPermissionAllowed,
+			PlatformObjects:              v1alpha1.GrantPermissionAllowed,
 			PrivateRoutes: &v1alpha1.CloudflarePrivateRouteGrant{
 				HostnameRouteSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"route": "allowed"}},
 			},
@@ -119,14 +192,16 @@ func TestEvaluateDeniesEachAccountBoundary(t *testing.T) {
 	}
 	newRequest := func(namespace *corev1.Namespace) Request {
 		return Request{
-			Hostname:        "public.example.com",
-			Zone:            "example.com",
-			Exposure:        v1alpha1.ExposurePublic,
-			Unprotected:     true,
-			AccessPolicyRef: true,
-			PlatformObject:  true,
-			PrivateRoute:    &PrivateRouteRequest{Kind: PrivateRouteHostname, Labels: map[string]string{"route": "allowed"}},
-			Backend:         &BackendRequest{Namespace: namespace, Kind: v1alpha1.BackendKindService},
+			Hostname:                    "public.example.com",
+			Zone:                        "example.com",
+			Exposure:                    v1alpha1.ExposurePublic,
+			Unprotected:                 true,
+			AccessPolicyRef:             true,
+			AccessCustomPageRef:         true,
+			DevicePostureIntegrationRef: true,
+			PlatformObject:              true,
+			PrivateRoute:                &PrivateRouteRequest{Kind: PrivateRouteHostname, Labels: map[string]string{"route": "allowed"}},
+			Backend:                     &BackendRequest{Namespace: namespace, Kind: v1alpha1.BackendKindService},
 		}
 	}
 
@@ -142,6 +217,12 @@ func TestEvaluateDeniesEachAccountBoundary(t *testing.T) {
 		}, reason: ReasonUnsupportedValue},
 		{name: "unprotected", alter: func(grant *v1alpha1.CloudflareAccountGrant) { grant.UnprotectedHostnames = nil }, reason: ReasonRefNotPermitted},
 		{name: "access policy", alter: func(grant *v1alpha1.CloudflareAccountGrant) { grant.AccessPolicyRefs = v1alpha1.GrantPermissionDenied }, reason: ReasonRefNotPermitted},
+		{name: "access custom page", alter: func(grant *v1alpha1.CloudflareAccountGrant) {
+			grant.AccessCustomPageRefs = v1alpha1.GrantPermissionDenied
+		}, reason: ReasonRefNotPermitted},
+		{name: "device posture integration", alter: func(grant *v1alpha1.CloudflareAccountGrant) {
+			grant.DevicePostureIntegrationRefs = v1alpha1.GrantPermissionDenied
+		}, reason: ReasonRefNotPermitted},
 		{name: "platform object", alter: func(grant *v1alpha1.CloudflareAccountGrant) { grant.PlatformObjects = v1alpha1.GrantPermissionDenied }, reason: ReasonRefNotPermitted},
 		{name: "private route", alter: func(grant *v1alpha1.CloudflareAccountGrant) { grant.PrivateRoutes = nil }, reason: ReasonRefNotPermitted},
 		{name: "backend kind", alter: func(grant *v1alpha1.CloudflareAccountGrant) { grant.Backends.Kinds = nil }, reason: ReasonRefNotPermitted},

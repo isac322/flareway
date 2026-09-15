@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -160,6 +161,77 @@ func TestBuildGolden(t *testing.T) {
 	}
 }
 
+func TestBuildKeepsCollidingLegacyBackendNamesDistinct(t *testing.T) {
+	firstName := "k8s://team/api--admin:80"
+	secondName := "k8s://team--api/admin:80"
+	gateway := &ir.Gateway{
+		Key:             types.NamespacedName{Namespace: "default", Name: "collision"},
+		ConformanceMode: true,
+		Listeners:       []ir.Listener{{Name: "http", Hostname: "api.example.com", EnvoyPort: 10080}},
+		Domains: []ir.ProtectionDomain{{
+			Name: "public", ListenerName: "http", EnvoyPort: 10080,
+			VirtualHosts: []ir.VirtualHost{{
+				Name: "api", Hostname: "api.example.com",
+				Routes: []ir.Route{{
+					Name:     "collision",
+					Match:    ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+					Backends: []ir.BackendRef{{ClusterName: firstName, Weight: 1}},
+					Filters:  ir.Filters{Mirrors: []ir.Mirror{{Backend: ir.BackendRef{ClusterName: secondName}, Percent: 100}}},
+				}},
+			}},
+		}},
+		Clusters: []ir.Cluster{
+			{Name: firstName, Port: 80, Endpoints: []ir.Endpoint{{Address: "10.0.0.1", Port: 8081}}},
+			{Name: secondName, Port: 80, Endpoints: []ir.Endpoint{{Address: "10.0.0.2", Port: 8082}}},
+		},
+	}
+
+	snapshot, err := Build(gateway, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusters := snapshot.GetResources(resourcev3.ClusterType)
+	assignments := snapshot.GetResources(resourcev3.EndpointType)
+	if len(clusters) != 2 || len(assignments) != 2 {
+		t.Fatalf("xDS clusters=%d endpoint assignments=%d, want two of each", len(clusters), len(assignments))
+	}
+	for _, expected := range []struct {
+		name    string
+		address string
+		port    uint32
+	}{
+		{name: firstName, address: "10.0.0.1", port: 8081},
+		{name: secondName, address: "10.0.0.2", port: 8082},
+	} {
+		cluster, ok := clusters[expected.name].(*clusterv3.Cluster)
+		if !ok || cluster.EdsClusterConfig.ServiceName != expected.name {
+			t.Fatalf("cluster %q = %#v", expected.name, clusters[expected.name])
+		}
+		assignment, ok := assignments[expected.name].(*endpointv3.ClusterLoadAssignment)
+		if !ok || assignment.ClusterName != expected.name || len(assignment.Endpoints) != 1 ||
+			len(assignment.Endpoints[0].LbEndpoints) != 1 {
+			t.Fatalf("endpoint assignment %q = %#v", expected.name, assignments[expected.name])
+		}
+		socket := assignment.Endpoints[0].LbEndpoints[0].GetEndpoint().Address.GetSocketAddress()
+		if socket.Address != expected.address || socket.GetPortValue() != expected.port {
+			t.Fatalf("endpoint assignment %q address = %s:%d, want %s:%d", expected.name, socket.Address, socket.GetPortValue(), expected.address, expected.port)
+		}
+	}
+
+	routeConfig, ok := snapshot.GetResources(resourcev3.RouteType)["public"].(*routev3.RouteConfiguration)
+	if !ok || len(routeConfig.VirtualHosts) != 1 || len(routeConfig.VirtualHosts[0].Routes) < 1 {
+		t.Fatalf("route configuration = %#v", routeConfig)
+	}
+	action := routeConfig.VirtualHosts[0].Routes[0].GetRoute()
+	if action == nil || len(action.GetWeightedClusters().Clusters) != 1 ||
+		action.GetWeightedClusters().Clusters[0].Name != firstName {
+		t.Fatalf("route action = %#v, want backend %q", action, firstName)
+	}
+	if len(action.RequestMirrorPolicies) != 1 || action.RequestMirrorPolicies[0].Cluster != secondName {
+		t.Fatalf("mirror policies = %#v, want cluster %q", action.RequestMirrorPolicies, secondName)
+	}
+}
+
 func TestBuildEmptySnapshot(t *testing.T) {
 	snapshot, err := Build(&ir.Gateway{Key: types.NamespacedName{Namespace: "default", Name: "invalid"}}, nil)
 	if err != nil {
@@ -294,7 +366,7 @@ func TestBuildPrivateTLSJWTListenerAndRecordedPodIPFallback(t *testing.T) {
 		}},
 		Domains: []ir.ProtectionDomain{{
 			Name: "private", ListenerName: "private", EnvoyPort: 443, Protected: true, Guard: ir.GuardForwarding,
-			Access:       &ir.AccessGuard{AUD: "private-aud", TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
+			Access:       &ir.AccessGuard{AUDs: []string{"private-aud"}, TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
 			VirtualHosts: []ir.VirtualHost{{Name: "private", Hostname: "admin.internal.example"}},
 		}},
 		Secrets: []ir.TLSSecret{{Name: "private-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")}},
@@ -324,6 +396,13 @@ func TestBuildPrivateTLSJWTListenerAndRecordedPodIPFallback(t *testing.T) {
 	}
 	if len(hcm.HttpFilters) < 2 || hcm.HttpFilters[0].Name != jwtFilterName {
 		t.Fatalf("private HTTP filters = %#v", hcm.HttpFilters)
+	}
+	jwt := &jwtauthnv3.JwtAuthentication{}
+	if err := hcm.HttpFilters[0].GetTypedConfig().UnmarshalTo(jwt); err != nil {
+		t.Fatal(err)
+	}
+	if provider := jwt.Providers["cloudflare-access"]; provider == nil || !slices.Equal(provider.Audiences, []string{"private-aud"}) {
+		t.Fatalf("single-AUD provider = %#v", provider)
 	}
 
 	gateway.Listeners[0].Binding = ir.ListenerBindingPodIP
@@ -428,7 +507,8 @@ func TestBuildAccessIsolationJWTAndPublicHeaderStripping(t *testing.T) {
 			{
 				Name: "protected", ListenerName: "http", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
 				Access: &ir.AccessGuard{
-					AUD: "aud-codex", TeamName: "team", AuthDomain: "team.cloudflareaccess.com", OptionsPreflightBypass: true,
+					AUDs: []string{"redash-reports", "", "redash-admin", "redash-reports"}, TeamName: "team",
+					AuthDomain: "team.cloudflareaccess.com", OptionsPreflightBypass: true,
 				},
 				VirtualHosts: []ir.VirtualHost{{Name: "protected", Hostname: "codex.example.com", Routes: []ir.Route{{
 					Name: "dashboard", Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"}, Backends: []ir.BackendRef{backend},
@@ -472,7 +552,7 @@ func TestBuildAccessIsolationJWTAndPublicHeaderStripping(t *testing.T) {
 	}
 	provider := jwt.Providers["cloudflare-access"]
 	if provider == nil || provider.Issuer != "https://team.cloudflareaccess.com" ||
-		len(provider.Audiences) != 1 || provider.Audiences[0] != "aud-codex" ||
+		!slices.Equal(provider.Audiences, []string{"redash-admin", "redash-reports"}) ||
 		len(provider.FromHeaders) != 1 || provider.FromHeaders[0].Name != "Cf-Access-Jwt-Assertion" ||
 		len(provider.FromCookies) != 1 || provider.FromCookies[0] != "CF_Authorization" || !provider.Forward {
 		t.Fatalf("Cloudflare JWT provider = %#v", provider)
@@ -485,6 +565,47 @@ func TestBuildAccessIsolationJWTAndPublicHeaderStripping(t *testing.T) {
 	}
 	if len(snapshot.GetResources(resourcev3.RouteType)) != 2 {
 		t.Fatalf("public/protected route tables were merged: %#v", snapshot.GetResources(resourcev3.RouteType))
+	}
+	firstVersion, err := SnapshotVersion(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway.Domains[1].Access.AUDs = []string{"redash-admin", "redash-reports", "redash-admin"}
+	secondSnapshot, err := Build(gateway, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondVersion, err := SnapshotVersion(secondSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstVersion != secondVersion {
+		t.Fatalf("equivalent audience sets produced different xDS versions: %q and %q", firstVersion, secondVersion)
+	}
+}
+
+func TestBuildRejectsProtectedEmptyAUDSet(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		access *ir.AccessGuard
+	}{
+		{name: "absent"},
+		{name: "empty", access: &ir.AccessGuard{AUDs: []string{"", ""}, AuthDomain: "team.cloudflareaccess.com"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gateway := &ir.Gateway{
+				Key:       types.NamespacedName{Namespace: "default", Name: "empty-aud"},
+				Listeners: []ir.Listener{{Name: "http", EnvoyPort: 18080}},
+				Domains: []ir.ProtectionDomain{{
+					Name: "protected", ListenerName: "http", EnvoyPort: 18080, Protected: true, Guard: ir.GuardForwarding,
+					Access:       test.access,
+					VirtualHosts: []ir.VirtualHost{{Name: "protected", Hostname: "redash.example.com"}},
+				}},
+			}
+			if _, err := Build(gateway, nil); err == nil {
+				t.Fatal("Build() accepted a protected forwarding domain without an audience")
+			}
+		})
 	}
 }
 
@@ -531,7 +652,7 @@ func TestBuildPublicWildcardBlocksProtectedExactHostname(t *testing.T) {
 			},
 			{
 				Name: "exact-protected", ListenerName: "exact", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
-				Access:       &ir.AccessGuard{AUD: "aud", AuthDomain: "team.cloudflareaccess.com"},
+				Access:       &ir.AccessGuard{AUDs: []string{"aud"}, AuthDomain: "team.cloudflareaccess.com"},
 				VirtualHosts: []ir.VirtualHost{{Name: "exact", Hostname: "admin.example.com"}},
 			},
 		},

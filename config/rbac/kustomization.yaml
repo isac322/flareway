@@ -18,3 +18,22 @@ resources:
 - metrics_auth_role.yaml
 - metrics_auth_role_binding.yaml
 - metrics_reader_role.yaml
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
+# default, aiding admins in cluster management. Those roles are
+# not used by the flareway itself. You can comment the following lines
+# if you do not want those helpers be installed with your Project.
+- warpconnector_admin_role.yaml
+- warpconnector_editor_role.yaml
+- warpconnector_viewer_role.yaml
+- devicepostureintegration_admin_role.yaml
+- devicepostureintegration_editor_role.yaml
+- devicepostureintegration_viewer_role.yaml
+- accessinfrastructuretarget_admin_role.yaml
+- accessinfrastructuretarget_editor_role.yaml
+- accessinfrastructuretarget_viewer_role.yaml
+- accesscustompage_admin_role.yaml
+- accesscustompage_editor_role.yaml
+- accesscustompage_viewer_role.yaml
+- accessstandaloneapplication_admin_role.yaml
+- accessstandaloneapplication_editor_role.yaml
+- accessstandaloneapplication_viewer_role.yaml

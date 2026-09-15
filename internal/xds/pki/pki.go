@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -94,12 +95,20 @@ func EnsureCA(ctx context.Context, c client.Client) (*corev1.Secret, error) {
 	return secret, nil
 }
 
-// EnsureClientCert returns a valid client certificate Secret for gwKey. An
-// existing certificate is replaced after two thirds of its lifetime or when
-// its key material or SPIFFE identity is invalid.
-func EnsureClientCert(ctx context.Context, c client.Client, gwKey types.NamespacedName) (*corev1.Secret, error) {
+// EnsureClientCert returns a valid client certificate Secret for gwKey. The
+// Secret must be controlled by owner before existing key material is parsed or
+// rotated. New Secrets are created with that owner reference atomically.
+func EnsureClientCert(
+	ctx context.Context,
+	c client.Client,
+	gwKey types.NamespacedName,
+	owner metav1.OwnerReference,
+) (*corev1.Secret, error) {
 	if gwKey.Namespace == "" || gwKey.Name == "" {
 		return nil, errors.New("gateway namespace and name are required")
+	}
+	if err := validateClientSecretOwner(owner, gwKey); err != nil {
+		return nil, err
 	}
 
 	caSecret, err := EnsureCA(ctx, c)
@@ -115,21 +124,7 @@ func EnsureClientCert(ctx context.Context, c client.Client, gwKey types.Namespac
 	current := &corev1.Secret{}
 	now := time.Now()
 	if err := c.Get(ctx, key, current); err == nil {
-		if cert, certErr := parseLeaf(current.Data[corev1.TLSCertKey]); certErr == nil &&
-			clientSecretMatches(current, cert, caCert, gwKey) && !NeedsRotation(cert, now) {
-			return current, nil
-		}
-		data, dataErr := newClientData(caCert, caKey, gwKey, now)
-		if dataErr != nil {
-			return nil, dataErr
-		}
-		current.Type = corev1.SecretTypeTLS
-		current.Data = data
-		current.Labels = clientLabels(gwKey)
-		if err := c.Update(ctx, current); err != nil {
-			return nil, fmt.Errorf("rotate xDS client certificate Secret %s: %w", key, err)
-		}
-		return current, nil
+		return ensureExistingClientCert(ctx, c, current, key, gwKey, owner, caCert, caKey, now)
 	} else if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("get xDS client certificate Secret %s: %w", key, err)
 	}
@@ -140,9 +135,10 @@ func EnsureClientCert(ctx context.Context, c client.Client, gwKey types.Namespac
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gwKey.Namespace,
-			Name:      ClientSecretName(gwKey.Name),
-			Labels:    clientLabels(gwKey),
+			Namespace:       gwKey.Namespace,
+			Name:            ClientSecretName(gwKey.Name),
+			Labels:          clientLabels(gwKey),
+			OwnerReferences: []metav1.OwnerReference{owner},
 		},
 		Type: corev1.SecretTypeTLS,
 		Data: data,
@@ -154,9 +150,52 @@ func EnsureClientCert(ctx context.Context, c client.Client, gwKey types.Namespac
 		if err := c.Get(ctx, key, current); err != nil {
 			return nil, fmt.Errorf("get concurrently created xDS client certificate Secret %s: %w", key, err)
 		}
-		return current, nil
+		return ensureExistingClientCert(ctx, c, current, key, gwKey, owner, caCert, caKey, now)
 	}
 	return secret, nil
+}
+
+func ensureExistingClientCert(
+	ctx context.Context,
+	c client.Client,
+	current *corev1.Secret,
+	key, gwKey types.NamespacedName,
+	owner metav1.OwnerReference,
+	caCert *x509.Certificate,
+	caKey *ecdsa.PrivateKey,
+	now time.Time,
+) (*corev1.Secret, error) {
+	controller := metav1.GetControllerOf(current)
+	if controller == nil || !reflect.DeepEqual(*controller, owner) {
+		return nil, fmt.Errorf(
+			"refuse to mutate xDS client certificate Secret %s: not controlled by expected Gateway UID %q",
+			key,
+			owner.UID,
+		)
+	}
+	if cert, certErr := parseLeaf(current.Data[corev1.TLSCertKey]); certErr == nil &&
+		clientSecretMatches(current, cert, caCert, gwKey) && !NeedsRotation(cert, now) {
+		return current, nil
+	}
+	data, err := newClientData(caCert, caKey, gwKey, now)
+	if err != nil {
+		return nil, err
+	}
+	current.Type = corev1.SecretTypeTLS
+	current.Data = data
+	current.Labels = clientLabels(gwKey)
+	if err := c.Update(ctx, current); err != nil {
+		return nil, fmt.Errorf("rotate xDS client certificate Secret %s: %w", key, err)
+	}
+	return current, nil
+}
+
+func validateClientSecretOwner(owner metav1.OwnerReference, gwKey types.NamespacedName) error {
+	if owner.APIVersion == "" || owner.Kind != "Gateway" || owner.Name != gwKey.Name ||
+		owner.UID == "" || owner.Controller == nil || !*owner.Controller {
+		return errors.New("exact Gateway controller owner reference is required")
+	}
+	return nil
 }
 
 // ClientSecretName returns the deterministic Secret name for a Gateway.

@@ -1,0 +1,112 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: direct-services
+  namespace: llm-proxy
+spec:
+  accountRef:
+    name: runbear
+  tunnel:
+    name: flareway-runbear-direct-services
+  configuration:
+    # Direct mode is the sole writer of the complete remote cloudflared configuration.
+    # Do not attach this tunnel to a Gateway or add Gateway-mode listeners.
+    mode: Direct
+    direct:
+      ingress:
+      - hostname: http.direct.example.com
+        path: ^/api(/|$)
+        service:
+          http:
+            address: web.llm-proxy.svc.cluster.local:8080
+        # This rule sets every originRequest field. SOCKS5 makes ipRules applicable.
+        originRequest:
+          access:
+            audTags:
+            - direct-services-aud
+            teamName: example-team
+            required: true
+          caPool: /etc/cloudflared/ca.pem
+          connectTimeout: 30
+          disableChunkedEncoding: true
+          http2Origin: true
+          httpHostHeader: origin.example.com
+          keepAliveConnections: 100
+          keepAliveTimeout: 90
+          matchSNIToHost: true
+          noHappyEyeballs: true
+          noTLSVerify: false
+          originServerName: tls.example.com
+          proxyType: SOCKS5
+          tcpKeepAlive: 30
+          tlsTimeout: 10
+          ipRules:
+          - prefix: 10.0.0.0/8
+            ports:
+            - 80
+            - 443
+            allow: true
+          - prefix: 0.0.0.0/0
+            allow: false
+      - hostname: https.direct.example.com
+        service:
+          https:
+            address: web.llm-proxy.svc.cluster.local:8443
+      - hostname: tcp.direct.example.com
+        service:
+          tcp:
+            address: database.llm-proxy.svc.cluster.local:5432
+      - hostname: ssh.direct.example.com
+        service:
+          ssh:
+            address: bastion.llm-proxy.svc.cluster.local:22
+      - hostname: rdp.direct.example.com
+        service:
+          rdp:
+            address: desktop.llm-proxy.svc.cluster.local:3389
+      - hostname: smb.direct.example.com
+        service:
+          smb:
+            address: files.llm-proxy.svc.cluster.local:445
+      - hostname: unix.direct.example.com
+        service:
+          unix:
+            path: /var/run/origin.sock
+      - hostname: unix-tls.direct.example.com
+        service:
+          unixTLS:
+            path: /var/run/origin-tls.sock
+      - hostname: hello.direct.example.com
+        service:
+          helloWorld: {}
+      - hostname: bastion.direct.example.com
+        service:
+          bastion: {}
+        originRequest:
+          proxyType: SOCKS5
+          ipRules:
+          - prefix: 10.20.0.0/16
+            ports:
+            - 22
+            allow: true
+      # Direct ingress must end with one hostname-free, path-free catch-all rule.
+      - service:
+          httpStatus:
+            code: 404
+      warpRouting:
+        enabled: true
+        connectTimeout: 30
+        tcpKeepAlive: 30
+        maxActiveFlows: 10000
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: direct tunnel sample
+    proxied: true
+    ttl: 1
+    settings:
+      ipv4Only: true
+      ipv6Only: false

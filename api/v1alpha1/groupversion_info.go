@@ -33,6 +33,9 @@ var (
 	// GroupVersion identifies the Flareway v1alpha1 API group and version.
 	GroupVersion = schema.GroupVersion{Group: Group, Version: Version}
 
+	// SchemeGroupVersion is the group and version used by Kubebuilder-generated API registrations.
+	SchemeGroupVersion = GroupVersion
+
 	// SchemeBuilder registers Flareway API types with a runtime scheme.
 	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 

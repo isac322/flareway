@@ -80,8 +80,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -104,6 +106,11 @@ spec:
               duration:
                 default: 8760h
                 type: string
+              enabled:
+                default: true
+                description: Enabled controls whether Cloudflare accepts the token
+                  credentials.
+                type: boolean
               externalRef:
                 description: ServiceTokenExternalReference is part of the servicetokenexternalreference
                   configuration.
@@ -146,9 +153,8 @@ spec:
                     type: string
                 type: object
               secretRef:
-                description: |-
-                  LocalObjectReference contains enough information to let you locate the
-                  referenced object inside the same namespace.
+                description: SecretRef names the credential Secret. An existing Secret
+                  must already be controlled by this ServiceToken.
                 properties:
                   name:
                     default: ""
@@ -161,8 +167,14 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              zone:
+                description: Zone selects a zone-scoped endpoint by exact DNS zone
+                  name. Empty uses the account endpoint.
+                minLength: 1
+                type: string
             required:
             - accountRef
+            - enabled
             - name
             - secretRef
             type: object
@@ -238,9 +250,21 @@ spec:
               expiresAt:
                 format: date-time
                 type: string
+              observedDuration:
+                description: ObservedDuration is the bounded remote validity duration
+                  retained for drift visibility.
+                type: string
+              observedEnabled:
+                description: ObservedEnabled is the bounded remote enabled state retained
+                  for drift visibility.
+                type: boolean
               observedGeneration:
                 format: int64
                 type: integer
+              observedName:
+                description: ObservedName is the bounded remote name retained for
+                  drift visibility.
+                type: string
               observedRotationRequest:
                 format: date-time
                 type: string
@@ -250,6 +274,8 @@ spec:
                 format: date-time
                 type: string
               tokenId:
+                type: string
+              zoneId:
                 type: string
             type: object
         type: object

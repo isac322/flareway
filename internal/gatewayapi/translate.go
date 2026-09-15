@@ -106,18 +106,30 @@ func Translate(in Inputs) (*ir.Gateway, Statuses) {
 		if policy == "" {
 			policy = v1alpha1.ManagementPolicyManaged
 		}
-		tunnelName := in.CloudflareTunnel.Spec.Tunnel.Name
-		if tunnelName == "" {
-			tunnelName = in.CloudflareTunnel.Name
-		}
-		out.Cloudflare = &ir.Cloudflare{
-			AccountID:        in.CloudflareAccount.Spec.AccountID,
-			TunnelName:       tunnelName,
-			TunnelID:         in.CloudflareTunnel.Status.TunnelID,
-			TokenSecretName:  "flareway-tunnel-" + in.CloudflareTunnel.Name,
-			ManagementPolicy: string(policy),
-			Teardown:         in.CloudflareTunnel.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true",
-			WARPRouting:      privateRoutesRequireWARP(in),
+		ownershipVerified := policy == v1alpha1.ManagementPolicyManaged &&
+			in.CloudflareTunnel.Status.DeletedAt == nil &&
+			in.CloudflareTunnel.Status.OwnershipVerified &&
+			in.CloudflareTunnel.Status.ConnectorTokenSecretRef != nil &&
+			in.CloudflareTunnel.Status.ConnectorTokenSecretRef.Name != "" &&
+			in.CloudflareTunnel.Status.GatewayRef != nil &&
+			in.CloudflareTunnel.Status.GatewayRef.Name == in.Gateway.Name &&
+			in.CloudflareTunnel.Status.GatewayUID != "" &&
+			in.CloudflareTunnel.Status.GatewayUID == in.Gateway.UID
+		if ownershipVerified {
+			tunnelName := in.CloudflareTunnel.Spec.Tunnel.Name
+			if tunnelName == "" {
+				tunnelName = in.CloudflareTunnel.Name
+			}
+			out.Cloudflare = &ir.Cloudflare{
+				AccountID:        in.CloudflareAccount.Spec.AccountID,
+				TunnelName:       tunnelName,
+				TunnelID:         in.CloudflareTunnel.Status.TunnelID,
+				TokenSecretName:  in.CloudflareTunnel.Status.ConnectorTokenSecretRef.Name,
+				ManagementPolicy: string(policy),
+				Teardown:         in.CloudflareTunnel.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true",
+				WARPRouting:      privateRoutesRequireWARP(in),
+				OriginRequest:    gatewayOriginRequestIR(in.GatewayClassConfig),
+			}
 		}
 	}
 
@@ -203,6 +215,47 @@ func Translate(in Inputs) (*ir.Gateway, Statuses) {
 	outStatuses.Gateway = gatewayStatus
 	return out, outStatuses
 }
+func gatewayOriginRequestIR(config *v1alpha1.GatewayClassConfig) ir.GatewayOriginRequest {
+	if config == nil {
+		return ir.GatewayOriginRequest{}
+	}
+	origin := config.Spec.OriginRequest
+	result := ir.GatewayOriginRequest{
+		KeepAliveConnections:   cloneInt64Pointer(origin.KeepAliveConnections),
+		NoHappyEyeballs:        cloneBoolPointer(origin.NoHappyEyeballs),
+		DisableChunkedEncoding: cloneBoolPointer(origin.DisableChunkedEncoding),
+		HTTP2Origin:            cloneBoolPointer(origin.HTTP2Origin),
+	}
+	if origin.ConnectTimeout != nil {
+		value := origin.ConnectTimeout.Duration
+		result.ConnectTimeout = &value
+	}
+	if origin.KeepAliveTimeout != nil {
+		value := origin.KeepAliveTimeout.Duration
+		result.KeepAliveTimeout = &value
+	}
+	if origin.TCPKeepAlive != nil {
+		value := origin.TCPKeepAlive.Duration
+		result.TCPKeepAlive = &value
+	}
+	return result
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
+}
+
+func cloneBoolPointer(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
+}
 func infrastructureLabels(infrastructure *gatewayv1.GatewayInfrastructure) map[string]string {
 	if infrastructure == nil || len(infrastructure.Labels) == 0 {
 		return nil
@@ -237,7 +290,7 @@ func listenerExposure(tunnel *v1alpha1.CloudflareTunnel, listenerName gatewayv1.
 }
 
 func listenerBinding(tunnel *v1alpha1.CloudflareTunnel, listenerName gatewayv1.SectionName) string {
-	if tunnel != nil {
+	if tunnel != nil && tunnel.Status.DeletedAt == nil {
 		for _, listener := range tunnel.Status.Listeners {
 			if listener.Name == listenerName && listener.Binding == v1alpha1.ListenerBindingPodIP {
 				return ir.ListenerBindingPodIP
@@ -975,6 +1028,10 @@ func finalizeIR(out *ir.Gateway) {
 	}
 }
 func gatewayAddresses(in Inputs) []gatewayv1.GatewayStatusAddress {
+	if in.GatewayClassConfig != nil && !in.GatewayClassConfig.Spec.ConformanceMode &&
+		in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt != nil {
+		return nil
+	}
 	name := "flareway-gw-" + in.Gateway.Name
 	for i := range in.Services {
 		service := &in.Services[i]

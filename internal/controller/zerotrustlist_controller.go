@@ -132,7 +132,7 @@ func observeGatewayList(ctx context.Context, api flarecloudflare.GatewayListAPI,
 		}
 	}
 	if len(matches) == 0 {
-		return flarecloudflare.GatewayList{}, privateInvalid("TargetNotFound", "Cloudflare Gateway list %q was not found", object.Spec.Name)
+		return flarecloudflare.GatewayList{}, privateInvalid("TargetNotFound", "the Cloudflare Gateway list %q was not found", object.Spec.Name)
 	}
 	if len(matches) > 1 {
 		return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "multiple Cloudflare Gateway lists are named %q", object.Spec.Name)
@@ -149,7 +149,7 @@ func (r *ZeroTrustListReconciler) ensureManaged(ctx context.Context, api flarecl
 	acquiring := adopting && !object.Status.OwnershipVerified
 	if adopting {
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.ListID == "" {
-			return flarecloudflare.GatewayList{}, privateInvalid("Invalid", "AdoptById requires externalRef.listId")
+			return flarecloudflare.GatewayList{}, privateInvalid("Invalid", "adoption mode AdoptById requires externalRef.listId")
 		}
 		if id != "" && id != object.Spec.ExternalRef.ListID {
 			return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "status list ID %q does not match adoption target %q", id, object.Spec.ExternalRef.ListID)
@@ -172,7 +172,7 @@ func (r *ZeroTrustListReconciler) ensureManaged(ctx context.Context, api flarecl
 			return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "remote list type %q does not match immutable spec.type %q", remote.Type, object.Spec.Type)
 		}
 	} else if object.Spec.ExternalRef != nil {
-		return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "Managed externalRef requires adoption.mode AdoptById")
+		return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "managed externalRef requires adoption.mode AdoptById")
 	}
 	if id == "" {
 		lists, err := api.ListGatewayLists(ctx)
@@ -181,7 +181,7 @@ func (r *ZeroTrustListReconciler) ensureManaged(ctx context.Context, api flarecl
 		}
 		for _, list := range lists {
 			if list.Name == object.Spec.Name {
-				return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "Cloudflare Gateway list %q already exists and cannot be adopted without AdoptById", object.Spec.Name)
+				return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "the Cloudflare Gateway list %q already exists and cannot be adopted without AdoptById", object.Spec.Name)
 			}
 		}
 		input := flarecloudflare.GatewayListInput{Name: object.Spec.Name, Type: flarecloudflare.GatewayListType(object.Spec.Type), Items: gatewayListItems(items)}
@@ -236,7 +236,7 @@ func (r *ZeroTrustListReconciler) checkSingleWriter(ctx context.Context, object 
 		}
 		otherKey := client.ObjectKeyFromObject(other)
 		if globalObjectPrecedes(other.CreationTimestamp, otherKey, object.CreationTimestamp, key) {
-			return privateInvalid("Conflict", "ZeroTrustList %s is the earlier authorized writer for Cloudflare account ID %q and the same remote list", otherKey, accountID)
+			return privateInvalid("Conflict", "the ZeroTrustList %s is the earlier authorized writer for Cloudflare account ID %q and the same remote list", otherKey, accountID)
 		}
 	}
 	return nil

@@ -6,7 +6,7 @@ metadata:
 spec:
   accountRef:
     name: example
-  type: warp
+  type: WARP
   name: WARP enrolled
   managementPolicy: ObserveOnly
   externalRef:

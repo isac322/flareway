@@ -19,8 +19,14 @@ package controller
 import (
 	"context"
 	"sync"
+	"time"
 
+	gomega "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/types"
+
+	flarewayv1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	statusutil "github.com/isac322/flareway/internal/gatewayapi/status"
 )
 
 var testAccountCloudflare = newFakeAccountCloudflareFactory()
@@ -55,6 +61,15 @@ func (factory *fakeAccountCloudflareFactory) reset() {
 	factory.orgErr = nil
 	factory.tokens = nil
 	factory.accountIDs = nil
+}
+
+func waitForCloudflareAccountReady(ctx context.Context, name string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		account := new(flarewayv1alpha1.CloudflareAccount)
+		g.Expect(testAPIReader.Get(ctx, types.NamespacedName{Name: name}, account)).To(gomega.Succeed())
+		g.Expect(statusutil.ConditionTrue(account.Status.Conditions, flarewayv1alpha1.CloudflareAccountConditionAccepted)).To(gomega.BeTrue())
+		g.Expect(statusutil.ConditionTrue(account.Status.Conditions, flarewayv1alpha1.CloudflareAccountConditionCredentialsValid)).To(gomega.BeTrue())
+	}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
 }
 
 func (factory *fakeAccountCloudflareFactory) AccountClient(token, accountID string) flarecloudflare.AccountAPI {

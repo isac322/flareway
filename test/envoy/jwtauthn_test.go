@@ -73,7 +73,7 @@ func TestEnvoyJWTAuthn(t *testing.T) {
 		}},
 		Domains: []ir.ProtectionDomain{{
 			Name: "protected", ListenerName: "http", EnvoyPort: envoyListenerPort, Protected: true,
-			Access: &ir.AccessGuard{AUD: jwtAudience, AuthDomain: "access.test", OptionsPreflightBypass: true},
+			Access: &ir.AccessGuard{AUDs: []string{jwtAudience}, AuthDomain: "access.test", OptionsPreflightBypass: true},
 			VirtualHosts: []ir.VirtualHost{{
 				Name: "protected", Hostname: "jwt.example.com",
 				Routes: []ir.Route{{

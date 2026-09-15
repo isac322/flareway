@@ -69,6 +69,65 @@ A name match is not ownership proof. If `Conflict` persists, compare:
 
 Keep shared Terraform-owned policies and identity providers as `ObserveOnly` with `deletionPolicy: Orphan`.
 
+## Access and Tunnel parity checks
+
+### Application type and variant
+
+Both application resources require `spec.accountRef`, an immutable PascalCase `spec.type`, and exactly one matching variant:
+
+- `AccessApplication`: `SelfHosted/selfHosted`, `SSH/ssh`, `VNC/vnc`, `RDP/rdp`, `MCP/mcp`, or `ProxyEndpoint/proxyEndpoint`;
+- `AccessStandaloneApplication`: `SaaS/saas`, `Bookmark/bookmark`, `Infrastructure/infrastructure`, `AppLauncher/appLauncher`, `WARP/warp`, `BISO/biso`, `DashSSO/dashSso`, or `MCPPortal/mcpPortal`.
+
+If admission reports that a variant is missing or mismatched, change the discriminator and variant together. Do not replace a type with a lower-case Cloudflare wire value such as `self_hosted` or `app_launcher`.
+
+`AccessApplication.targetRefs[]` accepts same-namespace `gateway.networking.k8s.io` `Gateway` and `HTTPRoute` references. `sectionName` selects a listener or named route rule. `pathScope` can narrow the compiled public region with `Exact` or `PathPrefix`; it cannot create a public destination without a target. Direct `destinations[]` entries must use one matching typed member. A `Private` entry requires exactly one of `networkRouteRef` or `hostnameRouteRef`.
+
+### Account and zone scope
+
+An empty `spec.zone` uses the account-scoped Access endpoint. A non-empty zone is resolved by exact DNS name from `CloudflareAccount.status.verified.zones`. If the zone is absent there, fix account token permissions or the zone name; do not copy a zone ID into the DNS-name field.
+
+`RefNotPermitted` can also mean the matching account grant denies `accessPolicyRefs`, `accessCustomPageRefs`, `devicePostureIntegrationRefs`, `accessStandaloneApplicationRefs`, `platformObjects`, or the selected `privateRoutes`. For a private route, both the account grant selector and the route's `allowedNamespaces` must permit the consumer.
+
+### Bypass-child adoption
+
+Flareway creates a more-specific child Access application when a protected parent contains a public carve-out. Existing children are never adopted by hostname or name alone. Declare the normalized `hostname` and `path` under `spec.bypass.children[]`, set `externalRef.applicationId`, and use `adoption.mode: AdoptById` with expected attributes. An `ObserveOnly` parent needs an `externalRef` for every declared child.
+
+If a child reports `Conflict`, compare the remote application ID, normalized path, expected name/domain, and Flareway ownership tags. Do not delete the protected parent to clear a child conflict; that widens the outage and can change the parent AUD.
+
+### Gateway and Direct Tunnel ownership
+
+`CloudflareTunnel.spec.configuration.mode` defaults to `Gateway`. In that mode, the Gateway controller owns the complete remote configuration and may use `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, and `listeners`.
+
+`Direct` mode is explicit whole-object ownership. Put rules under `configuration.direct.ingress`, and configure top-level `originRequest` and `warpRouting` there. A Direct rule selects exactly one service: `http`, `https`, `tcp`, `ssh`, `rdp`, `smb`, `unix`, `unixTLS`, `helloWorld`, `httpStatus`, or `bastion`. The final rule must omit hostname and path. `originRequest.access` is valid only for HTTP-family origins; `ipRules` requires `bastion` or `proxyType: SOCKS5`.
+
+If admission says Direct mode cannot use Gateway fields, remove the Gateway-owned fields or switch the mode back to `Gateway`. Do not copy generated Gateway ingress into Direct mode while a Gateway still references the Tunnel.
+
+Gateway-mode ownership is UID-bound and sticky. If a second Gateway reports that another Gateway owns the Tunnel, do not force a handoff by changing names or timestamps. Remove or delete the current owner, then wait for its connector Deployment and Pods to drain before the successor is admitted. A remote soft-delete sets `status.deletedAt`; Flareway keeps ownership provenance for cleanup but blocks xDS, connector scale-up, addresses, private routes, and further Tunnel configuration.
+
+DNS is shared by both modes. For Managed DNS, a proxied record requires `ttl: 1`; `settings.ipv4Only` and `settings.ipv6Only` are mutually exclusive and require `proxied: true`.
+
+### WARP Connector and typed routes
+
+`NetworkRoute.spec.tunnelRef` and `HostnameRoute.spec.tunnelRef` require `name` and accept `kind: CloudflareTunnel|WARPConnector` plus an optional `namespace`; omitted `kind` defaults to `CloudflareTunnel`. `CloudflareTunnel` owns a Gateway data plane. `WARPConnector` owns a separate Mesh connector, token Secret, bounded client status, HA configuration, and explicit failover requests.
+
+For WARP Connector HA, `AWS` requires `highAvailability.enabled: true` and `aws.fnrId`; `Local` requires enabled HA and at least one `local.vips` address. `highAvailability.enabled` is create-only. A failover request needs a linked `clientId` and a new `requestId`.
+
+### Secret recovery
+
+One-time values are not recoverable from Cloudflare and never appear in status:
+
+- `ServiceToken` writes `CF-Access-Client-Id` and `CF-Access-Client-Secret`, plus previous keys during a rotation grace period;
+- SaaS application creation stores the generated client secret in the controller-owned Secret referenced by `status.saas.clientSecretRef`;
+- SCIM HTTP Basic passwords, bearer tokens, OAuth client secrets, and Access service tokens come from Secret or `ServiceToken` references;
+- identity-provider and posture-integration credentials use Secret key references;
+- WARP Connector and Tunnel connector tokens use controller-owned Secrets.
+
+For `IdentityProvider` SCIM, `spec.scimConfig.secretRef` is immutable after it is set. Flareway reserves the owned Secret before creating or enabling SCIM, journals ambiguous create responses, and verifies that the stored token is bound to the same remote provider ID. Replace the resource through a deliberate migration if the Secret destination must change.
+
+If one of these Secrets is missing, restore it from the original secure source or create a deliberate rotation/replacement plan. Adoption does not rotate credentials, and the controller cannot reconstruct a create-only secret from status.
+
+Cloudflare response envelopes (`success`, `errors`, `messages`, `result`, pagination) and server-owned fields are intentionally absent from spec. Diagnose them through controller conditions and bounded status rather than adding untyped fields to manifests.
+
 ## Teardown
 
 Managed Tunnel teardown is ordered:

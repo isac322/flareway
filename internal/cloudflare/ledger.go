@@ -24,6 +24,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +33,45 @@ import (
 // ManagedByTag is retained for taggable Cloudflare resources. DNS ownership is
 // established by its deterministic comment instead of this optional tag.
 const ManagedByTag = "managed-by=flareway"
+
+// NormalizeDNSHostname converts a DNS hostname to the lowercase Punycode form
+// required by Cloudflare. A trailing root label is ignored.
+func NormalizeDNSHostname(hostname string) (string, error) {
+	if hostname == "" {
+		return "", fmt.Errorf("a DNS hostname is required")
+	}
+	if strings.TrimSpace(hostname) != hostname {
+		return "", fmt.Errorf("a DNS hostname %q contains surrounding whitespace", hostname)
+	}
+
+	hostname = strings.TrimSuffix(hostname, ".")
+	if hostname == "" {
+		return "", fmt.Errorf("a DNS hostname is required")
+	}
+
+	prefix := ""
+	if strings.HasPrefix(hostname, "*.") {
+		prefix = "*."
+		hostname = strings.TrimPrefix(hostname, prefix)
+		if hostname == "" {
+			return "", fmt.Errorf("wildcard DNS hostname requires a suffix")
+		}
+	}
+
+	ascii, err := idna.Lookup.ToASCII(hostname)
+	if err != nil {
+		return "", fmt.Errorf("convert DNS hostname %q to Punycode: %w", hostname, err)
+	}
+	return prefix + strings.ToLower(ascii), nil
+}
+
+// DNSHostnamesEqual compares DNS hostnames after Cloudflare Punycode
+// normalization.
+func DNSHostnamesEqual(first, second string) bool {
+	normalizedFirst, firstErr := NormalizeDNSHostname(first)
+	normalizedSecond, secondErr := NormalizeDNSHostname(second)
+	return firstErr == nil && secondErr == nil && normalizedFirst == normalizedSecond
+}
 
 // ClusterID returns the stable UID of the kube-system Namespace.
 func ClusterID(ctx context.Context, client kubeclient.Client) (string, error) {

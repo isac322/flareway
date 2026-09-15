@@ -180,7 +180,7 @@ metadata:
 spec:
   accountRef:
     name: codex-lb-example
-  type: google
+  type: Google
   name: Google
   managementPolicy: ObserveOnly
   externalRef:
@@ -196,7 +196,7 @@ spec:
   accountRef:
     name: codex-lb-example
   name: allow-developers-warp
-  decision: allow
+  decision: Allow
   include:
   - emailDomain:
       domain: example.com
@@ -219,7 +219,7 @@ spec:
   accountRef:
     name: codex-lb-example
   name: deny-everyone
-  decision: deny
+  decision: Deny
   include:
   - everyone: {}
   managementPolicy: ObserveOnly
@@ -235,11 +235,16 @@ metadata:
 spec:
   accountRef:
     name: codex-lb-example
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: HTTPRoute
     name: codex-lb
     sectionName: dashboard
+  pathScope:
+    type: PathPrefix
+    value: /
   application:
     name: codex-lb example dashboard
     sessionDuration: 720h
@@ -256,6 +261,22 @@ spec:
       name: deny-everyone
   originJWT:
     mode: Required
+  bypass:
+    children:
+    - hostname: codex-lb.example.com
+      path: /v1
+      name: codex-lb example public v1
+      externalRef:
+        applicationId: replace-with-existing-bypass-application-id
+      adoption:
+        mode: AdoptById
+        expect:
+          name: codex-lb example public v1
+      deletionPolicy: Orphan
+    - hostname: codex-lb.example.com
+      path: /backend-api/codex
+      name: codex-lb example public Codex API
+      deletionPolicy: Delete
   managementPolicy: Managed
   deletionPolicy: Delete
 ---
@@ -267,6 +288,8 @@ metadata:
 spec:
   accountRef:
     name: codex-lb-example
+  type: SelfHosted
+  selfHosted: {}
   targetRefs:
   - group: gateway.networking.k8s.io
     kind: Gateway

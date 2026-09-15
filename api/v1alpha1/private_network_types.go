@@ -22,16 +22,15 @@ import (
 )
 
 const (
-	// VirtualNetworkFinalizer identifies virtual network cleanup.
+	// VirtualNetworkFinalizer identifies the virtual network cleanup finalizer.
 	VirtualNetworkFinalizer = "flareway.bhyoo.com/virtualnetwork"
-	// NetworkRouteFinalizer is a supported API value.
+	// NetworkRouteFinalizer identifies the network route cleanup finalizer.
 	NetworkRouteFinalizer = "flareway.bhyoo.com/networkroute"
-	// HostnameRouteFinalizer is a supported API value.
+	// HostnameRouteFinalizer identifies the hostname route cleanup finalizer.
 	HostnameRouteFinalizer = "flareway.bhyoo.com/hostnameroute"
-
-	// PrivateNetworkConditionAccepted is a supported API value.
+	// PrivateNetworkConditionAccepted reports whether a private network resource is valid.
 	PrivateNetworkConditionAccepted = "Accepted"
-	// PrivateNetworkConditionReady is a supported API value.
+	// PrivateNetworkConditionReady reports whether a private network resource is ready.
 	PrivateNetworkConditionReady = "Ready"
 )
 
@@ -40,11 +39,11 @@ const (
 type AllowedNamespaceFrom string
 
 const (
-	// AllowedNamespaceFromSame permits same-namespace consumers.
+	// AllowedNamespaceFromSame permits references from the resource namespace.
 	AllowedNamespaceFromSame AllowedNamespaceFrom = "Same"
-	// AllowedNamespaceFromAll is a supported API value.
+	// AllowedNamespaceFromAll permits references from every namespace.
 	AllowedNamespaceFromAll AllowedNamespaceFrom = "All"
-	// AllowedNamespaceFromSelector is a supported API value.
+	// AllowedNamespaceFromSelector permits references from selected namespaces.
 	AllowedNamespaceFromSelector AllowedNamespaceFrom = "Selector"
 )
 
@@ -53,16 +52,27 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.selector) || (has(self.from) && self.from == 'Selector')",message="selector is only valid when from is Selector"
 type AllowedNamespaces struct {
 	// +kubebuilder:default=Same
-	From AllowedNamespaceFrom `json:"from,omitempty"`
-
+	From     AllowedNamespaceFrom  `json:"from,omitempty"`
 	Selector *metav1.LabelSelector `json:"selector,omitempty"`
 }
 
-// NamespacedObjectReference identifies a namespaced Flareway resource.
-type NamespacedObjectReference struct {
+// TunnelReferenceKind selects a supported private-route tunnel resource.
+// +kubebuilder:validation:Enum=CloudflareTunnel;WARPConnector
+type TunnelReferenceKind string
+
+const (
+	// TunnelReferenceKindCloudflareTunnel references a CloudflareTunnel.
+	TunnelReferenceKindCloudflareTunnel TunnelReferenceKind = "CloudflareTunnel"
+	// TunnelReferenceKindWARPConnector references a WARPConnector.
+	TunnelReferenceKindWARPConnector TunnelReferenceKind = "WARPConnector"
+)
+
+// TunnelReference identifies a namespaced CloudflareTunnel or WARPConnector.
+type TunnelReference struct {
+	// +kubebuilder:default=CloudflareTunnel
+	Kind TunnelReferenceKind `json:"kind,omitempty"`
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
-
 	// Namespace defaults to the referencing object's namespace.
 	Namespace string `json:"namespace,omitempty"`
 }
@@ -77,44 +87,38 @@ type VirtualNetworkExternalReference struct {
 // +kubebuilder:validation:XValidation:rule="self.managementPolicy != 'ObserveOnly' || has(self.externalRef)",message="ObserveOnly requires externalRef"
 // +kubebuilder:validation:XValidation:rule="self.adoption.mode != 'AdoptById' || has(self.externalRef)",message="AdoptById requires externalRef"
 // +kubebuilder:validation:XValidation:rule="!has(self.externalRef) || self.managementPolicy == 'ObserveOnly' || self.adoption.mode == 'AdoptById'",message="Managed externalRef requires adoption.mode AdoptById"
-// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && self.accountRef.name != \"\"",message="accountRef.name is required"
+// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && size(self.accountRef.name) > 0",message="accountRef.name is required"
 type VirtualNetworkSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
-
 	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-
-	IsDefault bool `json:"isDefault,omitempty"`
-
+	// +kubebuilder:validation:MaxLength=100
+	Name      string `json:"name"`
+	IsDefault bool   `json:"isDefault,omitempty"`
 	// +kubebuilder:validation:MaxLength=256
 	Comment string `json:"comment,omitempty"`
-
 	// +kubebuilder:default=Managed
-	ManagementPolicy ManagementPolicy `json:"managementPolicy,omitempty"`
-
-	ExternalRef *VirtualNetworkExternalReference `json:"externalRef,omitempty"`
-
+	ManagementPolicy ManagementPolicy                 `json:"managementPolicy,omitempty"`
+	ExternalRef      *VirtualNetworkExternalReference `json:"externalRef,omitempty"`
 	// +kubebuilder:default={}
 	Adoption AdoptionSpec `json:"adoption,omitempty"`
-
 	// +kubebuilder:default=Orphan
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
-// VirtualNetworkStatus records the remote virtual network identity and observed state.
+// VirtualNetworkStatus records all actionable remote virtual-network fields.
 type VirtualNetworkStatus struct {
-	VirtualNetworkID string `json:"virtualNetworkId,omitempty"`
-	Name             string `json:"name,omitempty"`
-	IsDefault        bool   `json:"isDefault,omitempty"`
-	Comment          string `json:"comment,omitempty"`
-
-	OwnershipVerified bool `json:"ownershipVerified,omitempty"`
-
+	VirtualNetworkID   string       `json:"virtualNetworkId,omitempty"`
+	Name               string       `json:"name,omitempty"`
+	IsDefault          bool         `json:"isDefault,omitempty"`
+	Comment            string       `json:"comment,omitempty"`
+	CreatedAt          *metav1.Time `json:"createdAt,omitempty"`
+	DeletedAt          *metav1.Time `json:"deletedAt,omitempty"`
+	OwnershipVerified  bool         `json:"ownershipVerified,omitempty"`
+	ObservedGeneration int64        `json:"observedGeneration,omitempty"`
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -146,65 +150,97 @@ type NetworkRouteExternalReference struct {
 	RouteID string `json:"routeId"`
 }
 
-// NetworkRouteSpec defines a CIDR routed through a CloudflareTunnel in one virtual network.
+// NetworkRouteIPLookupSpec requests the most-specific route containing one IP address.
+// +kubebuilder:validation:XValidation:rule="!has(self.virtualNetworkRef) || !has(self.defaultVirtualNetworkFallback)",message="virtualNetworkRef and defaultVirtualNetworkFallback are mutually exclusive"
+type NetworkRouteIPLookupSpec struct {
+	// +kubebuilder:validation:XValidation:rule="isIP(self)",message="ip must be a valid IPv4 or IPv6 address"
+	IP                            string                       `json:"ip"`
+	VirtualNetworkRef             *corev1.LocalObjectReference `json:"virtualNetworkRef,omitempty"`
+	DefaultVirtualNetworkFallback *bool                        `json:"defaultVirtualNetworkFallback,omitempty"`
+}
+
+// NetworkRouteIPLookupResultStatus records the Teamnet route returned by an IP lookup.
+type NetworkRouteIPLookupResultStatus struct {
+	RouteID            string           `json:"routeId,omitempty"`
+	Network            string           `json:"network,omitempty"`
+	TunnelID           string           `json:"tunnelId,omitempty"`
+	TunnelName         string           `json:"tunnelName,omitempty"`
+	TunnelType         TunnelRemoteType `json:"tunnelType,omitempty"`
+	VirtualNetworkID   string           `json:"virtualNetworkId,omitempty"`
+	VirtualNetworkName string           `json:"virtualNetworkName,omitempty"`
+	Comment            string           `json:"comment,omitempty"`
+	CreatedAt          *metav1.Time     `json:"createdAt,omitempty"`
+	DeletedAt          *metav1.Time     `json:"deletedAt,omitempty"`
+}
+
+// NetworkRouteIPLookupStatus records the request that produced the current lookup result.
+type NetworkRouteIPLookupStatus struct {
+	IP                            string                            `json:"ip,omitempty"`
+	VirtualNetworkID              string                            `json:"virtualNetworkId,omitempty"`
+	DefaultVirtualNetworkFallback *bool                             `json:"defaultVirtualNetworkFallback,omitempty"`
+	Result                        *NetworkRouteIPLookupResultStatus `json:"result,omitempty"`
+	ObservedGeneration            int64                             `json:"observedGeneration,omitempty"`
+}
+
+// NetworkRouteSpec defines a CIDR routed through a typed tunnel reference.
 // +kubebuilder:validation:XValidation:rule="self.managementPolicy != 'ObserveOnly' || has(self.externalRef)",message="ObserveOnly requires externalRef"
 // +kubebuilder:validation:XValidation:rule="self.adoption.mode != 'AdoptById' || has(self.externalRef)",message="AdoptById requires externalRef"
 // +kubebuilder:validation:XValidation:rule="!has(self.externalRef) || self.managementPolicy == 'ObserveOnly' || self.adoption.mode == 'AdoptById'",message="Managed externalRef requires adoption.mode AdoptById"
 // +kubebuilder:validation:XValidation:rule="isCIDR(self.network)",message="network must be a valid IPv4 or IPv6 CIDR"
 // +kubebuilder:validation:XValidation:rule="!isCIDR(self.network) || cidr(self.network) == cidr(self.network).masked()",message="network must be masked"
-// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && self.accountRef.name != \"\"",message="accountRef.name is required"
-// +kubebuilder:validation:XValidation:rule="has(self.virtualNetworkRef.name) && self.virtualNetworkRef.name != \"\"",message="virtualNetworkRef.name is required"
+// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && size(self.accountRef.name) > 0",message="accountRef.name is required"
+// +kubebuilder:validation:XValidation:rule="has(self.tunnelRef.name) && size(self.tunnelRef.name) > 0",message="tunnelRef.name is required"
 type NetworkRouteSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
-
-	// Network must be a masked IPv4 or IPv6 CIDR.
 	// +kubebuilder:validation:MinLength=3
 	// +kubebuilder:validation:MaxLength=49
-	Network string `json:"network"`
-
-	TunnelRef NamespacedObjectReference `json:"tunnelRef"`
-
-	VirtualNetworkRef corev1.LocalObjectReference `json:"virtualNetworkRef"`
-
+	Network   string          `json:"network"`
+	TunnelRef TunnelReference `json:"tunnelRef"`
+	// VirtualNetworkRef is optional; omission selects the account default virtual network.
+	VirtualNetworkRef *corev1.LocalObjectReference `json:"virtualNetworkRef,omitempty"`
+	IPLookup          *NetworkRouteIPLookupSpec    `json:"ipLookup,omitempty"`
 	// +kubebuilder:default={}
 	AllowedNamespaces AllowedNamespaces `json:"allowedNamespaces,omitempty"`
-
 	// +kubebuilder:validation:MaxLength=256
 	Comment string `json:"comment,omitempty"`
-
 	// +kubebuilder:default=Managed
-	ManagementPolicy ManagementPolicy `json:"managementPolicy,omitempty"`
-
-	ExternalRef *NetworkRouteExternalReference `json:"externalRef,omitempty"`
-
+	ManagementPolicy ManagementPolicy               `json:"managementPolicy,omitempty"`
+	ExternalRef      *NetworkRouteExternalReference `json:"externalRef,omitempty"`
 	// +kubebuilder:default={}
 	Adoption AdoptionSpec `json:"adoption,omitempty"`
-
 	// +kubebuilder:default=Orphan
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // NetworkRouteAppliedStatus is the exact CIDR and resolved remote target last applied.
 type NetworkRouteAppliedStatus struct {
-	Network            string `json:"network,omitempty"`
-	TunnelID           string `json:"tunnelId,omitempty"`
-	VirtualNetworkID   string `json:"virtualNetworkId,omitempty"`
-	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
+	Network            string           `json:"network,omitempty"`
+	TunnelID           string           `json:"tunnelId,omitempty"`
+	TunnelType         TunnelRemoteType `json:"tunnelType,omitempty"`
+	VirtualNetworkID   string           `json:"virtualNetworkId,omitempty"`
+	ObservedGeneration int64            `json:"observedGeneration,omitempty"`
 }
 
-// NetworkRouteStatus records the remote route identity and applied claim.
+// NetworkRouteStatus records actionable route and lookup metadata.
 type NetworkRouteStatus struct {
-	RouteID string                    `json:"routeId,omitempty"`
-	Applied NetworkRouteAppliedStatus `json:"applied,omitempty"`
-	Comment string                    `json:"comment,omitempty"`
-
-	OwnershipVerified bool `json:"ownershipVerified,omitempty"`
-
+	RouteID            string                      `json:"routeId,omitempty"`
+	Network            string                      `json:"network,omitempty"`
+	TunnelID           string                      `json:"tunnelId,omitempty"`
+	TunnelName         string                      `json:"tunnelName,omitempty"`
+	TunnelType         TunnelRemoteType            `json:"tunnelType,omitempty"`
+	VirtualNetworkID   string                      `json:"virtualNetworkId,omitempty"`
+	VirtualNetworkName string                      `json:"virtualNetworkName,omitempty"`
+	Comment            string                      `json:"comment,omitempty"`
+	CreatedAt          *metav1.Time                `json:"createdAt,omitempty"`
+	DeletedAt          *metav1.Time                `json:"deletedAt,omitempty"`
+	Applied            NetworkRouteAppliedStatus   `json:"applied,omitempty"`
+	IPLookup           *NetworkRouteIPLookupStatus `json:"ipLookup,omitempty"`
+	OwnershipVerified  bool                        `json:"ownershipVerified,omitempty"`
+	ObservedGeneration int64                       `json:"observedGeneration,omitempty"`
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -237,59 +273,56 @@ type HostnameRouteExternalReference struct {
 	RouteID string `json:"routeId"`
 }
 
-// HostnameRouteSpec defines an exact or single-label wildcard hostname routed through a CloudflareTunnel.
+// HostnameRouteSpec defines a private hostname routed through a typed tunnel reference.
 // +kubebuilder:validation:XValidation:rule="self.managementPolicy != 'ObserveOnly' || has(self.externalRef)",message="ObserveOnly requires externalRef"
 // +kubebuilder:validation:XValidation:rule="self.adoption.mode != 'AdoptById' || has(self.externalRef)",message="AdoptById requires externalRef"
 // +kubebuilder:validation:XValidation:rule="!has(self.externalRef) || self.managementPolicy == 'ObserveOnly' || self.adoption.mode == 'AdoptById'",message="Managed externalRef requires adoption.mode AdoptById"
-// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && self.accountRef.name != \"\"",message="accountRef.name is required"
+// +kubebuilder:validation:XValidation:rule="has(self.accountRef.name) && size(self.accountRef.name) > 0",message="accountRef.name is required"
+// +kubebuilder:validation:XValidation:rule="has(self.tunnelRef.name) && size(self.tunnelRef.name) > 0",message="tunnelRef.name is required"
 type HostnameRouteSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
-
-	// Hostname accepts an exact DNS name or a wildcard occupying exactly the first label.
 	// +kubebuilder:validation:Pattern=`^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=253
-	Hostname string `json:"hostname"`
-
-	TunnelRef NamespacedObjectReference `json:"tunnelRef"`
-
+	Hostname  string          `json:"hostname"`
+	TunnelRef TunnelReference `json:"tunnelRef"`
 	// +kubebuilder:default={}
 	AllowedNamespaces AllowedNamespaces `json:"allowedNamespaces,omitempty"`
-
 	// +kubebuilder:validation:MaxLength=256
 	Comment string `json:"comment,omitempty"`
-
 	// +kubebuilder:default=Managed
-	ManagementPolicy ManagementPolicy `json:"managementPolicy,omitempty"`
-
-	ExternalRef *HostnameRouteExternalReference `json:"externalRef,omitempty"`
-
+	ManagementPolicy ManagementPolicy                `json:"managementPolicy,omitempty"`
+	ExternalRef      *HostnameRouteExternalReference `json:"externalRef,omitempty"`
 	// +kubebuilder:default={}
 	Adoption AdoptionSpec `json:"adoption,omitempty"`
-
 	// +kubebuilder:default=Orphan
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
-// HostnameRouteAppliedStatus is the exact hostname and resolved tunnel last applied.
+// HostnameRouteAppliedStatus is the exact hostname and resolved remote tunnel last applied.
 type HostnameRouteAppliedStatus struct {
-	Hostname           string `json:"hostname,omitempty"`
-	TunnelID           string `json:"tunnelId,omitempty"`
-	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
+	Hostname           string           `json:"hostname,omitempty"`
+	TunnelID           string           `json:"tunnelId,omitempty"`
+	TunnelType         TunnelRemoteType `json:"tunnelType,omitempty"`
+	ObservedGeneration int64            `json:"observedGeneration,omitempty"`
 }
 
-// HostnameRouteStatus records the remote route identity and applied claim.
+// HostnameRouteStatus records actionable hostname-route and lookup metadata.
 type HostnameRouteStatus struct {
-	RouteID string                     `json:"routeId,omitempty"`
-	Applied HostnameRouteAppliedStatus `json:"applied,omitempty"`
-	Comment string                     `json:"comment,omitempty"`
-
-	OwnershipVerified bool `json:"ownershipVerified,omitempty"`
-
+	RouteID            string                     `json:"routeId,omitempty"`
+	Hostname           string                     `json:"hostname,omitempty"`
+	TunnelID           string                     `json:"tunnelId,omitempty"`
+	TunnelName         string                     `json:"tunnelName,omitempty"`
+	TunnelType         TunnelRemoteType           `json:"tunnelType,omitempty"`
+	Comment            string                     `json:"comment,omitempty"`
+	CreatedAt          *metav1.Time               `json:"createdAt,omitempty"`
+	DeletedAt          *metav1.Time               `json:"deletedAt,omitempty"`
+	Applied            HostnameRouteAppliedStatus `json:"applied,omitempty"`
+	OwnershipVerified  bool                       `json:"ownershipVerified,omitempty"`
+	ObservedGeneration int64                      `json:"observedGeneration,omitempty"`
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true

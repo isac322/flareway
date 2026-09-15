@@ -73,7 +73,7 @@
                     "backend": {
                       "name": "mirror",
                       "namespace": "default",
-                      "clusterName": "default--mirror--9090",
+                      "clusterName": "k8s://default/mirror:9090",
                       "port": 9090,
                       "weight": 1,
                       "filters": {}
@@ -103,7 +103,7 @@
                 {
                   "name": "backend",
                   "namespace": "default",
-                  "clusterName": "default--backend--8080",
+                  "clusterName": "k8s://default/backend:8080",
                   "port": 8080,
                   "weight": 100,
                   "filters": {}
@@ -121,7 +121,7 @@
   ],
   "clusters": [
     {
-      "name": "default--backend--8080",
+      "name": "k8s://default/backend:8080",
       "namespace": "default",
       "service": "backend",
       "port": 8080,
@@ -148,7 +148,7 @@
       }
     },
     {
-      "name": "default--mirror--9090",
+      "name": "k8s://default/mirror:9090",
       "namespace": "default",
       "service": "mirror",
       "port": 9090

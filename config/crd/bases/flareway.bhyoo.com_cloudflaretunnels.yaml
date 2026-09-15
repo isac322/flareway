@@ -81,8 +81,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -94,35 +96,457 @@ spec:
                     - AdoptById
                     type: string
                 type: object
+              configuration:
+                default: {}
+                description: CloudflareTunnelConfiguration selects the single configuration
+                  writer for a tunnel.
+                properties:
+                  direct:
+                    description: CloudflareTunnelDirectConfiguration is the whole-object
+                      configuration owned by Direct mode.
+                    properties:
+                      ingress:
+                        items:
+                          description: CloudflareTunnelIngressRule is one ordered
+                            direct-mode ingress rule.
+                          properties:
+                            hostname:
+                              description: Hostname may be omitted only for the final
+                                catch-all rule.
+                              maxLength: 253
+                              type: string
+                            originRequest:
+                              description: CloudflareTunnelOriginRequest is the complete
+                                remotely configurable cloudflared origin policy.
+                              properties:
+                                access:
+                                  description: CloudflareTunnelOriginAccess configures
+                                    Access JWT validation at cloudflared.
+                                  properties:
+                                    audTags:
+                                      items:
+                                        maxLength: 256
+                                        minLength: 1
+                                        type: string
+                                      maxItems: 64
+                                      type: array
+                                      x-kubernetes-list-type: set
+                                    required:
+                                      type: boolean
+                                    teamName:
+                                      maxLength: 63
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - audTags
+                                  - teamName
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: teamName is required
+                                    rule: has(self.teamName) && size(self.teamName)
+                                      > 0
+                                  - message: at least one audTag is required
+                                    rule: size(self.audTags) > 0
+                                caPool:
+                                  type: string
+                                connectTimeout:
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                                disableChunkedEncoding:
+                                  type: boolean
+                                http2Origin:
+                                  type: boolean
+                                httpHostHeader:
+                                  type: string
+                                ipRules:
+                                  items:
+                                    description: CloudflareTunnelIPRule configures
+                                      one bastion or SOCKS5 source-IP rule.
+                                    properties:
+                                      allow:
+                                        type: boolean
+                                      ports:
+                                        items:
+                                          format: int32
+                                          maximum: 65535
+                                          minimum: 1
+                                          type: integer
+                                        maxItems: 64
+                                        type: array
+                                        x-kubernetes-list-type: set
+                                      prefix:
+                                        maxLength: 49
+                                        minLength: 3
+                                        type: string
+                                        x-kubernetes-validations:
+                                        - message: prefix must be a valid IPv4 or
+                                            IPv6 CIDR
+                                          rule: isCIDR(self)
+                                    required:
+                                    - allow
+                                    - prefix
+                                    type: object
+                                  maxItems: 64
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                keepAliveConnections:
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                                keepAliveTimeout:
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                                matchSNIToHost:
+                                  type: boolean
+                                noHappyEyeballs:
+                                  type: boolean
+                                noTLSVerify:
+                                  type: boolean
+                                originServerName:
+                                  type: string
+                                proxyType:
+                                  description: CloudflareTunnelProxyType selects stream
+                                    proxy translation behavior.
+                                  enum:
+                                  - Regular
+                                  - SOCKS5
+                                  type: string
+                                tcpKeepAlive:
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                                tlsTimeout:
+                                  format: int64
+                                  minimum: 0
+                                  type: integer
+                              type: object
+                            path:
+                              description: Path is a Go regular expression evaluated
+                                by cloudflared.
+                              maxLength: 2048
+                              type: string
+                            service:
+                              description: CloudflareTunnelIngressService selects
+                                exactly one official cloudflared ingress service form.
+                              properties:
+                                bastion:
+                                  description: CloudflareTunnelBuiltinService is a
+                                    marker for a parameterless cloudflared service.
+                                  type: object
+                                helloWorld:
+                                  description: CloudflareTunnelBuiltinService is a
+                                    marker for a parameterless cloudflared service.
+                                  type: object
+                                http:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                httpStatus:
+                                  description: CloudflareTunnelHTTPStatusService configures
+                                    the embedded HTTP status responder.
+                                  properties:
+                                    code:
+                                      format: int32
+                                      maximum: 599
+                                      minimum: 100
+                                      type: integer
+                                  required:
+                                  - code
+                                  type: object
+                                https:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                rdp:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                smb:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                ssh:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                tcp:
+                                  description: CloudflareTunnelAddressService identifies
+                                    a network origin without embedding its wire protocol.
+                                  properties:
+                                    address:
+                                      description: Address is a host:port pair accepted
+                                        by cloudflared.
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - address
+                                  type: object
+                                unix:
+                                  description: CloudflareTunnelUnixService identifies
+                                    a UNIX domain socket origin.
+                                  properties:
+                                    path:
+                                      maxLength: 4096
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - path
+                                  type: object
+                                unixTLS:
+                                  description: CloudflareTunnelUnixService identifies
+                                    a UNIX domain socket origin.
+                                  properties:
+                                    path:
+                                      maxLength: 4096
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - path
+                                  type: object
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one ingress service must be configured
+                                rule: (has(self.http)?1:0)+(has(self.https)?1:0)+(has(self.tcp)?1:0)+(has(self.ssh)?1:0)+(has(self.rdp)?1:0)+(has(self.smb)?1:0)+(has(self.unix)?1:0)+(has(self.unixTLS)?1:0)+(has(self.helloWorld)?1:0)+(has(self.httpStatus)?1:0)+(has(self.bastion)?1:0)
+                                  == 1
+                          required:
+                          - service
+                          type: object
+                          x-kubernetes-validations:
+                          - message: originRequest.access is only valid for HTTP origins
+                            rule: '!has(self.originRequest) || !has(self.originRequest.access)
+                              || has(self.service.http) || has(self.service.https)
+                              || has(self.service.unix) || has(self.service.unixTLS)'
+                          - message: originRequest.ipRules requires Bastion or SOCKS5
+                              proxy service
+                            rule: '!has(self.originRequest) || size(self.originRequest.ipRules)
+                              == 0 || has(self.service.bastion) || (has(self.originRequest.proxyType)
+                              && self.originRequest.proxyType == ''SOCKS5'')'
+                        maxItems: 200
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      originRequest:
+                        description: CloudflareTunnelOriginRequest is the complete
+                          remotely configurable cloudflared origin policy.
+                        properties:
+                          access:
+                            description: CloudflareTunnelOriginAccess configures Access
+                              JWT validation at cloudflared.
+                            properties:
+                              audTags:
+                                items:
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                maxItems: 64
+                                type: array
+                                x-kubernetes-list-type: set
+                              required:
+                                type: boolean
+                              teamName:
+                                maxLength: 63
+                                minLength: 1
+                                type: string
+                            required:
+                            - audTags
+                            - teamName
+                            type: object
+                            x-kubernetes-validations:
+                            - message: teamName is required
+                              rule: has(self.teamName) && size(self.teamName) > 0
+                            - message: at least one audTag is required
+                              rule: size(self.audTags) > 0
+                          caPool:
+                            type: string
+                          connectTimeout:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          disableChunkedEncoding:
+                            type: boolean
+                          http2Origin:
+                            type: boolean
+                          httpHostHeader:
+                            type: string
+                          ipRules:
+                            items:
+                              description: CloudflareTunnelIPRule configures one bastion
+                                or SOCKS5 source-IP rule.
+                              properties:
+                                allow:
+                                  type: boolean
+                                ports:
+                                  items:
+                                    format: int32
+                                    maximum: 65535
+                                    minimum: 1
+                                    type: integer
+                                  maxItems: 64
+                                  type: array
+                                  x-kubernetes-list-type: set
+                                prefix:
+                                  maxLength: 49
+                                  minLength: 3
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: prefix must be a valid IPv4 or IPv6 CIDR
+                                    rule: isCIDR(self)
+                              required:
+                              - allow
+                              - prefix
+                              type: object
+                            maxItems: 64
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          keepAliveConnections:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          keepAliveTimeout:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          matchSNIToHost:
+                            type: boolean
+                          noHappyEyeballs:
+                            type: boolean
+                          noTLSVerify:
+                            type: boolean
+                          originServerName:
+                            type: string
+                          proxyType:
+                            description: CloudflareTunnelProxyType selects stream
+                              proxy translation behavior.
+                            enum:
+                            - Regular
+                            - SOCKS5
+                            type: string
+                          tcpKeepAlive:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          tlsTimeout:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                        type: object
+                      warpRouting:
+                        description: CloudflareTunnelWARPRouting configures private-network
+                          origin dialing.
+                        properties:
+                          connectTimeout:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          enabled:
+                            type: boolean
+                          maxActiveFlows:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          tcpKeepAlive:
+                            format: int64
+                            minimum: 0
+                            type: integer
+                        type: object
+                    required:
+                    - ingress
+                    type: object
+                    x-kubernetes-validations:
+                    - message: the final ingress rule must be a catch-all
+                      rule: (!has(self.ingress[size(self.ingress)-1].hostname) ||
+                        size(self.ingress[size(self.ingress)-1].hostname) == 0) &&
+                        (!has(self.ingress[size(self.ingress)-1].path) || size(self.ingress[size(self.ingress)-1].path)
+                        == 0)
+                  mode:
+                    default: Gateway
+                    description: CloudflareTunnelConfigurationMode selects Gateway
+                      aggregation or direct Cloudflare configuration.
+                    enum:
+                    - Gateway
+                    - Direct
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: Direct mode requires direct configuration
+                  rule: '!has(self.mode) || self.mode != ''Direct'' || has(self.direct)'
+                - message: direct configuration is only valid in Direct mode
+                  rule: '!has(self.direct) || (has(self.mode) && self.mode == ''Direct'')'
               connector:
-                description: Connector overrides the GatewayClassConfig connector
-                  settings.
+                description: Gateway-mode overrides.
                 properties:
                   gracePeriod:
                     default: 60s
-                    description: GracePeriod is the cloudflared shutdown grace period.
                     type: string
                   image:
                     default: cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4
-                    description: Image is the cloudflared container image.
                     type: string
                   protocol:
-                    default: auto
-                    description: Protocol is the transport protocol used to connect
-                      to Cloudflare.
+                    default: Auto
+                    description: ConnectorProtocol selects the transport protocol
+                      used by cloudflared.
                     enum:
-                    - auto
-                    - quic
-                    - http2
+                    - Auto
+                    - QUIC
+                    - HTTP2
                     type: string
                   replicas:
                     default: 2
-                    description: Replicas is the desired number of connector pods.
                     format: int32
+                    maximum: 25
+                    minimum: 1
                     type: integer
                   resources:
-                    description: Resources specifies compute resources for the cloudflared
-                      container.
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
                     properties:
                       claims:
                         description: |-
@@ -191,7 +615,8 @@ spec:
                 type: string
               dns:
                 default: {}
-                description: CloudflareTunnelDNSConfig configures public DNS ownership.
+                description: DNS applies to hostnames owned by either configuration
+                  mode.
                 properties:
                   mode:
                     default: Managed
@@ -201,13 +626,42 @@ spec:
                     - Managed
                     - External
                     type: string
+                  proxied:
+                    default: true
+                    type: boolean
                   recordComment:
                     default: managed-by=flareway
+                    maxLength: 100
                     type: string
+                  settings:
+                    description: DNSRecordSettings configures Cloudflare DNS record
+                      IP-family behavior.
+                    properties:
+                      ipv4Only:
+                        type: boolean
+                      ipv6Only:
+                        type: boolean
+                    type: object
+                    x-kubernetes-validations:
+                    - message: ipv4Only and ipv6Only cannot both be true
+                      rule: '!(has(self.ipv4Only) && self.ipv4Only && has(self.ipv6Only)
+                        && self.ipv6Only)'
+                  ttl:
+                    format: int64
+                    type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: ttl must be 1 (automatic) or between 60 and 86400 seconds
+                  rule: '!has(self.ttl) || self.ttl == 1 || (self.ttl >= 60 && self.ttl
+                    <= 86400)'
+                - message: proxied DNS records require automatic ttl
+                  rule: '!has(self.proxied) || !self.proxied || !has(self.ttl) ||
+                    self.ttl == 1'
+                - message: ipv4Only or ipv6Only requires proxied=true
+                  rule: '!has(self.settings) || ((!has(self.settings.ipv4Only) ||
+                    !self.settings.ipv4Only) && (!has(self.settings.ipv6Only) || !self.settings.ipv6Only))
+                    || (has(self.proxied) && self.proxied)'
               listeners:
-                description: Listeners configures per-listener exposure. Omitted listeners
-                  are Public.
                 items:
                   description: CloudflareTunnelListener configures exposure for one
                     Gateway listener.
@@ -278,6 +732,7 @@ spec:
                   required:
                   - name
                   type: object
+                maxItems: 64
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -290,17 +745,55 @@ spec:
                 - Managed
                 - ObserveOnly
                 type: string
+              managementToken:
+                description: CloudflareTunnelManagementTokenRequest requests an owned
+                  Secret containing a short-lived token.
+                properties:
+                  resources:
+                    items:
+                      description: CloudflareTunnelManagementResource selects a short-lived
+                        management-token capability.
+                      enum:
+                      - Logs
+                      type: string
+                    maxItems: 1
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
+                required:
+                - resources
+                type: object
+              originRequest:
+                description: GatewayOriginRequestSpec contains only origin settings
+                  valid for cloudflared's loopback Envoy origin.
+                properties:
+                  connectTimeout:
+                    type: string
+                  disableChunkedEncoding:
+                    type: boolean
+                  http2Origin:
+                    type: boolean
+                  keepAliveConnections:
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  keepAliveTimeout:
+                    type: string
+                  noHappyEyeballs:
+                    type: boolean
+                  tcpKeepAlive:
+                    type: string
+                type: object
               privateDNS:
-                description: PrivateDNS overrides the GatewayClassConfig private DNS
-                  settings.
+                description: PrivateDNSSpec configures the CoreDNS sidecar used by
+                  private listeners.
                 properties:
                   image:
                     default: coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
-                    description: Image is the CoreDNS container image.
                     type: string
                   resources:
-                    description: Resources specifies compute resources for the CoreDNS
-                      container.
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
                     properties:
                       claims:
                         description: |-
@@ -360,20 +853,19 @@ spec:
                     type: object
                 type: object
               proxy:
-                description: Proxy overrides the GatewayClassConfig proxy settings.
+                description: ProxySpec configures the Envoy proxy containers.
                 properties:
                   concurrency:
                     default: 1
-                    description: Concurrency is the number of Envoy worker threads.
                     format: int32
+                    minimum: 1
                     type: integer
                   image:
                     default: envoyproxy/envoy:distroless-v1.39.1
-                    description: Image is the Envoy container image.
                     type: string
                   resources:
-                    description: Resources specifies compute resources for the Envoy
-                      container.
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
                     properties:
                       claims:
                         description: |-
@@ -433,8 +925,6 @@ spec:
                     type: object
                   streamIdleTimeout:
                     default: 1h
-                    description: StreamIdleTimeout is the Envoy downstream stream
-                      idle timeout.
                     type: string
                 type: object
               tunnel:
@@ -454,6 +944,7 @@ spec:
                     type: object
                   name:
                     description: Name defaults in the controller to "<cluster>-<namespace>-<name>".
+                    maxLength: 100
                     type: string
                 type: object
             required:
@@ -464,12 +955,27 @@ spec:
               rule: self.managementPolicy != 'ObserveOnly' || has(self.tunnel.externalRef)
             - message: AdoptById requires tunnel.externalRef
               rule: self.adoption.mode != 'AdoptById' || has(self.tunnel.externalRef)
+            - message: AdoptById requires adoption.expect.name
+              rule: self.adoption.mode != 'AdoptById' || (has(self.adoption.expect)
+                && has(self.adoption.expect.name) && size(self.adoption.expect.name)
+                > 0)
+            - message: Managed externalRef requires adoption.mode AdoptById
+              rule: '!has(self.tunnel.externalRef) || self.managementPolicy == ''ObserveOnly''
+                || self.adoption.mode == ''AdoptById'''
             - message: accountRef.name is required
-              rule: has(self.accountRef.name) && self.accountRef.name != ''
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: Direct mode cannot use Gateway connector, proxy, privateDNS,
+                originRequest, or listeners
+              rule: '!has(self.configuration.mode) || self.configuration.mode != ''Direct''
+                || (!has(self.connector) && !has(self.proxy) && !has(self.privateDNS)
+                && !has(self.originRequest) && (!has(self.listeners) || size(self.listeners)
+                == 0))'
           status:
-            description: CloudflareTunnelStatus contains disjoint tunnel-controller
-              and gateway-controller fields.
+            description: CloudflareTunnelStatus contains bounded remote observations
+              and disjoint controller-owned fields.
             properties:
+              accountId:
+                type: string
               addresses:
                 items:
                   description: GatewayStatusAddress describes a network address that
@@ -502,11 +1008,68 @@ spec:
                 maxItems: 16
                 type: array
                 x-kubernetes-list-type: atomic
+              clients:
+                items:
+                  description: CloudflareTunnelClientStatus records one bounded cloudflared
+                    client observation.
+                  properties:
+                    arch:
+                      type: string
+                    configVersion:
+                      format: int64
+                      type: integer
+                    connections:
+                      items:
+                        description: CloudflareTunnelConnectionStatus records one
+                          edge connection.
+                        properties:
+                          clientId:
+                            type: string
+                          clientVersion:
+                            type: string
+                          coloName:
+                            type: string
+                          id:
+                            minLength: 1
+                            type: string
+                          openedAt:
+                            format: date-time
+                            type: string
+                          originIp:
+                            type: string
+                          uuid:
+                            type: string
+                        required:
+                        - id
+                        type: object
+                      maxItems: 16
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - id
+                      x-kubernetes-list-type: map
+                    features:
+                      items:
+                        maxLength: 128
+                        type: string
+                      maxItems: 64
+                      type: array
+                      x-kubernetes-list-type: set
+                    id:
+                      type: string
+                    runAt:
+                      format: date-time
+                      type: string
+                    version:
+                      type: string
+                  required:
+                  - id
+                  type: object
+                maxItems: 25
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
               conditions:
-                description: |-
-                  Conditions are merged by type. Accepted, TunnelReady, DNSReady, Ready,
-                  CleanupBlocked and Conflict are tunnel-owned; ConfigApplied and
-                  PrivateListenerDegraded are gateway-owned.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -561,54 +1124,53 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              configSource:
+                description: TunnelConfigSource is the public representation of tunnel
+                  configuration ownership.
+                enum:
+                - Local
+                - Cloudflare
+                type: string
               configVersion:
-                description: Gateway-controller-owned fields.
+                description: CloudflareTunnelConfigVersion records desired and observed
+                  whole-object configuration versions.
                 properties:
                   applied:
                     format: int64
                     type: integer
+                  createdAt:
+                    format: date-time
+                    type: string
                   desired:
                     format: int64
                     type: integer
                   desiredHash:
                     type: string
+                  remote:
+                    format: int64
+                    type: integer
                 type: object
-              connectorState:
-                description: ConnectorState is the observed health of the remote tunnel
-                  connectors.
-                enum:
-                - healthy
-                - degraded
-                - down
-                - inactive
+              connectionsActiveAt:
+                format: date-time
                 type: string
-              dnsRecords:
-                items:
-                  description: CloudflareTunnelDNSRecordStatus records a managed DNS
-                    record.
-                  properties:
-                    hostname:
-                      type: string
-                    recordId:
-                      type: string
-                    state:
-                      type: string
-                    zoneId:
-                      type: string
-                  required:
-                  - hostname
-                  - recordId
-                  - zoneId
-                  type: object
-                type: array
-                x-kubernetes-list-map-keys:
-                - hostname
-                x-kubernetes-list-type: map
-              gatewayRef:
+              connectionsInactiveAt:
+                format: date-time
+                type: string
+              connectorState:
+                description: ConnectorState is the public representation of observed
+                  tunnel health.
+                enum:
+                - Healthy
+                - Degraded
+                - Down
+                - Inactive
+                type: string
+              connectorTokenSecretRef:
                 description: |-
                   LocalObjectReference contains enough information to let you locate the
                   referenced object inside the same namespace.
@@ -624,13 +1186,93 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              createdAt:
+                format: date-time
+                type: string
+              deletedAt:
+                format: date-time
+                type: string
+              dnsRecords:
+                items:
+                  description: CloudflareTunnelDNSRecordStatus records a bounded projection
+                    of one managed DNS record.
+                  properties:
+                    commentModifiedOn:
+                      format: date-time
+                      type: string
+                    createdOn:
+                      format: date-time
+                      type: string
+                    hostname:
+                      type: string
+                    modifiedOn:
+                      format: date-time
+                      type: string
+                    ownershipComment:
+                      description: OwnershipComment checkpoints the exact comment
+                        written when this record was owned.
+                      maxLength: 100
+                      type: string
+                    proxiable:
+                      type: boolean
+                    proxied:
+                      type: boolean
+                    recordId:
+                      type: string
+                    settings:
+                      description: DNSRecordSettings configures Cloudflare DNS record
+                        IP-family behavior.
+                      properties:
+                        ipv4Only:
+                          type: boolean
+                        ipv6Only:
+                          type: boolean
+                      type: object
+                      x-kubernetes-validations:
+                      - message: ipv4Only and ipv6Only cannot both be true
+                        rule: '!(has(self.ipv4Only) && self.ipv4Only && has(self.ipv6Only)
+                          && self.ipv6Only)'
+                    state:
+                      type: string
+                    ttl:
+                      format: int64
+                      type: integer
+                    zoneId:
+                      type: string
+                  required:
+                  - hostname
+                  - recordId
+                  - zoneId
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-map-keys:
+                - hostname
+                x-kubernetes-list-type: map
+              gatewayRef:
+                description: GatewayRef names the Gateway selected by the Tunnel controller.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              gatewayUid:
+                description: GatewayUID binds GatewayRef to one exact live Kubernetes
+                  object.
+                type: string
               hostnames:
                 items:
                   description: CloudflareTunnelHostnameStatus is owned by the gateway
                     field manager.
                   properties:
                     accessApplication:
-                      default: ""
                       type: string
                     appliedVersion:
                       format: int64
@@ -646,7 +1288,6 @@ spec:
                     hostname:
                       type: string
                     protectionDomain:
-                      default: ""
                       type: string
                   required:
                   - accessApplication
@@ -654,6 +1295,7 @@ spec:
                   - hostname
                   - protectionDomain
                   type: object
+                maxItems: 256
                 type: array
                 x-kubernetes-list-map-keys:
                 - hostname
@@ -726,6 +1368,7 @@ spec:
                         - name
                         - protected
                         type: object
+                      maxItems: 64
                       type: array
                       x-kubernetes-list-map-keys:
                       - name
@@ -734,14 +1377,49 @@ spec:
                   - exposure
                   - name
                   type: object
+                maxItems: 64
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              managementTokenSecretRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              name:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
               orphanedTunnelId:
                 type: string
+              ownershipVerified:
+                type: boolean
               tunnelId:
-                description: Tunnel-controller-owned fields.
+                type: string
+              tunnelType:
+                description: TunnelRemoteType is the public representation of a Cloudflare
+                  tunnel type.
+                enum:
+                - CloudflareTunnel
+                - WARPConnector
+                - WARP
+                - Magic
+                - IPSec
+                - GRE
+                - CNI
                 type: string
             type: object
         type: object

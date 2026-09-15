@@ -7,6 +7,7 @@ spec:
   accountRef:
     name: example
   name: flareway/default/automation
+  enabled: true
   duration: 8760h
   secretRef:
     name: automation-access-token

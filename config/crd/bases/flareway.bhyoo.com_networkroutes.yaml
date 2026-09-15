@@ -51,8 +51,8 @@ spec:
           metadata:
             type: object
           spec:
-            description: NetworkRouteSpec defines a CIDR routed through a CloudflareTunnel
-              in one virtual network.
+            description: NetworkRouteSpec defines a CIDR routed through a typed tunnel
+              reference.
             properties:
               accountRef:
                 description: |-
@@ -80,8 +80,10 @@ spec:
                       match before adoption.
                     properties:
                       domain:
+                        maxLength: 253
                         type: string
                       name:
+                        maxLength: 100
                         type: string
                     type: object
                   mode:
@@ -183,6 +185,40 @@ spec:
                 required:
                 - routeId
                 type: object
+              ipLookup:
+                description: NetworkRouteIPLookupSpec requests the most-specific route
+                  containing one IP address.
+                properties:
+                  defaultVirtualNetworkFallback:
+                    type: boolean
+                  ip:
+                    type: string
+                    x-kubernetes-validations:
+                    - message: ip must be a valid IPv4 or IPv6 address
+                      rule: isIP(self)
+                  virtualNetworkRef:
+                    description: |-
+                      LocalObjectReference contains enough information to let you locate the
+                      referenced object inside the same namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - ip
+                type: object
+                x-kubernetes-validations:
+                - message: virtualNetworkRef and defaultVirtualNetworkFallback are
+                    mutually exclusive
+                  rule: '!has(self.virtualNetworkRef) || !has(self.defaultVirtualNetworkFallback)'
               managementPolicy:
                 default: Managed
                 description: ManagementPolicy controls whether Flareway mutates a
@@ -192,14 +228,21 @@ spec:
                 - ObserveOnly
                 type: string
               network:
-                description: Network must be a masked IPv4 or IPv6 CIDR.
                 maxLength: 49
                 minLength: 3
                 type: string
               tunnelRef:
-                description: NamespacedObjectReference identifies a namespaced Flareway
-                  resource.
+                description: TunnelReference identifies a namespaced CloudflareTunnel
+                  or WARPConnector.
                 properties:
+                  kind:
+                    default: CloudflareTunnel
+                    description: TunnelReferenceKind selects a supported private-route
+                      tunnel resource.
+                    enum:
+                    - CloudflareTunnel
+                    - WARPConnector
+                    type: string
                   name:
                     minLength: 1
                     type: string
@@ -210,9 +253,8 @@ spec:
                 - name
                 type: object
               virtualNetworkRef:
-                description: |-
-                  LocalObjectReference contains enough information to let you locate the
-                  referenced object inside the same namespace.
+                description: VirtualNetworkRef is optional; omission selects the account
+                  default virtual network.
                 properties:
                   name:
                     default: ""
@@ -229,7 +271,6 @@ spec:
             - accountRef
             - network
             - tunnelRef
-            - virtualNetworkRef
             type: object
             x-kubernetes-validations:
             - message: ObserveOnly requires externalRef
@@ -244,13 +285,11 @@ spec:
             - message: network must be masked
               rule: '!isCIDR(self.network) || cidr(self.network) == cidr(self.network).masked()'
             - message: accountRef.name is required
-              rule: has(self.accountRef.name) && self.accountRef.name != ""
-            - message: virtualNetworkRef.name is required
-              rule: has(self.virtualNetworkRef.name) && self.virtualNetworkRef.name
-                != ""
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: tunnelRef.name is required
+              rule: has(self.tunnelRef.name) && size(self.tunnelRef.name) > 0
           status:
-            description: NetworkRouteStatus records the remote route identity and
-              applied claim.
+            description: NetworkRouteStatus records actionable route and lookup metadata.
             properties:
               applied:
                 description: NetworkRouteAppliedStatus is the exact CIDR and resolved
@@ -262,6 +301,18 @@ spec:
                     format: int64
                     type: integer
                   tunnelId:
+                    type: string
+                  tunnelType:
+                    description: TunnelRemoteType is the public representation of
+                      a Cloudflare tunnel type.
+                    enum:
+                    - CloudflareTunnel
+                    - WARPConnector
+                    - WARP
+                    - Magic
+                    - IPSec
+                    - GRE
+                    - CNI
                     type: string
                   virtualNetworkId:
                     type: string
@@ -323,16 +374,96 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              createdAt:
+                format: date-time
+                type: string
+              deletedAt:
+                format: date-time
+                type: string
+              ipLookup:
+                description: NetworkRouteIPLookupStatus records the request that produced
+                  the current lookup result.
+                properties:
+                  defaultVirtualNetworkFallback:
+                    type: boolean
+                  ip:
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  result:
+                    description: NetworkRouteIPLookupResultStatus records the Teamnet
+                      route returned by an IP lookup.
+                    properties:
+                      comment:
+                        type: string
+                      createdAt:
+                        format: date-time
+                        type: string
+                      deletedAt:
+                        format: date-time
+                        type: string
+                      network:
+                        type: string
+                      routeId:
+                        type: string
+                      tunnelId:
+                        type: string
+                      tunnelName:
+                        type: string
+                      tunnelType:
+                        description: TunnelRemoteType is the public representation
+                          of a Cloudflare tunnel type.
+                        enum:
+                        - CloudflareTunnel
+                        - WARPConnector
+                        - WARP
+                        - Magic
+                        - IPSec
+                        - GRE
+                        - CNI
+                        type: string
+                      virtualNetworkId:
+                        type: string
+                      virtualNetworkName:
+                        type: string
+                    type: object
+                  virtualNetworkId:
+                    type: string
+                type: object
+              network:
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
               ownershipVerified:
                 type: boolean
               routeId:
+                type: string
+              tunnelId:
+                type: string
+              tunnelName:
+                type: string
+              tunnelType:
+                description: TunnelRemoteType is the public representation of a Cloudflare
+                  tunnel type.
+                enum:
+                - CloudflareTunnel
+                - WARPConnector
+                - WARP
+                - Magic
+                - IPSec
+                - GRE
+                - CNI
+                type: string
+              virtualNetworkId:
+                type: string
+              virtualNetworkName:
                 type: string
             type: object
         type: object

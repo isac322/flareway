@@ -29,10 +29,21 @@ func TestWorkloadSamplesContainCompleteMappings(t *testing.T) {
 		path               string
 		accessApplications int
 		publicRules        []string
+		bypassPaths        []string
 	}{
 		{path: "workload_cc_lb.yaml", accessApplications: 1, publicRules: []string{"v1"}},
-		{path: "workload_codex_lb.yaml", accessApplications: 2, publicRules: []string{"public-v1", "public-codex"}},
-		{path: "workload_cliproxyapi.yaml", accessApplications: 2, publicRules: []string{"public-v1", "public-v1beta", "public-openai-v1", "public-codex"}},
+		{
+			path:               "workload_codex_lb.yaml",
+			accessApplications: 2,
+			publicRules:        []string{"public-v1", "public-codex"},
+			bypassPaths:        []string{"/v1", "/backend-api/codex"},
+		},
+		{
+			path:               "workload_cliproxyapi.yaml",
+			accessApplications: 2,
+			publicRules:        []string{"public-v1", "public-v1beta", "public-openai-v1", "public-codex"},
+			bypassPaths:        []string{"/v1", "/v1beta", "/openai/v1", "/backend-api/codex"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -41,10 +52,27 @@ func TestWorkloadSamplesContainCompleteMappings(t *testing.T) {
 			objects := decodeSample(t, tc.path)
 			counts := map[string]int{}
 			rules := map[string]bool{}
+			bypassPaths := map[string]bool{}
 			for _, object := range objects {
 				counts[object.GetKind()]++
 				if object.GetKind() == "HTTPRoute" {
 					collectNamedRules(t, object, rules)
+				}
+				if object.GetKind() == "AccessApplication" {
+					assertApplicationVariant(t, object, map[string]string{"SelfHosted": "selfHosted"})
+					collectBypassPaths(t, object, bypassPaths)
+				}
+				if object.GetKind() == "AccessPolicy" {
+					decision, found, err := unstructured.NestedString(object.Object, "spec", "decision")
+					if err != nil || !found || (decision != "Allow" && decision != "Deny") {
+						t.Fatalf("AccessPolicy %s decision=%q found=%t err=%v", object.GetName(), decision, found, err)
+					}
+				}
+				if object.GetKind() == "IdentityProvider" {
+					typeName, found, err := unstructured.NestedString(object.Object, "spec", "type")
+					if err != nil || !found || typeName != "Google" {
+						t.Fatalf("IdentityProvider %s type=%q found=%t err=%v", object.GetName(), typeName, found, err)
+					}
 				}
 				if object.GetKind() == "AccessPolicy" || object.GetKind() == "IdentityProvider" {
 					management, found, err := unstructured.NestedString(object.Object, "spec", "managementPolicy")
@@ -71,7 +99,175 @@ func TestWorkloadSamplesContainCompleteMappings(t *testing.T) {
 					t.Errorf("missing public rule %q", rule)
 				}
 			}
+			for _, path := range tc.bypassPaths {
+				if !bypassPaths[path] {
+					t.Errorf("missing bypass declaration for %q", path)
+				}
+			}
 		})
+	}
+}
+
+func TestAccessSamplesCoverEveryApplicationType(t *testing.T) {
+	t.Parallel()
+
+	gatewayVariants := map[string]string{
+		"SelfHosted":    "selfHosted",
+		"SSH":           "ssh",
+		"VNC":           "vnc",
+		"RDP":           "rdp",
+		"MCP":           "mcp",
+		"ProxyEndpoint": "proxyEndpoint",
+	}
+	standaloneVariants := map[string]string{
+		"SaaS":           "saas",
+		"Bookmark":       "bookmark",
+		"Infrastructure": "infrastructure",
+		"AppLauncher":    "appLauncher",
+		"WARP":           "warp",
+		"BISO":           "biso",
+		"DashSSO":        "dashSso",
+		"MCPPortal":      "mcpPortal",
+	}
+	seen := map[string]bool{}
+	for _, sample := range []struct {
+		path     string
+		kind     string
+		variants map[string]string
+	}{
+		{path: "flareway_v1alpha1_accessapplication_cc_lb.yaml", kind: "AccessApplication", variants: gatewayVariants},
+		{path: "flareway_v1alpha1_accessstandaloneapplication.yaml", kind: "AccessStandaloneApplication", variants: standaloneVariants},
+	} {
+		for _, object := range decodeSample(t, sample.path) {
+			if object.GetKind() != sample.kind {
+				continue
+			}
+			typeName := assertApplicationVariant(t, object, sample.variants)
+			seen[typeName] = true
+		}
+	}
+	for typeName := range gatewayVariants {
+		if !seen[typeName] {
+			t.Errorf("missing AccessApplication type %s", typeName)
+		}
+	}
+	for typeName := range standaloneVariants {
+		if !seen[typeName] {
+			t.Errorf("missing AccessStandaloneApplication type %s", typeName)
+		}
+	}
+}
+
+func TestAccessSamplesDemonstrateAdoptedBypassAndHostnameAudienceScope(t *testing.T) {
+	t.Parallel()
+	codex := sampleByKindAndName(t, decodeSample(t, "flareway_v1alpha1_accessapplication_codex_carveout.yaml"), "AccessApplication", "codex-lb-dashboard")
+	children, found, err := unstructured.NestedSlice(codex.Object, "spec", "bypass", "children")
+	if err != nil || !found || len(children) < 1 {
+		t.Fatalf("codex bypass children=%#v found=%t err=%v", children, found, err)
+	}
+	adopted := children[0].(map[string]any)
+	applicationID, found, err := unstructured.NestedString(adopted, "externalRef", "applicationId")
+	if err != nil || !found || applicationID != "replace-with-existing-bypass-application-id" {
+		t.Fatalf("adopted bypass applicationId=%q found=%t err=%v", applicationID, found, err)
+	}
+	mode, found, err := unstructured.NestedString(adopted, "adoption", "mode")
+	if err != nil || !found || mode != "AdoptById" {
+		t.Fatalf("adopted bypass mode=%q found=%t err=%v", mode, found, err)
+	}
+
+	redashObjects := decodeSample(t, "flareway_v1alpha1_accessapplication_cc_lb.yaml")
+	for _, name := range []string{"redash-ui", "redash-reports"} {
+		application := sampleByKindAndName(t, redashObjects, "AccessApplication", name)
+		scope, found, err := unstructured.NestedString(application.Object, "spec", "originJWT", "audienceScope")
+		if err != nil || !found || scope != "Hostname" {
+			t.Fatalf("AccessApplication %s audienceScope=%q found=%t err=%v", name, scope, found, err)
+		}
+		if _, found, err := unstructured.NestedMap(application.Object, "spec", "externalRef"); err != nil || found {
+			t.Fatalf("AccessApplication %s must not embed an application ID; found=%t err=%v", name, found, err)
+		}
+	}
+}
+
+func TestNewAccessResourceSamplesContainRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	page := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_accesscustompage.yaml"), "AccessCustomPage")
+	assertAccountRef(t, page)
+	for _, field := range []string{"name", "type", "html"} {
+		if value, found, err := unstructured.NestedString(page.Object, "spec", field); err != nil || !found || value == "" {
+			t.Errorf("AccessCustomPage spec.%s=%q found=%t err=%v", field, value, found, err)
+		}
+	}
+
+	target := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_accessinfrastructuretarget.yaml"), "AccessInfrastructureTarget")
+	assertAccountRef(t, target)
+	if _, found, err := unstructured.NestedMap(target.Object, "spec", "ip", "ipv4"); err != nil || !found {
+		t.Errorf("AccessInfrastructureTarget missing IPv4 address: found=%t err=%v", found, err)
+	}
+	if _, found, err := unstructured.NestedMap(target.Object, "spec", "ip", "ipv6"); err != nil || !found {
+		t.Errorf("AccessInfrastructureTarget missing IPv6 address: found=%t err=%v", found, err)
+	}
+
+	integration := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_devicepostureintegration.yaml"), "DevicePostureIntegration")
+	assertAccountRef(t, integration)
+	if typeName, found, err := unstructured.NestedString(integration.Object, "spec", "type"); err != nil || !found || typeName != "CustomS2S" {
+		t.Errorf("DevicePostureIntegration type=%q found=%t err=%v", typeName, found, err)
+	}
+	for _, field := range []string{"accessClientIdRef", "accessClientSecretRef"} {
+		if _, found, err := unstructured.NestedMap(integration.Object, "spec", "config", field); err != nil || !found {
+			t.Errorf("DevicePostureIntegration config.%s missing: found=%t err=%v", field, found, err)
+		}
+	}
+
+	token := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_servicetoken.yaml"), "ServiceToken")
+	if enabled, found, err := unstructured.NestedBool(token.Object, "spec", "enabled"); err != nil || !found || !enabled {
+		t.Errorf("ServiceToken enabled=%t found=%t err=%v", enabled, found, err)
+	}
+}
+
+func assertApplicationVariant(t *testing.T, object *unstructured.Unstructured, variants map[string]string) string {
+	t.Helper()
+	assertAccountRef(t, object)
+	typeName, found, err := unstructured.NestedString(object.Object, "spec", "type")
+	if err != nil || !found || typeName == "" {
+		t.Fatalf("%s %s type=%q found=%t err=%v", object.GetKind(), object.GetName(), typeName, found, err)
+	}
+	variant, ok := variants[typeName]
+	if !ok {
+		t.Fatalf("%s %s has unexpected type %q", object.GetKind(), object.GetName(), typeName)
+	}
+	if _, found, err := unstructured.NestedMap(object.Object, "spec", variant); err != nil || !found {
+		t.Fatalf("%s %s type %s missing spec.%s: found=%t err=%v", object.GetKind(), object.GetName(), typeName, variant, found, err)
+	}
+	return typeName
+}
+
+func assertAccountRef(t *testing.T, object *unstructured.Unstructured) {
+	t.Helper()
+	name, found, err := unstructured.NestedString(object.Object, "spec", "accountRef", "name")
+	if err != nil || !found || name == "" {
+		t.Fatalf("%s %s accountRef.name=%q found=%t err=%v", object.GetKind(), object.GetName(), name, found, err)
+	}
+}
+
+func collectBypassPaths(t *testing.T, application *unstructured.Unstructured, paths map[string]bool) {
+	t.Helper()
+	children, found, err := unstructured.NestedSlice(application.Object, "spec", "bypass", "children")
+	if err != nil {
+		t.Fatalf("AccessApplication %s bypass children: %v", application.GetName(), err)
+	}
+	if !found {
+		return
+	}
+	for _, item := range children {
+		child, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("AccessApplication %s bypass child has type %T", application.GetName(), item)
+		}
+		path, _ := child["path"].(string)
+		if path != "" {
+			paths[path] = true
+		}
 	}
 }
 
@@ -94,4 +290,15 @@ func collectNamedRules(t *testing.T, route *unstructured.Unstructured, names map
 			names[name] = true
 		}
 	}
+}
+
+func sampleByKindAndName(t *testing.T, objects []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	t.Helper()
+	for _, object := range objects {
+		if object.GetKind() == kind && object.GetName() == name {
+			return object
+		}
+	}
+	t.Fatalf("sample has no %s %s", kind, name)
+	return nil
 }
