@@ -1,0 +1,205 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flareway.fullname" . }}-manager-role
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "namespaces", "secrets", "services"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["flareway.bhyoo.com"]
+    resources:
+      - accessapplications
+      - accesscustompages
+      - accessgroups
+      - accessinfrastructuretargets
+      - accesspolicies
+      - accessstandaloneapplications
+      - cloudflareaccounts
+      - cloudflaretunnels
+      - devicepostureintegrations
+      - deviceposturerules
+      - deviceprofiles
+      - devicesettings
+      - gatewayclassconfigs
+      - hostnameroutes
+      - identityproviders
+      - networkroutes
+      - servicetokens
+      - virtualnetworks
+      - warpconnectors
+      - zerotrustgatewaypolicies
+      - zerotrustlists
+      - zerotrustorganizations
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["flareway.bhyoo.com"]
+    resources:
+      - accessapplications/finalizers
+      - accessgroups/finalizers
+      - accessinfrastructuretargets/finalizers
+      - accesspolicies/finalizers
+      - accessstandaloneapplications/finalizers
+      - cloudflareaccounts/finalizers
+      - cloudflaretunnels/finalizers
+      - deviceposturerules/finalizers
+      - deviceprofiles/finalizers
+      - devicesettings/finalizers
+      - gatewayclassconfigs/finalizers
+      - hostnameroutes/finalizers
+      - identityproviders/finalizers
+      - networkroutes/finalizers
+      - servicetokens/finalizers
+      - virtualnetworks/finalizers
+      - warpconnectors/finalizers
+      - zerotrustgatewaypolicies/finalizers
+      - zerotrustlists/finalizers
+      - zerotrustorganizations/finalizers
+    verbs: ["patch", "update"]
+  - apiGroups: ["flareway.bhyoo.com"]
+    resources:
+      - accessapplications/status
+      - accesscustompages/status
+      - accessgroups/status
+      - accessinfrastructuretargets/status
+      - accesspolicies/status
+      - accessstandaloneapplications/status
+      - cloudflareaccounts/status
+      - cloudflaretunnels/status
+      - devicepostureintegrations/status
+      - deviceposturerules/status
+      - deviceprofiles/status
+      - devicesettings/status
+      - gatewayclassconfigs/status
+      - hostnameroutes/status
+      - identityproviders/status
+      - networkroutes/status
+      - servicetokens/status
+      - virtualnetworks/status
+      - warpconnectors/status
+      - zerotrustgatewaypolicies/status
+      - zerotrustlists/status
+      - zerotrustorganizations/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["flareway.bhyoo.com"]
+    resources:
+      - accesscustompages/finalizers
+      - devicepostureintegrations/finalizers
+    verbs: ["update"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["backendtlspolicies", "gatewayclasses", "gateways", "httproutes", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["backendtlspolicies/status", "gatewayclasses/status", "gateways/status", "httproutes/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flareway.fullname" . }}-manager-rolebinding
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flareway.fullname" . }}-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flareway.serviceAccountName" . }}
+    namespace: {{ include "flareway.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flareway.fullname" . }}-leader-election-role
+  namespace: {{ include "flareway.namespace" . }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flareway.fullname" . }}-leader-election-rolebinding
+  namespace: {{ include "flareway.namespace" . }}
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flareway.fullname" . }}-leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flareway.serviceAccountName" . }}
+    namespace: {{ include "flareway.namespace" . }}
+{{- if and .Values.metrics.enabled .Values.metrics.secure }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flareway.fullname" . }}-metrics-auth-role
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flareway.fullname" . }}-metrics-auth-rolebinding
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flareway.fullname" . }}-metrics-auth-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flareway.serviceAccountName" . }}
+    namespace: {{ include "flareway.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flareway.fullname" . }}-metrics-reader
+  labels:
+    {{- include "flareway.labels" . | nindent 4 }}
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+{{- end }}

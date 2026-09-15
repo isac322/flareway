@@ -1,0 +1,16 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: ZeroTrustOrganization
+metadata:
+  name: default
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: example-account
+  sessionDuration: 24h
+  warpAuthSessionDuration: 720h
+  allowAuthenticateViaWarp: true
+  isUiReadOnly: false
+  denyUnmatchedRequests: false
+  warpAuthNonBrowser401: true
+  managementPolicy: ObserveOnly
+  deletionPolicy: Orphan

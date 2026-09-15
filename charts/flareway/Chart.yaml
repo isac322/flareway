@@ -1,0 +1,12 @@
+apiVersion: v2
+name: flareway
+description: Kubernetes Gateway API controller for Cloudflare Tunnel, Access, and WARP
+home: https://github.com/isac322/flareway
+sources:
+  - https://github.com/isac322/flareway
+type: application
+version: 0.1.0
+appVersion: v0.1.0
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/operator: "true"

@@ -1,0 +1,571 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: warpconnectors.flareway.bhyoo.com
+spec:
+  group: flareway.bhyoo.com
+  names:
+    categories:
+    - flareway
+    kind: WARPConnector
+    listKind: WARPConnectorList
+    plural: warpconnectors
+    shortNames:
+    - warpc
+    singular: warpconnector
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.tunnelId
+      name: Tunnel
+      type: string
+    - jsonPath: .status.configuration.mode
+      name: HA
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: WARPConnector manages one Cloudflare WARP Connector tunnel.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WARPConnectorSpec defines a distinct WARP Connector tunnel
+              with no Gateway data plane.
+            properties:
+              accountRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              adoption:
+                default: {}
+                description: AdoptionSpec configures explicit adoption of an existing
+                  remote object.
+                properties:
+                  expect:
+                    description: AdoptionExpect declares remote attributes that must
+                      match before adoption.
+                    properties:
+                      domain:
+                        maxLength: 253
+                        type: string
+                      name:
+                        maxLength: 100
+                        type: string
+                    type: object
+                  mode:
+                    default: None
+                    description: AdoptionMode controls explicit adoption of a remote
+                      resource.
+                    enum:
+                    - None
+                    - AdoptById
+                    type: string
+                type: object
+              deletionPolicy:
+                default: Orphan
+                description: DeletionPolicy controls whether a managed remote resource
+                  is deleted or orphaned.
+                enum:
+                - Delete
+                - Orphan
+                type: string
+              externalRef:
+                description: WARPConnectorExternalReference identifies an existing
+                  WARP Connector tunnel.
+                properties:
+                  tunnelId:
+                    minLength: 1
+                    type: string
+                required:
+                - tunnelId
+                type: object
+              failover:
+                description: WARPConnectorFailoverRequest requests activation of one
+                  linked HA client.
+                properties:
+                  clientId:
+                    minLength: 1
+                    type: string
+                  requestId:
+                    description: RequestID must change to request another failover,
+                      including to the same client.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - clientId
+                - requestId
+                type: object
+              highAvailability:
+                default: {}
+                description: WARPConnectorHighAvailability configures the create-only
+                  HA capability and its mutable provider.
+                properties:
+                  aws:
+                    description: WARPConnectorAWSHAConfig configures AWS ENI movement
+                      on failover.
+                    properties:
+                      fnrId:
+                        description: FNRID is the Floating Network Resource ID for
+                          the secondary ENI.
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                    required:
+                    - fnrId
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enabled is sent only when the remote tunnel is created.
+                    type: boolean
+                    x-kubernetes-validations:
+                    - message: enabled is immutable
+                      rule: self == oldSelf
+                  local:
+                    description: WARPConnectorLocalHAConfig configures virtual IPs
+                      on the local CloudflareWARP interface.
+                    properties:
+                      vips:
+                        items:
+                          description: WARPConnectorVirtualIP identifies one local
+                            HA virtual IP.
+                          properties:
+                            address:
+                              maxLength: 45
+                              minLength: 2
+                              type: string
+                              x-kubernetes-validations:
+                              - message: address must be a valid IPv4 or IPv6 address
+                                rule: isIP(self)
+                          required:
+                          - address
+                          type: object
+                        maxItems: 64
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - address
+                        x-kubernetes-list-type: map
+                      vipsPrevious:
+                        description: VIPsPrevious are removed on demotion or configuration-version
+                          drift.
+                        items:
+                          description: WARPConnectorVirtualIP identifies one local
+                            HA virtual IP.
+                          properties:
+                            address:
+                              maxLength: 45
+                              minLength: 2
+                              type: string
+                              x-kubernetes-validations:
+                              - message: address must be a valid IPv4 or IPv6 address
+                                rule: isIP(self)
+                          required:
+                          - address
+                          type: object
+                        maxItems: 64
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - address
+                        x-kubernetes-list-type: map
+                    required:
+                    - vips
+                    type: object
+                  mode:
+                    default: Disabled
+                    description: WARPConnectorHAMode selects the WARP Connector high-availability
+                      provider.
+                    enum:
+                    - None
+                    - Disabled
+                    - AWS
+                    - Local
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: AWS mode requires only aws configuration
+                  rule: '!has(self.mode) || self.mode != ''AWS'' || (has(self.aws)
+                    && !has(self.local))'
+                - message: Local mode requires only local configuration
+                  rule: '!has(self.mode) || self.mode != ''Local'' || (has(self.local)
+                    && !has(self.aws))'
+                - message: aws configuration is only valid in AWS mode
+                  rule: '!has(self.aws) || (has(self.mode) && self.mode == ''AWS'')'
+                - message: local configuration is only valid in Local mode
+                  rule: '!has(self.local) || (has(self.mode) && self.mode == ''Local'')'
+                - message: HA provider modes require enabled=true
+                  rule: '!has(self.enabled) || self.enabled || !has(self.mode) ||
+                    self.mode == ''Disabled'''
+              managementPolicy:
+                default: Managed
+                description: ManagementPolicy controls whether Flareway mutates a
+                  remote resource.
+                enum:
+                - Managed
+                - ObserveOnly
+                type: string
+              name:
+                description: Name is trimmed of surrounding whitespace before remote
+                  operations.
+                maxLength: 100
+                minLength: 1
+                type: string
+            required:
+            - accountRef
+            - name
+            type: object
+            x-kubernetes-validations:
+            - message: ObserveOnly requires externalRef
+              rule: self.managementPolicy != 'ObserveOnly' || has(self.externalRef)
+            - message: AdoptById requires externalRef
+              rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
+            - message: Managed externalRef requires adoption.mode AdoptById
+              rule: '!has(self.externalRef) || self.managementPolicy == ''ObserveOnly''
+                || self.adoption.mode == ''AdoptById'''
+            - message: AdoptById requires adoption.expect.name
+              rule: self.adoption.mode != 'AdoptById' || (has(self.adoption.expect)
+                && has(self.adoption.expect.name) && size(self.adoption.expect.name)
+                > 0)
+            - message: accountRef.name is required
+              rule: has(self.accountRef.name) && size(self.accountRef.name) > 0
+            - message: failover requires enabled high availability
+              rule: '!has(self.failover) || (has(self.highAvailability.enabled) &&
+                self.highAvailability.enabled && self.highAvailability.mode != ''Disabled'')'
+          status:
+            description: WARPConnectorStatus records bounded remote lifecycle, HA,
+              token and client observations.
+            properties:
+              accountId:
+                type: string
+              clients:
+                items:
+                  description: WARPConnectorClientStatus records one bounded connected
+                    client observation.
+                  properties:
+                    arch:
+                      type: string
+                    connections:
+                      items:
+                        description: WARPConnectorConnectionStatus records one edge
+                          connection for a WARP client.
+                        properties:
+                          clientId:
+                            type: string
+                          clientVersion:
+                            type: string
+                          coloName:
+                            type: string
+                          id:
+                            minLength: 1
+                            type: string
+                          openedAt:
+                            format: date-time
+                            type: string
+                          originIp:
+                            type: string
+                        required:
+                        - id
+                        type: object
+                      maxItems: 16
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - id
+                      x-kubernetes-list-type: map
+                    features:
+                      items:
+                        maxLength: 128
+                        type: string
+                      maxItems: 64
+                      type: array
+                      x-kubernetes-list-type: set
+                    haStatus:
+                      description: WARPConnectorClientHAStatus is the public representation
+                        of a client's HA role.
+                      enum:
+                      - Offline
+                      - Passive
+                      - Active
+                      type: string
+                    id:
+                      type: string
+                    runAt:
+                      format: date-time
+                      type: string
+                    version:
+                      type: string
+                  required:
+                  - id
+                  type: object
+                maxItems: 25
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              configuration:
+                description: WARPConnectorHAConfigurationStatus records the applied
+                  remote HA configuration.
+                properties:
+                  aws:
+                    description: WARPConnectorAWSHAConfig configures AWS ENI movement
+                      on failover.
+                    properties:
+                      fnrId:
+                        description: FNRID is the Floating Network Resource ID for
+                          the secondary ENI.
+                        maxLength: 256
+                        minLength: 1
+                        type: string
+                    required:
+                    - fnrId
+                    type: object
+                  configurationVersion:
+                    format: int64
+                    type: integer
+                  createdAt:
+                    format: date-time
+                    type: string
+                  local:
+                    description: WARPConnectorLocalHAConfig configures virtual IPs
+                      on the local CloudflareWARP interface.
+                    properties:
+                      vips:
+                        items:
+                          description: WARPConnectorVirtualIP identifies one local
+                            HA virtual IP.
+                          properties:
+                            address:
+                              maxLength: 45
+                              minLength: 2
+                              type: string
+                              x-kubernetes-validations:
+                              - message: address must be a valid IPv4 or IPv6 address
+                                rule: isIP(self)
+                          required:
+                          - address
+                          type: object
+                        maxItems: 64
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - address
+                        x-kubernetes-list-type: map
+                      vipsPrevious:
+                        description: VIPsPrevious are removed on demotion or configuration-version
+                          drift.
+                        items:
+                          description: WARPConnectorVirtualIP identifies one local
+                            HA virtual IP.
+                          properties:
+                            address:
+                              maxLength: 45
+                              minLength: 2
+                              type: string
+                              x-kubernetes-validations:
+                              - message: address must be a valid IPv4 or IPv6 address
+                                rule: isIP(self)
+                          required:
+                          - address
+                          type: object
+                        maxItems: 64
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - address
+                        x-kubernetes-list-type: map
+                    required:
+                    - vips
+                    type: object
+                  mode:
+                    description: WARPConnectorHAMode selects the WARP Connector high-availability
+                      provider.
+                    enum:
+                    - None
+                    - Disabled
+                    - AWS
+                    - Local
+                    type: string
+                  tunnelId:
+                    type: string
+                  updatedAt:
+                    format: date-time
+                    type: string
+                type: object
+              connectionsActiveAt:
+                format: date-time
+                type: string
+              connectionsInactiveAt:
+                format: date-time
+                type: string
+              connectorState:
+                description: ConnectorState is the public representation of observed
+                  tunnel health.
+                enum:
+                - Healthy
+                - Degraded
+                - Down
+                - Inactive
+                type: string
+              createAttemptGeneration:
+                format: int64
+                type: integer
+              createAttemptName:
+                description: |-
+                  CreateAttemptName and CreateAttemptGeneration form the controller-owned
+                  checkpoint for recovering an ambiguous create request.
+                type: string
+              createdAt:
+                format: date-time
+                type: string
+              deletedAt:
+                format: date-time
+                type: string
+              failover:
+                description: WARPConnectorFailoverStatus records the most recently
+                  completed manual failover request.
+                properties:
+                  appliedAt:
+                    format: date-time
+                    type: string
+                  clientId:
+                    type: string
+                  requestId:
+                    type: string
+                type: object
+              name:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              orphanedTunnelId:
+                type: string
+              ownershipVerified:
+                type: boolean
+              tokenSecretRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              tunnelId:
+                type: string
+              tunnelType:
+                description: TunnelRemoteType is the public representation of a Cloudflare
+                  tunnel type.
+                enum:
+                - CloudflareTunnel
+                - WARPConnector
+                - WARP
+                - Magic
+                - IPSec
+                - GRE
+                - CNI
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

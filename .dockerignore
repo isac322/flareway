@@ -1,0 +1,14 @@
+# Send only production Go sources and module metadata to the builder.
+**
+
+!go.mod
+!go.sum
+
+!cmd/
+!cmd/**/*.go
+!api/
+!api/**/*.go
+!internal/
+!internal/**/*.go
+
+**/*_test.go

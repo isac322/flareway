@@ -1,0 +1,82 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: WARPConnector
+metadata:
+  name: branch-disabled
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  name: flareway-example-branch-disabled
+  highAvailability:
+    enabled: false
+    mode: Disabled
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Orphan
+# Managed connectors create a controller-owned Secret in the same namespace.
+# status.tokenSecretRef reports flareway-warp-branch-disabled; key token holds the bootstrap token.
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: WARPConnector
+metadata:
+  name: branch-none
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  name: flareway-example-branch-none
+  highAvailability:
+    enabled: true
+    mode: None
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Orphan
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: WARPConnector
+metadata:
+  name: branch-local
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  name: flareway-example-branch-local
+  highAvailability:
+    enabled: true
+    mode: Local
+    local:
+      vips:
+      - address: 192.0.2.10
+      - address: 2001:db8::10
+      vipsPrevious:
+      - address: 192.0.2.9
+  # Change requestId for each deliberate failover, including repeat failover to this client.
+  failover:
+    clientId: replace-with-linked-client-id
+    requestId: replace-with-failover-request-id
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Orphan
+# This connector's bootstrap token is stored in Secret flareway-warp-branch-local, key token.
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: WARPConnector
+metadata:
+  name: branch-aws
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  name: flareway-example-branch-aws
+  highAvailability:
+    enabled: true
+    mode: AWS
+    aws:
+      fnrId: replace-with-floating-network-resource-id
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Orphan

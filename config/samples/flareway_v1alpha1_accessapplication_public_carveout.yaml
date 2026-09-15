@@ -1,0 +1,105 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-app
+  namespace: default
+spec:
+  gatewayClassName: flareway
+  listeners:
+  - name: web
+    hostname: public.example.com
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-app
+  namespace: default
+spec:
+  parentRefs:
+  - name: demo-app
+  hostnames:
+  - public.example.com
+  rules:
+  - name: public-v1
+    matches:
+    - path:
+        type: PathPrefix
+        value: /v1
+    backendRefs:
+    - name: demo-app
+      port: 2455
+  - name: public-content
+    matches:
+    - path:
+        type: PathPrefix
+        value: /public
+    backendRefs:
+    - name: demo-app
+      port: 2455
+  - name: dashboard
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: demo-app
+      port: 2455
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: demo-dashboard
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: demo-app
+    sectionName: dashboard
+  pathScope:
+    type: PathPrefix
+    value: /
+  application:
+    name: Demo dashboard
+    sessionDuration: 720h
+    appLauncherVisible: false
+    customPageRefs:
+    - objectRef:
+        name: accesscustompage-sample
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+  bypass:
+    children:
+    - hostname: public.example.com
+      path: /v1
+      name: Demo public API
+      externalRef:
+        applicationId: replace-with-existing-bypass-application-id
+      adoption:
+        mode: AdoptById
+        expect:
+          name: Demo public API
+      deletionPolicy: Orphan
+    - hostname: public.example.com
+      path: /public
+      name: Demo public content
+      policyRef:
+        policyRef:
+          name: bypass-public-api
+      deletionPolicy: Delete
+  managementPolicy: Managed
+  deletionPolicy: Delete

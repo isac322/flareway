@@ -1,0 +1,14 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: DevicePostureRule
+metadata:
+  name: warp
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  type: WARP
+  name: WARP enrolled
+  managementPolicy: ObserveOnly
+  externalRef:
+    ruleId: "00000000-0000-0000-0000-000000000003"
+  deletionPolicy: Orphan

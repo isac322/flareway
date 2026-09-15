@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "labels", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string", "enum": ["flareway-system"]},
+        "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "digest", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+    "goRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["GOMEMLIMIT", "GODEBUG"],
+      "properties": {
+        "GOMEMLIMIT": {"type": "string", "minLength": 1},
+        "GODEBUG": {"type": "string", "minLength": 1}
+      }
+    },
+    "controllers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gateway", "access", "privateNetwork", "device", "organization"],
+      "properties": {
+        "gateway": {"type": "boolean"},
+        "access": {"type": "boolean"},
+        "privateNetwork": {"type": "boolean"},
+        "device": {"type": "boolean"},
+        "organization": {"type": "boolean"}
+      }
+    },
+    "leaderElection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {"enabled": {"type": "boolean"}}
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "secure", "service"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "secure": {"type": "boolean"},
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "port", "annotations"],
+          "properties": {
+            "type": {"type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "xds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service"],
+      "properties": {
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "port", "annotations"],
+          "properties": {
+            "type": {"type": "string", "enum": ["ClusterIP"]},
+            "port": {"type": "integer", "enum": [18000]},
+            "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "metrics", "xds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "metrics": {"$ref": "#/definitions/networkPolicyPeer"},
+        "xds": {"$ref": "#/definitions/networkPolicyPeer"}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "deploymentAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "resources": {"type": "object"},
+    "priorityClassName": {"type": "string"},
+    "nodeSelector": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"},
+    "topologySpreadConstraints": {"type": "array"},
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "gatewayClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "configName", "config"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string", "minLength": 1},
+        "configName": {"type": "string", "minLength": 1},
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["accountRefName", "conformanceMode", "connector", "proxy", "privateDNS", "dns", "originJWT", "conformance"],
+          "properties": {
+            "accountRefName": {"type": "string"},
+            "conformanceMode": {"type": "boolean"},
+            "connector": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "replicas", "protocol", "gracePeriod", "resources"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "replicas": {"type": "integer", "minimum": 1},
+                "protocol": {"type": "string", "enum": ["Auto", "QUIC", "HTTP2"]},
+                "gracePeriod": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
+                "resources": {"type": "object"}
+              }
+            },
+            "proxy": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "concurrency", "streamIdleTimeout", "resources"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "concurrency": {"type": "integer", "minimum": 1},
+                "streamIdleTimeout": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
+                "resources": {"type": "object"}
+              }
+            },
+            "privateDNS": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image", "resources"],
+              "properties": {
+                "image": {"type": "string", "minLength": 1},
+                "resources": {"type": "object"}
+              }
+            },
+            "dns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode"],
+              "properties": {"mode": {"type": "string", "enum": ["Managed", "External"]}}
+            },
+            "originJWT": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode"],
+              "properties": {"mode": {"type": "string", "enum": ["Required", "Disabled"]}}
+            },
+            "conformance": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["serviceType"],
+              "properties": {"serviceType": {"type": "string", "enum": ["LoadBalancer", "ClusterIP"]}}
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "networkPolicyPeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespaceSelector"],
+      "properties": {"namespaceSelector": {"type": "object"}}
+    }
+  }
+}

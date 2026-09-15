@@ -1,0 +1,63 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: private-https
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: private-gateway
+    sectionName: admin-private
+  application:
+    name: Private HTTPS
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Disabled
+  managementPolicy: Managed
+  deletionPolicy: Delete
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessApplication
+metadata:
+  name: private-l4
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: example-account
+  type: SelfHosted
+  selfHosted: {}
+  destinations:
+  - type: Private
+    private:
+      networkRouteRef:
+        name: private-services
+      cidr: 10.20.0.0/16
+      portRange: "443"
+      l4Protocol: TCP
+  application:
+    name: Private L4 service
+    sessionDuration: 720h
+    allowAuthenticateViaWarp: true
+    appLauncherVisible: false
+  policies:
+  - policyRef:
+      name: allow-developers-warp
+  - policyRef:
+      name: deny-everyone
+  originJWT:
+    mode: Required
+    assumeGatewayTLSDecryption: true
+  managementPolicy: Managed
+  deletionPolicy: Delete

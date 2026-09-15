@@ -1,0 +1,406 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: gatewayclassconfigs.flareway.bhyoo.com
+spec:
+  group: flareway.bhyoo.com
+  names:
+    categories:
+    - flareway
+    kind: GatewayClassConfig
+    listKind: GatewayClassConfigList
+    plural: gatewayclassconfigs
+    shortNames:
+    - gwcc
+    singular: gatewayclassconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.conformanceMode
+      name: Conformance
+      type: boolean
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GatewayClassConfig configures defaults and conformance behavior
+          for a GatewayClass.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: GatewayClassConfigSpec defines defaults and operating mode
+              for a GatewayClass.
+            properties:
+              accountRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              conformance:
+                default: {}
+                description: ConformanceSpec configures the data-plane Service used
+                  by conformance mode.
+                properties:
+                  serviceType:
+                    default: LoadBalancer
+                    description: Service Type string describes ingress methods for
+                      a service
+                    enum:
+                    - LoadBalancer
+                    - ClusterIP
+                    type: string
+                type: object
+              conformanceMode:
+                default: false
+                type: boolean
+              connector:
+                default: {}
+                description: ConnectorSpec configures the cloudflared connector containers.
+                properties:
+                  gracePeriod:
+                    default: 60s
+                    type: string
+                  image:
+                    default: cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4
+                    type: string
+                  protocol:
+                    default: Auto
+                    description: ConnectorProtocol selects the transport protocol
+                      used by cloudflared.
+                    enum:
+                    - Auto
+                    - QUIC
+                    - HTTP2
+                    type: string
+                  replicas:
+                    default: 2
+                    format: int32
+                    maximum: 25
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
+              dns:
+                default: {}
+                description: GatewayClassDNSConfig configures DNS ownership for Gateways
+                  in a class.
+                properties:
+                  mode:
+                    default: Managed
+                    description: DNSMode controls whether Flareway manages public
+                      DNS records.
+                    enum:
+                    - Managed
+                    - External
+                    type: string
+                  proxied:
+                    default: true
+                    type: boolean
+                  settings:
+                    description: DNSRecordSettings configures Cloudflare DNS record
+                      IP-family behavior.
+                    properties:
+                      ipv4Only:
+                        type: boolean
+                      ipv6Only:
+                        type: boolean
+                    type: object
+                    x-kubernetes-validations:
+                    - message: ipv4Only and ipv6Only cannot both be true
+                      rule: '!(has(self.ipv4Only) && self.ipv4Only && has(self.ipv6Only)
+                        && self.ipv6Only)'
+                  ttl:
+                    format: int64
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: ttl must be 1 (automatic) or between 60 and 86400 seconds
+                  rule: '!has(self.ttl) || self.ttl == 1 || (self.ttl >= 60 && self.ttl
+                    <= 86400)'
+                - message: proxied DNS records require automatic ttl
+                  rule: '!has(self.proxied) || !self.proxied || !has(self.ttl) ||
+                    self.ttl == 1'
+                - message: ipv4Only or ipv6Only requires proxied=true
+                  rule: '!has(self.settings) || ((!has(self.settings.ipv4Only) ||
+                    !self.settings.ipv4Only) && (!has(self.settings.ipv6Only) || !self.settings.ipv6Only))
+                    || (has(self.proxied) && self.proxied)'
+              originJWT:
+                default: {}
+                description: GatewayClassOriginJWTConfig configures the default Access
+                  origin JWT policy.
+                properties:
+                  mode:
+                    default: Required
+                    description: OriginJWTMode controls the default Cloudflare Access
+                      origin JWT requirement.
+                    enum:
+                    - Required
+                    - Disabled
+                    type: string
+                type: object
+              originRequest:
+                default: {}
+                description: GatewayOriginRequestSpec contains only origin settings
+                  valid for cloudflared's loopback Envoy origin.
+                properties:
+                  connectTimeout:
+                    type: string
+                  disableChunkedEncoding:
+                    type: boolean
+                  http2Origin:
+                    type: boolean
+                  keepAliveConnections:
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  keepAliveTimeout:
+                    type: string
+                  noHappyEyeballs:
+                    type: boolean
+                  tcpKeepAlive:
+                    type: string
+                type: object
+              privateDNS:
+                default: {}
+                description: PrivateDNSSpec configures the CoreDNS sidecar used by
+                  private listeners.
+                properties:
+                  image:
+                    default: coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+                    type: string
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
+              proxy:
+                default: {}
+                description: ProxySpec configures the Envoy proxy containers.
+                properties:
+                  concurrency:
+                    default: 1
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  image:
+                    default: envoyproxy/envoy:distroless-v1.39.1
+                    type: string
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  streamIdleTimeout:
+                    default: 1h
+                    type: string
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: accountRef must be omitted when conformanceMode is true
+              rule: '!self.conformanceMode || !has(self.accountRef)'
+            - message: accountRef.name is required unless conformanceMode is true
+              rule: self.conformanceMode || (has(self.accountRef) && has(self.accountRef.name)
+                && size(self.accountRef.name) > 0)
+        type: object
+    served: true
+    storage: true
+    subresources: {}

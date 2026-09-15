@@ -1,0 +1,28 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: public
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  tunnel:
+    name: flareway-example-public
+  configuration:
+    # Gateway mode is the sole writer of ingress assembled from Gateway API resources.
+    mode: Gateway
+  managementPolicy: Managed
+  adoption:
+    mode: None
+  deletionPolicy: Delete
+  dns:
+    mode: Managed
+    recordComment: example public tunnel
+    proxied: true
+    ttl: 1
+    settings:
+      ipv4Only: false
+      ipv6Only: true
+  listeners:
+  - name: web
+    exposure: Public

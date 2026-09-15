@@ -1,0 +1,13 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: VirtualNetwork
+metadata:
+  name: private-services
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: example-account
+  name: private-services
+  isDefault: false
+  comment: Example private services
+  managementPolicy: Managed
+  deletionPolicy: Orphan

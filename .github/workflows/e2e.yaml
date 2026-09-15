@@ -1,0 +1,180 @@
+name: Cloudflare end-to-end tests
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # 03:00 KST
+  workflow_dispatch:
+    inputs:
+      labels:
+        description: Ginkgo labels to run (use account-global for device-profile ownership)
+        required: true
+        default: public,access
+        type: string
+      device_profile_kind:
+        description: Profile target for account-global tests; Default mutates the human profile and is manual-only
+        required: true
+        default: Custom
+        type: choice
+        options:
+          - Custom
+          - Default
+  pull_request:
+    types:
+      - labeled
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.label.name == 'e2e' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    name: Cloudflare edge contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: cloudflare-e2e
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install test tools
+        run: make kind ko kustomize
+      - name: Create Kind cluster
+        env:
+          KIND_CLUSTER_NAME: flareway-e2e
+        run: |
+          node_args=()
+          if docker manifest inspect kindest/node:v1.35.0 >/dev/null 2>&1; then
+            node_args=(--image kindest/node:v1.35.0)
+          else
+            echo "kindest/node:v1.35.0 is unavailable; using the Kind default node image"
+          fi
+          bin/kind create cluster \
+            --name "${KIND_CLUSTER_NAME}" \
+            --config hack/kind-config.yaml \
+            "${node_args[@]}"
+          kubectl config use-context "kind-${KIND_CLUSTER_NAME}"
+      - name: Install Gateway API
+        run: |
+          kubectl apply --server-side -f \
+            https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+          kubectl wait --for=condition=Established --timeout=2m \
+            customresourcedefinition/gatewayclasses.gateway.networking.k8s.io \
+            customresourcedefinition/gateways.gateway.networking.k8s.io \
+            customresourcedefinition/httproutes.gateway.networking.k8s.io
+      - name: Build and install Flareway
+        env:
+          KIND_CLUSTER_NAME: flareway-e2e
+          KO_DOCKER_REPO: kind.local
+        run: |
+          controller_image="$(bin/ko build --platform=linux/amd64 --bare ./cmd)"
+          kubectl apply --server-side -k config/crd
+          bin/kustomize build config/default | \
+            sed "s|image: controller:latest|image: ${controller_image}|" | \
+            kubectl apply -f -
+          kubectl -n flareway-system rollout status \
+            deployment/flareway-controller-manager --timeout=5m
+      - name: Run end-to-end tests
+        env:
+          FLAREWAY_E2E_CF_API_TOKEN: ${{ secrets.FLAREWAY_E2E_CF_API_TOKEN }}
+          FLAREWAY_E2E_CF_ACCOUNT_ID: ${{ secrets.FLAREWAY_E2E_CF_ACCOUNT_ID }}
+          FLAREWAY_E2E_ZONE: ${{ secrets.FLAREWAY_E2E_ZONE }}
+          FLAREWAY_E2E_LABELS: ${{ github.event_name == 'schedule' && 'public,access,warp' || inputs.labels || 'public,access' }}
+          FLAREWAY_E2E_WARP_DEVICE: ${{ vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
+          FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER: ${{ vars.FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER }}
+          FLAREWAY_E2E_DEVICE_PROFILE_KIND: ${{ github.event_name == 'workflow_dispatch' && inputs.device_profile_kind || 'Custom' }}
+          FLAREWAY_E2E_ALLOW_DEFAULT_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.device_profile_kind == 'Default' && '1' || '0' }}
+        run: |
+          if ! make e2e; then
+            mkdir -p artifacts/first-attempt
+            cp artifacts/e2e-latency.json artifacts/e2e-private-warp.json \
+              artifacts/first-attempt/ 2>/dev/null || true
+            rm -f artifacts/e2e-private-warp.json
+            make e2e
+          fi
+      - name: Classify private WARP result
+        if: always()
+        env:
+          REQUESTED_LABELS: ${{ github.event_name == 'schedule' && 'public,access,warp' || inputs.labels || 'public,access' }}
+          WARP_DEVICE: ${{ vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          labels = {value.strip() for value in os.environ["REQUESTED_LABELS"].split(",")}
+          if "warp" not in labels:
+              raise SystemExit(0)
+
+          path = Path("artifacts/e2e-private-warp.json")
+          if not path.exists() and os.environ["WARP_DEVICE"] != "1":
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps({
+                  "result": "blocked: runner",
+                  "reason": "workflow did not declare a registered WARP runner",
+                  "unregisteredPathChecked": False,
+              }, indent=2) + "\n")
+          if not path.exists():
+              print("::error::WARP_DEVICE=1 was set, but the test produced no private WARP classification")
+              raise SystemExit(1)
+
+          report = json.loads(path.read_text())
+          result = report.get("result")
+          if result not in {"pass", "blocked: plan", "blocked: runner"}:
+              print(f"::error::invalid private WARP classification: {result!r}")
+              raise SystemExit(1)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(f"## Private WARP e2e\n\n`{result}`\n")
+              if report.get("reason"):
+                  summary.write(f"\n{report['reason']}\n")
+          print(f"private WARP classification: {result}")
+          PY
+      - name: Collect controller diagnostics
+        if: always()
+        run: |
+          mkdir -p artifacts/cluster
+          kubectl -n flareway-system logs deployment/flareway-controller-manager \
+            --all-containers --ignore-errors > artifacts/cluster/controller.log 2>&1 || true
+          kubectl get \
+            cloudflareaccounts,cloudflaretunnels,accessapplications,accesspolicies,accessgroups,identityproviders,deviceposturerules,servicetokens,virtualnetworks,networkroutes,hostnameroutes,deviceprofiles,devicesettings,zerotrustorganizations,zerotrustgatewaypolicies,zerotrustlists,gateways,httproutes \
+            -A -o yaml > artifacts/cluster/resources.yaml 2>&1 || true
+          kubectl get pods,deployments,services,endpointslices \
+            -A -o wide > artifacts/cluster/workloads.txt 2>&1 || true
+          kubectl get events -A --sort-by=.lastTimestamp \
+            > artifacts/cluster/events.txt 2>&1 || true
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          sensitive = re.compile(
+              r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
+              r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
+              r'(\s*[":=]\s*)("[^"]*"|[^\s,}]+)'
+          )
+          bearer = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
+          for name in ("controller.log", "resources.yaml", "events.txt"):
+              path = Path("artifacts/cluster") / name
+              if path.exists():
+                  redacted = sensitive.sub(r'\1\2"[REDACTED]"', path.read_text())
+                  path.write_text(bearer.sub("Bearer [REDACTED]", redacted))
+          PY
+      - name: Upload end-to-end artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cloudflare-e2e-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: warn

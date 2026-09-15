@@ -1,0 +1,27 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessCustomPage
+metadata:
+  labels:
+    app.kubernetes.io/name: flareway
+    app.kubernetes.io/managed-by: kustomize
+  name: accesscustompage-sample
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  name: Example Access denied page
+  type: Forbidden
+  html: |
+    <!doctype html>
+    <html lang="en">
+      <head><meta charset="utf-8"><title>Access denied</title></head>
+      <body>
+        <main>
+          <h1>Access denied</h1>
+          <p>{{ message | escape }}</p>
+        </main>
+      </body>
+    </html>
+  contractVersion: 1
+  managementPolicy: Managed
+  deletionPolicy: Orphan

@@ -1,0 +1,16 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: AccessGroup
+metadata:
+  name: developers
+  namespace: default
+spec:
+  accountRef:
+    name: example-account
+  name: developers
+  include:
+  - emailDomain:
+      domain: example.com
+  managementPolicy: ObserveOnly
+  externalRef:
+    groupId: "00000000-0000-0000-0000-000000000002"
+  deletionPolicy: Orphan

@@ -1,0 +1,634 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: zerotrustorganizations.flareway.bhyoo.com
+spec:
+  group: flareway.bhyoo.com
+  names:
+    categories:
+    - flareway
+    kind: ZeroTrustOrganization
+    listKind: ZeroTrustOrganizationList
+    plural: zerotrustorganizations
+    shortNames:
+    - ztorg
+    singular: zerotrustorganization
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.authDomain
+      name: Auth Domain
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ZeroTrustOrganization manages the Cloudflare Zero Trust organization
+          singleton.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZeroTrustOrganizationSpec defines one account- or zone-scoped Access organization.
+              AuthDomain is create-only and is never sent by update operations.
+            properties:
+              accountRef:
+                description: |-
+                  LocalObjectReference contains enough information to let you locate the
+                  referenced object inside the same namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              allowAuthenticateViaWarp:
+                type: boolean
+              authDomain:
+                description: AuthDomain is required only when a Managed organization
+                  must be created.
+                type: string
+              autoRedirectToIdentity:
+                type: boolean
+              customPages:
+                description: ZeroTrustOrganizationCustomPageReferences selects organization
+                  deny pages.
+                properties:
+                  forbidden:
+                    description: AccessObjectReference selects a local managed object
+                      or a remote object ID.
+                    properties:
+                      externalId:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of name or externalId is required
+                      rule: has(self.name) != has(self.externalId)
+                  identityDenied:
+                    description: AccessObjectReference selects a local managed object
+                      or a remote object ID.
+                    properties:
+                      externalId:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of name or externalId is required
+                      rule: has(self.name) != has(self.externalId)
+                type: object
+              deletionPolicy:
+                default: Orphan
+                description: Organization deletion is always orphaning because Cloudflare
+                  exposes no delete endpoint.
+                enum:
+                - Delete
+                - Orphan
+                type: string
+              denyUnmatchedRequests:
+                type: boolean
+              denyUnmatchedRequestsExemptedZoneNames:
+                items:
+                  type: string
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-type: set
+              doh:
+                description: ZeroTrustOrganizationDOH configures account-scoped Access
+                  DoH authentication.
+                properties:
+                  jwtDuration:
+                    type: string
+                  serviceTokenRef:
+                    description: AccessObjectReference selects a local managed object
+                      or a remote object ID.
+                    properties:
+                      externalId:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of name or externalId is required
+                      rule: has(self.name) != has(self.externalId)
+                required:
+                - serviceTokenRef
+                type: object
+              isUiReadOnly:
+                type: boolean
+              loginDesign:
+                description: ZeroTrustOrganizationLoginDesign configures the Access
+                  login page.
+                properties:
+                  backgroundColor:
+                    type: string
+                  footerText:
+                    type: string
+                  headerText:
+                    type: string
+                  logoPath:
+                    type: string
+                  textColor:
+                    type: string
+                type: object
+              managementPolicy:
+                default: ObserveOnly
+                description: ManagementPolicy controls whether Flareway mutates a
+                  remote resource.
+                enum:
+                - Managed
+                - ObserveOnly
+                type: string
+              mfaConfig:
+                description: ZeroTrustOrganizationMFAConfig configures organization-wide
+                  MFA.
+                properties:
+                  allowedAuthenticators:
+                    items:
+                      description: ZeroTrustOrganizationMFAAuthenticator is an Access
+                        MFA method.
+                      enum:
+                      - Totp
+                      - Biometrics
+                      - SecurityKey
+                      - PivKey
+                      - SshFido2Key
+                      type: string
+                    maxItems: 5
+                    type: array
+                    x-kubernetes-list-type: set
+                  amrMatchingSessionDuration:
+                    type: string
+                  requiredAaguids:
+                    type: string
+                  sessionDuration:
+                    type: string
+                type: object
+              mfaPivKeyRequirements:
+                description: ZeroTrustOrganizationMFAPIVKeyRequirements configures
+                  hardware SSH keys.
+                properties:
+                  pinPolicy:
+                    description: ZeroTrustOrganizationPIVPinPolicy controls PIV PIN
+                      prompting.
+                    enum:
+                    - Never
+                    - Once
+                    - Always
+                    type: string
+                  requireFipsDevice:
+                    type: boolean
+                  sshKeySizes:
+                    items:
+                      format: int64
+                      type: integer
+                    maxItems: 6
+                    type: array
+                    x-kubernetes-list-type: set
+                  sshKeyTypes:
+                    items:
+                      description: ZeroTrustOrganizationPIVSSHKeyType is an allowed
+                        SSH key algorithm.
+                      enum:
+                      - Ecdsa
+                      - Ed25519
+                      - Rsa
+                      type: string
+                    maxItems: 3
+                    type: array
+                    x-kubernetes-list-type: set
+                  touchPolicy:
+                    description: ZeroTrustOrganizationPIVTouchPolicy controls hardware-key
+                      touch prompting.
+                    enum:
+                    - Never
+                    - Always
+                    - Cached
+                    type: string
+                type: object
+              mfaRequiredForAllApps:
+                type: boolean
+              name:
+                type: string
+              sessionDuration:
+                type: string
+              uiReadOnlyToggleReason:
+                type: string
+              userRevocation:
+                description: ZeroTrustOrganizationUserRevocation requests one idempotent
+                  user revocation.
+                properties:
+                  devices:
+                    type: boolean
+                  email:
+                    minLength: 1
+                    type: string
+                  requestedAt:
+                    format: date-time
+                    type: string
+                  userUid:
+                    type: string
+                  warpSessionReauth:
+                    type: boolean
+                required:
+                - email
+                type: object
+              userSeatExpirationInactiveTime:
+                type: string
+              warpAuthNonBrowser401:
+                type: boolean
+              warpAuthSessionDuration:
+                type: string
+              zone:
+                description: Zone is an optional DNS zone name from CloudflareAccount.status.verified.zones.
+                type: string
+            required:
+            - accountRef
+            type: object
+            x-kubernetes-validations:
+            - message: authDomain cannot change once set
+              rule: '!has(oldSelf.authDomain) || (has(self.authDomain) && self.authDomain
+                == oldSelf.authDomain)'
+          status:
+            description: ZeroTrustOrganizationStatus records bounded, non-secret observed
+              state.
+            properties:
+              authDomain:
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observed:
+                description: |-
+                  ZeroTrustOrganizationValues contains mutable organization settings returned
+                  by Cloudflare. Pointers let WouldApply distinguish false, empty, and omitted.
+                properties:
+                  allowAuthenticateViaWarp:
+                    type: boolean
+                  autoRedirectToIdentity:
+                    type: boolean
+                  customPages:
+                    description: ZeroTrustOrganizationCustomPageValues contains observed
+                      custom-page IDs.
+                    properties:
+                      forbidden:
+                        type: string
+                      identityDenied:
+                        type: string
+                    type: object
+                  denyUnmatchedRequests:
+                    type: boolean
+                  denyUnmatchedRequestsExemptedZoneNames:
+                    items:
+                      type: string
+                    maxItems: 1000
+                    type: array
+                    x-kubernetes-list-type: set
+                  doh:
+                    description: ZeroTrustOrganizationDOHValues contains non-secret
+                      observed DoH settings.
+                    properties:
+                      jwtDuration:
+                        type: string
+                      serviceTokenId:
+                        type: string
+                    type: object
+                  isUiReadOnly:
+                    type: boolean
+                  loginDesign:
+                    description: ZeroTrustOrganizationLoginDesign configures the Access
+                      login page.
+                    properties:
+                      backgroundColor:
+                        type: string
+                      footerText:
+                        type: string
+                      headerText:
+                        type: string
+                      logoPath:
+                        type: string
+                      textColor:
+                        type: string
+                    type: object
+                  mfaConfig:
+                    description: ZeroTrustOrganizationMFAConfig configures organization-wide
+                      MFA.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: ZeroTrustOrganizationMFAAuthenticator is an
+                            Access MFA method.
+                          enum:
+                          - Totp
+                          - Biometrics
+                          - SecurityKey
+                          - PivKey
+                          - SshFido2Key
+                          type: string
+                        maxItems: 5
+                        type: array
+                        x-kubernetes-list-type: set
+                      amrMatchingSessionDuration:
+                        type: string
+                      requiredAaguids:
+                        type: string
+                      sessionDuration:
+                        type: string
+                    type: object
+                  mfaPivKeyRequirements:
+                    description: ZeroTrustOrganizationMFAPIVKeyRequirements configures
+                      hardware SSH keys.
+                    properties:
+                      pinPolicy:
+                        description: ZeroTrustOrganizationPIVPinPolicy controls PIV
+                          PIN prompting.
+                        enum:
+                        - Never
+                        - Once
+                        - Always
+                        type: string
+                      requireFipsDevice:
+                        type: boolean
+                      sshKeySizes:
+                        items:
+                          format: int64
+                          type: integer
+                        maxItems: 6
+                        type: array
+                        x-kubernetes-list-type: set
+                      sshKeyTypes:
+                        items:
+                          description: ZeroTrustOrganizationPIVSSHKeyType is an allowed
+                            SSH key algorithm.
+                          enum:
+                          - Ecdsa
+                          - Ed25519
+                          - Rsa
+                          type: string
+                        maxItems: 3
+                        type: array
+                        x-kubernetes-list-type: set
+                      touchPolicy:
+                        description: ZeroTrustOrganizationPIVTouchPolicy controls
+                          hardware-key touch prompting.
+                        enum:
+                        - Never
+                        - Always
+                        - Cached
+                        type: string
+                    type: object
+                  mfaRequiredForAllApps:
+                    type: boolean
+                  name:
+                    type: string
+                  sessionDuration:
+                    type: string
+                  uiReadOnlyToggleReason:
+                    type: string
+                  userSeatExpirationInactiveTime:
+                    type: string
+                  warpAuthNonBrowser401:
+                    type: boolean
+                  warpAuthSessionDuration:
+                    type: string
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              observedUserRevocationRequest:
+                format: date-time
+                type: string
+              wouldApply:
+                description: |-
+                  ZeroTrustOrganizationValues contains mutable organization settings returned
+                  by Cloudflare. Pointers let WouldApply distinguish false, empty, and omitted.
+                properties:
+                  allowAuthenticateViaWarp:
+                    type: boolean
+                  autoRedirectToIdentity:
+                    type: boolean
+                  customPages:
+                    description: ZeroTrustOrganizationCustomPageValues contains observed
+                      custom-page IDs.
+                    properties:
+                      forbidden:
+                        type: string
+                      identityDenied:
+                        type: string
+                    type: object
+                  denyUnmatchedRequests:
+                    type: boolean
+                  denyUnmatchedRequestsExemptedZoneNames:
+                    items:
+                      type: string
+                    maxItems: 1000
+                    type: array
+                    x-kubernetes-list-type: set
+                  doh:
+                    description: ZeroTrustOrganizationDOHValues contains non-secret
+                      observed DoH settings.
+                    properties:
+                      jwtDuration:
+                        type: string
+                      serviceTokenId:
+                        type: string
+                    type: object
+                  isUiReadOnly:
+                    type: boolean
+                  loginDesign:
+                    description: ZeroTrustOrganizationLoginDesign configures the Access
+                      login page.
+                    properties:
+                      backgroundColor:
+                        type: string
+                      footerText:
+                        type: string
+                      headerText:
+                        type: string
+                      logoPath:
+                        type: string
+                      textColor:
+                        type: string
+                    type: object
+                  mfaConfig:
+                    description: ZeroTrustOrganizationMFAConfig configures organization-wide
+                      MFA.
+                    properties:
+                      allowedAuthenticators:
+                        items:
+                          description: ZeroTrustOrganizationMFAAuthenticator is an
+                            Access MFA method.
+                          enum:
+                          - Totp
+                          - Biometrics
+                          - SecurityKey
+                          - PivKey
+                          - SshFido2Key
+                          type: string
+                        maxItems: 5
+                        type: array
+                        x-kubernetes-list-type: set
+                      amrMatchingSessionDuration:
+                        type: string
+                      requiredAaguids:
+                        type: string
+                      sessionDuration:
+                        type: string
+                    type: object
+                  mfaPivKeyRequirements:
+                    description: ZeroTrustOrganizationMFAPIVKeyRequirements configures
+                      hardware SSH keys.
+                    properties:
+                      pinPolicy:
+                        description: ZeroTrustOrganizationPIVPinPolicy controls PIV
+                          PIN prompting.
+                        enum:
+                        - Never
+                        - Once
+                        - Always
+                        type: string
+                      requireFipsDevice:
+                        type: boolean
+                      sshKeySizes:
+                        items:
+                          format: int64
+                          type: integer
+                        maxItems: 6
+                        type: array
+                        x-kubernetes-list-type: set
+                      sshKeyTypes:
+                        items:
+                          description: ZeroTrustOrganizationPIVSSHKeyType is an allowed
+                            SSH key algorithm.
+                          enum:
+                          - Ecdsa
+                          - Ed25519
+                          - Rsa
+                          type: string
+                        maxItems: 3
+                        type: array
+                        x-kubernetes-list-type: set
+                      touchPolicy:
+                        description: ZeroTrustOrganizationPIVTouchPolicy controls
+                          hardware-key touch prompting.
+                        enum:
+                        - Never
+                        - Always
+                        - Cached
+                        type: string
+                    type: object
+                  mfaRequiredForAllApps:
+                    type: boolean
+                  name:
+                    type: string
+                  sessionDuration:
+                    type: string
+                  uiReadOnlyToggleReason:
+                    type: string
+                  userSeatExpirationInactiveTime:
+                    type: string
+                  warpAuthNonBrowser401:
+                    type: boolean
+                  warpAuthSessionDuration:
+                    type: string
+                type: object
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: ZeroTrustOrganization must be named default
+          rule: self.metadata.name == 'default'
+    served: true
+    storage: true
+    subresources:
+      status: {}

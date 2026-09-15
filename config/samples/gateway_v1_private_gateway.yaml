@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/allow-origin-jwt-disable: "true"
+---
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: CloudflareTunnel
+metadata:
+  name: private-gateway
+  namespace: demo
+spec:
+  accountRef:
+    name: example-account
+  tunnel:
+    name: flareway-example-private-gateway
+  configuration:
+    # Gateway owns the complete remote ingress program for this tunnel.
+    mode: Gateway
+  managementPolicy: Managed
+  deletionPolicy: Delete
+  dns:
+    mode: External
+  listeners:
+  - name: admin-private
+    exposure: Private
+    hostnameRoute:
+      create: false
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: private-gateway
+  namespace: demo
+spec:
+  gatewayClassName: flareway
+  infrastructure:
+    parametersRef:
+      group: flareway.bhyoo.com
+      kind: CloudflareTunnel
+      name: private-gateway
+  listeners:
+  - name: admin-private
+    hostname: admin.internal.example
+    port: 443
+    protocol: HTTPS
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        name: admin-internal-tls
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: private-admin
+  namespace: demo
+spec:
+  parentRefs:
+  - name: private-gateway
+    sectionName: admin-private
+  hostnames:
+  - admin.internal.example
+  rules:
+  - backendRefs:
+    - name: demo-admin
+      port: 9090

@@ -1,0 +1,14 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: ZeroTrustList
+metadata:
+  name: trusted-egress
+  namespace: flareway-system
+spec:
+  accountRef:
+    name: example-account
+  name: trusted-egress
+  type: IP
+  items:
+  - 203.0.113.0/24
+  managementPolicy: ObserveOnly
+  deletionPolicy: Orphan
