@@ -117,7 +117,7 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 		})
 		allowPolicy = object("flareway.bhyoo.com/v1alpha1", "AccessPolicy", namespace, "private-warp", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
-			"name":       namespace + "/private-warp", "decision": "allow",
+			"name":       namespace + "/private-warp", "decision": "Allow",
 			"include":          []any{map[string]any{"everyone": map[string]any{}}},
 			"managementPolicy": "Managed", "deletionPolicy": "Delete",
 		})

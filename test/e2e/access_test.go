@@ -70,7 +70,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		servicePolicy = object("flareway.bhyoo.com/v1alpha1", "AccessPolicy", namespace, "service-auth", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
 			"name":       namespace + "/service-auth",
-			"decision":   "nonIdentity",
+			"decision":   "NonIdentity",
 			"include": []any{map[string]any{
 				"serviceToken": map[string]any{"tokenRef": map[string]any{"name": serviceToken.GetName()}},
 			}},
@@ -80,7 +80,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		denyPolicy = object("flareway.bhyoo.com/v1alpha1", "AccessPolicy", namespace, "deny-everyone", map[string]any{
 			"accountRef":       map[string]any{"name": accountName},
 			"name":             namespace + "/deny-everyone",
-			"decision":         "deny",
+			"decision":         "Deny",
 			"include":          []any{map[string]any{"everyone": map[string]any{}}},
 			"managementPolicy": "Managed",
 			"deletionPolicy":   "Delete",
