@@ -261,13 +261,17 @@ verify-container: docker-build ## Verify the image filesystem, metadata, startup
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
-# PLATFORMS defines the target platforms for the published manager image.
-PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+# PLATFORMS optionally overrides the Linux platforms discovered from Dockerfile's pinned Go builder image.
+PLATFORMS ?=
 .PHONY: docker-buildx
-docker-buildx: ## Build and push the manager image for all supported platforms.
+docker-buildx: ## Build and push the manager image for every platform supported by the pinned Go builder.
 	- $(CONTAINER_TOOL) buildx create --name flareway-builder
 	$(CONTAINER_TOOL) buildx use flareway-builder
-	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} .
+	@platforms="$(PLATFORMS)"; \
+	if [[ -z "$${platforms}" ]]; then \
+		platforms="$$(CONTAINER_TOOL="$(CONTAINER_TOOL)" python3 hack/release-platforms.py)"; \
+	fi; \
+	$(CONTAINER_TOOL) buildx build --push --platform="$${platforms}" --tag ${IMG} .
 	- $(CONTAINER_TOOL) buildx rm flareway-builder
 
 .PHONY: build-installer

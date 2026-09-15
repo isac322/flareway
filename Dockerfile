@@ -10,6 +10,7 @@ FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG TARGETVARIANT
 
 WORKDIR /workspace
 
@@ -22,8 +23,12 @@ COPY api/ api/
 COPY internal/ internal/
 
 RUN --mount=type=cache,id=flareway-gomod,target=/go/pkg/mod,sharing=locked \
-    --mount=type=cache,id=flareway-gobuild-${TARGETOS}-${TARGETARCH},target=/root/.cache/go-build,sharing=locked \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    --mount=type=cache,id=flareway-gobuild-${TARGETOS}-${TARGETARCH}-${TARGETVARIANT},target=/root/.cache/go-build,sharing=locked \
+    set -eu; \
+    if [ "${TARGETARCH}" = "arm" ] && [ -n "${TARGETVARIANT}" ]; then \
+      export GOARM="${TARGETVARIANT#v}"; \
+    fi; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go build \
       -mod=readonly \
       -trimpath \

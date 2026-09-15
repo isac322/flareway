@@ -47,7 +47,7 @@ jobs:
     permissions:
       actions: read
     steps:
-      - name: Require a successful scheduled e2e run from the last 24 hours
+      - name: Require recent successful full e2e evidence
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -101,14 +101,19 @@ jobs:
               with urllib.request.urlopen(location, timeout=60) as response:
                   return response.read()
 
-          query = urllib.parse.urlencode({
-              "branch": "main",
-              "event": "schedule",
-              "per_page": 20,
-          })
-          runs = request_json(
-              f"/actions/workflows/e2e.yaml/runs?{query}"
-          ).get("workflow_runs", [])
+          runs = []
+          for event in ("schedule", "workflow_dispatch"):
+              query = urllib.parse.urlencode({
+                  "branch": "main",
+                  "event": event,
+                  "per_page": 20,
+              })
+              runs.extend(
+                  request_json(
+                      f"/actions/workflows/e2e.yaml/runs?{query}"
+                  ).get("workflow_runs", [])
+              )
+          runs.sort(key=lambda run: run.get("updated_at") or "", reverse=True)
           cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
           failures = []
           selected = None
@@ -182,8 +187,9 @@ jobs:
 
           if selected is None:
               print(
-                  "::error::No successful scheduled e2e run completed in the last "
-                  "24 hours with public, access, and WARP classification evidence."
+                  "::error::No successful scheduled or manually requested e2e run "
+                  "completed in the last 24 hours with public, access, and WARP "
+                  "classification evidence."
               )
               for failure in failures:
                   print(f"::error::{failure}")
@@ -264,7 +270,7 @@ jobs:
       - quality
       - conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: release
     env:
       RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
@@ -284,7 +290,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Install pinned release tools
-        run: make ko cosign helm
+        run: make cosign helm
       - name: Authenticate to GitHub Container Registry
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -293,23 +299,73 @@ jobs:
             --username "${GITHUB_ACTOR}" --password-stdin
           echo "${GHCR_TOKEN}" | bin/helm registry login ghcr.io \
             --username "${GITHUB_ACTOR}" --password-stdin
+      - name: Set up Docker Buildx
+        run: |
+          docker buildx create \
+            --driver docker-container \
+            --name flareway-release \
+            --use
+          docker buildx inspect --bootstrap
+      - name: Resolve release platforms
+        id: platforms
+        run: |
+          mkdir -p dist
+          platforms="$(python3 hack/release-platforms.py)"
+          printf '%s\n' "${platforms}" | tee dist/platforms.txt
+          echo "platforms=${platforms}" >> "${GITHUB_OUTPUT}"
       - name: Build and push multi-architecture image with SBOM
         id: image
+        env:
+          RELEASE_PLATFORMS: ${{ steps.platforms.outputs.platforms }}
         run: |
-          mkdir -p dist/sbom
-          image_ref="$(
-            bin/ko build \
-              --bare \
-              --platform=linux/amd64,linux/arm64 \
-              --tags="${RELEASE_TAG}" \
-              --sbom=spdx \
-              --sbom-dir=dist/sbom \
-              ./cmd
+          image_name="ghcr.io/isac322/flareway"
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker buildx build \
+            --platform="${RELEASE_PLATFORMS}" \
+            --tag="${image_name}:${RELEASE_TAG}" \
+            --build-arg="VERSION=${RELEASE_TAG}" \
+            --build-arg="REVISION=${GITHUB_SHA}" \
+            --build-arg="CREATED=${created}" \
+            --provenance=mode=max \
+            --sbom=true \
+            --metadata-file=dist/build-metadata.json \
+            --push \
+            .
+          digest="$(
+            python3 - <<'PY'
+          import json
+
+          with open("dist/build-metadata.json", encoding="utf-8") as metadata_file:
+              print(json.load(metadata_file)["containerimage.digest"])
+          PY
           )"
-          if [[ "${image_ref}" != ghcr.io/isac322/flareway*@sha256:* ]]; then
-            echo "::error::ko did not return the expected digest reference: ${image_ref}"
+          if [[ ! "${digest}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Buildx did not return an image-index digest: ${digest}"
             exit 1
           fi
+          image_ref="${image_name}@${digest}"
+          published_platforms="$(
+            python3 hack/release-platforms.py --image "${image_ref}"
+          )"
+          if [[ "${published_platforms}" != "${RELEASE_PLATFORMS}" ]]; then
+            echo "::error::Published platforms ${published_platforms} do not match ${RELEASE_PLATFORMS}"
+            exit 1
+          fi
+          docker buildx imagetools inspect "${image_ref}" \
+            --format '{{ json .SBOM }}' > dist/image.spdx.json
+          RELEASE_PLATFORMS="${RELEASE_PLATFORMS}" python3 - <<'PY'
+          import json
+          import os
+
+          with open("dist/image.spdx.json", encoding="utf-8") as sbom_file:
+              sboms = json.load(sbom_file)
+          expected = len(os.environ["RELEASE_PLATFORMS"].split(","))
+          if not isinstance(sboms, dict) or len(sboms) != expected:
+              raise SystemExit(
+                  f"expected {expected} platform SBOMs, found "
+                  f"{len(sboms) if isinstance(sboms, dict) else 0}"
+              )
+          PY
           printf '%s\n' "${image_ref}" > dist/image-digest.txt
           echo "ref=${image_ref}" >> "${GITHUB_OUTPUT}"
       - name: Sign and verify the image
@@ -368,7 +424,9 @@ jobs:
             dist/flareway-${{ needs.metadata.outputs.version }}.tgz
             dist/SHA256SUMS
             dist/image-digest.txt
+            dist/platforms.txt
+            dist/build-metadata.json
             dist/chart-ref.txt
             dist/chart-push.txt
             dist/cosign-verification.json
-            dist/sbom/*
+            dist/image.spdx.json
