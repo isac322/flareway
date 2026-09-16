@@ -123,6 +123,29 @@ func TestBuildDeploymentCloudflareReadyContract(t *testing.T) {
 	}
 }
 
+func TestBuildCloudflaredTransportProtocolUsesWireValues(t *testing.T) {
+	for _, test := range []struct {
+		protocol v1alpha1.ConnectorProtocol
+		want     string
+	}{
+		{protocol: v1alpha1.ConnectorProtocolAuto, want: "auto"},
+		{protocol: v1alpha1.ConnectorProtocolQUIC, want: "quic"},
+		{protocol: v1alpha1.ConnectorProtocolHTTP2, want: "http2"},
+	} {
+		t.Run(string(test.protocol), func(t *testing.T) {
+			gw := testGateway(false)
+			gw.Cloudflare = &ir.Cloudflare{TokenSecretName: "flareway-tunnel-explicit"}
+			cfg := testConfig(false)
+			cfg.Spec.Connector.Protocol = test.protocol
+			deployment := BuildDeployment(gw, cfg, BootstrapConfigMapName(gw), "hash")
+			transport := envVar(deployment.Spec.Template.Spec.Containers[0], "TUNNEL_TRANSPORT_PROTOCOL")
+			if transport == nil || transport.Value != test.want {
+				t.Fatalf("cloudflared transport protocol = %#v, want %q", transport, test.want)
+			}
+		})
+	}
+}
+
 func TestBuildPrivateDNSDataplaneIsPodLocal(t *testing.T) {
 	gw := testGateway(false)
 	gw.Cloudflare = &ir.Cloudflare{TokenSecretName: "flareway-tunnel-private"}

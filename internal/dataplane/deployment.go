@@ -18,6 +18,7 @@ package dataplane
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -225,7 +226,7 @@ func buildCloudflaredContainer(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig)
 	env := []corev1.EnvVar{
 		{Name: "TUNNEL_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: TunnelTokenSecretName(gw)}, Key: "token"}}},
 		{Name: "TUNNEL_METRICS", Value: "0.0.0.0:2000"},
-		{Name: "TUNNEL_TRANSPORT_PROTOCOL", Value: string(protocol)},
+		{Name: "TUNNEL_TRANSPORT_PROTOCOL", Value: strings.ToLower(string(protocol))},
 		{Name: "TUNNEL_GRACE_PERIOD", Value: gracePeriod.String()},
 		{Name: "TUNNEL_LOGLEVEL", Value: "info"},
 		{Name: "TUNNEL_EDGE_IP_VERSION", Value: "auto"},
