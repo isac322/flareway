@@ -100,6 +100,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		accessApplication = object("flareway.bhyoo.com/v1alpha1", "AccessApplication", namespace, "access", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
 			"type":       "SelfHosted",
+			"selfHosted": map[string]any{},
 			"targetRefs": []any{map[string]any{
 				"group": "gateway.networking.k8s.io", "kind": "Gateway",
 				"name": accessGateway.GetName(), "sectionName": "web",
@@ -130,6 +131,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		mixedApplication = object("flareway.bhyoo.com/v1alpha1", "AccessApplication", namespace, "mixed", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
 			"type":       "SelfHosted",
+			"selfHosted": map[string]any{},
 			"targetRefs": []any{map[string]any{
 				"group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
 				"name": mixedRoute.GetName(), "sectionName": "dashboard",
@@ -314,7 +316,16 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		}
 		return tunnelHostnameGuard(checkCtx, tunnel, host, "Forwarding")
 	})
-	Expect(err).NotTo(HaveOccurred(), "wait for protected hostname %s", host)
+	Expect(
+		err,
+	).NotTo(
+		HaveOccurred(),
+		"wait for protected hostname %s; application conditions: %s; Gateway conditions: %s; Tunnel conditions: %s",
+		host,
+		conditionSummary(ctx, application),
+		conditionSummary(ctx, gateway),
+		conditionSummary(ctx, tunnel),
+	)
 	recordLatency("access-ready-"+application.GetName(), time.Since(started))
 }
 

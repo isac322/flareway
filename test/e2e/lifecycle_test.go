@@ -77,7 +77,7 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 		duration, err := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			return hasCondition(checkCtx, tunnel, "Ready", "True")
 		})
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(ctx, tunnel))
 		recordLatency("lifecycle-adoption-ready", duration)
 
 		Expect(kubeClient.Delete(ctx, tunnel)).To(Succeed())

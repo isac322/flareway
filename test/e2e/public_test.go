@@ -75,7 +75,7 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 		duration, err := poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			return hasCondition(checkCtx, gateway, "Programmed", "True")
 		})
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred(), "Gateway conditions: %s", conditionSummary(ctx, gateway))
 		recordLatency("public-programmed", duration)
 
 		duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
@@ -89,7 +89,7 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 			tunnelID = value
 			return hasCondition(checkCtx, tunnel, "Ready", "True")
 		})
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(ctx, tunnel))
 		recordLatency("public-tunnel-ready", duration)
 
 		status, body, err := edgeRequest(ctx, "/get")

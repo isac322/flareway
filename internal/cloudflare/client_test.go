@@ -484,6 +484,10 @@ func TestGetTunnelObservesLocalAndForeignTunnelTypes(t *testing.T) {
 		switch request.URL.Path {
 		case "/accounts/account/cfd_tunnel/local-tunnel":
 			_, _ = fmt.Fprint(response, `{"success":true,"errors":[],"messages":[],"result":{"id":"local-tunnel","account_tag":"account","name":"local","status":"inactive","tun_type":"cfd_tunnel","config_src":"local","created_at":"2026-09-01T00:00:00Z","conns_active_at":"2026-09-02T00:00:00Z","conns_inactive_at":"2026-09-03T00:00:00Z"}}`)
+		case "/accounts/account/cfd_tunnel/remote-config-fallback":
+			_, _ = fmt.Fprint(response, `{"success":true,"errors":[],"messages":[],"result":{"id":"remote-config-fallback","account_tag":"account","name":"remote","status":"inactive","tun_type":"cfd_tunnel","remote_config":true}}`)
+		case "/accounts/account/cfd_tunnel/local-config-fallback":
+			_, _ = fmt.Fprint(response, `{"success":true,"errors":[],"messages":[],"result":{"id":"local-config-fallback","account_tag":"account","name":"local","status":"inactive","tun_type":"cfd_tunnel","remote_config":false}}`)
 		case "/accounts/account/cfd_tunnel/foreign-tunnel":
 			_, _ = fmt.Fprint(response, `{"success":true,"errors":[],"messages":[],"result":{"id":"foreign-tunnel","account_tag":"account","name":"foreign","status":"down","tun_type":"magic","config_src":"cloudflare"}}`)
 		case "/accounts/account/cfd_tunnel/unknown-tunnel":
@@ -512,6 +516,14 @@ func TestGetTunnelObservesLocalAndForeignTunnelTypes(t *testing.T) {
 		local.ConnectionsActiveAt == nil ||
 		local.ConnectionsInactiveAt == nil {
 		t.Fatalf("local GetTunnel() = %#v, %v", local, err)
+	}
+	remoteFallback, err := client.GetTunnel(context.Background(), "remote-config-fallback")
+	if err != nil || remoteFallback.ConfigSource != TunnelConfigSourceCloudflare {
+		t.Fatalf("remote fallback GetTunnel() = %#v, %v", remoteFallback, err)
+	}
+	localFallback, err := client.GetTunnel(context.Background(), "local-config-fallback")
+	if err != nil || localFallback.ConfigSource != TunnelConfigSourceLocal {
+		t.Fatalf("local fallback GetTunnel() = %#v, %v", localFallback, err)
 	}
 	foreign, err := client.GetTunnel(context.Background(), "foreign-tunnel")
 	if err != nil || foreign.Type != TunnelTypeMagic || foreign.ConfigSource != TunnelConfigSourceCloudflare || foreign.Status != TunnelStatusDown {

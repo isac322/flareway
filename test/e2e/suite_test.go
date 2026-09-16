@@ -299,6 +299,25 @@ func hasCondition(ctx context.Context, template *unstructured.Unstructured, cond
 	return false, nil
 }
 
+func conditionSummary(ctx context.Context, template *unstructured.Unstructured) string {
+	current := template.DeepCopy()
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(template), current); err != nil {
+		return fmt.Sprintf("get %s/%s: %v", template.GetKind(), client.ObjectKeyFromObject(template), err)
+	}
+	conditions, found, err := unstructured.NestedSlice(current.Object, "status", "conditions")
+	if err != nil {
+		return fmt.Sprintf("read %s/%s conditions: %v", template.GetKind(), client.ObjectKeyFromObject(template), err)
+	}
+	if !found {
+		return "conditions are absent"
+	}
+	payload, err := json.Marshal(conditions)
+	if err != nil {
+		return fmt.Sprintf("encode conditions: %v", err)
+	}
+	return string(payload)
+}
+
 func object(apiVersion, kind, objectNamespace, name string, spec map[string]any) *unstructured.Unstructured {
 	value := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": apiVersion,

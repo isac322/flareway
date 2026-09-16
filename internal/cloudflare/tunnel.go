@@ -522,7 +522,17 @@ func tunnelFromSDK(remote *shared.CloudflareTunnel) (Tunnel, error) {
 	if err != nil {
 		return Tunnel{}, err
 	}
-	configSource, err := tunnelConfigSourceFromWire(string(remote.ConfigSrc))
+	wireConfigSource := string(remote.ConfigSrc)
+	if wireConfigSource == "" {
+		var remoteConfig bool
+		if raw := remote.JSON.RemoteConfig.Raw(); raw != "" && json.Unmarshal([]byte(raw), &remoteConfig) == nil {
+			wireConfigSource = string(shared.CloudflareTunnelConfigSrcLocal)
+			if remoteConfig {
+				wireConfigSource = string(shared.CloudflareTunnelConfigSrcCloudflare)
+			}
+		}
+	}
+	configSource, err := tunnelConfigSourceFromWire(wireConfigSource)
 	if err != nil {
 		return Tunnel{}, err
 	}
