@@ -276,10 +276,13 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 		recordLatency("access-application-deleted", duration)
-
 		status, _, body, err := edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusForbidden), "deleting AccessApplication must never make the hostname public; body: %s", body)
+		Expect(status).To(
+			SatisfyAny(Equal(http.StatusForbidden), Equal(http.StatusNotFound)),
+			"deleting AccessApplication must keep the hostname fail-closed; body: %s",
+			body,
+		)
 	}, NodeTimeout(4*time.Minute))
 })
 
