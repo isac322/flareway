@@ -77,6 +77,9 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 		duration, err := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			return hasCondition(checkCtx, tunnel, "Ready", "True")
 		})
+		if err != nil {
+			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
+		}
 		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(ctx, tunnel))
 		recordLatency("lifecycle-adoption-ready", duration)
 

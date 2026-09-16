@@ -316,6 +316,9 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		}
 		return tunnelHostnameGuard(checkCtx, tunnel, host, "Forwarding")
 	})
+	if err != nil {
+		GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
+	}
 	Expect(
 		err,
 	).NotTo(

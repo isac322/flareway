@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,6 +70,7 @@ type suiteConfig struct {
 var (
 	configuration   suiteConfig
 	kubeClient      client.Client
+	kubeClientset   kubernetes.Interface
 	cloudflareAPI   *cfapi.Client
 	runID           string
 	namespace       string
@@ -135,6 +137,8 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
 	kubeClient, err = client.New(restConfig, client.Options{Scheme: scheme})
 	Expect(err).NotTo(HaveOccurred(), "create Kubernetes client")
+	kubeClientset, err = kubernetes.NewForConfig(restConfig)
+	Expect(err).NotTo(HaveOccurred(), "create Kubernetes clientset")
 
 	cloudflareAPI = cfapi.New(configuration.Token, configuration.AccountID, configuration.BaseURL)
 	Expect(cloudflareAPI.ResolveZone(ctx, configuration.Zone)).To(Succeed())
@@ -316,6 +320,39 @@ func conditionSummary(ctx context.Context, template *unstructured.Unstructured) 
 		return fmt.Sprintf("encode conditions: %v", err)
 	}
 	return string(payload)
+}
+
+func dataplaneDiagnostics() string {
+	if kubeClientset == nil || namespace == "" {
+		return "Kubernetes clientset or E2E namespace is unavailable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pods, err := kubeClientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Sprintf("list dataplane Pods: %v", err)
+	}
+	var summary strings.Builder
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		fmt.Fprintf(&summary, "Pod %s phase=%s conditions=%v containerStatuses=%v\n", pod.Name, pod.Status.Phase, pod.Status.Conditions, pod.Status.ContainerStatuses)
+		for _, container := range pod.Spec.Containers {
+			if container.Name != "cloudflared" && container.Name != "envoy" {
+				continue
+			}
+			tailLines := int64(80)
+			logs, logErr := kubeClientset.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+				Container: container.Name,
+				TailLines: &tailLines,
+			}).DoRaw(ctx)
+			if logErr != nil {
+				fmt.Fprintf(&summary, "  %s logs: %v\n", container.Name, logErr)
+				continue
+			}
+			fmt.Fprintf(&summary, "  %s logs:\n%s\n", container.Name, logs)
+		}
+	}
+	return summary.String()
 }
 
 func object(apiVersion, kind, objectNamespace, name string, spec map[string]any) *unstructured.Unstructured {

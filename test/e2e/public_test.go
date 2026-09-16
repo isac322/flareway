@@ -75,6 +75,9 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 		duration, err := poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			return hasCondition(checkCtx, gateway, "Programmed", "True")
 		})
+		if err != nil {
+			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
+		}
 		Expect(err).NotTo(HaveOccurred(), "Gateway conditions: %s", conditionSummary(ctx, gateway))
 		recordLatency("public-programmed", duration)
 
