@@ -316,8 +316,13 @@ func (t *AckTracker) ConvergenceDetails(node, version string) string {
 		if !t.subscribedLocked(node, typeURL) {
 			continue
 		}
-		if t.acked[node][typeURL] != version {
-			missing = append(missing, shortTypeURL(typeURL))
+		ackedVersion := t.acked[node][typeURL]
+		if ackedVersion != version {
+			state := "no ACK"
+			if ackedVersion != "" {
+				state = "got " + shortVersion(ackedVersion)
+			}
+			missing = append(missing, fmt.Sprintf("%s(%s)", shortTypeURL(typeURL), state))
 		}
 	}
 	sort.Strings(missing)
@@ -325,7 +330,12 @@ func (t *AckTracker) ConvergenceDetails(node, version string) string {
 		return fmt.Sprintf("NACK %s: %s", shortTypeURL(nack.TypeURL), nack.Detail)
 	}
 	if len(missing) > 0 {
-		return fmt.Sprintf("%d live stream(s), missing %s", streams, strings.Join(missing, ","))
+		return fmt.Sprintf(
+			"want %s, %d live stream(s), missing %s",
+			shortVersion(version),
+			streams,
+			strings.Join(missing, ","),
+		)
 	}
 	return ""
 }

@@ -166,8 +166,8 @@ func TestAckTrackerRequiresLiveStreamForNonEmptySnapshot(t *testing.T) {
 	tracker.OnResponse(7, request, &discoveryv3.DeltaDiscoveryResponse{
 		TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1",
 	})
-	if details := tracker.ConvergenceDetails(node, version); details != "1 live stream(s), missing Listener" {
-		t.Fatalf("convergence details = %q, want missing Listener", details)
+	if details := tracker.ConvergenceDetails(node, version); details != "want v1, 1 live stream(s), missing Listener(no ACK)" {
+		t.Fatalf("convergence details = %q, want missing Listener without an ACK", details)
 	}
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
 	if !tracker.IsACKed(node, version) {
