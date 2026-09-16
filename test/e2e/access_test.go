@@ -318,6 +318,7 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 	})
 	if err != nil {
 		GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
+		GinkgoWriter.Printf("AUD Secret diagnostics:\n%s\n", audSecretDiagnostics())
 	}
 	Expect(
 		err,

@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -344,6 +345,41 @@ func statusSummary(template *unstructured.Unstructured) string {
 		return fmt.Sprintf("encode status: %v", err)
 	}
 	return string(payload)
+}
+
+func audSecretDiagnostics() string {
+	if kubeClientset == nil {
+		return "Kubernetes clientset is unavailable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	secrets, err := kubeClientset.CoreV1().Secrets("flareway-system").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Sprintf("list AUD Secrets: %v", err)
+	}
+	var summary strings.Builder
+	for index := range secrets.Items {
+		secret := &secrets.Items[index]
+		if !strings.HasPrefix(secret.Name, "aud-") {
+			continue
+		}
+		fmt.Fprintf(
+			&summary,
+			"Secret %s labels=%v application=%q applicationUID=%q applicationID=%q gateway=%q gatewayUID=%q ready=%q\n",
+			secret.Name,
+			secret.Labels,
+			secret.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey],
+			secret.Data[v1alpha1.AccessApplicationUIDSecretKey],
+			secret.Data[v1alpha1.AccessApplicationIDSecretKey],
+			secret.Data[v1alpha1.AccessApplicationGatewayNamespacedNameSecretKey],
+			secret.Data[v1alpha1.AccessApplicationGatewayUIDSecretKey],
+			secret.Data["ready"],
+		)
+	}
+	if summary.Len() == 0 {
+		return "no AUD Secrets found"
+	}
+	return summary.String()
 }
 
 func dataplaneDiagnostics() string {
