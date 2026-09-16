@@ -72,6 +72,41 @@ func TestAckTrackerIgnoresUnsubscribedTypes(t *testing.T) {
 	}
 }
 
+func TestAckTrackerAcceptsReconnectInitialResourceVersions(t *testing.T) {
+	resourceVersions := map[string]string{"listener-a": "resource-hash-a"}
+	fingerprint, err := fingerprintVersionMap(resourceVersions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{
+		Node:    &corev3.Node{Cluster: node},
+		TypeUrl: resourcev3.ClusterType,
+	})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl:                 resourcev3.ListenerType,
+		InitialResourceVersions: resourceVersions,
+	})
+	if !tracker.IsACKed(node, version) {
+		t.Fatalf("matching reconnect versions did not converge: %s", tracker.ConvergenceDetails(node, version))
+	}
+
+	mismatch := NewAckTracker()
+	mismatch.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint})
+	mismatch.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{
+		Node:                    &corev3.Node{Cluster: node},
+		TypeUrl:                 resourcev3.ListenerType,
+		InitialResourceVersions: map[string]string{"listener-a": "stale-hash"},
+	})
+	if mismatch.IsACKed(node, version) {
+		t.Fatal("stale reconnect versions converged without a response ACK")
+	}
+}
+
 func TestAckTrackerNewSubscriptionRequiresACK(t *testing.T) {
 	tracker := NewAckTracker()
 	node := "default/gateway"

@@ -140,11 +140,15 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if node := req.GetNode().GetCluster(); node != "" {
+	node := req.GetNode().GetCluster()
+	if node != "" {
 		t.nodes[streamID] = node
+	} else {
+		node = t.nodes[streamID]
 	}
 	t.subscribeLocked(streamID, req.GetTypeUrl())
 	if req.GetResponseNonce() == "" {
+		t.acceptInitialVersionsLocked(node, req.GetTypeUrl(), req.GetInitialResourceVersions())
 		return
 	}
 	byType := t.pending[streamID]
@@ -183,6 +187,36 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	byAckType[req.GetTypeUrl()] = pending.version
 	if nack, ok := t.nacks[pending.node]; ok && nack.Version == pending.version && nack.TypeURL == req.GetTypeUrl() {
 		delete(t.nacks, pending.node)
+	}
+}
+
+// acceptInitialVersionsLocked recognizes a reconnected Delta client that
+// reports it already holds the exact current resource versions. The snapshot
+// cache emits no response in that case, so the initial versions are the only
+// protocol evidence available for convergence.
+func (t *AckTracker) acceptInitialVersionsLocked(node, typeURL string, versions map[string]string) {
+	if node == "" || typeURL == "" || len(versions) == 0 {
+		return
+	}
+	expected, ok := t.expected[node]
+	if !ok {
+		return
+	}
+	if _, changed := expected.types[typeURL]; !changed {
+		return
+	}
+	fingerprint, err := fingerprintVersionMap(versions)
+	if err != nil || fingerprint != t.fingerprints[node][typeURL] {
+		return
+	}
+	byType := t.acked[node]
+	if byType == nil {
+		byType = make(map[string]string)
+		t.acked[node] = byType
+	}
+	byType[typeURL] = expected.version
+	if nack, found := t.nacks[node]; found && nack.Version == expected.version && nack.TypeURL == typeURL {
+		delete(t.nacks, node)
 	}
 }
 

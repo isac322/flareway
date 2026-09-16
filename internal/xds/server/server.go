@@ -241,15 +241,22 @@ func snapshotVersionAndFingerprints(snapshot *cachev3.Snapshot) (string, map[str
 		if len(snapshot.GetResources(typeURL)) == 0 {
 			continue
 		}
-		versionMap := snapshot.GetVersionMap(string(typeURL))
-		data, err := json.Marshal(versionMap)
+		fingerprint, err := fingerprintVersionMap(snapshot.GetVersionMap(string(typeURL)))
 		if err != nil {
-			return "", nil, fmt.Errorf("marshal resource fingerprints for %s: %w", typeURL, err)
+			return "", nil, fmt.Errorf("fingerprint resources for %s: %w", typeURL, err)
 		}
-		sum := sha256.Sum256(data)
-		fingerprints[string(typeURL)] = hex.EncodeToString(sum[:])
+		fingerprints[string(typeURL)] = fingerprint
 	}
 	return version, fingerprints, nil
+}
+
+func fingerprintVersionMap(versionMap map[string]string) (string, error) {
+	data, err := json.Marshal(versionMap)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 type loggerAdapter struct {
