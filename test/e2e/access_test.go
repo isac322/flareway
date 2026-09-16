@@ -329,6 +329,12 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		conditionSummary(gateway),
 		conditionSummary(tunnel),
 	)
+	var lastEdgeErr error
+	_, err = poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+		_, _, lastEdgeErr = edgeRequestTo(checkCtx, host, "/", nil)
+		return lastEdgeErr == nil, nil
+	})
+	Expect(err).NotTo(HaveOccurred(), "wait for edge hostname %s: %v", host, lastEdgeErr)
 	recordLatency("access-ready-"+application.GetName(), time.Since(started))
 }
 

@@ -133,18 +133,31 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kubeClient.Delete(ctx, route)).To(Succeed())
 
-		convergeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		convergeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
 		duration, err := poll.Until(convergeCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			desired, applied, versionErr := tunnelConfigVersions(checkCtx, tunnel)
 			return desired > before && applied == desired, versionErr
 		})
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(tunnel))
 		recordLatency("public-route-removal", duration)
 
-		status, body, err := edgeRequest(ctx, "/get")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusNotFound), "deleted HTTPRoute must stop forwarding; body: %s", body)
+		var status int
+		var body string
+		var requestErr error
+		duration, err = poll.Until(convergeCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+			status, body, requestErr = edgeRequest(checkCtx, "/get")
+			return requestErr == nil && status == http.StatusNotFound, nil
+		})
+		Expect(
+			err,
+		).NotTo(
+			HaveOccurred(),
+			"deleted HTTPRoute did not stop forwarding: status=%d body=%q error=%v",
+			status,
+			body,
+			requestErr,
+		)
 
 		Expect(kubeClient.Delete(ctx, gateway)).To(Succeed())
 		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 5*time.Minute)

@@ -49,6 +49,35 @@ func TestAckTrackerRequiresEveryExpectedType(t *testing.T) {
 	}
 }
 
+func TestAckTrackerCorrelatesNodeLessFollowupResponsesToStream(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	streamID := int64(17)
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"})
+
+	tracker.OnRequest(streamID, &discoveryv3.DeltaDiscoveryRequest{
+		Node:    &corev3.Node{Cluster: node},
+		TypeUrl: resourcev3.ListenerType,
+	})
+	tracker.OnResponse(streamID,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
+		&discoveryv3.DeltaDiscoveryResponse{
+			TypeUrl:           resourcev3.ListenerType,
+			SystemVersionInfo: version,
+			Nonce:             "node-less-response",
+		},
+	)
+	tracker.OnRequest(streamID, &discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl:       resourcev3.ListenerType,
+		ResponseNonce: "node-less-response",
+	})
+
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("node-less follow-up response was not correlated to the stream node")
+	}
+}
+
 func TestAckTrackerRecordsNACKAndRecovers(t *testing.T) {
 	tracker := NewAckTracker()
 	node := "default/gateway"

@@ -45,6 +45,7 @@ type expectedSnapshot struct {
 type AckTracker struct {
 	mu           sync.RWMutex
 	pending      map[int64]map[string]map[string]pendingResponse
+	nodes        map[int64]string
 	expected     map[string]expectedSnapshot
 	fingerprints map[string]map[string]string
 	acked        map[string]map[string]string
@@ -55,6 +56,7 @@ type AckTracker struct {
 func NewAckTracker() *AckTracker {
 	return &AckTracker{
 		pending:      make(map[int64]map[string]map[string]pendingResponse),
+		nodes:        make(map[int64]string),
 		expected:     make(map[string]expectedSnapshot),
 		fingerprints: make(map[string]map[string]string),
 		acked:        make(map[string]map[string]string),
@@ -89,11 +91,20 @@ func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[strin
 
 // OnResponse records the nonce/version tuple immediately before transmission.
 func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryRequest, resp *discoveryv3.DeltaDiscoveryResponse) {
-	if req == nil || resp == nil || resp.GetNonce() == "" || req.GetNode().GetCluster() == "" {
+	if req == nil || resp == nil || resp.GetNonce() == "" {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	node := req.GetNode().GetCluster()
+	if node != "" {
+		t.nodes[streamID] = node
+	} else {
+		node = t.nodes[streamID]
+	}
+	if node == "" {
+		return
+	}
 	byType := t.pending[streamID]
 	if byType == nil {
 		byType = make(map[string]map[string]pendingResponse)
@@ -105,7 +116,7 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 		byType[resp.GetTypeUrl()] = byNonce
 	}
 	byNonce[resp.GetNonce()] = pendingResponse{
-		node:    req.GetNode().GetCluster(),
+		node:    node,
 		version: resp.GetSystemVersionInfo(),
 	}
 }
@@ -113,11 +124,17 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 // OnRequest consumes an ACK or NACK. Subscription-only requests have no nonce
 // and do not alter convergence state.
 func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) {
-	if req == nil || req.GetResponseNonce() == "" {
+	if req == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if node := req.GetNode().GetCluster(); node != "" {
+		t.nodes[streamID] = node
+	}
+	if req.GetResponseNonce() == "" {
+		return
+	}
 	byType := t.pending[streamID]
 	if byType == nil {
 		return
@@ -162,6 +179,7 @@ func (t *AckTracker) OnStreamClosed(streamID int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.pending, streamID)
+	delete(t.nodes, streamID)
 }
 
 // Forget removes every convergence record associated with node.
@@ -172,6 +190,11 @@ func (t *AckTracker) Forget(node string) {
 	delete(t.acked, node)
 	delete(t.fingerprints, node)
 	delete(t.nacks, node)
+	for streamID, streamNode := range t.nodes {
+		if streamNode == node {
+			delete(t.nodes, streamID)
+		}
+	}
 	for streamID, byType := range t.pending {
 		for typeURL, byNonce := range byType {
 			for nonce, pending := range byNonce {
