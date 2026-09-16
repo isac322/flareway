@@ -193,6 +193,11 @@ func (s *Server) IsACKed(node, version string) bool {
 	return s.tracker.IsACKed(node, version)
 }
 
+// ACKDetails explains why the requested snapshot has not converged.
+func (s *Server) ACKDetails(node, version string) string {
+	return s.tracker.ConvergenceDetails(node, version)
+}
+
 // LastNACK returns the latest rejection for node.
 func (s *Server) LastNACK(node string) (version, detail string, ok bool) {
 	nack, ok := s.tracker.LastNACK(node)

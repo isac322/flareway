@@ -158,16 +158,24 @@ func TestAckTrackerRequiresLiveStreamForNonEmptySnapshot(t *testing.T) {
 	if tracker.IsACKed(node, version) {
 		t.Fatal("snapshot converged without a live xDS stream")
 	}
+	if details := tracker.ConvergenceDetails(node, version); details != "no live xDS stream" {
+		t.Fatalf("convergence details = %q, want no live xDS stream", details)
+	}
 
 	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
 	tracker.OnResponse(7, request, &discoveryv3.DeltaDiscoveryResponse{
 		TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1",
 	})
+	if details := tracker.ConvergenceDetails(node, version); details != "1 live stream(s), missing Listener" {
+		t.Fatalf("convergence details = %q, want missing Listener", details)
+	}
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
 	if !tracker.IsACKed(node, version) {
 		t.Fatal("live stream ACK did not converge")
 	}
-
+	if details := tracker.ConvergenceDetails(node, version); details != "" {
+		t.Fatalf("converged snapshot details = %q, want empty", details)
+	}
 	tracker.OnStreamClosed(7)
 	if tracker.IsACKed(node, version) {
 		t.Fatal("snapshot stayed converged after the last xDS stream closed")

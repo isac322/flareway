@@ -17,6 +17,9 @@ limitations under the License.
 package server
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -285,6 +288,60 @@ func (t *AckTracker) subscribedLocked(node, typeURL string) bool {
 		}
 	}
 	return false
+}
+
+// ConvergenceDetails returns a concise, non-sensitive explanation when the
+// requested snapshot has not converged.
+func (t *AckTracker) ConvergenceDetails(node, version string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	expected, ok := t.expected[node]
+	if !ok {
+		return "snapshot is not registered"
+	}
+	if expected.version != version {
+		return fmt.Sprintf("expected version %s, requested %s", shortVersion(expected.version), shortVersion(version))
+	}
+	streams := 0
+	for _, streamNode := range t.nodes {
+		if streamNode == node {
+			streams++
+		}
+	}
+	if len(expected.types) > 0 && streams == 0 {
+		return "no live xDS stream"
+	}
+	missing := make([]string, 0, len(expected.types))
+	for typeURL := range expected.types {
+		if !t.subscribedLocked(node, typeURL) {
+			continue
+		}
+		if t.acked[node][typeURL] != version {
+			missing = append(missing, shortTypeURL(typeURL))
+		}
+	}
+	sort.Strings(missing)
+	if nack, found := t.nacks[node]; found && nack.Version == version {
+		return fmt.Sprintf("NACK %s: %s", shortTypeURL(nack.TypeURL), nack.Detail)
+	}
+	if len(missing) > 0 {
+		return fmt.Sprintf("%d live stream(s), missing %s", streams, strings.Join(missing, ","))
+	}
+	return ""
+}
+
+func shortTypeURL(typeURL string) string {
+	if index := strings.LastIndexByte(typeURL, '.'); index >= 0 {
+		return typeURL[index+1:]
+	}
+	return typeURL
+}
+
+func shortVersion(version string) string {
+	if len(version) > 12 {
+		return version[:12]
+	}
+	return version
 }
 
 func sameFingerprints(left, right map[string]string) bool {

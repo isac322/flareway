@@ -645,7 +645,15 @@ func (r *GatewayReconciler) cloudflareGate(
 		lagging = append(lagging, "no active dataplane Pods")
 	}
 	if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) {
-		lagging = append(lagging, "Envoy xDS ACK")
+		message := "Envoy xDS ACK"
+		if diagnostics, ok := r.Snapshots.(interface {
+			ACKDetails(node, version string) string
+		}); ok {
+			if details := diagnostics.ACKDetails(gateway.Key.String(), snapshotVersion); details != "" {
+				message += " (" + details + ")"
+			}
+		}
+		lagging = append(lagging, message)
 	}
 
 	dnsReady = tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(gateway, tunnel)
