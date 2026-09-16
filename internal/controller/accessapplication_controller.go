@@ -98,7 +98,7 @@ type AccessApplicationReconciler struct {
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesspolicies;identityproviders;accesscustompages;servicetokens;cloudflareaccounts;cloudflaretunnels,verbs=get;list;watch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications/finalizers,verbs=update;patch
-// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=networkroutes;hostnameroutes;virtualnetworks,verbs=get;list;watch
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=networkroutes;hostnameroutes;virtualnetworks;gatewayclassconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;gatewayclasses;httproutes;referencegrants;backendtlspolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces;secrets;services;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
@@ -253,7 +253,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context, application *v1alpha1.AccessApplication, invalid gatewayapi.AccessApplicationCompilation) (ctrl.Result, error) {
 	retained := invalid
 	if application.Status.ApplicationID != "" || len(application.Status.DataPlanes) > 0 || len(application.Status.Destinations) > 0 {
-		retained = statusCompilation(application, invalid.Reason, invalid.Message)
+		retained = statusCompilation(application, invalid)
 	}
 	if application.Status.ApplicationID == "" && len(application.Status.BypassApplications) == 0 && !applicationProgrammed(application) {
 		if err := r.deleteAUDSecrets(ctx, application); err != nil {
@@ -305,15 +305,13 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 	}
 	return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 }
+
+// targetInfrastructureUnavailable reports whether the rejection was caused by a
+// lost platform target object rather than a configuration or authorization
+// problem. Only target loss may delete a managed remote application; every
+// other rejection only blocks it.
 func targetInfrastructureUnavailable(compilation gatewayapi.AccessApplicationCompilation) bool {
-	if compilation.Reason != "TargetNotFound" {
-		return false
-	}
-	return strings.Contains(compilation.Message, "Gateway ") ||
-		strings.Contains(compilation.Message, "GatewayClass ") ||
-		strings.Contains(compilation.Message, "CloudflareTunnel ") ||
-		strings.Contains(compilation.Message, "NetworkRoute ") ||
-		strings.Contains(compilation.Message, "HostnameRoute ")
+	return compilation.TargetLoss != gatewayapi.AccessTargetLossNone
 }
 
 func rejectedFrom(compilation gatewayapi.AccessApplicationCompilation, reason, message string) gatewayapi.AccessApplicationCompilation {
@@ -323,9 +321,9 @@ func rejectedFrom(compilation gatewayapi.AccessApplicationCompilation, reason, m
 	return compilation
 }
 
-func statusCompilation(application *v1alpha1.AccessApplication, reason, message string) gatewayapi.AccessApplicationCompilation {
+func statusCompilation(application *v1alpha1.AccessApplication, invalid gatewayapi.AccessApplicationCompilation) gatewayapi.AccessApplicationCompilation {
 	compilation := gatewayapi.AccessApplicationCompilation{
-		Accepted: false, Reason: reason, Message: message,
+		Accepted: false, Reason: invalid.Reason, Message: invalid.Message, TargetLoss: invalid.TargetLoss,
 		OriginJWTEnforced: application.Spec.OriginJWT.Mode != v1alpha1.AccessOriginJWTModeDisabled,
 	}
 	for _, destination := range application.Status.Destinations {
@@ -423,10 +421,6 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		if err != nil {
 			return accessApplicationContext{}, err
 		}
-		if invalid := validatePrivateRouteLifecycle(privateInputs, application); invalid != nil {
-			result.compilation = *invalid
-			return result, nil
-		}
 	}
 	if len(gatewayKeys) == 0 {
 		compiled := gatewayapi.CompileAccessApplication(privateInputs, application)
@@ -438,30 +432,34 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		var gateway gatewayv1.Gateway
 		if err := r.Get(ctx, gatewayKey, &gateway); err != nil {
 			if apierrors.IsNotFound(err) {
-				result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s was not found", gatewayKey))
+				result.compilation = rejectedCompilationLoss(fmt.Sprintf("Gateway %s was not found", gatewayKey), gatewayapi.AccessTargetLossGateway)
 				return result, nil
 			}
 			return accessApplicationContext{}, fmt.Errorf("get target Gateway %s: %w", gatewayKey, err)
 		}
 		if !gateway.DeletionTimestamp.IsZero() {
-			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is deleting", gatewayKey))
+			result.compilation = rejectedCompilationLoss(fmt.Sprintf("Gateway %s is deleting", gatewayKey), gatewayapi.AccessTargetLossGateway)
 			return result, nil
 		}
 		var gatewayClass gatewayv1.GatewayClass
 		if err := r.Get(ctx, types.NamespacedName{Name: string(gateway.Spec.GatewayClassName)}, &gatewayClass); err != nil {
 			if apierrors.IsNotFound(err) {
-				result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("GatewayClass %q was not found", gateway.Spec.GatewayClassName))
+				result.compilation = rejectedCompilationLoss(fmt.Sprintf("GatewayClass %q was not found", gateway.Spec.GatewayClassName), gatewayapi.AccessTargetLossGatewayClass)
 				return result, nil
 			}
 			return accessApplicationContext{}, fmt.Errorf("get GatewayClass: %w", err)
 		}
 		if gatewayClass.Spec.ControllerName != gatewayapi.ControllerName {
-			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("Gateway %s is not managed by Flareway", gatewayKey))
+			result.compilation = rejectedCompilationLoss(fmt.Sprintf("Gateway %s is not managed by Flareway", gatewayKey), gatewayapi.AccessTargetLossGatewayClass)
 			return result, nil
 		}
 		collector := &GatewayReconciler{Client: r.Client, Now: r.Now}
 		config, err := collector.loadGatewayClassConfig(ctx, &gatewayClass)
 		if err != nil {
+			if isGatewayClassConfigInvalid(err) {
+				result.compilation = rejectedCompilation("InvalidParameters", err.Error())
+				return result, nil
+			}
 			return accessApplicationContext{}, err
 		}
 		revocationCeiling := collector.revocationState().ceiling()
@@ -474,11 +472,11 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			return accessApplicationContext{}, err
 		}
 		if tunnel == nil {
-			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel for Gateway %s was not found", gatewayKey))
+			result.compilation = rejectedCompilationLoss(fmt.Sprintf("CloudflareTunnel for Gateway %s was not found", gatewayKey), gatewayapi.AccessTargetLossTunnel)
 			return result, nil
 		}
 		if !tunnel.DeletionTimestamp.IsZero() {
-			result.compilation = rejectedCompilation("TargetNotFound", fmt.Sprintf("CloudflareTunnel %s/%s is deleting", tunnel.Namespace, tunnel.Name))
+			result.compilation = rejectedCompilationLoss(fmt.Sprintf("CloudflareTunnel %s/%s is deleting", tunnel.Namespace, tunnel.Name), gatewayapi.AccessTargetLossTunnel)
 			return result, nil
 		}
 		if tunnel.Spec.AccountRef.Name != account.Name {
@@ -564,56 +562,6 @@ func accessApplicationPrivateDestinations(application *v1alpha1.AccessApplicatio
 	return result
 }
 
-func validatePrivateRouteLifecycle(inputs gatewayapi.Inputs, application *v1alpha1.AccessApplication) *gatewayapi.AccessApplicationCompilation {
-	for _, destination := range accessApplicationPrivateDestinations(application) {
-		if destination.NetworkRouteRef != nil {
-			var route *v1alpha1.NetworkRoute
-			for index := range inputs.NetworkRoutes {
-				if inputs.NetworkRoutes[index].Namespace == application.Namespace && inputs.NetworkRoutes[index].Name == destination.NetworkRouteRef.Name {
-					route = &inputs.NetworkRoutes[index]
-					break
-				}
-			}
-			if route == nil {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("NetworkRoute %s/%s was not found", application.Namespace, destination.NetworkRouteRef.Name))
-				return &failure
-			}
-			if !route.DeletionTimestamp.IsZero() {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("NetworkRoute %s/%s is deleting", route.Namespace, route.Name))
-				return &failure
-			}
-			if route.Status.ObservedGeneration != route.Generation ||
-				!gatewaystatus.ConditionTrue(route.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted) {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("NetworkRoute %s/%s is not valid for its current generation", route.Namespace, route.Name))
-				return &failure
-			}
-		}
-		if destination.HostnameRouteRef != nil {
-			var route *v1alpha1.HostnameRoute
-			for index := range inputs.HostnameRoutes {
-				if inputs.HostnameRoutes[index].Namespace == application.Namespace && inputs.HostnameRoutes[index].Name == destination.HostnameRouteRef.Name {
-					route = &inputs.HostnameRoutes[index]
-					break
-				}
-			}
-			if route == nil {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s was not found", application.Namespace, destination.HostnameRouteRef.Name))
-				return &failure
-			}
-			if !route.DeletionTimestamp.IsZero() {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s is deleting", route.Namespace, route.Name))
-				return &failure
-
-			}
-			if route.Status.ObservedGeneration != route.Generation ||
-				!gatewaystatus.ConditionTrue(route.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted) {
-				failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s is not valid for its current generation", route.Namespace, route.Name))
-				return &failure
-			}
-		}
-	}
-	return nil
-}
 func (r *AccessApplicationReconciler) preparePrivateTunnelLedger(ctx context.Context, application *v1alpha1.AccessApplication) ([]string, error) {
 	desired, err := r.currentPrivateTunnelKeys(ctx, application)
 	if err != nil {
@@ -1685,6 +1633,13 @@ func rejectedCompilation(reason, message string) gatewayapi.AccessApplicationCom
 	return gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: reason, Message: message}
 }
 
+// rejectedCompilationLoss rejects because a platform target object is gone or
+// permanently unusable; the structured TargetLoss discriminator, not the
+// message text, decides delete-vs-block handling downstream.
+func rejectedCompilationLoss(message string, loss gatewayapi.AccessTargetLoss) gatewayapi.AccessApplicationCompilation {
+	return gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
+}
+
 func (r *AccessApplicationReconciler) patchStatus(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) error {
 	current := &v1alpha1.AccessApplication{}
 	key := client.ObjectKeyFromObject(application)
@@ -1737,6 +1692,8 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1alpha1.AccessApplication{}).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
+		Watches(&gatewayv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayClassToApplications)).
+		Watches(&v1alpha1.GatewayClassConfig{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayClassConfigToApplications)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&v1alpha1.AccessPolicy{}, handler.EnqueueRequestsFromMapFunc(r.mapPolicyToApplications)).
@@ -1827,6 +1784,39 @@ func (r *AccessApplicationReconciler) mapTargetToApplications(ctx context.Contex
 				requests = append(requests, r.mapTargetToApplications(ctx, &routes.Items[index])...)
 			}
 		}
+	}
+	return compactReconcileRequests(requests)
+}
+
+// mapGatewayClassToApplications enqueues every AccessApplication whose target
+// Gateways use the changed GatewayClass. The GatewayReconciler owns the
+// shared gatewayClassNameIndex field index.
+func (r *AccessApplicationReconciler) mapGatewayClassToApplications(ctx context.Context, object client.Object) []reconcile.Request {
+	var gateways gatewayv1.GatewayList
+	if err := r.List(ctx, &gateways, client.MatchingFields{gatewayClassNameIndex: object.GetName()}); err != nil {
+		log.FromContext(ctx).Error(err, "list Gateways for AccessApplication GatewayClass", "gatewayClass", object.GetName())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range gateways.Items {
+		requests = append(requests, r.mapTargetToApplications(ctx, &gateways.Items[index])...)
+	}
+	return compactReconcileRequests(requests)
+}
+
+// mapGatewayClassConfigToApplications enqueues every AccessApplication whose
+// target Gateways use a GatewayClass that references the changed
+// GatewayClassConfig. The GatewayReconciler owns the shared
+// gatewayClassConfigIndex field index.
+func (r *AccessApplicationReconciler) mapGatewayClassConfigToApplications(ctx context.Context, object client.Object) []reconcile.Request {
+	var classes gatewayv1.GatewayClassList
+	if err := r.List(ctx, &classes, client.MatchingFields{gatewayClassConfigIndex: object.GetName()}); err != nil {
+		log.FromContext(ctx).Error(err, "list GatewayClasses for AccessApplication GatewayClassConfig", "gatewayClassConfig", object.GetName())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range classes.Items {
+		requests = append(requests, r.mapGatewayClassToApplications(ctx, &classes.Items[index])...)
 	}
 	return compactReconcileRequests(requests)
 }

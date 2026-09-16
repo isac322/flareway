@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -347,11 +348,16 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		calls := remote.Calls()
 		gomega.Expect(indexOfAccessCall(calls, "Delete:"+created.ID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+bypassTag)))
 	})
-	ginkgo.It("treats deleting and stale-generation private routes as TargetNotFound", func() {
+	ginkgo.It("treats deleting and stale-generation private routes as target loss", func() {
 		accepted := metav1.Condition{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}
 		route := v1alpha1.NetworkRoute{
-			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant", Generation: 2},
-			Status:     v1alpha1.NetworkRouteStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{accepted}},
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant", Generation: 2, Labels: map[string]string{"route": "allowed"}},
+			Spec: v1alpha1.NetworkRouteSpec{
+				AccountRef:        corev1.LocalObjectReference{Name: "account"},
+				Network:           "10.96.0.0/16",
+				AllowedNamespaces: v1alpha1.AllowedNamespaces{From: v1alpha1.AllowedNamespaceFromSame},
+			},
+			Status: v1alpha1.NetworkRouteStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{accepted}},
 		}
 		application := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant"},
@@ -363,17 +369,33 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 				})},
 			},
 		}
-		failure := validatePrivateRouteLifecycle(gatewayapi.Inputs{NetworkRoutes: []v1alpha1.NetworkRoute{route}}, application)
-		gomega.Expect(failure).NotTo(gomega.BeNil())
+		inputs := gatewayapi.Inputs{
+			CloudflareAccount: &v1alpha1.CloudflareAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "account"},
+				Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "tenant"}},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+					PrivateRoutes:     &v1alpha1.CloudflarePrivateRouteGrant{NetworkRouteSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"route": "allowed"}}},
+				}}},
+			},
+			Namespaces:    []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "tenant"}}}},
+			NetworkRoutes: []v1alpha1.NetworkRoute{route},
+		}
+		failure := gatewayapi.CompilePrivateDestinations(inputs, application)
+		gomega.Expect(failure.Accepted).To(gomega.BeFalse())
 		gomega.Expect(failure.Reason).To(gomega.Equal("TargetNotFound"))
-		gomega.Expect(failure.Message).To(gomega.ContainSubstring("current generation"))
+		gomega.Expect(failure.TargetLoss).To(gomega.Equal(gatewayapi.AccessTargetLossNetworkRoute))
 
+		deletingRoute := route
+		deletingRoute.Status.ObservedGeneration = deletingRoute.Generation
 		now := metav1.Now()
-		route.Status.ObservedGeneration = route.Generation
-		route.DeletionTimestamp = &now
-		failure = validatePrivateRouteLifecycle(gatewayapi.Inputs{NetworkRoutes: []v1alpha1.NetworkRoute{route}}, application)
-		gomega.Expect(failure).NotTo(gomega.BeNil())
-		gomega.Expect(failure.Message).To(gomega.ContainSubstring("deleting"))
+		deletingRoute.DeletionTimestamp = &now
+		inputs.NetworkRoutes = []v1alpha1.NetworkRoute{deletingRoute}
+		failure = gatewayapi.CompilePrivateDestinations(inputs, application)
+		gomega.Expect(failure.Accepted).To(gomega.BeFalse())
+		gomega.Expect(failure.Message).To(gomega.ContainSubstring("is deleting"))
+		gomega.Expect(failure.Reason).To(gomega.Equal("TargetNotFound"))
+		gomega.Expect(failure.TargetLoss).To(gomega.Equal(gatewayapi.AccessTargetLossNetworkRoute))
 	})
 
 	ginkgo.It("keeps Tunnel teardown blocked by the private-tunnel ledger until Managed+Delete cleanup completes", func() {
@@ -870,6 +892,67 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeFalse())
 			g.Expect(testAccessCloudflare.Has(childID)).To(gomega.BeFalse())
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("maps GatewayClass and GatewayClassConfig events to the target applications", func() {
+		fixture := newAccessFixture("class-map", false, false)
+		fixture.create()
+		reconciler := &AccessApplicationReconciler{Client: testClient}
+		expected := reconcile.Request{NamespacedName: fixture.applicationKey}
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var gatewayClass gatewayv1.GatewayClass
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.gatewayClass}, &gatewayClass)).To(gomega.Succeed())
+			g.Expect(reconciler.mapGatewayClassToApplications(testContext, &gatewayClass)).To(gomega.ContainElement(expected))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var config v1alpha1.GatewayClassConfig
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.config}, &config)).To(gomega.Succeed())
+			g.Expect(reconciler.mapGatewayClassConfigToApplications(testContext, &config)).To(gomega.ContainElement(expected))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("invalidates the AUD handoff and status when the GatewayClassConfig disappears without deleting the remote application", func() {
+		fixture := newAccessFixture("config-loss", false, false)
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		programAccessFixture(fixture, &application, 1)
+		parentID := application.Status.ApplicationID
+
+		gomega.Expect(testClient.Delete(testContext, &v1alpha1.GatewayClassConfig{ObjectMeta: metav1.ObjectMeta{Name: fixture.config}})).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Annotations[accessApplicationRevocationAnnotation]).NotTo(gomega.BeEmpty())
+			programmed := findCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+			g.Expect(programmed).NotTo(gomega.BeNil())
+			g.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(programmed.Reason).To(gomega.Equal("InvalidParameters"))
+			var secret corev1.Secret
+			err := testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret)
+			g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		applyBlockedAfterLatch(fixture, &application)
+		// TokensRevoked is persisted only after every claim acknowledges a fresh
+		// Blocked version, so it proves the reconciler consumed the handshake and
+		// ran the post-ack delete-vs-block decision.
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			var latch accessRevocationLatch
+			g.Expect(json.Unmarshal([]byte(application.Annotations[accessApplicationRevocationAnnotation]), &latch)).To(gomega.Succeed())
+			g.Expect(latch.TokensRevoked).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).To(gomega.ContainElement("Revoke:" + parentID))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		// The acknowledged pass requeues after accessApplicationRequeue; spanning two
+		// cycles observes that pass and the next one deciding to keep the parent.
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).To(gomega.Equal(parentID))
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Delete:" + parentID))
+		}).WithTimeout(2 * accessApplicationRequeue).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("deletes the AUD first, waits for Blocked, then deletes child applications before the parent", func() {

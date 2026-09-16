@@ -36,7 +36,6 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	"github.com/isac322/flareway/internal/dataplane"
-	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -488,7 +487,9 @@ func privateListenerHasReadyVNet(listenerName string, tunnel *v1alpha1.Cloudflar
 	for index := range vnets {
 		vnet := &vnets[index]
 		if vnet.Namespace != tunnel.Namespace || vnet.Spec.AccountRef.Name != account.Name || vnet.Status.VirtualNetworkID == "" ||
-			!gatewaystatus.ConditionTrue(vnet.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted) {
+			!vnet.DeletionTimestamp.IsZero() || vnet.Status.DeletedAt != nil ||
+			vnet.Status.ObservedGeneration != vnet.Generation ||
+			!conditionTrueForGeneration(vnet.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, vnet.Generation) {
 			continue
 		}
 		if (name != "" && vnet.Name == name) || (name == "" && vnet.Spec.IsDefault) {

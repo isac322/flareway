@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -78,11 +79,17 @@ func TestPrivateListenerVirtualNetworkMustBeReadyAndSameAccount(t *testing.T) {
 	}
 	account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: "account"}}
 	vnet := v1alpha1.VirtualNetwork{
-		ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: "tenant"},
-		Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "prod",
+			Namespace:  "tenant",
+			Generation: 2,
+			Finalizers: []string{v1alpha1.VirtualNetworkFinalizer},
+		},
+		Spec: v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
 		Status: v1alpha1.VirtualNetworkStatus{
-			VirtualNetworkID: "vnet-prod",
-			Conditions:       []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}},
+			VirtualNetworkID:   "vnet-prod",
+			ObservedGeneration: 2,
+			Conditions:         []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue, ObservedGeneration: 2}},
 		},
 	}
 	if !privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{vnet}) {
@@ -91,6 +98,31 @@ func TestPrivateListenerVirtualNetworkMustBeReadyAndSameAccount(t *testing.T) {
 	vnet.Spec.AccountRef.Name = "other"
 	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{vnet}) {
 		t.Fatal("different-account VirtualNetwork was accepted")
+	}
+	vnet.Spec.AccountRef.Name = "account"
+
+	terminating := vnet.DeepCopy()
+	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{*terminating}) {
+		t.Fatal("terminating VirtualNetwork was accepted")
+	}
+
+	tombstoned := vnet.DeepCopy()
+	tombstoned.Status.DeletedAt = &metav1.Time{Time: time.Now()}
+	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{*tombstoned}) {
+		t.Fatal("remotely deleted VirtualNetwork was accepted")
+	}
+
+	staleStatus := vnet.DeepCopy()
+	staleStatus.Status.ObservedGeneration = 1
+	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{*staleStatus}) {
+		t.Fatal("VirtualNetwork with stale status.observedGeneration was accepted")
+	}
+
+	staleCondition := vnet.DeepCopy()
+	staleCondition.Status.Conditions[0].ObservedGeneration = 1
+	if privateListenerHasReadyVNet("private", tunnel, account, []v1alpha1.VirtualNetwork{*staleCondition}) {
+		t.Fatal("VirtualNetwork accepted for a stale generation was accepted")
 	}
 }
 

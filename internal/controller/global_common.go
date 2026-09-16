@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -109,22 +110,42 @@ func globalContenderAccountID(ctx context.Context, kube client.Reader, namespace
 	if !preserveRejectedOwner && globalConditionFalse(conditions, "Accepted") {
 		return "", false
 	}
-	account := new(v1alpha1.CloudflareAccount)
-	if err := kube.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
-		return "", false
-	}
-	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
-		!metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return "", false
-	}
-	namespaceObject := new(corev1.Namespace)
-	if err := kube.Get(ctx, types.NamespacedName{Name: namespace}, namespaceObject); err != nil {
-		return "", false
-	}
-	if decision := authz.Evaluate(account, namespaceObject, authz.Request{PlatformObject: true}); !decision.Allowed {
+	account, eligible, err := globalContenderAccount(ctx, kube, namespace, accountName)
+	if err != nil || !eligible {
 		return "", false
 	}
 	return account.Spec.AccountID, true
+}
+
+// globalContenderAccount resolves the account behind a singleton writer contender.
+// Eligibility derives only from the referenced account's health and namespace
+// authorization, never from the contender's own conditions, so an established
+// writer keeps precedence through transient remote failures. Missing accounts
+// and namespaces make the contender ineligible; indeterminate reader errors
+// propagate so arbitration cannot silently elect a replacement.
+func globalContenderAccount(ctx context.Context, kube client.Reader, namespace, accountName string) (*v1alpha1.CloudflareAccount, bool, error) {
+	account := new(v1alpha1.CloudflareAccount)
+	if err := kube.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
+		!metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
+		return nil, false, nil
+	}
+	namespaceObject := new(corev1.Namespace)
+	if err := kube.Get(ctx, types.NamespacedName{Name: namespace}, namespaceObject); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if decision := authz.Evaluate(account, namespaceObject, authz.Request{PlatformObject: true}); !decision.Allowed {
+		return nil, false, nil
+	}
+	return account, true, nil
 }
 
 func globalConditionFalse(conditions []metav1.Condition, conditionType string) bool {

@@ -224,10 +224,14 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		pod.Status.Phase = corev1.PodRunning
 		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		gomega.Expect(testClient.Status().Update(testContext, pod)).To(gomega.Succeed())
-		testSnapshots.mu.Lock()
-		testSnapshots.acked[compiled.Key.String()] = "snapshot-1"
-		testSnapshots.mu.Unlock()
-		statusWriter.Snapshots = testSnapshots
+		// The suite's running GatewayReconciler clears the shared publisher for
+		// this Gateway while its CloudflareAccount is absent, so the gate checks
+		// use a dedicated publisher to keep the seeded ACK isolated.
+		gateSnapshots := newFakeSnapshotPublisher()
+		gateSnapshots.mu.Lock()
+		gateSnapshots.acked[compiled.Key.String()] = "snapshot-1"
+		gateSnapshots.mu.Unlock()
+		statusWriter.Snapshots = gateSnapshots
 		statusWriter.Prober = &staticGatewayProber{version: 6, ready: true}
 		observed.Spec.DNS.Mode = v1alpha1.DNSModeManaged
 		observed.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "edge.example.com", RecordID: "record"}}
@@ -246,9 +250,9 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(lagging).To(gomega.ContainElement("dataplane(version 5)"))
 
 		statusWriter.Prober = &staticGatewayProber{version: 6, ready: true}
-		testSnapshots.mu.Lock()
-		delete(testSnapshots.acked, compiled.Key.String())
-		testSnapshots.mu.Unlock()
+		gateSnapshots.mu.Lock()
+		delete(gateSnapshots.acked, compiled.Key.String())
+		gateSnapshots.mu.Unlock()
 		initial := observed.DeepCopy()
 		initial.Status.ConfigVersion.Applied = 0
 		ready, lagging, _, err = statusWriter.cloudflareGate(testContext, compiled, initial, "6", "snapshot-1")
@@ -611,7 +615,34 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 			},
 		}
 		gomega.Expect(testClient.Create(testContext, first)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			_ = client.IgnoreNotFound(testClient.Delete(testContext, first))
+		})
 		gomega.Expect(testClient.Create(testContext, second)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			_ = client.IgnoreNotFound(testClient.Delete(testContext, second))
+		})
+		secondReplicas := int32(2)
+		secondDataplaneLabels := map[string]string{dataplaneGatewayLabel: namespaceName + "--" + second.Name}
+		secondDataplane := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "flareway-gw-" + second.Name, Namespace: namespaceName,
+				Labels:          secondDataplaneLabels,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(second, gatewayControllerGVK())},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &secondReplicas,
+				Selector: &metav1.LabelSelector{MatchLabels: secondDataplaneLabels},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: secondDataplaneLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "cloudflared", Image: "example.invalid/cloudflared:latest"}}},
+				},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, secondDataplane)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			_ = client.IgnoreNotFound(testClient.Delete(testContext, secondDataplane))
+		})
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(tunnel), &current)).To(gomega.Succeed())
@@ -648,11 +679,12 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(remote.locks).To(gomega.Equal(0))
 		gomega.Expect(factoryCalls).To(gomega.Equal(0))
 
-		var secondDataplane appsv1.Deployment
-		err = testClient.Get(testContext, types.NamespacedName{
+		var observedSecondDataplane appsv1.Deployment
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{
 			Namespace: namespaceName, Name: "flareway-gw-" + second.Name,
-		}, &secondDataplane)
-		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+		}, &observedSecondDataplane)).To(gomega.Succeed())
+		gomega.Expect(observedSecondDataplane.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*observedSecondDataplane.Spec.Replicas).To(gomega.Equal(int32(0)))
 
 		var preserved v1alpha1.CloudflareTunnel
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(tunnel), &preserved)).To(gomega.Succeed())
@@ -699,6 +731,9 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		replacement.Finalizers = nil
 		replacement.Status = gatewayv1.GatewayStatus{}
 		gomega.Expect(testClient.Create(testContext, replacement)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			_ = client.IgnoreNotFound(testClient.Delete(testContext, replacement))
+		})
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(tunnel), &current)).To(gomega.Succeed())

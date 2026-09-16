@@ -42,6 +42,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -612,6 +613,7 @@ var _ = ginkgo.Describe("Gateway Direct tunnel admission", func() {
 			config := &v1alpha1.GatewayClassConfig{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
 			class := gatewayClass("class", config.Name)
 			gateway := httpGateway(gatewayKey, class.Name)
+			gateway.UID = "gateway-uid"
 			gateway.Generation = 3
 			addressType := gatewayv1.HostnameAddressType
 			gateway.Status = gatewayv1.GatewayStatus{
@@ -660,12 +662,20 @@ var _ = ginkgo.Describe("Gateway Direct tunnel admission", func() {
 				},
 			}
 			beforeTunnel := tunnel.DeepCopy()
+			replicas := int32(2)
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "flareway-gw-" + gateway.Name, Namespace: gateway.Namespace,
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())},
+				},
+				Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+			}
 			snapshots := newFakeSnapshotPublisher()
 			snapshots.versions[gatewayKey.String()] = "stale"
 			kube := fakeclient.NewClientBuilder().
 				WithScheme(scheme).
 				WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
-				WithObjects(config, class, gateway, tunnel).
+				WithObjects(config, class, gateway, tunnel, deployment).
 				Build()
 			reconciler := &GatewayReconciler{Client: kube, Scheme: scheme, Snapshots: snapshots}
 
@@ -694,9 +704,10 @@ var _ = ginkgo.Describe("Gateway Direct tunnel admission", func() {
 			gomega.Expect(observedTunnel.Status).To(gomega.Equal(beforeTunnel.Status))
 			gomega.Expect(snapshots.Version(gatewayKey.String())).To(gomega.BeEmpty())
 
-			var deployments appsv1.DeploymentList
-			gomega.Expect(kube.List(context.Background(), &deployments, client.InNamespace(gateway.Namespace))).To(gomega.Succeed())
-			gomega.Expect(deployments.Items).To(gomega.BeEmpty())
+			var observedDeployment appsv1.Deployment
+			gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(deployment), &observedDeployment)).To(gomega.Succeed())
+			gomega.Expect(observedDeployment.Spec.Replicas).NotTo(gomega.BeNil())
+			gomega.Expect(*observedDeployment.Spec.Replicas).To(gomega.Equal(int32(0)))
 			var services corev1.ServiceList
 			gomega.Expect(kube.List(context.Background(), &services, client.InNamespace(gateway.Namespace))).To(gomega.Succeed())
 			gomega.Expect(services.Items).To(gomega.BeEmpty())
@@ -759,15 +770,14 @@ var _ = ginkgo.Describe("Gateway soft-deleted tunnel admission", func() {
 			},
 		}
 		beforeTunnel := tunnel.DeepCopy()
-		zero := int32(0)
+		replicas := int32(2)
 		deployment := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "flareway-gw-" + gateway.Name, Namespace: gateway.Namespace,
 				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())},
 			},
-			Spec: appsv1.DeploymentSpec{Replicas: &zero},
+			Spec: appsv1.DeploymentSpec{Replicas: &replicas},
 		}
-		beforeDeployment := deployment.DeepCopy()
 		snapshots := newFakeSnapshotPublisher()
 		snapshots.versions[gatewayKey.String()] = "stale"
 		kube := fakeclient.NewClientBuilder().
@@ -792,7 +802,7 @@ var _ = ginkgo.Describe("Gateway soft-deleted tunnel admission", func() {
 
 		var observedDeployment appsv1.Deployment
 		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(deployment), &observedDeployment)).To(gomega.Succeed())
-		gomega.Expect(observedDeployment.Spec).To(gomega.Equal(beforeDeployment.Spec))
+		gomega.Expect(observedDeployment.OwnerReferences).To(gomega.Equal(deployment.OwnerReferences))
 		gomega.Expect(observedDeployment.Spec.Replicas).NotTo(gomega.BeNil())
 		gomega.Expect(*observedDeployment.Spec.Replicas).To(gomega.Equal(int32(0)))
 
@@ -819,6 +829,379 @@ var _ = ginkgo.Describe("Gateway soft-deleted tunnel admission", func() {
 		gomega.Expect(networkPolicies.Items).To(gomega.BeEmpty())
 	})
 })
+
+var _ = ginkgo.Describe("Gateway dependency loss", func() {
+	type dependencyFixture struct {
+		gateway    *gatewayv1.Gateway
+		class      *gatewayv1.GatewayClass
+		config     *v1alpha1.GatewayClassConfig
+		tunnel     *v1alpha1.CloudflareTunnel
+		deployment *appsv1.Deployment
+		extra      []client.Object
+	}
+
+	newDependencyFixture := func() *dependencyFixture {
+		gatewayKey := types.NamespacedName{Namespace: "tenant", Name: "gateway"}
+		config := defaultGatewayClassConfig()
+		config.Name = "config"
+		class := gatewayClass("class", config.Name)
+		gateway := httpGateway(gatewayKey, class.Name)
+		gateway.UID = "gateway-uid"
+		gateway.Generation = 3
+		hostname := gatewayv1.Hostname("app.example.com")
+		gateway.Spec.Listeners[0].Hostname = &hostname
+		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
+			ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			},
+		}
+		addressType := gatewayv1.HostnameAddressType
+		gateway.Status = gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &addressType, Value: "stale.cfargotunnel.com"}},
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(gatewayv1.GatewayConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 2,
+					Reason:             string(gatewayv1.GatewayReasonAccepted),
+					Message:            "previously accepted",
+				},
+				{
+					Type:               string(gatewayv1.GatewayConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 2,
+					Reason:             string(gatewayv1.GatewayReasonProgrammed),
+					Message:            "previously programmed",
+				},
+			},
+			Listeners: []gatewayv1.ListenerStatus{{Name: "http"}},
+		}
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: gateway.Namespace, UID: "tunnel-uid"},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: "account"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID:                "remote-id",
+				OwnershipVerified:       true,
+				ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "connector-token"},
+				GatewayRef:              &corev1.LocalObjectReference{Name: gateway.Name},
+				GatewayUID:              gateway.UID,
+			},
+		}
+		replicas := int32(2)
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "flareway-gw-" + gateway.Name, Namespace: gateway.Namespace,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())},
+			},
+			Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+		}
+		return &dependencyFixture{gateway: gateway, class: class, config: config, tunnel: tunnel, deployment: deployment}
+	}
+
+	expectTerminalRejection := func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+		gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
+
+		var observed gatewayv1.Gateway
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.gateway), &observed)).To(gomega.Succeed())
+		accepted := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		gomega.Expect(accepted).NotTo(gomega.BeNil())
+		gomega.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+		gomega.Expect(accepted.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonInvalidParameters)))
+		gomega.Expect(accepted.ObservedGeneration).To(gomega.Equal(f.gateway.Generation))
+		programmed := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		gomega.Expect(programmed).NotTo(gomega.BeNil())
+		gomega.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+		gomega.Expect(programmed.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonInvalid)))
+		gomega.Expect(observed.Status.Addresses).To(gomega.BeEmpty())
+		gomega.Expect(observed.Status.Listeners).To(gomega.BeEmpty())
+	}
+
+	expectDataplaneScaledToZero := func(kube client.Client, f *dependencyFixture) {
+		var observed appsv1.Deployment
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.deployment), &observed)).To(gomega.Succeed())
+		gomega.Expect(observed.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*observed.Spec.Replicas).To(gomega.Equal(int32(0)))
+	}
+
+	expectDataplanePreserved := func(kube client.Client, f *dependencyFixture) {
+		var observed appsv1.Deployment
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.deployment), &observed)).To(gomega.Succeed())
+		gomega.Expect(observed.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*observed.Spec.Replicas).To(gomega.Equal(*f.deployment.Spec.Replicas))
+		gomega.Expect(observed.OwnerReferences).To(gomega.Equal(f.deployment.OwnerReferences))
+	}
+	expectPreservedProgrammed := func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+		gomega.Expect(err).To(gomega.HaveOccurred())
+		gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+		gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.Equal("stale"))
+
+		var observed gatewayv1.Gateway
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.gateway), &observed)).To(gomega.Succeed())
+		programmed := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		gomega.Expect(programmed).NotTo(gomega.BeNil())
+		gomega.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(observed.Status.Addresses).To(gomega.Equal(f.gateway.Status.Addresses))
+
+		expectDataplanePreserved(kube, f)
+	}
+
+	ginkgo.DescribeTable("retracts publication and reports the lost dependency",
+		func(arrange func(*dependencyFixture), assert func(client.Client, *dependencyFixture, *fakeSnapshotPublisher, ctrl.Result, error)) {
+			scheme := runtime.NewScheme()
+			gomega.Expect(clientgoscheme.AddToScheme(scheme)).To(gomega.Succeed())
+			gomega.Expect(gatewayv1.Install(scheme)).To(gomega.Succeed())
+			gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+
+			f := newDependencyFixture()
+			arrange(f)
+			objects := []client.Object{f.gateway}
+			if f.class != nil {
+				objects = append(objects, f.class)
+			}
+			if f.config != nil {
+				objects = append(objects, f.config)
+			}
+			if f.tunnel != nil {
+				objects = append(objects, f.tunnel)
+			}
+			if f.deployment != nil {
+				objects = append(objects, f.deployment)
+			}
+			objects = append(objects, f.extra...)
+			gatewayKey := client.ObjectKeyFromObject(f.gateway)
+			snapshots := newFakeSnapshotPublisher()
+			snapshots.versions[gatewayKey.String()] = "stale"
+			kube := fakeclient.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
+				WithObjects(objects...).
+				Build()
+			reconciler := &GatewayReconciler{Client: kube, Scheme: scheme, Snapshots: snapshots}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: gatewayKey})
+			assert(kube, f, snapshots, result, err)
+		},
+		ginkgo.Entry("clears publication and scales the owned dataplane to zero when the GatewayClass is missing",
+			func(f *dependencyFixture) { f.class = nil },
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+				gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("clears publication and scales the owned dataplane to zero when the GatewayClass belongs to a foreign controller",
+			func(f *dependencyFixture) {
+				f.class.Spec.ControllerName = "example.net/other-controller"
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+				gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("rejects a Gateway whose explicit CloudflareTunnel is missing and scales its owned dataplane to zero",
+			func(f *dependencyFixture) { f.tunnel = nil },
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectTerminalRejection(kube, f, snapshots, result, err)
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("leaves a foreign-owned dataplane Deployment running when the explicit CloudflareTunnel is missing",
+			func(f *dependencyFixture) {
+				f.tunnel = nil
+				foreignGateway := f.gateway.DeepCopy()
+				foreignGateway.UID = "recreated-gateway-uid"
+				f.deployment.OwnerReferences = []metav1.OwnerReference{
+					*metav1.NewControllerRef(foreignGateway, gatewayControllerGVK()),
+				}
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectTerminalRejection(kube, f, snapshots, result, err)
+				expectDataplanePreserved(kube, f)
+			}),
+		ginkgo.Entry("leaves an ownerless dataplane Deployment running when the explicit CloudflareTunnel is missing",
+			func(f *dependencyFixture) {
+				f.tunnel = nil
+				f.deployment.OwnerReferences = nil
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectTerminalRejection(kube, f, snapshots, result, err)
+				expectDataplanePreserved(kube, f)
+			}),
+		ginkgo.Entry("rejects a Gateway whose GatewayClassConfig is missing and scales its owned dataplane to zero",
+			func(f *dependencyFixture) { f.config = nil },
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectTerminalRejection(kube, f, snapshots, result, err)
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("rejects a Gateway whose GatewayClass parametersRef is unsupported and scales its owned dataplane to zero",
+			func(f *dependencyFixture) {
+				f.class.Spec.ParametersRef = &gatewayv1.ParametersReference{
+					Group: "example.net", Kind: "OtherConfig", Name: "other",
+				}
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectTerminalRejection(kube, f, snapshots, result, err)
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("keeps a valid Gateway Accepted but unprogrammed and stops polling while its CloudflareAccount is missing",
+			func(_ *dependencyFixture) {},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+				gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
+
+				var observed gatewayv1.Gateway
+				gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.gateway), &observed)).To(gomega.Succeed())
+				accepted := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+				gomega.Expect(accepted).NotTo(gomega.BeNil())
+				gomega.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+				programmed := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+				gomega.Expect(programmed).NotTo(gomega.BeNil())
+				gomega.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("terminally rejects a Gateway whose infrastructure parametersRef is unsupported and scales its owned dataplane to zero",
+			func(f *dependencyFixture) {
+				f.gateway.Spec.Infrastructure.ParametersRef = &gatewayv1.LocalParametersReference{
+					Group: "example.net", Kind: "OtherTunnel", Name: "other",
+				}
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+				gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
+
+				var observed gatewayv1.Gateway
+				gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(f.gateway), &observed)).To(gomega.Succeed())
+				accepted := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+				gomega.Expect(accepted).NotTo(gomega.BeNil())
+				gomega.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+				gomega.Expect(accepted.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonInvalidParameters)))
+				programmed := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+				gomega.Expect(programmed).NotTo(gomega.BeNil())
+				gomega.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+				gomega.Expect(programmed.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonInvalid)))
+
+				expectDataplaneScaledToZero(kube, f)
+			}),
+	)
+
+	ginkgo.DescribeTable("returns transient dependency lookup failures as errors",
+		func(kind string) {
+			scheme := runtime.NewScheme()
+			gomega.Expect(clientgoscheme.AddToScheme(scheme)).To(gomega.Succeed())
+			gomega.Expect(gatewayv1.Install(scheme)).To(gomega.Succeed())
+			gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+
+			f := newDependencyFixture()
+			f.extra = append(f.extra, &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: "account"}})
+			objects := []client.Object{f.gateway, f.class, f.config, f.tunnel, f.deployment}
+			objects = append(objects, f.extra...)
+			gatewayKey := client.ObjectKeyFromObject(f.gateway)
+			snapshots := newFakeSnapshotPublisher()
+			snapshots.versions[gatewayKey.String()] = "stale"
+			kube := fakeclient.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
+				WithObjects(objects...).
+				Build()
+			reconciler := &GatewayReconciler{
+				Client:    &getErrorClient{Client: kube, kind: kind, err: errors.New("injected transport failure")},
+				Scheme:    scheme,
+				Snapshots: snapshots,
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: gatewayKey})
+			expectPreservedProgrammed(kube, f, snapshots, result, err)
+		},
+		ginkgo.Entry("for the referenced CloudflareTunnel", "CloudflareTunnel"),
+		ginkgo.Entry("for the referenced CloudflareAccount", "CloudflareAccount"),
+		ginkgo.Entry("for the referenced GatewayClassConfig", "GatewayClassConfig"),
+	)
+
+	ginkgo.It("restores the configured dataplane replicas when a valid reconcile follows retraction", func() {
+		scheme := runtime.NewScheme()
+		gomega.Expect(clientgoscheme.AddToScheme(scheme)).To(gomega.Succeed())
+		gomega.Expect(gatewayv1.Install(scheme)).To(gomega.Succeed())
+		gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+
+		gatewayKey := types.NamespacedName{Namespace: "tenant", Name: "gateway"}
+		config := conformanceConfig("config", corev1.ServiceTypeClusterIP)
+		class := gatewayClass("class", config.Name)
+		gateway := httpGateway(gatewayKey, class.Name)
+		gateway.UID = "gateway-uid"
+		gateway.Generation = 3
+		replicas := int32(2)
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "flareway-gw-" + gateway.Name, Namespace: gateway.Namespace,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())},
+			},
+			Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+		}
+		snapshots := newFakeSnapshotPublisher()
+		snapshots.versions[gatewayKey.String()] = "stale"
+		kube := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&gatewayv1.Gateway{}).
+			WithObjects(class, gateway, deployment).
+			Build()
+		reconciler := &GatewayReconciler{Client: kube, Scheme: scheme, Snapshots: snapshots}
+
+		// The referenced GatewayClassConfig is confirmed missing: the Gateway is
+		// terminally rejected and its owned dataplane scales to zero.
+		result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: gatewayKey})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(result).To(gomega.Equal(ctrl.Result{}))
+		var retracted appsv1.Deployment
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(deployment), &retracted)).To(gomega.Succeed())
+		gomega.Expect(retracted.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*retracted.Spec.Replicas).To(gomega.Equal(int32(0)))
+
+		// Recreating the config lets the next reconcile restore the desired
+		// replicas through the normal owned-object path.
+		gomega.Expect(kube.Create(context.Background(), config)).To(gomega.Succeed())
+		result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: gatewayKey})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(result.RequeueAfter).To(gomega.Equal(programmedRequeue))
+		var restored appsv1.Deployment
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(deployment), &restored)).To(gomega.Succeed())
+		gomega.Expect(restored.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*restored.Spec.Replicas).To(gomega.Equal(int32(2)))
+	})
+})
+
+// getErrorClient fails Get calls for one object kind so tests can exercise
+// transient API failures that must surface as reconcile errors.
+type getErrorClient struct {
+	client.Client
+	kind string
+	err  error
+}
+
+func (c *getErrorClient) Get(ctx context.Context, key types.NamespacedName, object client.Object, options ...client.GetOption) error {
+	switch object.(type) {
+	case *v1alpha1.CloudflareTunnel:
+		if c.kind == "CloudflareTunnel" {
+			return c.err
+		}
+	case *v1alpha1.CloudflareAccount:
+		if c.kind == "CloudflareAccount" {
+			return c.err
+		}
+	case *v1alpha1.GatewayClassConfig:
+		if c.kind == "GatewayClassConfig" {
+			return c.err
+		}
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
 
 var _ = ginkgo.Describe("AUD handoff identity", func() {
 	ginkgo.It("uses bounded injective labels for namespaced names that collided under delimiter concatenation", func() {
@@ -1199,6 +1582,55 @@ var _ = ginkgo.Describe("Service address selection", func() {
 		gomega.Expect(ready).To(gomega.BeTrue())
 		gomega.Expect(*addresses[0].Type).To(gomega.Equal(gatewayv1.IPAddressType))
 		gomega.Expect(addresses[0].Value).To(gomega.Equal("192.0.2.55"))
+	})
+})
+
+var _ = ginkgo.Describe("Gateway CloudflareAccount watch mapping", func() {
+	ginkgo.It("enqueues Gateways through CloudflareTunnels that reference the account", func() {
+		scheme := runtime.NewScheme()
+		gomega.Expect(clientgoscheme.AddToScheme(scheme)).To(gomega.Succeed())
+		gomega.Expect(gatewayv1.Install(scheme)).To(gomega.Succeed())
+		gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+
+		explicit := httpGateway(types.NamespacedName{Namespace: "tenant", Name: "explicit"}, "class")
+		explicit.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
+			ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			},
+		}
+		implicit := httpGateway(types.NamespacedName{Namespace: "tenant", Name: "implicit"}, "class")
+		unrelated := httpGateway(types.NamespacedName{Namespace: "tenant", Name: "unrelated"}, "class")
+		tunnels := []client.Object{
+			&v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "tenant"},
+				Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+			},
+			&v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Name: "implicit", Namespace: "tenant"},
+				Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+			},
+			&v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "tenant"},
+				Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "other-account"}},
+			},
+		}
+		kube := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(append([]client.Object{explicit, implicit, unrelated}, tunnels...)...).
+			Build()
+		reconciler := &GatewayReconciler{Client: kube, Scheme: scheme}
+
+		requests := reconciler.mapAccountToGateways(context.Background(), &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		})
+		gomega.Expect(requests).To(gomega.ConsistOf(
+			reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "explicit"}},
+			reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "implicit"}},
+		))
+
+		gomega.Expect(reconciler.mapAccountToGateways(context.Background(), &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-account"},
+		})).To(gomega.BeEmpty())
 	})
 })
 

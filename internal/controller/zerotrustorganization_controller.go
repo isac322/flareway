@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -160,14 +161,34 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	}
 
 	observedRevocation := copyOrganizationTime(object.Status.ObservedUserRevocationRequest)
-	if request := object.Spec.UserRevocation; organizationUserRevocationRequested(request, object.Status.ObservedUserRevocationRequest) {
-		_, revokeErr := api.RevokeAccessOrganizationUser(ctx, scope, flarecloudflare.OrganizationUserRevocationInput{
-			Email: request.Email, UserUID: request.UserUID, Devices: request.Devices, WARPSessionReauth: request.WARPSessionReauth,
-		})
-		if revokeErr != nil {
-			return r.finishRemoteError(ctx, object, revokeErr)
+	if revocation := object.Spec.UserRevocation; organizationUserRevocationRequested(revocation, observedRevocation) {
+		// The informer cache can lag the status patch that recorded a previous
+		// revocation; re-read status directly so a queued reconcile cannot revoke twice.
+		if reader := r.APIReader; reader != nil {
+			fresh := new(v1alpha1.ZeroTrustOrganization)
+			if err := reader.Get(ctx, request.NamespacedName, fresh); err != nil {
+				if apierrors.IsNotFound(err) {
+					return ctrl.Result{}, nil
+				}
+				return r.finishError(ctx, object, err)
+			}
+			if fresh.UID != object.UID {
+				return ctrl.Result{}, nil
+			}
+			if latest := fresh.Status.ObservedUserRevocationRequest; latest != nil &&
+				(observedRevocation == nil || latest.After(observedRevocation.Time)) {
+				observedRevocation = copyOrganizationTime(latest)
+			}
 		}
-		observedRevocation = request.RequestedAt.DeepCopy()
+		if organizationUserRevocationRequested(revocation, observedRevocation) {
+			_, revokeErr := api.RevokeAccessOrganizationUser(ctx, scope, flarecloudflare.OrganizationUserRevocationInput{
+				Email: revocation.Email, UserUID: revocation.UserUID, Devices: revocation.Devices, WARPSessionReauth: revocation.WARPSessionReauth,
+			})
+			if revokeErr != nil {
+				return r.finishRemoteError(ctx, object, revokeErr)
+			}
+			observedRevocation = revocation.RequestedAt.DeepCopy()
+		}
 	}
 
 	if err := r.patchStatus(ctx, object, observed, observedDOH, nil, observedRevocation, metav1.ConditionTrue, "Ready", "Zero Trust organization is synchronized"); err != nil {
@@ -286,16 +307,15 @@ func (r *ZeroTrustOrganizationReconciler) checkSingleWriter(ctx context.Context,
 		if other.UID == object.UID || !other.DeletionTimestamp.IsZero() || effectiveGlobalManagementPolicy(other.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged {
 			continue
 		}
-		otherAccountID, eligible := globalContenderAccountID(ctx, reader, other.Namespace, other.Spec.AccountRef.Name, other.Status.Conditions, false)
-		if !eligible || otherAccountID != accountID {
+		otherAccount, eligible, err := globalContenderAccount(ctx, reader, other.Namespace, other.Spec.AccountRef.Name)
+		if err != nil {
+			return err
+		}
+		if !eligible || otherAccount.Spec.AccountID != accountID {
 			continue
 		}
-		var otherAccount v1alpha1.CloudflareAccount
-		if err := reader.Get(ctx, types.NamespacedName{Name: other.Spec.AccountRef.Name}, &otherAccount); err != nil {
-			continue
-		}
-		otherScope, err := organizationScope(&otherAccount, other.Spec.Zone)
-		if err != nil || organizationScopeKey(otherAccountID, otherScope) != target {
+		otherScope, err := organizationScope(otherAccount, other.Spec.Zone)
+		if err != nil || organizationScopeKey(accountID, otherScope) != target {
 			continue
 		}
 		otherKey := client.ObjectKeyFromObject(other)

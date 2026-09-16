@@ -92,8 +92,34 @@ type AccessApplicationCompilation struct {
 	Ancestors         []AccessAncestor
 	OriginJWTEnforced bool
 
+	// TargetLoss names the platform object whose loss made the remote Access
+	// application permanently unreachable. It is empty for configuration or
+	// authorization rejections that must only block, never delete, the remote
+	// application.
+	TargetLoss AccessTargetLoss
+
 	claims []accessClaim
 }
+
+// AccessTargetLoss identifies the platform object whose loss permanently
+// removes an Access application's data-plane target.
+type AccessTargetLoss string
+
+const (
+	// AccessTargetLossNone marks rejections that are not caused by a lost
+	// target, such as invalid configuration or denied references.
+	AccessTargetLossNone AccessTargetLoss = ""
+	// AccessTargetLossGateway marks a lost or unmanaged target Gateway.
+	AccessTargetLossGateway AccessTargetLoss = "Gateway"
+	// AccessTargetLossGatewayClass marks a lost or unmanaged GatewayClass.
+	AccessTargetLossGatewayClass AccessTargetLoss = "GatewayClass"
+	// AccessTargetLossTunnel marks a lost or remotely deleted CloudflareTunnel.
+	AccessTargetLossTunnel AccessTargetLoss = "CloudflareTunnel"
+	// AccessTargetLossNetworkRoute marks a lost or unready NetworkRoute.
+	AccessTargetLossNetworkRoute AccessTargetLoss = "NetworkRoute"
+	// AccessTargetLossHostnameRoute marks a lost or unready HostnameRoute.
+	AccessTargetLossHostnameRoute AccessTargetLoss = "HostnameRoute"
+)
 
 type accessClaim struct {
 	listener    string
@@ -127,7 +153,7 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 	gateway, _ := Translate(base)
 	if gateway == nil {
 		if len(application.Spec.TargetRefs) > 0 {
-			return accessFailure("TargetNotFound", "Gateway target was not found")
+			return accessLossFailure("Gateway target was not found", AccessTargetLossGateway)
 		}
 		return compileDeclaredAccessDestinations(in, application)
 	}
@@ -912,6 +938,12 @@ func rejectedAccessCompilation(compilation AccessApplicationCompilation, reason,
 
 func accessFailure(reason, message string) AccessApplicationCompilation {
 	return AccessApplicationCompilation{Accepted: false, Reason: reason, Message: message}
+}
+
+// accessLossFailure rejects because a platform target object is gone or
+// permanently unusable; TargetLoss carries the structured discriminator.
+func accessLossFailure(message string, loss AccessTargetLoss) AccessApplicationCompilation {
+	return AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
 }
 
 func accessRegionsToMatches(regions []accessRegion) []ir.PathMatch {
