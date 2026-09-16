@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -373,17 +374,22 @@ func waitForAUDSecret(ctx context.Context, application *unstructured.Unstructure
 	var result *corev1.Secret
 	_, err := poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 		secrets := &corev1.SecretList{}
-		label := namespace + "--" + application.GetName()
-		if err := kubeClient.List(checkCtx, secrets,
-			client.InNamespace("flareway-system"),
-			client.MatchingLabels{"flareway.bhyoo.com/access-application": label},
-		); err != nil {
+		if err := kubeClient.List(checkCtx, secrets, client.InNamespace("flareway-system")); err != nil {
 			return false, err
 		}
-		if len(secrets.Items) != 1 {
+		applicationKey := namespace + "/" + application.GetName()
+		matches := make([]corev1.Secret, 0, 1)
+		for index := range secrets.Items {
+			secret := &secrets.Items[index]
+			if string(secret.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey]) == applicationKey &&
+				string(secret.Data[v1alpha1.AccessApplicationUIDSecretKey]) == string(application.GetUID()) {
+				matches = append(matches, *secret)
+			}
+		}
+		if len(matches) != 1 {
 			return false, nil
 		}
-		result = secrets.Items[0].DeepCopy()
+		result = matches[0].DeepCopy()
 		return true, nil
 	})
 	Expect(err).NotTo(HaveOccurred(), "wait for AUD Secret for %s", application.GetName())
