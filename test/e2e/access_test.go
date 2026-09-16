@@ -323,11 +323,11 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		err,
 	).NotTo(
 		HaveOccurred(),
-		"wait for protected hostname %s; application conditions: %s; Gateway conditions: %s; Tunnel conditions: %s",
+		"wait for protected hostname %s; application status: %s; Gateway status: %s; Tunnel status: %s",
 		host,
-		conditionSummary(application),
-		conditionSummary(gateway),
-		conditionSummary(tunnel),
+		statusSummary(application),
+		statusSummary(gateway),
+		statusSummary(tunnel),
 	)
 	var lastEdgeErr error
 	_, err = poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {

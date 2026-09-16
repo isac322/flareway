@@ -325,6 +325,27 @@ func conditionSummary(template *unstructured.Unstructured) string {
 	return string(payload)
 }
 
+func statusSummary(template *unstructured.Unstructured) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	current := template.DeepCopy()
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(template), current); err != nil {
+		return fmt.Sprintf("get %s/%s: %v", template.GetKind(), client.ObjectKeyFromObject(template), err)
+	}
+	status, found, err := unstructured.NestedMap(current.Object, "status")
+	if err != nil {
+		return fmt.Sprintf("read %s/%s status: %v", template.GetKind(), client.ObjectKeyFromObject(template), err)
+	}
+	if !found {
+		return "status is absent"
+	}
+	payload, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Sprintf("encode status: %v", err)
+	}
+	return string(payload)
+}
+
 func dataplaneDiagnostics() string {
 	if kubeClientset == nil || namespace == "" {
 		return "Kubernetes clientset or E2E namespace is unavailable"
