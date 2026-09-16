@@ -325,9 +325,9 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		HaveOccurred(),
 		"wait for protected hostname %s; application conditions: %s; Gateway conditions: %s; Tunnel conditions: %s",
 		host,
-		conditionSummary(ctx, application),
-		conditionSummary(ctx, gateway),
-		conditionSummary(ctx, tunnel),
+		conditionSummary(application),
+		conditionSummary(gateway),
+		conditionSummary(tunnel),
 	)
 	recordLatency("access-ready-"+application.GetName(), time.Since(started))
 }

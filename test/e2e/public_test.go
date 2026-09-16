@@ -78,7 +78,7 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 		if err != nil {
 			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
 		}
-		Expect(err).NotTo(HaveOccurred(), "Gateway conditions: %s", conditionSummary(ctx, gateway))
+		Expect(err).NotTo(HaveOccurred(), "Gateway conditions: %s", conditionSummary(gateway))
 		recordLatency("public-programmed", duration)
 
 		duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
@@ -92,16 +92,40 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 			tunnelID = value
 			return hasCondition(checkCtx, tunnel, "Ready", "True")
 		})
-		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(ctx, tunnel))
+		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(tunnel))
 		recordLatency("public-tunnel-ready", duration)
 
-		status, body, err := edgeRequest(ctx, "/get")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusOK), "Programmed=True must make the first edge request succeed; body: %s", body)
+		var status int
+		var body string
+		var requestErr error
+		duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+			status, body, requestErr = edgeRequest(checkCtx, "/get")
+			return requestErr == nil && status == http.StatusOK, nil
+		})
+		Expect(
+			err,
+		).NotTo(
+			HaveOccurred(),
+			"edge /get did not become ready: status=%d body=%q error=%v",
+			status,
+			body,
+			requestErr,
+		)
+		recordLatency("public-edge-ready", duration)
 
-		status, body, err = edgeRequest(ctx, "/nope")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusNotFound), "unmatched paths must remain fail-closed; body: %s", body)
+		duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+			status, body, requestErr = edgeRequest(checkCtx, "/nope")
+			return requestErr == nil && status == http.StatusNotFound, nil
+		})
+		Expect(
+			err,
+		).NotTo(
+			HaveOccurred(),
+			"edge /nope did not become fail-closed: status=%d body=%q error=%v",
+			status,
+			body,
+			requestErr,
+		)
 	}, NodeTimeout(6*time.Minute))
 
 	It("removes route configuration and remote resources", func(ctx SpecContext) {

@@ -303,7 +303,9 @@ func hasCondition(ctx context.Context, template *unstructured.Unstructured, cond
 	return false, nil
 }
 
-func conditionSummary(ctx context.Context, template *unstructured.Unstructured) string {
+func conditionSummary(template *unstructured.Unstructured) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	current := template.DeepCopy()
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(template), current); err != nil {
 		return fmt.Sprintf("get %s/%s: %v", template.GetKind(), client.ObjectKeyFromObject(template), err)

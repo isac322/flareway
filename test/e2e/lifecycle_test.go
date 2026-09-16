@@ -80,7 +80,7 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 		if err != nil {
 			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
 		}
-		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(ctx, tunnel))
+		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(tunnel))
 		recordLatency("lifecycle-adoption-ready", duration)
 
 		Expect(kubeClient.Delete(ctx, tunnel)).To(Succeed())
