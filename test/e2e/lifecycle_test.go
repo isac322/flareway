@@ -75,7 +75,24 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		duration, err := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
-			return hasCondition(checkCtx, tunnel, "Ready", "True")
+			current := tunnel.DeepCopy()
+			if err := kubeClient.Get(checkCtx, client.ObjectKeyFromObject(tunnel), current); err != nil {
+				return false, err
+			}
+			accepted, err := hasCondition(checkCtx, current, "Accepted", "True")
+			if err != nil || !accepted {
+				return false, err
+			}
+			tunnelReady, err := hasCondition(checkCtx, current, "TunnelReady", "True")
+			if err != nil || !tunnelReady {
+				return false, err
+			}
+			tunnelID, _, err := unstructured.NestedString(current.Object, "status", "tunnelId")
+			if err != nil {
+				return false, err
+			}
+			owned, _, err := unstructured.NestedBool(current.Object, "status", "ownershipVerified")
+			return tunnelID == remote.ID && owned, err
 		})
 		if err != nil {
 			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())

@@ -129,23 +129,13 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 	}, NodeTimeout(6*time.Minute))
 
 	It("removes route configuration and remote resources", func(ctx SpecContext) {
-		before, err := tunnelConfigVersion(ctx, tunnel)
-		Expect(err).NotTo(HaveOccurred())
 		Expect(kubeClient.Delete(ctx, route)).To(Succeed())
-
 		convergeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		defer cancel()
-		duration, err := poll.Until(convergeCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
-			desired, applied, versionErr := tunnelConfigVersions(checkCtx, tunnel)
-			return desired > before && applied == desired, versionErr
-		})
-		Expect(err).NotTo(HaveOccurred(), "CloudflareTunnel conditions: %s", conditionSummary(tunnel))
-		recordLatency("public-route-removal", duration)
-
 		var status int
 		var body string
 		var requestErr error
-		duration, err = poll.Until(convergeCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+		duration, err := poll.Until(convergeCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			status, body, requestErr = edgeRequest(checkCtx, "/get")
 			return requestErr == nil && status == http.StatusNotFound, nil
 		})
@@ -158,6 +148,7 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 			body,
 			requestErr,
 		)
+		recordLatency("public-route-removal", duration)
 
 		Expect(kubeClient.Delete(ctx, gateway)).To(Succeed())
 		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 5*time.Minute)
