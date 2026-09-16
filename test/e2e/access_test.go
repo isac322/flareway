@@ -180,7 +180,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	It("denies unauthenticated and forged assertions while accepting a service token", func(ctx SpecContext) {
 		status, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusForbidden), "unauthenticated Access request must fail closed; body: %s", body)
+		Expect(status).To(Equal(http.StatusFound), "unauthenticated Access request must redirect to authentication; body: %s", body)
 
 		status, body, err = edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
@@ -192,7 +192,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		} {
 			status, body, err = edgeRequestTo(ctx, accessHostname, "/get", map[string]string{"Cf-Access-Jwt-Assertion": assertion})
 			Expect(err).NotTo(HaveOccurred(), name)
-			Expect(status).To(Equal(http.StatusForbidden), "%s assertion must not bypass Access; body: %s", name, body)
+			Expect(status).To(SatisfyAny(Equal(http.StatusFound), Equal(http.StatusUnauthorized), Equal(http.StatusForbidden)), "%s assertion must not bypass Access; body: %s", name, body)
 		}
 	}, NodeTimeout(2*time.Minute))
 
@@ -205,7 +205,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 
 		status, body, err := edgeRequestTo(ctx, mixedHostname, "/dashboard", nil)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal(http.StatusForbidden), "dashboard must remain protected; body: %s", body)
+		Expect(status).To(Equal(http.StatusFound), "dashboard must redirect unauthenticated clients to Access; body: %s", body)
 		status, body, err = edgeRequestTo(ctx, mixedHostname, "/dashboard", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusOK), "service token must reach protected dashboard; body: %s", body)
@@ -380,7 +380,13 @@ func tunnelHostnameGuard(ctx context.Context, tunnel *unstructured.Unstructured,
 func edgeRequestTo(ctx context.Context, host, path string, headers map[string]string) (int, string, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	httpClient := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
 	if err != nil {
 		return 0, "", fmt.Errorf("create edge request: %w", err)

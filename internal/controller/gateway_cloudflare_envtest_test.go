@@ -222,6 +222,7 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(testClient.Create(testContext, pod)).To(gomega.Succeed())
 		pod.Status.PodIP = "10.0.0.8"
 		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		gomega.Expect(testClient.Status().Update(testContext, pod)).To(gomega.Succeed())
 		testSnapshots.mu.Lock()
 		testSnapshots.acked[compiled.Key.String()] = "snapshot-1"
@@ -243,6 +244,17 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(ready).To(gomega.BeFalse())
 		gomega.Expect(lagging).To(gomega.ContainElement("dataplane(version 5)"))
+
+		statusWriter.Prober = &staticGatewayProber{version: 6, ready: true}
+		testSnapshots.mu.Lock()
+		delete(testSnapshots.acked, compiled.Key.String())
+		testSnapshots.mu.Unlock()
+		initial := observed.DeepCopy()
+		initial.Status.ConfigVersion.Applied = 0
+		ready, lagging, _, err = statusWriter.cloudflareGate(testContext, compiled, initial, "6", "snapshot-1")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(ready).To(gomega.BeTrue())
+		gomega.Expect(lagging).To(gomega.BeEmpty())
 		gomega.Expect(testClient.Delete(testContext, gateway)).To(gomega.Succeed())
 
 	})
