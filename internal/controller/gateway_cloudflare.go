@@ -85,6 +85,11 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 		for _, virtualHost := range domain.VirtualHosts {
 			host := strings.ToLower(virtualHost.Hostname)
 			guard := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
+			if guard == v1alpha1.HostnameGuardBlocked {
+				// The block-first handshake already completed for this domain;
+				// a public carve-out on the same hostname must not re-block it.
+				continue
+			}
 			if guard == v1alpha1.HostnameGuardForwarding || unprotectedHosts[host] {
 				requiresBlock = true
 				break
@@ -603,52 +608,43 @@ func (r *GatewayReconciler) cloudflareGate(
 		return false, nil, false, err
 	}
 
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(gateway.Key.Namespace), client.MatchingLabels{dataplane.StandardGatewayLabelKey: gateway.Key.Name}); err != nil {
-		return false, nil, false, fmt.Errorf("list dataplane Pods: %w", err)
-	}
 	prober := r.Prober
 	if prober == nil {
 		prober = dataplane.NewHTTPProber(5 * time.Second)
 	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(gateway.Key.Namespace), client.MatchingLabels{dataplane.StandardGatewayLabelKey: gateway.Key.Name}); err != nil {
+		return false, nil, false, fmt.Errorf("list dataplane Pods: %w", err)
+	}
 	activePods := 0
-	initialDataplaneReady := true
 	for index := range pods.Items {
 		pod := &pods.Items[index]
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		activePods++
-		if !podConditionTrue(pod.Status.Conditions, corev1.PodReady) {
-			initialDataplaneReady = false
-		}
 		if pod.Status.PodIP == "" {
 			lagging = append(lagging, pod.Name+"(no Pod IP)")
-			initialDataplaneReady = false
 			continue
 		}
 		if err := prober.Ready(ctx, pod.Status.PodIP); err != nil {
 			lagging = append(lagging, pod.Name+"(not ready)")
-			initialDataplaneReady = false
 			continue
 		}
 		got, err := prober.ConfigVersion(ctx, pod.Status.PodIP)
 		if err != nil {
 			lagging = append(lagging, pod.Name+"(config unavailable)")
-			initialDataplaneReady = false
 			continue
 		}
 		if got != wantVersion {
 			lagging = append(lagging, fmt.Sprintf("%s(version %d)", pod.Name, got))
-			initialDataplaneReady = false
 		}
 	}
 	if activePods == 0 {
-		initialDataplaneReady = false
 		lagging = append(lagging, "no active dataplane Pods")
 	}
-	if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) &&
-		(tunnel.Status.ConfigVersion.Applied != 0 || !initialDataplaneReady) {
+	if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) {
 		lagging = append(lagging, "Envoy xDS ACK")
 	}
 
@@ -657,15 +653,6 @@ func (r *GatewayReconciler) cloudflareGate(
 		lagging = append(lagging, "managed DNS records")
 	}
 	return len(lagging) == 0, lagging, dnsReady, nil
-}
-
-func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.PodConditionType) bool {
-	for _, condition := range conditions {
-		if condition.Type == conditionType {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
 
 func parseVersion(version string) (int64, error) {

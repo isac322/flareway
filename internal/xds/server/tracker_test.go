@@ -35,10 +35,12 @@ func TestAckTrackerRequiresEveryExpectedType(t *testing.T) {
 	})
 
 	listenerRequest := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
+	tracker.OnRequest(7, listenerRequest)
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResourceNamesSubscribe: []string{"route-a"}})
 	tracker.OnResponse(7, listenerRequest, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1"})
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
 	if tracker.IsACKed(node, version) {
-		t.Fatal("snapshot converged before RouteConfiguration ACK")
+		t.Fatal("snapshot converged before subscribed RouteConfiguration ACK")
 	}
 
 	routeRequest := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType}
@@ -46,6 +48,163 @@ func TestAckTrackerRequiresEveryExpectedType(t *testing.T) {
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResponseNonce: "2"})
 	if !tracker.IsACKed(node, version) {
 		t.Fatal("snapshot did not converge after every expected ACK")
+	}
+}
+
+func TestAckTrackerIgnoresUnsubscribedTypes(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{
+		resourcev3.ListenerType: "listener",
+		resourcev3.RouteType:    "route",
+		resourcev3.SecretType:   "secret",
+	})
+
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
+	tracker.OnResponse(7,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1"})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
+
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("unsubscribed RouteConfiguration/Secret types blocked convergence")
+	}
+}
+
+func TestAckTrackerNewSubscriptionRequiresACK(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{
+		resourcev3.ListenerType: "listener",
+		resourcev3.RouteType:    "route",
+	})
+
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
+	tracker.OnResponse(7,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1"})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("snapshot did not converge while RouteConfiguration was unsubscribed")
+	}
+
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResourceNamesSubscribe: []string{"route-a"}})
+	if tracker.IsACKed(node, version) {
+		t.Fatal("new RouteConfiguration subscription did not require an ACK")
+	}
+	tracker.OnResponse(7,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.RouteType, SystemVersionInfo: version, Nonce: "2"})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResponseNonce: "2"})
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("snapshot did not converge after the new subscription ACKed")
+	}
+}
+
+func TestAckTrackerStreamCloseDropsExpectationWithoutSubscriber(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{
+		resourcev3.ListenerType: "listener",
+		resourcev3.RouteType:    "route",
+	})
+
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
+	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
+	tracker.OnResponse(7,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1"})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
+	if tracker.IsACKed(node, version) {
+		t.Fatal("snapshot converged while a subscribed RouteConfiguration ACK was pending")
+	}
+
+	tracker.OnStreamClosed(8)
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("closed stream's RouteConfiguration subscription still blocked convergence")
+	}
+}
+
+func TestAckTrackerStreamCloseKeepsExpectationWithRemainingSubscriber(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.RouteType: "route"})
+
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
+	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
+	tracker.OnStreamClosed(7)
+	if tracker.IsACKed(node, version) {
+		t.Fatal("closing one of two RouteConfiguration subscribers dropped the ACK expectation")
+	}
+
+	tracker.OnResponse(8,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.RouteType, SystemVersionInfo: version, Nonce: "1"})
+	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResponseNonce: "1"})
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("snapshot did not converge after the remaining subscriber ACKed")
+	}
+}
+
+func TestAckTrackerRequiresLiveStreamForNonEmptySnapshot(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	version := "v1"
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"})
+	if tracker.IsACKed(node, version) {
+		t.Fatal("snapshot converged without a live xDS stream")
+	}
+
+	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
+	tracker.OnResponse(7, request, &discoveryv3.DeltaDiscoveryResponse{
+		TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "1",
+	})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "1"})
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("live stream ACK did not converge")
+	}
+
+	tracker.OnStreamClosed(7)
+	if tracker.IsACKed(node, version) {
+		t.Fatal("snapshot stayed converged after the last xDS stream closed")
+	}
+}
+
+func TestAckTrackerForgetPreservesLiveStreamIdentity(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
+	tracker.OnRequest(7, request)
+	tracker.ExpectSnapshot(node, "v1", map[string]string{resourcev3.ListenerType: "listener-v1"})
+	tracker.OnResponse(7, request, &discoveryv3.DeltaDiscoveryResponse{
+		TypeUrl: resourcev3.ListenerType, SystemVersionInfo: "v1", Nonce: "nack",
+	})
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl: resourcev3.ListenerType, ResponseNonce: "nack",
+		ErrorDetail: &statuspb.Status{Message: "invalid listener"},
+	})
+
+	tracker.Forget(node)
+	if _, ok := tracker.nacks[node]; ok {
+		t.Fatal("Forget retained a stale NACK")
+	}
+
+	tracker.ExpectSnapshot(node, "v2", map[string]string{resourcev3.ListenerType: "listener-v2"})
+	tracker.OnResponse(7,
+		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
+		&discoveryv3.DeltaDiscoveryResponse{
+			TypeUrl: resourcev3.ListenerType, SystemVersionInfo: "v2", Nonce: "ack",
+		},
+	)
+	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{
+		TypeUrl: resourcev3.ListenerType, ResponseNonce: "ack",
+	})
+	if !tracker.IsACKed(node, "v2") {
+		t.Fatal("Forget dropped the live stream identity needed for node-less follow-up ACKs")
 	}
 }
 

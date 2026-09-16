@@ -459,6 +459,67 @@ func TestAccessBlockFirstGateway(t *testing.T) {
 	}
 }
 
+func TestAccessBlockFirstGatewayMixedPublicCarveOut(t *testing.T) {
+	gateway := &ir.Gateway{
+		Cloudflare: &ir.Cloudflare{AccountID: "account-id"},
+		Listeners:  []ir.Listener{{Name: "http", Exposure: ir.ExposurePublic}},
+		Domains: []ir.ProtectionDomain{
+			{
+				Name: "public", ListenerName: "http", EnvoyPort: 18080, Guard: ir.GuardUnprotected,
+				VirtualHosts: []ir.VirtualHost{{Hostname: "mixed.example.com"}},
+			},
+			{
+				Name: "protected", ListenerName: "http", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
+				AccessApplication: "apps/access",
+				Access:            &ir.AccessGuard{AUDs: []string{"aud"}, TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
+				VirtualHosts:      []ir.VirtualHost{{Hostname: "mixed.example.com"}},
+			},
+		},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{Status: v1alpha1.CloudflareTunnelStatus{
+		ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{DesiredHash: "old-config"},
+		Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{
+			{Hostname: "mixed.example.com", ProtectionDomain: "public", Guard: v1alpha1.HostnameGuardUnprotected},
+			{Hostname: "mixed.example.com", ProtectionDomain: "protected", AccessApplication: "apps/access", Guard: v1alpha1.HostnameGuardBlocked},
+		},
+	}}
+
+	// The protected domain already completed block-first: the public carve-out
+	// on the same hostname must not pin it in Blocked forever.
+	desired, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transitioning || desired != gateway {
+		t.Fatalf("blocked protected domain did not release desired config on mixed hostname: transitioning %v", transitioning)
+	}
+
+	// The initial Forwarding -> Blocked security gate still applies: a protected
+	// domain observed Forwarding must block before the new config is pushed.
+	tunnel.Status.Hostnames[1].Guard = v1alpha1.HostnameGuardForwarding
+	blocked, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transitioning || blocked.Domains[1].Guard != ir.GuardBlocked || blocked.Domains[1].Access != nil {
+		t.Fatalf("forwarding protected domain skipped block-first: transitioning %v, gateway %#v", transitioning, blocked)
+	}
+	if blocked.Domains[0].Guard != ir.GuardUnprotected {
+		t.Fatal("block-first transition must keep the public carve-out unprotected")
+	}
+
+	// A protected domain never observed Blocked on a host that is still exposed
+	// unprotected must block first.
+	tunnel.Status.Hostnames = tunnel.Status.Hostnames[:1]
+	blocked, transitioning, err = accessBlockFirstGateway(gateway, tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transitioning || blocked.Domains[1].Guard != ir.GuardBlocked {
+		t.Fatalf("unprotected host exposure skipped block-first: transitioning %v, gateway %#v", transitioning, blocked)
+	}
+}
+
 func TestDesiredTunnelHostnamesPreservePerDomainHandshake(t *testing.T) {
 	gateway := &ir.Gateway{
 		Domains: []ir.ProtectionDomain{

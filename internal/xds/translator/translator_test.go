@@ -584,6 +584,86 @@ func TestBuildAccessIsolationJWTAndPublicHeaderStripping(t *testing.T) {
 	}
 }
 
+func TestBuildJWKSClusterPinsIPv4TLSAndTimeouts(t *testing.T) {
+	const authDomain = "team.cloudflareaccess.com"
+	gateway := &ir.Gateway{
+		Key:       types.NamespacedName{Namespace: "default", Name: "jwks"},
+		Listeners: []ir.Listener{{Name: "http", Hostname: "reports.example.com", EnvoyPort: 18080}},
+		Domains: []ir.ProtectionDomain{{
+			Name: "protected", ListenerName: "http", EnvoyPort: 18080, Protected: true, Guard: ir.GuardForwarding,
+			Access: &ir.AccessGuard{
+				AUDs: []string{"reports-read"}, TeamName: "team", AuthDomain: authDomain,
+			},
+			VirtualHosts: []ir.VirtualHost{{Name: "protected", Hostname: "reports.example.com", Routes: []ir.Route{{
+				Name: "dashboard", Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+				Backends: []ir.BackendRef{{Name: "backend", ClusterName: "backend", Weight: 1}},
+			}}}},
+		}},
+		Clusters: []ir.Cluster{{Name: "backend", Port: 8080}},
+	}
+	snapshot, err := Build(gateway, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwksName := "flareway-jwks-" + shortHash(authDomain)
+	cluster, ok := snapshot.GetResources(resourcev3.ClusterType)[jwksName].(*clusterv3.Cluster)
+	if !ok {
+		t.Fatalf("JWKS cluster %q missing from snapshot: %#v", jwksName, snapshot.GetResources(resourcev3.ClusterType))
+	}
+	if cluster.GetType() != clusterv3.Cluster_STRICT_DNS {
+		t.Fatalf("JWKS cluster type = %v, want STRICT_DNS", cluster.GetType())
+	}
+	if cluster.GetDnsLookupFamily() != clusterv3.Cluster_V4_ONLY {
+		t.Fatalf("JWKS cluster DNS lookup family = %v, want V4_ONLY", cluster.GetDnsLookupFamily())
+	}
+	if got := cluster.ConnectTimeout.AsDuration(); got != 10*time.Second {
+		t.Fatalf("JWKS cluster connect timeout = %v, want 10s", got)
+	}
+	endpoints := cluster.LoadAssignment.GetEndpoints()
+	if len(endpoints) != 1 || len(endpoints[0].LbEndpoints) != 1 {
+		t.Fatalf("JWKS cluster endpoints = %#v", endpoints)
+	}
+	endpoint := endpoints[0].LbEndpoints[0].GetEndpoint()
+	if endpoint.Hostname != authDomain ||
+		endpoint.Address.GetSocketAddress().GetAddress() != authDomain ||
+		endpoint.Address.GetSocketAddress().GetPortValue() != 443 {
+		t.Fatalf("JWKS endpoint = %#v", endpoint)
+	}
+
+	tlsContext := &tlsv3.UpstreamTlsContext{}
+	if err := cluster.TransportSocket.GetTypedConfig().UnmarshalTo(tlsContext); err != nil {
+		t.Fatal(err)
+	}
+	validation := tlsContext.CommonTlsContext.GetValidationContext()
+	if tlsContext.Sni != authDomain ||
+		validation.GetTrustedCa().GetFilename() != "/etc/ssl/certs/ca-certificates.crt" ||
+		len(validation.MatchTypedSubjectAltNames) != 1 ||
+		validation.MatchTypedSubjectAltNames[0].SanType != tlsv3.SubjectAltNameMatcher_DNS ||
+		validation.MatchTypedSubjectAltNames[0].Matcher.GetExact() != authDomain {
+		t.Fatalf("JWKS upstream TLS context = %#v", tlsContext)
+	}
+
+	listener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-18080"].(*listenerv3.Listener)
+	hcm := &hcmv3.HttpConnectionManager{}
+	if err := listener.FilterChains[0].Filters[0].GetTypedConfig().UnmarshalTo(hcm); err != nil {
+		t.Fatal(err)
+	}
+	jwt := &jwtauthnv3.JwtAuthentication{}
+	if err := hcm.HttpFilters[0].GetTypedConfig().UnmarshalTo(jwt); err != nil {
+		t.Fatal(err)
+	}
+	remote := jwt.Providers["cloudflare-access"].GetRemoteJwks()
+	if remote == nil {
+		t.Fatal("Cloudflare provider does not use remote JWKS")
+	}
+	if remote.HttpUri.Uri != "https://"+authDomain+"/cdn-cgi/access/certs" ||
+		remote.HttpUri.GetCluster() != jwksName ||
+		remote.HttpUri.Timeout.AsDuration() != 10*time.Second {
+		t.Fatalf("remote JWKS HTTP URI = %#v", remote.HttpUri)
+	}
+}
+
 func TestBuildRejectsProtectedEmptyAUDSet(t *testing.T) {
 	for _, test := range []struct {
 		name   string

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -167,22 +168,38 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	}, NodeTimeout(9*time.Minute))
 
 	AfterAll(func(ctx SpecContext) {
+		// Reverse remote-dependency order: application finalizers remove
+		// remote bypass children first, then routes and gateways, then the
+		// shared policies, and finally the service token they reference.
+		for _, value := range []*unstructured.Unstructured{mixedApplication, accessApplication} {
+			deleteObject(ctx, value)
+		}
+		for _, value := range []*unstructured.Unstructured{mixedApplication, accessApplication} {
+			waitForObjectDeletion(ctx, value)
+		}
 		for _, value := range []*unstructured.Unstructured{
-			mixedApplication, accessApplication,
 			mixedRoute, accessRoute,
 			mixedGateway, accessGateway,
-			denyPolicy, servicePolicy, serviceToken,
 		} {
 			deleteObject(ctx, value)
 		}
-	}, NodeTimeout(2*time.Minute))
+		for _, value := range []*unstructured.Unstructured{denyPolicy, servicePolicy} {
+			deleteObject(ctx, value)
+		}
+		for _, value := range []*unstructured.Unstructured{denyPolicy, servicePolicy} {
+			waitForObjectDeletion(ctx, value)
+		}
+		deleteObject(ctx, serviceToken)
+		waitForObjectDeletion(ctx, serviceToken)
+	}, NodeTimeout(4*time.Minute))
 
 	It("denies unauthenticated and forged assertions while accepting a service token", func(ctx SpecContext) {
-		status, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)
+		status, responseHeaders, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusFound), "unauthenticated Access request must redirect to authentication; body: %s", body)
+		expectAccessChallenge(responseHeaders, "unauthenticated Access request")
 
-		status, body, err = edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
+		status, _, body, err = edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		if status != http.StatusOK {
 			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
@@ -193,23 +210,32 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 			"forged":    "forged.invalid.signature",
 			"wrong-aud": syntheticJWT("aud-for-a-different-application"),
 		} {
-			status, body, err = edgeRequestTo(ctx, accessHostname, "/get", map[string]string{"Cf-Access-Jwt-Assertion": assertion})
+			status, responseHeaders, body, err = edgeRequestTo(ctx, accessHostname, "/get", map[string]string{"Cf-Access-Jwt-Assertion": assertion})
 			Expect(err).NotTo(HaveOccurred(), name)
-			Expect(status).To(SatisfyAny(Equal(http.StatusFound), Equal(http.StatusUnauthorized), Equal(http.StatusForbidden)), "%s assertion must not bypass Access; body: %s", name, body)
+			Expect(status).To(
+				SatisfyAny(Equal(http.StatusFound), Equal(http.StatusUnauthorized), Equal(http.StatusForbidden)),
+				"%s assertion must receive an Access denial or challenge instead of reaching the origin; body: %s",
+				name,
+				body,
+			)
+			if status == http.StatusFound {
+				expectAccessChallenge(responseHeaders, name+" assertion")
+			}
 		}
 	}, NodeTimeout(2*time.Minute))
 
 	It("keeps child bypass paths public while protecting the enclosing dashboard", func(ctx SpecContext) {
 		for _, path := range []string{"/v1", "/backend-api/tools"} {
-			status, body, err := edgeRequestTo(ctx, mixedHostname, path, nil)
+			status, _, body, err := edgeRequestTo(ctx, mixedHostname, path, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), "operator-owned bypass path %s must stay public; body: %s", path, body)
 		}
 
-		status, body, err := edgeRequestTo(ctx, mixedHostname, "/dashboard", nil)
+		status, responseHeaders, body, err := edgeRequestTo(ctx, mixedHostname, "/dashboard", nil)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusFound), "dashboard must redirect unauthenticated clients to Access; body: %s", body)
-		status, body, err = edgeRequestTo(ctx, mixedHostname, "/dashboard", serviceTokenHeader)
+		expectAccessChallenge(responseHeaders, "dashboard")
+		status, _, body, err = edgeRequestTo(ctx, mixedHostname, "/dashboard", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusOK), "service token must reach protected dashboard; body: %s", body)
 
@@ -233,7 +259,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred())
 		recordLatency("access-aud-secret-blocked", duration)
 
-		status, body, err := edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
+		status, _, body, err := edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusForbidden), "missing AUD Secret must block instead of disabling Access; body: %s", body)
 	}, NodeTimeout(2*time.Minute))
@@ -250,7 +276,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred())
 		recordLatency("access-application-deleted", duration)
 
-		status, body, err := edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
+		status, _, body, err := edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusForbidden), "deleting AccessApplication must never make the hostname public; body: %s", body)
 	}, NodeTimeout(4*time.Minute))
@@ -333,12 +359,13 @@ func waitForAccessReady(ctx context.Context, gateway, tunnel, application *unstr
 		statusSummary(gateway),
 		statusSummary(tunnel),
 	)
+	var lastStatus int
 	var lastEdgeErr error
 	_, err = poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
-		_, _, lastEdgeErr = edgeRequestTo(checkCtx, host, "/", nil)
-		return lastEdgeErr == nil, nil
+		lastStatus, _, _, lastEdgeErr = edgeRequestTo(checkCtx, host, "/", nil)
+		return lastEdgeErr == nil && lastStatus < http.StatusInternalServerError, nil
 	})
-	Expect(err).NotTo(HaveOccurred(), "wait for edge hostname %s: %v", host, lastEdgeErr)
+	Expect(err).NotTo(HaveOccurred(), "wait for edge hostname %s: status=%d error=%v", host, lastStatus, lastEdgeErr)
 	recordLatency("access-ready-"+application.GetName(), time.Since(started))
 }
 
@@ -381,7 +408,7 @@ func tunnelHostnameGuard(ctx context.Context, tunnel *unstructured.Unstructured,
 	return false, nil
 }
 
-func edgeRequestTo(ctx context.Context, host, path string, headers map[string]string) (int, string, error) {
+func edgeRequestTo(ctx context.Context, host, path string, headers map[string]string) (int, http.Header, string, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	httpClient := &http.Client{
@@ -393,7 +420,7 @@ func edgeRequestTo(ctx context.Context, host, path string, headers map[string]st
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("create edge request: %w", err)
+		return 0, nil, "", fmt.Errorf("create edge request: %w", err)
 	}
 	request.Header.Set("User-Agent", e2eUserAgent)
 	for key, value := range headers {
@@ -401,14 +428,35 @@ func edgeRequestTo(ctx context.Context, host, path string, headers map[string]st
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
-		return 0, "", fmt.Errorf("send edge request: %w", err)
+		return 0, nil, "", fmt.Errorf("send edge request: %w", err)
 	}
 	defer response.Body.Close()
 	content, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
-		return 0, "", fmt.Errorf("read edge response: %w", err)
+		return 0, nil, "", fmt.Errorf("read edge response: %w", err)
 	}
-	return response.StatusCode, string(content), nil
+	return response.StatusCode, response.Header, string(content), nil
+}
+
+// expectAccessChallenge proves a redirect leads to the Cloudflare Access
+// login flow instead of an origin-controlled location.
+func expectAccessChallenge(headers http.Header, scenario string) {
+	location := headers.Get("Location")
+	Expect(location).NotTo(BeEmpty(), "%s must redirect to the Access login flow", scenario)
+	target, err := url.Parse(location)
+	Expect(err).NotTo(HaveOccurred(), "%s redirect Location must parse: %q", scenario, location)
+	Expect(target.Hostname()).To(
+		HaveSuffix(".cloudflareaccess.com"),
+		"%s must redirect to a Cloudflare Access team domain, got %q",
+		scenario,
+		location,
+	)
+	Expect(target.Path).To(
+		HavePrefix("/cdn-cgi/access/"),
+		"%s must use the Access login path, got %q",
+		scenario,
+		location,
+	)
 }
 
 func syntheticJWT(audience string) string {

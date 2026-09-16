@@ -176,7 +176,8 @@ func buildJWKCluster(host, name string) (*clusterv3.Cluster, error) {
 	return &clusterv3.Cluster{
 		Name:                 name,
 		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STRICT_DNS},
-		ConnectTimeout:       durationpb.New(5 * time.Second),
+		ConnectTimeout:       durationpb.New(10 * time.Second),
+		DnsLookupFamily:      clusterv3.Cluster_V4_ONLY,
 		LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
 		LoadAssignment: &endpointv3.ClusterLoadAssignment{
 			ClusterName: name,

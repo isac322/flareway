@@ -479,7 +479,7 @@ func buildHTTPFilters(access *ir.AccessGuard) ([]*hcmv3.HttpFilter, string, stri
 						HttpUri: &corev3.HttpUri{
 							Uri:              "https://" + jwksHost + "/cdn-cgi/access/certs",
 							HttpUpstreamType: &corev3.HttpUri_Cluster{Cluster: jwksName},
-							Timeout:          durationpb.New(5 * time.Second),
+							Timeout:          durationpb.New(10 * time.Second),
 						},
 						CacheDuration: durationpb.New(5 * time.Minute),
 					}},

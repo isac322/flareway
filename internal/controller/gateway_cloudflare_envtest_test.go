@@ -253,8 +253,8 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		initial.Status.ConfigVersion.Applied = 0
 		ready, lagging, _, err = statusWriter.cloudflareGate(testContext, compiled, initial, "6", "snapshot-1")
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		gomega.Expect(ready).To(gomega.BeTrue())
-		gomega.Expect(lagging).To(gomega.BeEmpty())
+		gomega.Expect(ready).To(gomega.BeFalse())
+		gomega.Expect(lagging).To(gomega.ContainElement("Envoy xDS ACK"))
 		gomega.Expect(testClient.Delete(testContext, gateway)).To(gomega.Succeed())
 
 	})

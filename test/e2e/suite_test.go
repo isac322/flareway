@@ -442,6 +442,20 @@ func deleteObject(ctx context.Context, value client.Object) {
 	}
 }
 
+// waitForObjectDeletion blocks until the object, including its finalizers, is
+// fully removed so later cleanup cannot hit remote dependency conflicts.
+func waitForObjectDeletion(ctx context.Context, value client.Object) {
+	if value == nil {
+		return
+	}
+	_, err := poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+		current := value.DeepCopyObject().(client.Object)
+		getErr := kubeClient.Get(checkCtx, client.ObjectKeyFromObject(value), current)
+		return apierrors.IsNotFound(getErr), client.IgnoreNotFound(getErr)
+	})
+	Expect(err).NotTo(HaveOccurred(), "wait for %T %s deletion", value, client.ObjectKeyFromObject(value))
+}
+
 func recordLatency(name string, duration time.Duration) {
 	latencies[name] = duration
 }

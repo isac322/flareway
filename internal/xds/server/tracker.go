@@ -40,33 +40,38 @@ type expectedSnapshot struct {
 }
 
 // AckTracker correlates Delta response nonces with later ACK/NACK requests and
-// reports convergence after every resource type changed by a snapshot has
-// been ACKed.
+// reports convergence after every subscribed resource type changed by a
+// snapshot has been ACKed. Only types present in a node's active Delta
+// subscriptions can receive a response, so unsubscribed types never block
+// convergence.
 type AckTracker struct {
-	mu           sync.RWMutex
-	pending      map[int64]map[string]map[string]pendingResponse
-	nodes        map[int64]string
-	expected     map[string]expectedSnapshot
-	fingerprints map[string]map[string]string
-	acked        map[string]map[string]string
-	nacks        map[string]NACK
+	mu            sync.RWMutex
+	pending       map[int64]map[string]map[string]pendingResponse
+	nodes         map[int64]string
+	subscriptions map[int64]map[string]struct{}
+	expected      map[string]expectedSnapshot
+	fingerprints  map[string]map[string]string
+	acked         map[string]map[string]string
+	nacks         map[string]NACK
 }
 
 // NewAckTracker returns an empty, concurrency-safe tracker.
 func NewAckTracker() *AckTracker {
 	return &AckTracker{
-		pending:      make(map[int64]map[string]map[string]pendingResponse),
-		nodes:        make(map[int64]string),
-		expected:     make(map[string]expectedSnapshot),
-		fingerprints: make(map[string]map[string]string),
-		acked:        make(map[string]map[string]string),
-		nacks:        make(map[string]NACK),
+		pending:       make(map[int64]map[string]map[string]pendingResponse),
+		nodes:         make(map[int64]string),
+		subscriptions: make(map[int64]map[string]struct{}),
+		expected:      make(map[string]expectedSnapshot),
+		fingerprints:  make(map[string]map[string]string),
+		acked:         make(map[string]map[string]string),
+		nacks:         make(map[string]NACK),
 	}
 }
 
 // ExpectSnapshot records only present resource types whose per-resource
 // fingerprint changed. Delta xDS emits no response for unchanged types, and
-// removed types do not block Gateway convergence.
+// removed types do not block Gateway convergence. Changed types block
+// convergence only while at least one stream for the node subscribes to them.
 func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[string]string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -90,6 +95,7 @@ func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[strin
 }
 
 // OnResponse records the nonce/version tuple immediately before transmission.
+// A response also proves the stream holds an active subscription for the type.
 func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryRequest, resp *discoveryv3.DeltaDiscoveryResponse) {
 	if req == nil || resp == nil || resp.GetNonce() == "" {
 		return
@@ -105,6 +111,7 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 	if node == "" {
 		return
 	}
+	t.subscribeLocked(streamID, resp.GetTypeUrl())
 	byType := t.pending[streamID]
 	if byType == nil {
 		byType = make(map[string]map[string]pendingResponse)
@@ -121,8 +128,9 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 	}
 }
 
-// OnRequest consumes an ACK or NACK. Subscription-only requests have no nonce
-// and do not alter convergence state.
+// OnRequest consumes an ACK or NACK and records the stream's type
+// subscription. Subscription-only requests have no nonce and do not alter
+// convergence state beyond marking the type subscribed.
 func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) {
 	if req == nil {
 		return
@@ -132,6 +140,7 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	if node := req.GetNode().GetCluster(); node != "" {
 		t.nodes[streamID] = node
 	}
+	t.subscribeLocked(streamID, req.GetTypeUrl())
 	if req.GetResponseNonce() == "" {
 		return
 	}
@@ -174,15 +183,21 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	}
 }
 
-// OnStreamClosed forgets nonce correlation state for a disconnected stream.
+// OnStreamClosed forgets nonce correlation and subscription state for a
+// disconnected stream. Changed types lose their convergence expectation once
+// no remaining stream for the node subscribes to them.
 func (t *AckTracker) OnStreamClosed(streamID int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.pending, streamID)
 	delete(t.nodes, streamID)
+	delete(t.subscriptions, streamID)
 }
 
-// Forget removes every convergence record associated with node.
+// Forget removes every convergence record associated with node while keeping
+// live stream identity and subscriptions. Delta requests carry Node only on
+// the first request of a stream, so dropping that association here would make
+// a later snapshot converge without an ACK.
 func (t *AckTracker) Forget(node string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -190,11 +205,6 @@ func (t *AckTracker) Forget(node string) {
 	delete(t.acked, node)
 	delete(t.fingerprints, node)
 	delete(t.nacks, node)
-	for streamID, streamNode := range t.nodes {
-		if streamNode == node {
-			delete(t.nodes, streamID)
-		}
-	}
 	for streamID, byType := range t.pending {
 		for typeURL, byNonce := range byType {
 			for nonce, pending := range byNonce {
@@ -212,8 +222,10 @@ func (t *AckTracker) Forget(node string) {
 	}
 }
 
-// IsACKed reports whether every expected resource type for node has ACKed the
-// exact version. An empty expected set is already converged.
+// IsACKed reports whether every changed resource type that at least one of
+// node's streams subscribes to has ACKed the exact version. An empty expected
+// set is already converged; a non-empty set requires a live stream so a dead
+// or disconnected Envoy cannot converge vacuously.
 func (t *AckTracker) IsACKed(node, version string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -221,13 +233,58 @@ func (t *AckTracker) IsACKed(node, version string) bool {
 	if !ok || expected.version != version {
 		return false
 	}
+	if len(expected.types) > 0 && !t.hasStreamLocked(node) {
+		return false
+	}
 	acked := t.acked[node]
 	for typeURL := range expected.types {
+		if !t.subscribedLocked(node, typeURL) {
+			continue
+		}
 		if acked[typeURL] != version {
 			return false
 		}
 	}
 	return true
+}
+
+// subscribeLocked records that streamID holds an active Delta subscription for
+// typeURL. Callers must hold t.mu.
+func (t *AckTracker) subscribeLocked(streamID int64, typeURL string) {
+	if typeURL == "" {
+		return
+	}
+	types := t.subscriptions[streamID]
+	if types == nil {
+		types = make(map[string]struct{})
+		t.subscriptions[streamID] = types
+	}
+	types[typeURL] = struct{}{}
+}
+
+// hasStreamLocked reports whether node has any active Delta stream. Callers
+// must hold t.mu.
+func (t *AckTracker) hasStreamLocked(node string) bool {
+	for _, streamNode := range t.nodes {
+		if streamNode == node {
+			return true
+		}
+	}
+	return false
+}
+
+// subscribedLocked reports whether any stream associated with node subscribes
+// to typeURL. Callers must hold t.mu.
+func (t *AckTracker) subscribedLocked(node, typeURL string) bool {
+	for streamID, streamNode := range t.nodes {
+		if streamNode != node {
+			continue
+		}
+		if _, ok := t.subscriptions[streamID][typeURL]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func sameFingerprints(left, right map[string]string) bool {

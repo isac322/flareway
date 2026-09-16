@@ -113,19 +113,47 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 		)
 		recordLatency("public-edge-ready", duration)
 
-		duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
-			status, body, requestErr = edgeRequest(checkCtx, "/nope")
-			return requestErr == nil && status == http.StatusNotFound, nil
-		})
-		Expect(
-			err,
-		).NotTo(
-			HaveOccurred(),
-			"edge /nope did not become fail-closed: status=%d body=%q error=%v",
-			status,
-			body,
-			requestErr,
-		)
+		// /nope must never reach the origin: a single 404 proves fail-closed,
+		// otherwise require three consecutive 404s so propagation noise cannot
+		// hide a transient leak. Any 2xx is a deterministic failure.
+		status, body, requestErr = edgeRequest(programCtx, "/nope")
+		if requestErr == nil {
+			Expect(status).NotTo(
+				And(BeNumerically(">=", http.StatusOK), BeNumerically("<", http.StatusMultipleChoices)),
+				"edge /nope leaked to the origin: status=%d body=%q",
+				status,
+				body,
+			)
+		}
+		if requestErr != nil || status != http.StatusNotFound {
+			consecutive := 0
+			duration, err = poll.Until(programCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+				status, body, requestErr = edgeRequest(checkCtx, "/nope")
+				if requestErr != nil {
+					consecutive = 0
+					return false, nil
+				}
+				if status >= http.StatusOK && status < http.StatusMultipleChoices {
+					return false, fmt.Errorf("edge /nope leaked to the origin: status=%d body=%q", status, body)
+				}
+				if status != http.StatusNotFound {
+					consecutive = 0
+					return false, nil
+				}
+				consecutive++
+				return consecutive >= 3, nil
+			})
+			Expect(
+				err,
+			).NotTo(
+				HaveOccurred(),
+				"edge /nope did not become fail-closed: status=%d body=%q error=%v",
+				status,
+				body,
+				requestErr,
+			)
+			recordLatency("public-edge-failclosed", duration)
+		}
 	}, NodeTimeout(6*time.Minute))
 
 	It("removes route configuration and remote resources", func(ctx SpecContext) {
@@ -206,22 +234,4 @@ func edgeRequest(ctx context.Context, path string) (int, string, error) {
 		return 0, "", fmt.Errorf("read edge response: %w", err)
 	}
 	return response.StatusCode, string(content), nil
-}
-
-func tunnelConfigVersion(ctx context.Context, tunnel *unstructured.Unstructured) (int64, error) {
-	desired, _, err := tunnelConfigVersions(ctx, tunnel)
-	return desired, err
-}
-
-func tunnelConfigVersions(ctx context.Context, tunnel *unstructured.Unstructured) (int64, int64, error) {
-	current := tunnel.DeepCopy()
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(tunnel), current); err != nil {
-		return 0, 0, err
-	}
-	desired, _, err := unstructured.NestedInt64(current.Object, "status", "configVersion", "desired")
-	if err != nil {
-		return 0, 0, err
-	}
-	applied, _, err := unstructured.NestedInt64(current.Object, "status", "configVersion", "applied")
-	return desired, applied, err
 }
