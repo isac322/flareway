@@ -184,6 +184,9 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 
 		status, body, err = edgeRequestTo(ctx, accessHostname, "/get", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
+		if status != http.StatusOK {
+			GinkgoWriter.Printf("Dataplane diagnostics:\n%s\n", dataplaneDiagnostics())
+		}
 		Expect(status).To(Equal(http.StatusOK), "valid service token must reach the origin; body: %s", body)
 
 		for name, assertion := range map[string]string{
