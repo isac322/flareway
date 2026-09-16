@@ -191,6 +191,7 @@ func edgeRequest(ctx context.Context, path string) (int, string, error) {
 	if err != nil {
 		return 0, "", fmt.Errorf("create edge request: %w", err)
 	}
+	request.Header.Set("User-Agent", e2eUserAgent)
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, "", fmt.Errorf("send edge request: %w", err)

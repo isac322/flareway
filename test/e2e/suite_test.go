@@ -53,6 +53,7 @@ import (
 const (
 	controllerName = "flareway.bhyoo.com/gateway-controller"
 	runLabelKey    = "flareway.bhyoo.com/e2e-run"
+	e2eUserAgent   = "flareway-e2e/1.0 (+https://github.com/isac322/flareway)"
 )
 
 type suiteConfig struct {

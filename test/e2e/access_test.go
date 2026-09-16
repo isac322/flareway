@@ -379,6 +379,7 @@ func edgeRequestTo(ctx context.Context, host, path string, headers map[string]st
 	if err != nil {
 		return 0, "", fmt.Errorf("create edge request: %w", err)
 	}
+	request.Header.Set("User-Agent", e2eUserAgent)
 	for key, value := range headers {
 		request.Header.Set(key, value)
 	}
