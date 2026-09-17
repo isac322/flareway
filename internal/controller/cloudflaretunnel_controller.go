@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -146,8 +147,13 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 
 	now := r.now()
 	mode := tunnelConfigurationMode(tunnel)
+	// clearIntent records explicit revocation intent for protected status
+	// fields; patchOwnedStatus restores any other protected field a stale
+	// cache omitted.
+	clearIntent := tunnelStatusClear{}
 	if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
 		tunnel.Status.OwnershipVerified = false
+		clearIntent.Ownership = true
 	}
 	ownedConditions := tunnelOwnedConditions(tunnel)
 	set := func(condition metav1.Condition) {
@@ -168,8 +174,16 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, ownedConditions)
 			r.setReadyForMode(&status, tunnel, mode, now)
-			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
+		// The recorded Gateway dataplane has drained; the binding is now
+		// authoritatively unbound and may be cleared.
+		clearIntent.GatewayBinding = true
+	}
+	if mode == v1alpha1.CloudflareTunnelConfigurationModeDirect &&
+		(tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "") {
+		// Direct mode never had a recorded Gateway binding.
+		clearIntent.GatewayBinding = true
 	}
 
 	var gateway *gatewayv1.Gateway
@@ -194,19 +208,25 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForOwnerDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, ownedConditions)
 			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 		if gateway == nil {
+			// No Gateway claims this Tunnel: the binding is authoritatively
+			// unbound, so clearing gatewayRef/gatewayUid is explicit intent.
+			clearIntent.GatewayBinding = true
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionAccepted, metav1.ConditionFalse, "TargetNotFound", "No Gateway references this CloudflareTunnel", tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", "Waiting for an owning Gateway", tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", "Waiting for an owning Gateway", tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, nil, "", ownedConditions)
 			if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+				// Gateway-absent ObserveOnly cleanup explicitly revokes the
+				// recorded credential references.
 				status.ConnectorTokenSecretRef = nil
 				status.ManagementTokenSecretRef = nil
+				clearIntent.Credentials = true
 			}
 			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-			return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status)
+			return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 		gatewayRef = &corev1.LocalObjectReference{Name: gateway.Name}
 		gatewayUID = gateway.UID
@@ -221,7 +241,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "OwnershipCheckpoint", "Waiting for the exact Gateway UID ownership checkpoint", tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 	}
 	if mode == v1alpha1.CloudflareTunnelConfigurationModeGateway &&
@@ -238,7 +258,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 			r.setReadyForMode(&status, tunnel, mode, now)
-			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 	}
 	if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
@@ -255,12 +275,14 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 				status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 				status.OwnershipVerified = false
 				r.setReadyForMode(&status, tunnel, mode, now)
-				return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+				return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 			}
 		}
 		tunnel.Status.OwnershipVerified = false
+		// ObserveOnly transition explicitly revokes recorded credential refs.
 		tunnel.Status.ConnectorTokenSecretRef = nil
 		tunnel.Status.ManagementTokenSecretRef = nil
+		clearIntent.Credentials = true
 	}
 
 	var account v1alpha1.CloudflareAccount
@@ -274,7 +296,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	if !gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
 		!gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
@@ -284,7 +306,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 
 	namespace := &corev1.Namespace{}
@@ -305,7 +327,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Invalid", bindingErr.Error(), tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	if decision := authorizeBindings(&account, namespace, allBindings, mode == v1alpha1.CloudflareTunnelConfigurationModeDirect); !decision.Allowed {
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionAccepted, metav1.ConditionFalse, decision.Reason, decision.Message, tunnel.Generation, now))
@@ -313,7 +335,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", decision.Message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	acceptedMessage := fmt.Sprintf("Direct configuration is authorized for CloudflareAccount %s", account.Name)
 	if mode == v1alpha1.CloudflareTunnelConfigurationModeGateway {
@@ -327,7 +349,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", "Waiting for valid Cloudflare credentials", tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, err
@@ -346,7 +368,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", "Waiting for the remote Tunnel", tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, err
@@ -362,8 +384,14 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			remote.ID != "" &&
 			remote.ID == tunnel.Status.TunnelID &&
 			validateRemoteTunnel(remote, account.Spec.AccountID) == nil
+		// Ownership conflict revokes verified ownership; credential refs are
+		// revoked only once the recorded dataplane has drained (or immediately
+		// in Direct mode, which has no connector dataplane to drain).
+		conflictClear := clearIntent
+		conflictClear.Ownership = true
 		if remote.ID != "" && (tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly || remote.ID == tunnel.Status.TunnelID) {
 			projectRemoteTunnelStatus(&status, remote, tunnel.Generation)
+			conflictClear.DeletedAt = true
 		}
 		status.OwnershipVerified = preserveVerifiedOwnership
 		if mode == v1alpha1.CloudflareTunnelConfigurationModeGateway {
@@ -374,13 +402,15 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			if drained {
 				status.ConnectorTokenSecretRef = nil
 				status.ManagementTokenSecretRef = nil
+				conflictClear.Credentials = true
 			}
 		} else {
 			status.ConnectorTokenSecretRef = nil
 			status.ManagementTokenSecretRef = nil
+			conflictClear.Credentials = true
 		}
 		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
-		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, conflictClear)
 	}
 
 	if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
@@ -391,10 +421,12 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			status.OwnershipVerified = false
 			status.ConnectorTokenSecretRef = nil
 			status.ManagementTokenSecretRef = nil
-			status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{}
+			observeClear := clearIntent
+			observeClear.DNSRecords = true
+			observeClear.DeletedAt = true
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "ConnectionsUnavailable", err.Error(), tunnel.Generation, now), now)
 			r.setReadyForMode(&status, tunnel, mode, now)
-			if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+			if patchErr := r.patchOwnedStatus(ctx, tunnel, status, observeClear); patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
 			return ctrl.Result{}, err
@@ -407,16 +439,25 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		status.Clients = tunnelClientStatuses(clients)
 		status.Addresses = tunnelAddresses(remote.ID, len(publicHosts) > 0)
 		status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{}
+		// ObserveOnly DNS withdrawal plus the fresh client/address projection
+		// are authoritative empties.
+		observeClear := clearIntent
+		observeClear.DNSRecords = true
+		observeClear.Clients = true
+		observeClear.Addresses = true
+		observeClear.DeletedAt = true
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed Cloudflare Tunnel %s without adopting it", remote.ID), tunnel.Generation, now), now)
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, "ObserveOnly", "ObserveOnly does not manage DNS records", tunnel.Generation, now), now)
 		r.setReadyForMode(&status, tunnel, mode, now)
-		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, observeClear)
 	}
 
 	checkpoint := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 	projectRemoteTunnelStatus(&checkpoint, remote, tunnel.Generation)
 	if !remoteProjectionEqual(tunnel.Status, checkpoint) {
-		if err := r.patchOwnedStatus(ctx, tunnel, checkpoint); err != nil {
+		checkpointClear := clearIntent
+		checkpointClear.DeletedAt = true
+		if err := r.patchOwnedStatus(ctx, tunnel, checkpoint, checkpointClear); err != nil {
 			return ctrl.Result{}, fmt.Errorf("checkpoint remote Tunnel identity: %w", err)
 		}
 		tunnel.Status = mergeTunnelOwnedStatus(tunnel.Status, checkpoint)
@@ -441,6 +482,9 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	status.ManagementTokenSecretRef = managementSecretRef
 	status.Clients = tunnelClientStatuses(clients)
 	status.Addresses = tunnelAddresses(remote.ID, len(publicHosts) > 0)
+	clearIntent.Clients = true
+	clearIntent.Addresses = true
+	clearIntent.DeletedAt = true
 
 	if err := r.reconcileConfiguration(ctx, cf, tunnel, &account, mode, &status, now); err != nil {
 		if mode == v1alpha1.CloudflareTunnelConfigurationModeDirect {
@@ -448,7 +492,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "ConfigurationError", err.Error(), tunnel.Generation, now), now)
 		r.setReadyForMode(&status, tunnel, mode, now)
-		if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, err
@@ -489,7 +533,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		if dnsErr != nil {
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "CloudflareError", dnsErr.Error(), tunnel.Generation, now), now)
 			r.setReadyForMode(&status, tunnel, mode, now)
-			if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+			if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
 			return ctrl.Result{}, dnsErr
@@ -504,7 +548,8 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	}
 
 	r.setReadyForMode(&status, tunnel, mode, now)
-	return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status)
+	clearIntent.DNSRecords = true
+	return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 }
 
 func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel) (ctrl.Result, error) {
@@ -529,6 +574,9 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 		return ctrl.Result{}, err
 	}
 	dependencyTunnel := tunnel.DeepCopy()
+	// Delete-path applies get the same stale-cache protection; only the
+	// authoritative DNS removal and connection listing below may empty fields.
+	clearIntent := tunnelStatusClear{}
 	status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, tunnelOwnedConditions(tunnel))
 	if owner != nil && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly &&
 		tunnel.Status.OwnershipVerified && !allHostnamesBlocked(tunnel.Status.Hostnames) {
@@ -537,7 +585,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 			message = "The recorded Gateway UID did not block every hostname within 30s; teardown remains fail-closed"
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "WaitingForBlock", message, tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
@@ -551,12 +599,12 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	if manageDNS && len(tunnel.Status.DNSRecords) > 0 || needsRemote {
 		var account v1alpha1.CloudflareAccount
 		if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account); err != nil {
-			return r.cleanupFailure(ctx, tunnel, status, "CredentialsUnavailable", fmt.Errorf("get CloudflareAccount for cleanup: %w", err))
+			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "CredentialsUnavailable", fmt.Errorf("get CloudflareAccount for cleanup: %w", err))
 		}
 		accountID = account.Spec.AccountID
 		cf, err = r.cloudflareClient(ctx, &account)
 		if err != nil {
-			return r.cleanupFailure(ctx, tunnel, status, "CredentialsUnavailable", err)
+			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "CredentialsUnavailable", err)
 		}
 	}
 
@@ -565,7 +613,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect || owner != nil {
 			clusterID, err := r.clusterID(ctx)
 			if err != nil {
-				return r.cleanupFailure(ctx, tunnel, status, "DNSOwnershipUnavailable", err)
+				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "DNSOwnershipUnavailable", err)
 			}
 			dnsOwnerName := tunnel.Name
 			if owner != nil {
@@ -575,21 +623,22 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 		}
 		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, currentOwnershipComment, tunnel.Status.DNSRecords)
 		if err != nil {
-			return r.cleanupFailure(ctx, tunnel, status, "DNSDeleteFailed", err)
+			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "DNSDeleteFailed", err)
 		}
 		status.DNSRecords = remainingRecords
+		clearIntent.DNSRecords = true
 		if cleanupConflict != "" {
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Conflict", cleanupConflict, tunnel.Generation, now), now)
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConflict, metav1.ConditionTrue, "DNSOwnership", cleanupConflict, tunnel.Generation, now), now)
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "DNSOwnership", cleanupConflict, tunnel.Generation, now), now)
-			if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+			if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Deleted", "Managed DNS records were removed", tunnel.Generation, now), now)
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionFalse, "Draining", "DNS is removed; waiting for connector drain", tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
@@ -601,7 +650,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	}
 	if !drained {
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "WaitingForDrain", "Waiting for the recorded Gateway UID dataplane to scale to zero and terminate its Pods", tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
@@ -614,7 +663,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	if len(accessPending) > 0 {
 		message := "Waiting for AccessApplication cleanup: " + strings.Join(accessPending, ", ")
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "WaitingForAccessCleanup", message, tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
@@ -627,7 +676,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	if len(dependencies) > 0 {
 		message := "Remove dependent routes before deleting the Tunnel: " + strings.Join(dependencies, ", ")
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "DependenciesRemain", message, tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
@@ -642,35 +691,36 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 			message = "Remote Tunnel identity was observed without verified ownership and was not deleted"
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionFalse, reason, message, tunnel.Generation, now), now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+		if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if tunnel.Status.TunnelID != "" {
 		remote, err := cf.GetTunnel(ctx, tunnel.Status.TunnelID)
 		if err != nil && !isRemoteNotFound(err) {
-			return r.cleanupFailure(ctx, tunnel, status, "TunnelObserveFailed", fmt.Errorf("get Cloudflare Tunnel before deletion: %w", err))
+			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "TunnelObserveFailed", fmt.Errorf("get Cloudflare Tunnel before deletion: %w", err))
 		}
 		if err == nil {
 			if validationErr := validateRemoteTunnel(remote, accountID); validationErr != nil {
-				return r.cleanupFailure(ctx, tunnel, status, "OwnershipMismatch", validationErr)
+				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "OwnershipMismatch", validationErr)
 			}
 			if err := cf.EvictTunnelConnections(ctx, tunnel.Status.TunnelID, nil); err != nil && !isRemoteNotFound(err) {
-				return r.cleanupFailure(ctx, tunnel, status, "ConnectionEvictionFailed", err)
+				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "ConnectionEvictionFailed", err)
 			}
 			clients, _, err := cf.ListTunnelConnections(ctx, tunnel.Status.TunnelID, tunnelObservationLimit)
 			if err != nil && !isRemoteNotFound(err) {
-				return r.cleanupFailure(ctx, tunnel, status, "ConnectionObservationFailed", err)
+				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "ConnectionObservationFailed", err)
 			}
 			status.Clients = tunnelClientStatuses(clients)
+			clearIntent.Clients = true
 			if tunnelClientsHaveConnections(clients) {
 				setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, "WaitingForConnectionEviction", "Cloudflare Tunnel connections were evicted; waiting for the edge to report zero connections", tunnel.Generation, now), now)
-				if err := r.patchOwnedStatus(ctx, tunnel, status); err != nil {
+				if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 					return ctrl.Result{}, err
 				}
 				return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 			}
 			if err := cf.DeleteTunnel(ctx, tunnel.Status.TunnelID, true); err != nil && !isRemoteNotFound(err) {
-				return r.cleanupFailure(ctx, tunnel, status, "TunnelDeleteFailed", fmt.Errorf("delete Cloudflare Tunnel: %w", err))
+				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "TunnelDeleteFailed", fmt.Errorf("delete Cloudflare Tunnel: %w", err))
 			}
 		}
 	}
@@ -686,10 +736,10 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	})
 }
 
-func (r *CloudflareTunnelReconciler) cleanupFailure(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus, reason string, err error) (ctrl.Result, error) {
+func (r *CloudflareTunnelReconciler) cleanupFailure(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus, clearIntent tunnelStatusClear, reason string, err error) (ctrl.Result, error) {
 	now := r.now()
 	setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionCleanupBlocked, metav1.ConditionTrue, reason, err.Error(), tunnel.Generation, now), now)
-	if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+	if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
@@ -2257,7 +2307,10 @@ func (r *CloudflareTunnelReconciler) activeFailure(
 	status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, conditions)
 	setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, reason, err.Error(), tunnel.Generation, now), now)
 	r.setReadyForMode(&status, tunnel, tunnelConfigurationMode(tunnel), now)
-	if patchErr := r.patchOwnedStatus(ctx, tunnel, status); patchErr != nil {
+	// Direct mode never has a valid Gateway binding; Gateway mode keeps the
+	// selected owner identity authoritative.
+	clearIntent := tunnelStatusClear{GatewayBinding: tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect}
+	if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
@@ -2293,10 +2346,82 @@ func mergeTunnelOwnedStatus(current, owned v1alpha1.CloudflareTunnelStatus) v1al
 	return owned
 }
 
-func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus) error {
+// tunnelStatusClear declares which protected tunnel-owned status fields an
+// apply is allowed to empty. Server-side apply deletes any field the
+// flareway-tunnel manager owns when the apply document omits it, so a status
+// built from a stale cached object would silently erase live remote identity,
+// credential references, and observed collections. Callers must set the
+// matching flag only on the explicit revocation paths: ObserveOnly transition
+// and drained ownership conflict may clear credential refs and ownership, and
+// ObserveOnly DNS withdrawal may clear DNS records. Fresh remote observations
+// (clients, addresses, dnsRecords) are authoritative lists, not clears.
+type tunnelStatusClear struct {
+	// Credentials allows connectorTokenSecretRef and managementTokenSecretRef
+	// to be emptied: ObserveOnly transition and drained ownership conflict.
+	Credentials bool
+	// Ownership allows ownershipVerified to be emptied: ObserveOnly
+	// transition and ownership conflict.
+	Ownership bool
+	// GatewayBinding allows gatewayRef and gatewayUid to be emptied: only
+	// when the current reconcile authoritatively computes an unbound Tunnel —
+	// Gateway mode with no owning Gateway, and Direct mode where no Gateway
+	// binding is valid. Drain, delete, and stale paths must preserve them.
+	GatewayBinding bool
+	// DeletedAt allows deletedAt to be emptied: only applies carrying a fresh
+	// remote projection may rewrite it; a stale apply must never erase a
+	// recorded remote deletion because deletedAt gates fail-closed handling
+	// in the Gateway dataplane paths.
+	DeletedAt bool
+	// DNSRecords allows dnsRecords to be emptied: ObserveOnly DNS withdrawal
+	// and the authoritative results of ensureDNS/removeDNSRecords.
+	DNSRecords bool
+	// Clients allows clients to be emptied by a fresh connection listing.
+	Clients bool
+	// Addresses allows addresses to be emptied by a fresh projection.
+	Addresses bool
+}
+
+// patchOwnedStatus applies the tunnel-owned status under the flareway-tunnel
+// field manager. Because SSA deletes owned fields omitted from the document,
+// an apply built from a stale cached object must not empty protected fields
+// that exist live unless the caller declared clear intent. When the document
+// would empty a protected field without intent, the live object is read once
+// through APIReader and the live values are restored into the document. The
+// live read only happens on a potential regression — a converged apply that
+// carries its protected fields never reads — so the steady-state loop does
+// not pay a quorum read. The controller is the sole writer of these fields
+// and runs with MaxConcurrentReconciles=1, so the read-to-apply window cannot
+// observe a newer tunnel write; only an external actor could interpose, which
+// is the bounded TOCTOU tradeoff accepted here.
+func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus, clearIntent tunnelStatusClear) error {
+	statusMap, err := tunnelOwnedStatusMap(tunnel, status)
+	if err != nil {
+		return err
+	}
+	if err := r.preserveTunnelStatusFields(ctx, tunnel, statusMap, clearIntent); err != nil {
+		return err
+	}
+	apply := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": v1alpha1.GroupVersion.String(),
+		"kind":       "CloudflareTunnel",
+		"metadata": map[string]any{
+			"name": tunnel.Name, "namespace": tunnel.Namespace,
+		},
+		"status": statusMap,
+	}}
+	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(tunnelFieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("apply tunnel-owned status for %s/%s: %w", tunnel.Namespace, tunnel.Name, err)
+	}
+	return nil
+}
+
+// tunnelOwnedStatusMap converts the tunnel-owned status into the apply
+// document: gateway-owned fields are dropped, and in Gateway mode only the
+// tunnel-owned configVersion subfields (remote, createdAt) remain.
+func tunnelOwnedStatusMap(tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus) (map[string]any, error) {
 	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&status)
 	if err != nil {
-		return fmt.Errorf("convert CloudflareTunnel status: %w", err)
+		return nil, fmt.Errorf("convert CloudflareTunnel status: %w", err)
 	}
 	delete(statusMap, "hostnames")
 	delete(statusMap, "listeners")
@@ -2321,18 +2446,163 @@ func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunne
 	statusMap["addresses"] = sliceOrEmpty(statusMap["addresses"])
 	statusMap["dnsRecords"] = sliceOrEmpty(statusMap["dnsRecords"])
 	statusMap["clients"] = sliceOrEmpty(statusMap["clients"])
-	apply := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": v1alpha1.GroupVersion.String(),
-		"kind":       "CloudflareTunnel",
-		"metadata": map[string]any{
-			"name": tunnel.Name, "namespace": tunnel.Namespace,
-		},
-		"status": statusMap,
-	}}
-	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(tunnelFieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("apply tunnel-owned status for %s/%s: %w", tunnel.Namespace, tunnel.Name, err)
+	return statusMap, nil
+}
+
+// preserveTunnelStatusFields restores protected fields into the outgoing apply
+// document from the live object when the document would empty them without
+// declared clear intent. It performs at most one APIReader read, and only when
+// some protected field is absent or empty in the document while it could exist
+// live. Fields that can never exist live for this spec (managementTokenSecretRef
+// without spec.managementToken, orphanedTunnelId outside deletion) are skipped
+// so legitimately absent fields do not force a read. The observational
+// connectionsActiveAt and connectionsInactiveAt are deliberately unprotected:
+// they are legitimately empty on live tunnels and are authoritatively
+// rewritten by each fresh remote projection.
+func (r *CloudflareTunnelReconciler) preserveTunnelStatusFields(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, statusMap map[string]any, clearIntent tunnelStatusClear) error {
+	protected := []string{
+		"tunnelId", "accountId", "name", "tunnelType", "configSource",
+		"connectorState", "createdAt", "observedGeneration",
 	}
+	if !clearIntent.Credentials {
+		protected = append(protected, "connectorTokenSecretRef")
+		if tunnel.Spec.ManagementToken != nil {
+			protected = append(protected, "managementTokenSecretRef")
+		}
+	}
+	if !tunnel.DeletionTimestamp.IsZero() {
+		protected = append(protected, "orphanedTunnelId")
+	}
+	if !clearIntent.Ownership {
+		protected = append(protected, "ownershipVerified")
+	}
+	if !clearIntent.DeletedAt {
+		protected = append(protected, "deletedAt")
+	}
+	if !clearIntent.GatewayBinding {
+		protected = append(protected, "gatewayRef", "gatewayUid")
+	}
+	if !clearIntent.DNSRecords {
+		protected = append(protected, "dnsRecords")
+	}
+	if !clearIntent.Clients {
+		protected = append(protected, "clients")
+	}
+	if !clearIntent.Addresses {
+		protected = append(protected, "addresses")
+	}
+	// ownershipVerified=false and deletedAt=nil are the legitimate state of a
+	// tunnel that was never adopted; only treat them as possible regressions
+	// when the cached object shows a prior adoption. A fully stale cache still
+	// triggers the read through the absent identity fields above.
+	priorAdoption := tunnel.Status.TunnelID != "" || tunnel.Status.ObservedGeneration != 0
+	needsLive := false
+	for _, field := range protected {
+		if (field == "ownershipVerified" || field == "deletedAt") && !priorAdoption {
+			continue
+		}
+		if statusFieldEmpty(statusMap[field]) {
+			needsLive = true
+			break
+		}
+	}
+	if !needsLive && tunnelConfigVersionRegresses(tunnel, statusMap) {
+		needsLive = true
+	}
+	if !needsLive {
+		return nil
+	}
+	reader := r.APIReader
+	if reader == nil {
+		return errors.New("CloudflareTunnelReconciler APIReader is required for status preservation")
+	}
+	var live v1alpha1.CloudflareTunnel
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(tunnel), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read live CloudflareTunnel %s/%s for status preservation: %w", tunnel.Namespace, tunnel.Name, err)
+	}
+	liveMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&live.Status)
+	if err != nil {
+		return fmt.Errorf("convert live CloudflareTunnel status: %w", err)
+	}
+	for _, field := range protected {
+		if statusFieldEmpty(statusMap[field]) && !statusFieldEmpty(liveMap[field]) {
+			statusMap[field] = liveMap[field]
+		}
+	}
+	restoreTunnelConfigVersion(tunnel, statusMap, liveMap)
 	return nil
+}
+
+// statusFieldEmpty reports whether an unstructured status field is absent or
+// holds an empty value; an empty applied value deletes the live field under SSA.
+func statusFieldEmpty(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return typed == ""
+	case []any:
+		return len(typed) == 0
+	case map[string]any:
+		return len(typed) == 0
+	case int64:
+		return typed == 0
+	case bool:
+		return !typed
+	}
+	return false
+}
+
+// tunnelConfigVersionKeys lists the configVersion subfields owned by this
+// manager. In Gateway mode only remote and createdAt are tunnel-owned; in
+// Direct mode the tunnel owns the whole object.
+func tunnelConfigVersionKeys(tunnel *v1alpha1.CloudflareTunnel) []string {
+	if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway {
+		return []string{"remote", "createdAt"}
+	}
+	return []string{"desired", "desiredHash", "applied", "remote", "createdAt"}
+}
+
+// tunnelConfigVersionRegresses reports whether the outgoing document drops
+// tunnel-owned configVersion subfields while evidence shows a version was
+// previously published: either the document carries a partial configVersion,
+// or the cached status still records one. A tunnel that never published a
+// configuration has no evidence and must not force a live read.
+func tunnelConfigVersionRegresses(tunnel *v1alpha1.CloudflareTunnel, statusMap map[string]any) bool {
+	applied, _ := statusMap["configVersion"].(map[string]any)
+	if len(applied) == 0 && tunnel.Status.ConfigVersion == (v1alpha1.CloudflareTunnelConfigVersion{}) {
+		return false
+	}
+	for _, key := range tunnelConfigVersionKeys(tunnel) {
+		if statusFieldEmpty(applied[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func restoreTunnelConfigVersion(tunnel *v1alpha1.CloudflareTunnel, statusMap, liveMap map[string]any) {
+	liveVersion, _ := liveMap["configVersion"].(map[string]any)
+	if len(liveVersion) == 0 {
+		return
+	}
+	applied, _ := statusMap["configVersion"].(map[string]any)
+	restored := false
+	for _, key := range tunnelConfigVersionKeys(tunnel) {
+		if statusFieldEmpty(applied[key]) && !statusFieldEmpty(liveVersion[key]) {
+			if applied == nil {
+				applied = map[string]any{}
+			}
+			applied[key] = liveVersion[key]
+			restored = true
+		}
+	}
+	if restored {
+		statusMap["configVersion"] = applied
+	}
 }
 
 func sliceOrEmpty(value any) any {
@@ -2392,6 +2662,7 @@ func (r *CloudflareTunnelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapDataplaneToTunnel)).
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToTunnel)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToTunnel)).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(observedReconciler("cloudflare-tunnel", r))
 }
 
