@@ -352,6 +352,10 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
 			Data:       map[string][]byte{"token": []byte("secret")},
 		})).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			var cachedSecret corev1.Secret
+			return testClient.Get(testContext, types.NamespacedName{Namespace: namespaceName, Name: "token"}, &cachedSecret)
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 
 		account := privatePrerequisiteAccount(namespaceName, true)
 		tunnel := &v1alpha1.CloudflareTunnel{
@@ -454,6 +458,10 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
 			Data:       map[string][]byte{"token": []byte("secret")},
 		})).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			var cachedSecret corev1.Secret
+			return testClient.Get(testContext, types.NamespacedName{Namespace: namespaceName, Name: "token"}, &cachedSecret)
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 
 		account := privatePrerequisiteAccount(namespaceName, true)
 		disabled := false
