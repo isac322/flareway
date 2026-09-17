@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -619,5 +620,258 @@ func TestServiceTokenRejectsOwnerlessSecretBeforeIssuance(t *testing.T) {
 	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != "Conflict" ||
 		!strings.Contains(accepted.Message, "not controlled by this ServiceToken") {
 		t.Fatalf("ownerless Secret collision status = %#v, want Accepted=False/Conflict", accepted)
+	}
+}
+
+func TestServiceTokenOrphanAndUnverifiedDeletesSkipRemoteDeletion(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := newParityServiceTokenCloudflare(func() time.Time { return clock })
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: "tenant", Name: "api-token", Key: "token"}},
+			Grants:      []v1alpha1.CloudflareAccountGrant{{NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}}, PlatformObjects: v1alpha1.GrantPermissionAllowed}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", LastTransitionTime: metav1.NewTime(clock)},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Valid", LastTransitionTime: metav1.NewTime(clock)},
+		}},
+	}
+	orphan := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphan", Namespace: "tenant", UID: types.UID("orphan"), Finalizers: []string{v1alpha1.ServiceTokenFinalizer}},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "orphan", Enabled: true, Duration: "24h",
+			SecretRef:        corev1.LocalObjectReference{Name: "orphan-credentials"},
+			Rotation:         v1alpha1.ServiceTokenRotationSpec{Mode: v1alpha1.ServiceTokenRotationManual, GraceDuration: "1h"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyOrphan,
+		},
+		Status: v1alpha1.ServiceTokenStatus{TokenID: "orphan-id", OwnershipVerified: true},
+	}
+	unverified := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Name: "unverified", Namespace: "tenant", UID: types.UID("unverified"), Finalizers: []string{v1alpha1.ServiceTokenFinalizer}},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "unverified", Enabled: true, Duration: "24h",
+			SecretRef:        corev1.LocalObjectReference{Name: "unverified-credentials"},
+			Rotation:         v1alpha1.ServiceTokenRotationSpec{Mode: v1alpha1.ServiceTokenRotationManual, GraceDuration: "1h"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+		Status: v1alpha1.ServiceTokenStatus{TokenID: "unverified-id"},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.ServiceToken{}).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"}, Data: map[string][]byte{"token": []byte("api-token")}},
+		account, orphan, unverified,
+	).Build()
+	reconciler := &ServiceTokenReconciler{Client: kube, Scheme: scheme, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }, Now: func() time.Time { return clock }}
+	api.tokens["orphan-id"] = flarecloudflare.ServiceToken{ID: "orphan-id", ClientID: "orphan-client", Name: "orphan", Duration: "24h", Enabled: true}
+	api.tokens["unverified-id"] = flarecloudflare.ServiceToken{ID: "unverified-id", ClientID: "unverified-client", Name: "unverified", Duration: "24h", Enabled: true}
+
+	for _, object := range []*v1alpha1.ServiceToken{orphan, unverified} {
+		key := client.ObjectKeyFromObject(object)
+		if err := kube.Delete(ctx, object); err != nil {
+			t.Fatalf("delete %s: %v", key, err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile delete %s: %v", key, err)
+		}
+		if err := kube.Get(ctx, key, &v1alpha1.ServiceToken{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s still exists after finalizer removal: %v", key, err)
+		}
+	}
+	if _, found := api.tokens["orphan-id"]; !found {
+		t.Fatal("Orphan deletion removed the remote service token")
+	}
+	if _, found := api.tokens["unverified-id"]; !found {
+		t.Fatal("unverified remote service token was deleted without proven ownership")
+	}
+}
+
+func TestServiceTokenObserveOnlyNeverMutatesRemoteOrSecret(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := newParityServiceTokenCloudflare(func() time.Time { return clock })
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: "tenant", Name: "api-token", Key: "token"}},
+			Grants:      []v1alpha1.CloudflareAccountGrant{{NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}}, PlatformObjects: v1alpha1.GrantPermissionAllowed}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", LastTransitionTime: metav1.NewTime(clock)},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Valid", LastTransitionTime: metav1.NewTime(clock)},
+		}},
+	}
+	token := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Name: "observed", Namespace: "tenant", UID: types.UID("observed")},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "observed",
+			Enabled:          true,
+			Duration:         "24h",
+			SecretRef:        corev1.LocalObjectReference{Name: "observed-credentials"},
+			Rotation:         v1alpha1.ServiceTokenRotationSpec{Mode: v1alpha1.ServiceTokenRotationManual, GraceDuration: "1h"},
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			ExternalRef:      &v1alpha1.ServiceTokenExternalReference{TokenID: "external-id"},
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.ServiceToken{}).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"}, Data: map[string][]byte{"token": []byte("api-token")}},
+		account, token,
+	).Build()
+	reconciler := &ServiceTokenReconciler{Client: kube, Scheme: scheme, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }, Now: func() time.Time { return clock }}
+	api.tokens["external-id"] = flarecloudflare.ServiceToken{ID: "external-id", ClientID: "external-client", Name: "external", Duration: "24h", Enabled: true, ExpiresAt: clock.Add(24 * time.Hour)}
+
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(token)}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("add finalizer: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("observe service token: %v", err)
+	}
+	var current v1alpha1.ServiceToken
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.TokenID != "external-id" {
+		t.Fatalf("observed token ID = %q, want external-id", current.Status.TokenID)
+	}
+	var ready *metav1.Condition
+	for index := range current.Status.Conditions {
+		if current.Status.Conditions[index].Type == "Ready" {
+			ready = &current.Status.Conditions[index]
+		}
+	}
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("observed token Ready condition = %#v", ready)
+	}
+	if api.next != 0 || api.updates != 0 || api.rotations != 0 || api.refreshes != 0 {
+		t.Fatalf("ObserveOnly mutated remote state: creates=%d updates=%d rotations=%d refreshes=%d", api.next, api.updates, api.rotations, api.refreshes)
+	}
+	var secret corev1.Secret
+	if err := kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "observed-credentials"}, &secret); !apierrors.IsNotFound(err) {
+		t.Fatalf("ObserveOnly wrote a credential Secret: %v", err)
+	}
+
+	if err := kube.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("delete observed token: %v", err)
+	}
+	if err := kube.Get(ctx, request.NamespacedName, &v1alpha1.ServiceToken{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("observed token still exists after finalizer removal: %v", err)
+	}
+	if _, found := api.tokens["external-id"]; !found {
+		t.Fatal("ObserveOnly deletion removed the remote service token")
+	}
+}
+
+func TestServiceTokenRotationRecreatesMissingSecretWithoutPreviousCredentials(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := newParityServiceTokenCloudflare(func() time.Time { return clock })
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: "tenant", Name: "api-token", Key: "token"}},
+			Grants:      []v1alpha1.CloudflareAccountGrant{{NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}}, PlatformObjects: v1alpha1.GrantPermissionAllowed}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", LastTransitionTime: metav1.NewTime(clock)},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Valid", LastTransitionTime: metav1.NewTime(clock)},
+		}},
+	}
+	token := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotating", Namespace: "tenant", UID: types.UID("rotating")},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "rotating", Enabled: true, Duration: "24h",
+			SecretRef:        corev1.LocalObjectReference{Name: "rotating-credentials"},
+			Rotation:         v1alpha1.ServiceTokenRotationSpec{Mode: v1alpha1.ServiceTokenRotationManual, GraceDuration: "1h"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.ServiceToken{}).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"}, Data: map[string][]byte{"token": []byte("api-token")}},
+		account, token,
+	).Build()
+	reconciler := &ServiceTokenReconciler{Client: kube, Scheme: scheme, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }, Now: func() time.Time { return clock }}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(token)}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("add finalizer: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("create service token: %v", err)
+	}
+	secretKey := types.NamespacedName{Namespace: "tenant", Name: "rotating-credentials"}
+	var issued corev1.Secret
+	if err := kube.Get(ctx, secretKey, &issued); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &issued); err != nil {
+		t.Fatal(err)
+	}
+
+	var current v1alpha1.ServiceToken
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	requestedAt := metav1.NewTime(clock.Add(time.Minute))
+	current.Spec.Rotation.RequestedAt = &requestedAt
+	if err := kube.Update(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	clock = requestedAt.Time
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("rotate after Secret loss: %v", err)
+	}
+	if api.rotations != 1 {
+		t.Fatalf("rotation count = %d, want 1", api.rotations)
+	}
+	var recreated corev1.Secret
+	if err := kube.Get(ctx, secretKey, &recreated); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(recreated.Data[v1alpha1.ServiceTokenClientSecretKey]), "rotated-") {
+		t.Fatalf("recreated Secret does not carry the rotated credential: %#v", recreated.Data)
+	}
+	if _, found := recreated.Data[v1alpha1.ServiceTokenPreviousClientSecretKey]; found {
+		t.Fatal("a Secret recreated after loss must not resurrect previous credentials")
+	}
+	if recreated.Annotations[v1alpha1.ServiceTokenPreviousClientSecretExpiresAtAnnotation] != "" {
+		t.Fatal("a Secret recreated after loss must not carry a previous-expiry annotation")
 	}
 }

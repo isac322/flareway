@@ -35,9 +35,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -146,29 +148,46 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	Expect(cloudflareAPI.ResolveZone(ctx, configuration.Zone)).To(Succeed())
 	Expect(createSuiteFixtures(ctx)).To(Succeed())
 }, NodeTimeout(5*time.Minute))
-
 var _ = AfterSuite(func(ctx SpecContext) {
 	defer writeLatencies()
 	if kubeClient == nil || namespace == "" {
 		return
 	}
-	deleteObject(ctx, object("gateway.networking.k8s.io/v1", "GatewayClass", "", className, nil))
-	deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "GatewayClassConfig", "", classConfig, nil))
-	deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "CloudflareAccount", "", accountName, nil))
-	deleteObject(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
 
+	// Reverse remote-dependency order: every namespaced dependent must finish
+	// its finalizer before the cluster-scoped fixtures disappear, otherwise a
+	// CloudflareTunnel loses its CloudflareAccount mid-cleanup and the
+	// namespace stays Terminating (issue #14).
+	dependentCtx, dependentCancel := context.WithTimeout(ctx, 4*time.Minute)
+	dependentsErr := deleteNamespacedDependents(dependentCtx)
+	dependentCancel()
+
+	if dependentsErr == nil {
+		deleteObject(ctx, object("gateway.networking.k8s.io/v1", "GatewayClass", "", className, nil))
+		deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "GatewayClassConfig", "", classConfig, nil))
+		deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "CloudflareAccount", "", accountName, nil))
+		waitForObjectDeletion(ctx, object("gateway.networking.k8s.io/v1", "GatewayClass", "", className, nil))
+		waitForObjectDeletion(ctx, object("flareway.bhyoo.com/v1alpha1", "GatewayClassConfig", "", classConfig, nil))
+		waitForObjectDeletion(ctx, object("flareway.bhyoo.com/v1alpha1", "CloudflareAccount", "", accountName, nil))
+	}
+
+	deleteObject(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	_, _ = poll.Until(waitCtx, 5*time.Second, func(checkCtx context.Context) (bool, error) {
+	_, namespaceErr := poll.Until(waitCtx, 5*time.Second, func(checkCtx context.Context) (bool, error) {
 		current := &corev1.Namespace{}
 		err := kubeClient.Get(checkCtx, types.NamespacedName{Name: namespace}, current)
 		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 	})
+
 	if cloudflareAPI != nil {
 		report, err := janitor.SweepPrefix(ctx, cloudflareAPI, namespace, 0, time.Now().UTC())
 		Expect(err).NotTo(HaveOccurred())
 		GinkgoWriter.Printf("e2e janitor deleted Access applications=%d policies=%d service tokens=%d hostname routes=%d network routes=%d virtual networks=%d DNS records=%d tunnels=%d; connected skipped=%d\n", report.AccessApplicationsDeleted, report.AccessPoliciesDeleted, report.ServiceTokensDeleted, report.HostnameRoutesDeleted, report.NetworkRoutesDeleted, report.VirtualNetworksDeleted, report.DNSRecordsDeleted, report.TunnelsDeleted, report.ConnectedSkipped)
 	}
+
+	Expect(dependentsErr).NotTo(HaveOccurred(), "namespaced dependents must finish cleanup before the CloudflareAccount is deleted")
+	Expect(namespaceErr).NotTo(HaveOccurred(), "namespace %s must terminate after dependent cleanup", namespace)
 }, NodeTimeout(7*time.Minute))
 
 func createSuiteFixtures(ctx context.Context) error {
@@ -454,6 +473,91 @@ func waitForObjectDeletion(ctx context.Context, value client.Object) {
 		return apierrors.IsNotFound(getErr), client.IgnoreNotFound(getErr)
 	})
 	Expect(err).NotTo(HaveOccurred(), "wait for %T %s deletion", value, client.ObjectKeyFromObject(value))
+}
+
+// namespacedDependentGroups lists every namespaced kind the suite can leave
+// behind, ordered so referrers are deleted before the objects they reference:
+// Access applications first, then routes and Gateways, then tunnels and the
+// policies they consume, and finally the remaining account-level objects.
+var namespacedDependentGroups = [][]schema.GroupVersionKind{
+	{
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessApplication"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessStandaloneApplication"},
+	},
+	{
+		{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "HostnameRoute"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "NetworkRoute"},
+		{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"},
+	},
+	{
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "CloudflareTunnel"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "WARPConnector"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessInfrastructureTarget"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessPolicy"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "DevicePostureRule"},
+	},
+	{
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessGroup"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "AccessCustomPage"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "IdentityProvider"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "ServiceToken"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "DevicePostureIntegration"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "DeviceProfile"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "DeviceSettings"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "VirtualNetwork"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "ZeroTrustGatewayPolicy"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "ZeroTrustList"},
+		{Group: "flareway.bhyoo.com", Version: "v1alpha1", Kind: "ZeroTrustOrganization"},
+	},
+}
+
+// deleteNamespacedDependents removes every leftover namespaced Flareway and
+// Gateway API object in the e2e namespace and waits for each group to finish
+// its finalizers before moving on, so cluster-scoped fixtures stay usable
+// while dependents clean up remote resources.
+func deleteNamespacedDependents(ctx context.Context) error {
+	for _, group := range namespacedDependentGroups {
+		for _, gvk := range group {
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+			if err := kubeClient.List(ctx, list, client.InNamespace(namespace)); err != nil {
+				if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("list %s in %s: %w", gvk.Kind, namespace, err)
+			}
+			for index := range list.Items {
+				deleteObject(ctx, &list.Items[index])
+			}
+		}
+		for _, gvk := range group {
+			if err := waitForNamespacedKindDeletion(ctx, gvk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// waitForNamespacedKindDeletion blocks until no object of the kind remains in
+// the e2e namespace, including objects still held by finalizers.
+func waitForNamespacedKindDeletion(ctx context.Context, gvk schema.GroupVersionKind) error {
+	_, err := poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		if err := kubeClient.List(checkCtx, list, client.InNamespace(namespace)); err != nil {
+			if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		return len(list.Items) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait for %s deletion in %s: %w", gvk.Kind, namespace, err)
+	}
+	return nil
 }
 
 func recordLatency(name string, duration time.Duration) {

@@ -600,6 +600,56 @@ func TestTunnelClientStatusIsBounded(t *testing.T) {
 	}
 }
 
+func TestDeleteDNSRecordIfOwnedFailsClosed(t *testing.T) {
+	g := gomega.NewWithT(t)
+	cf := newFakeTunnelCloudflareFactory()
+	cf.PutDNS("zone", RemoteDNSRecord{
+		ID: "record", Name: "app.example.test", Type: "CNAME",
+		Content: "tunnel.cfargotunnel.com", Comment: "checkpointed-owner",
+	})
+
+	// Gateway-absent teardown passes no current owner identity: a record that
+	// never checkpointed its ownership comment must be preserved, not deleted.
+	missingCheckpoint := v1alpha1.CloudflareTunnelDNSRecordStatus{
+		Hostname: "app.example.test", RecordID: "record", ZoneID: "zone",
+	}
+	deleted, conflict, err := deleteDNSRecordIfOwned(context.Background(), cf, "", missingCheckpoint)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(deleted).To(gomega.BeFalse())
+	g.Expect(conflict).To(gomega.ContainSubstring("no checkpointed ownership comment"))
+	g.Expect(cf.HasDNSRecord("zone", "record")).To(gomega.BeTrue())
+	g.Expect(cf.Calls()).NotTo(gomega.ContainElement("DeleteDNSRecord"))
+
+	// A same-name record whose ID no longer matches the checkpointed record is
+	// a foreign replacement and must survive teardown.
+	replaced := missingCheckpoint
+	replaced.RecordID = "other-id"
+	deleted, conflict, err = deleteDNSRecordIfOwned(context.Background(), cf, "checkpointed-owner", replaced)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(deleted).To(gomega.BeFalse())
+	g.Expect(conflict).To(gomega.ContainSubstring("no longer has managed record ID"))
+	g.Expect(cf.HasDNSRecord("zone", "record")).To(gomega.BeTrue())
+	g.Expect(cf.Calls()).NotTo(gomega.ContainElement("DeleteDNSRecord"))
+}
+
+func TestTunnelGatewayBindingsRequireHostnameAndZone(t *testing.T) {
+	g := gomega.NewWithT(t)
+	tunnel := &v1alpha1.CloudflareTunnel{}
+
+	hostnameless := &gatewayv1.Gateway{Spec: gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{
+		Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80,
+	}}}}
+	_, _, err := tunnelGatewayBindings(tunnel, hostnameless, nil)
+	g.Expect(err).To(gomega.MatchError("gateway listener http must have a hostname in Cloudflare mode"))
+
+	hostname := gatewayv1.Hostname("app.example.test")
+	zoned := &gatewayv1.Gateway{Spec: gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{
+		Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &hostname,
+	}}}}
+	_, _, err = tunnelGatewayBindings(tunnel, zoned, nil)
+	g.Expect(err).To(gomega.MatchError("zone not found for hostname app.example.test"))
+}
+
 var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 	ginkgo.BeforeAll(func() {
 		ensureSystemNamespace("kube-system")
@@ -1525,6 +1575,10 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &deleting)).To(gomega.Succeed())
 			g.Expect(deleting.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation]).To(gomega.Equal("true"))
 			g.Expect(deleting.Finalizers).To(gomega.ContainElement(v1alpha1.CloudflareTunnelFinalizer))
+			blocked := findCondition(deleting.Status.Conditions, v1alpha1.CloudflareTunnelConditionCleanupBlocked)
+			g.Expect(blocked).NotTo(gomega.BeNil())
+			g.Expect(blocked.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(blocked.Reason).To(gomega.Equal("WaitingForBlock"))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 		gomega.Consistently(func() []string { return testTunnelCloudflare.Calls() }).WithTimeout(750 * time.Millisecond).ShouldNot(gomega.ContainElement("DeleteDNSRecord"))
 
@@ -1557,6 +1611,150 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 		gomega.Expect(dnsDelete).To(gomega.BeNumerically(">=", 0))
 		gomega.Expect(connectionEviction).To(gomega.BeNumerically(">", dnsDelete))
 		gomega.Expect(tunnelDelete).To(gomega.BeNumerically(">", connectionEviction))
+	})
+
+	ginkgo.It("reports a MultipleGateways conflict while the recorded owner keeps the Tunnel", func() {
+		fixture := newTunnelFixture("multi-owner", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
+		fixture.create()
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.TunnelID).NotTo(gomega.BeEmpty())
+			g.Expect(tunnel.Status.GatewayRef).To(gomega.Equal(&corev1.LocalObjectReference{Name: fixture.gatewayKey.Name}))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		hostname := gatewayv1.Hostname("second-" + fixture.hostname)
+		second := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: fixture.namespace},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "unused-by-tunnel-controller",
+				Listeners:        []gatewayv1.Listener{{Name: "public", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &hostname}},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: gatewayv1.Group(v1alpha1.Group), Kind: gatewayv1.Kind("CloudflareTunnel"), Name: fixture.tunnelKey.Name,
+				}},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, second)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			conflict := findCondition(current.Status.Conditions, v1alpha1.CloudflareTunnelConditionConflict)
+			g.Expect(conflict).NotTo(gomega.BeNil())
+			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(conflict.Reason).To(gomega.Equal("MultipleGateways"))
+			g.Expect(conflict.Message).To(gomega.ContainSubstring("second"))
+			g.Expect(current.Status.GatewayRef).To(gomega.Equal(&corev1.LocalObjectReference{Name: fixture.gatewayKey.Name}))
+			g.Expect(current.Status.OwnershipVerified).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("fails closed on a connector token error and recovers on retry", func() {
+		fixture := newTunnelFixture("token-failure", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
+		testTunnelCloudflare.FailNext("GetTunnelToken", errors.New("injected token failure"))
+		fixture.create()
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var tunnel v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.TunnelID).NotTo(gomega.BeEmpty())
+			ready := findCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionTunnelReady)
+			g.Expect(ready).NotTo(gomega.BeNil())
+			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(gomega.Equal("TokenUnavailable"))
+			g.Expect(tunnel.Status.ConnectorTokenSecretRef).To(gomega.BeNil())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		testTunnelCloudflare.ClearFailure("GetTunnelToken")
+		gomega.Eventually(func(g gomega.Gomega) {
+			var tunnel v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			ready := findCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionTunnelReady)
+			g.Expect(ready).NotTo(gomega.BeNil())
+			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(tunnel.Status.ConnectorTokenSecretRef).NotTo(gomega.BeNil())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(countCall(testTunnelCloudflare.Calls(), "CreateTunnel")).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("drains the recorded Gateway dataplane before reconciling a Direct-mode transition", func() {
+		fixture := newTunnelFixture("direct-transition", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
+		fixture.create()
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.OwnershipVerified).To(gomega.BeTrue())
+			g.Expect(tunnel.Status.ConnectorTokenSecretRef).NotTo(gomega.BeNil())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		replicas := int32(1)
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "flareway-gw-" + fixture.gatewayKey.Name, Namespace: fixture.namespace,
+				Labels: map[string]string{dataplaneGatewayLabel: fixture.namespace + "--" + fixture.gatewayKey.Name},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "direct-transition"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "direct-transition"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name: "cloudflared", Image: "example.invalid/cloudflared",
+						Env: []corev1.EnvVar{{Name: "TUNNEL_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: tunnel.Status.ConnectorTokenSecretRef.Name},
+							Key:                  v1alpha1.CloudflareTunnelConnectorTokenSecretKey,
+						}}}},
+					}}},
+				},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, deployment)).To(gomega.Succeed())
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "connector", Namespace: fixture.namespace,
+				Labels: map[string]string{dataplaneGatewayLabel: fixture.namespace + "--" + fixture.gatewayKey.Name},
+			},
+			Spec: deployment.Spec.Template.Spec,
+		}
+		gomega.Expect(testClient.Create(testContext, pod)).To(gomega.Succeed())
+
+		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+		before := tunnel.DeepCopy()
+		tunnel.Spec.Configuration = v1alpha1.CloudflareTunnelConfiguration{
+			Mode: v1alpha1.CloudflareTunnelConfigurationModeDirect,
+			Direct: &v1alpha1.CloudflareTunnelDirectConfiguration{Ingress: []v1alpha1.CloudflareTunnelIngressRule{{
+				Service: v1alpha1.CloudflareTunnelIngressService{HTTPStatus: &v1alpha1.CloudflareTunnelHTTPStatusService{Code: 404}},
+			}}},
+		}
+		gomega.Expect(testClient.Patch(testContext, &tunnel, client.MergeFrom(before))).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			ready := findCondition(current.Status.Conditions, v1alpha1.CloudflareTunnelConditionTunnelReady)
+			g.Expect(ready).NotTo(gomega.BeNil())
+			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(gomega.Equal("WaitingForDrain"))
+			var currentDeployment appsv1.Deployment
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(deployment), &currentDeployment)).To(gomega.Succeed())
+			g.Expect(currentDeployment.Spec.Replicas).NotTo(gomega.BeNil())
+			g.Expect(*currentDeployment.Spec.Replicas).To(gomega.Equal(int32(0)))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElement("UpdateTunnelConfiguration"))
+
+		gomega.Expect(testClient.Delete(testContext, pod)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			g.Expect(current.Status.GatewayRef).To(gomega.BeNil())
+			accepted := findCondition(current.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(accepted.Reason).To(gomega.Equal(authz.ReasonRefNotPermitted))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElement("UpdateTunnelConfiguration"))
 	})
 })
 

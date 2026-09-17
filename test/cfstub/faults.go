@@ -24,13 +24,25 @@ import (
 )
 
 // Fault describes a deterministic response injected before a registered
-// endpoint handler. Times defaults to one; a negative value repeats forever.
+// endpoint handler. Times counts HTTP attempts, not logical client calls: a
+// client that retries consumes one Times unit per attempt. Times defaults to
+// one; a negative value repeats forever.
 type Fault struct {
 	Status     int
 	Body       string
 	Delay      time.Duration
 	Times      int
 	RetryAfter string
+}
+
+// Attempts returns how many HTTP attempts the fault intercepts: Times
+// normalized so zero means one attempt and a negative value means the fault
+// never expires.
+func (f Fault) Attempts() int {
+	if f.Times == 0 {
+		return 1
+	}
+	return f.Times
 }
 
 type faultRule struct {
@@ -52,10 +64,7 @@ func (s *Server) Fault(method, pathRegex string, fault Fault) {
 	if fault.Status == 0 {
 		fault.Status = http.StatusInternalServerError
 	}
-	remaining := fault.Times
-	if remaining == 0 {
-		remaining = 1
-	}
+	remaining := fault.Attempts()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

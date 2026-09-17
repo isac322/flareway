@@ -1,0 +1,91 @@
+name: State exploration
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: rapid PRNG seed
+        required: true
+        default: "1"
+        type: string
+      checks:
+        description: Number of rapid property checks
+        required: true
+        default: "25"
+        type: string
+      steps:
+        description: Average state-machine actions per check
+        required: true
+        default: "8"
+        type: string
+  schedule:
+    - cron: "17 17 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: state-exploration-${{ github.ref }}-${{ inputs.seed }}
+  cancel-in-progress: false
+
+jobs:
+  explore:
+    name: State-machine exploration
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve exploration parameters
+        id: params
+        shell: bash
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_CHECKS: ${{ inputs.checks }}
+          INPUT_STEPS: ${{ inputs.steps }}
+        run: |
+          seed="${INPUT_SEED}"
+          checks="${INPUT_CHECKS}"
+          steps="${INPUT_STEPS}"
+          if [[ -z "${seed}" ]]; then
+            seed="$(date -u +%s)"
+          fi
+          if [[ -z "${checks}" ]]; then
+            checks="25"
+          fi
+          if [[ -z "${steps}" ]]; then
+            steps="8"
+          fi
+          for parameter in seed checks steps; do
+            value="${!parameter}"
+            if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "${parameter} must be a positive integer" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "seed=${seed}"
+            echo "checks=${checks}"
+            echo "steps=${steps}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Run bounded exploration
+        env:
+          EXPLORATORY_SEED: ${{ steps.params.outputs.seed }}
+          EXPLORATORY_CHECKS: ${{ steps.params.outputs.checks }}
+          EXPLORATORY_STEPS: ${{ steps.params.outputs.steps }}
+        run: make test-exploratory
+      - name: Upload minimized traces
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state-exploration-${{ github.sha }}-${{ steps.params.outputs.seed }}
+          path: bin/exploratory-artifacts
+          if-no-files-found: warn
+          retention-days: 14

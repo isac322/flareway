@@ -342,7 +342,7 @@ var (
 	requirePattern            = regexp.MustCompile(`(?m)^\s*(?:require\s+)?github\.com/cloudflare/cloudflare-go/v7\s+(v\S+)\s*$`)
 	placeholderMappingPattern = regexp.MustCompile(`(?i)(?:\bnot[\s_-]*mapped\b|\bunmapped\b|\bunimplemented\b|\bplaceholder\b|\btbd\b|\btodo\b)`)
 	bareNoneMappingPattern    = regexp.MustCompile(`(?i)^(?:none|\(none\)|<none>)$`)
-	evidenceReferencePattern = regexp.MustCompile(`(?:^|[\s;(])([A-Za-z0-9_./-]+\.go):([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)`)
+	evidenceReferencePattern  = regexp.MustCompile(`(?:^|[\s;(])([A-Za-z0-9_./-]+\.go):([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)`)
 )
 
 func validateSDKVersion(root string, value ledger, problems *problemList) {

@@ -648,3 +648,37 @@ func fakeCustomPageFromInput(id string, input flarecloudflare.AccessCustomPageIn
 		HTML: input.HTML,
 	}
 }
+
+func TestAccessCustomPageOrphanDeletionRetainsRemotePage(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeCustomPageCloudflare()
+	kube, reconciler, page := newCustomPageTestReconciler(t, remote, nil, clock)
+	page.Spec.DeletionPolicy = v1alpha1.DeletionPolicyOrphan
+	if err := kube.Create(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(page)}
+
+	reconcileCustomPage(ctx, t, reconciler, request, "add finalizer")
+	reconcileCustomPage(ctx, t, reconciler, request, "create custom page")
+
+	var current v1alpha1.AccessCustomPage
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	pageID := current.Status.CustomPageID
+	if pageID == "" || !current.Status.OwnershipVerified {
+		t.Fatalf("custom page was not programmed: %#v", current.Status)
+	}
+	if err := kube.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCustomPage(ctx, t, reconciler, request, "orphan custom page")
+	if _, found := remote.pages[pageID]; !found {
+		t.Fatal("Orphan deletion removed the remote custom page")
+	}
+	if err := kube.Get(ctx, request.NamespacedName, &v1alpha1.AccessCustomPage{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphaned AccessCustomPage still exists: %v", err)
+	}
+}

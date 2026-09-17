@@ -40,7 +40,7 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 		remoteDeleted := false
 		DeferCleanup(func(cleanupCtx SpecContext) {
 			if !remoteDeleted {
-				_ = cloudflareAPI.DeleteTunnel(cleanupCtx, remote.ID)
+				Expect(cloudflareAPI.DeleteTunnel(cleanupCtx, remote.ID)).To(Succeed())
 			}
 		})
 
@@ -58,7 +58,10 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 			"listeners":      []any{map[string]any{"name": "web", "exposure": "Public"}},
 		})
 		Expect(kubeClient.Create(ctx, tunnel)).To(Succeed())
-		DeferCleanup(func(cleanupCtx SpecContext) { deleteObject(cleanupCtx, tunnel) })
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			deleteObject(cleanupCtx, tunnel)
+			waitForObjectDeletion(cleanupCtx, tunnel)
+		})
 
 		gateway := object("gateway.networking.k8s.io/v1", "Gateway", namespace, "adoption", map[string]any{
 			"gatewayClassName": className,
@@ -70,7 +73,10 @@ var _ = Describe("Tunnel lifecycle", Label("public", "lifecycle"), func() {
 			}},
 		})
 		Expect(kubeClient.Create(ctx, gateway)).To(Succeed())
-		DeferCleanup(func(cleanupCtx SpecContext) { deleteObject(cleanupCtx, gateway) })
+		DeferCleanup(func(cleanupCtx SpecContext) {
+			deleteObject(cleanupCtx, gateway)
+			waitForObjectDeletion(cleanupCtx, gateway)
+		})
 
 		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()

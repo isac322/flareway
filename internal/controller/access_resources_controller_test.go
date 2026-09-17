@@ -382,6 +382,94 @@ var _ = ginkgo.Describe("Access resource controllers", ginkgo.Ordered, func() {
 		gomega.Expect(tokenCount).To(gomega.BeZero())
 		gomega.Expect(secretCount).To(gomega.BeZero())
 	})
+	ginkgo.It("fails an AccessPolicy closed when its referenced AccessGroup is deleted", func() {
+		suffix := accessResourceCounter.Add(1)
+		namespace := fmt.Sprintf("access-grouploss-%d", suffix)
+		accountName := fmt.Sprintf("access-account-gl-%d", suffix)
+		gomega.Expect(testClient.Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace, Labels: map[string]string{"access-test": namespace}}})).To(gomega.Succeed())
+		ginkgo.DeferCleanup(forceDeleteAccessNamespace, namespace)
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: namespace}, Data: map[string][]byte{"token": []byte("api-token")}})).To(gomega.Succeed())
+		account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: accountName}, Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   fmt.Sprintf("%032x", suffix),
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: "credentials", Namespace: namespace, Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"access-test": namespace}},
+				Hostnames:         []string{"*"}, Zones: []string{"*"},
+				Exposures:        []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate},
+				PlatformObjects:  v1alpha1.GrantPermissionAllowed,
+				AccessPolicyRefs: v1alpha1.GrantPermissionAllowed,
+			}},
+		}}
+		gomega.Expect(testClient.Create(testContext, account)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(context.Background(), account) })
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareAccount
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: accountName}, &current)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted)).To(gomega.BeTrue())
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid)).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		accountRef := corev1.LocalObjectReference{Name: accountName}
+		group := &v1alpha1.AccessGroup{
+			ObjectMeta: metav1.ObjectMeta{Name: "developers", Namespace: namespace},
+			Spec: v1alpha1.AccessGroupSpec{
+				AccountRef: accountRef, Name: "developers",
+				Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		policy := &v1alpha1.AccessPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "allow", Namespace: namespace},
+			Spec: v1alpha1.AccessPolicySpec{
+				AccountRef: accountRef, Name: "allow", Decision: v1alpha1.AccessPolicyDecisionAllow,
+				Include:          []v1alpha1.AccessRule{{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{Name: group.Name}}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, group)).To(gomega.Succeed())
+		gomega.Expect(testClient.Create(testContext, policy)).To(gomega.Succeed())
+
+		var groupID, policyID string
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(group), group)).To(gomega.Succeed())
+			g.Expect(group.Status.GroupID).NotTo(gomega.BeEmpty())
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(policy), policy)).To(gomega.Succeed())
+			g.Expect(policy.Status.PolicyID).NotTo(gomega.BeEmpty())
+			g.Expect(statusutil.ConditionTrue(policy.Status.Conditions, "Accepted")).To(gomega.BeTrue())
+			g.Expect(statusutil.ConditionTrue(policy.Status.Conditions, "Ready")).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		groupID, policyID = group.Status.GroupID, policy.Status.PolicyID
+
+		gomega.Expect(testClient.Delete(testContext, group)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(policy), policy)).To(gomega.Succeed())
+			accepted := statusutil.FindCondition(policy.Status.Conditions, "Accepted")
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(accepted.Reason).To(gomega.Equal("RefNotPermitted"))
+			g.Expect(accepted.Message).To(gomega.ContainSubstring("AccessGroup"))
+			// Fail closed: the remote policy is retained, never deleted on
+			// reference loss.
+			testResourceAccessCloudflare.mu.Lock()
+			_, retained := testResourceAccessCloudflare.policies[policyID]
+			_, groupRetained := testResourceAccessCloudflare.groups[fakeAccessGroupKey(flarecloudflare.AccessScope{}, groupID)]
+			testResourceAccessCloudflare.mu.Unlock()
+			g.Expect(retained).To(gomega.BeTrue())
+			g.Expect(groupRetained).To(gomega.BeFalse())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Expect(testClient.Delete(testContext, policy)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testAPIReader.Get(testContext, client.ObjectKeyFromObject(policy), &v1alpha1.AccessPolicy{}))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+		testResourceAccessCloudflare.mu.Lock()
+		_, retained := testResourceAccessCloudflare.policies[policyID]
+		testResourceAccessCloudflare.mu.Unlock()
+		gomega.Expect(retained).To(gomega.BeFalse())
+	})
+
 })
 
 func TestAccessPolicyRuleRoundTripCoversEveryOfficialVariant(t *testing.T) {

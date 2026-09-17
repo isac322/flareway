@@ -182,33 +182,47 @@ type State struct {
 
 // NewState returns empty synchronized state with a valid active API token.
 func NewState() *State {
-	return &State{
-		values:                 make(map[string]any),
-		token:                  TokenVerification{ID: "stub-token", Status: "active"},
-		zones:                  make(map[string]Zone),
-		organizations:          make(map[string]Organization),
-		tunnels:                make(map[string]map[string]Tunnel),
-		configs:                make(map[string]TunnelConfiguration),
-		tunnelTokens:           make(map[string]string),
-		tunnelManagementTokens: make(map[string]string),
-		tunnelConnectors:       make(map[string]map[string]TunnelConnector),
-		dnsRecords:             make(map[string]map[string]DNSRecord),
-		accessApps:             make(map[string]map[string]AccessResource),
-		accessTags:             make(map[string]map[string]AccessTag),
-		accessPolicies:         make(map[string]map[string]AccessResource),
-		accessGroups:           make(map[string]map[string]AccessResource),
-		identityProviders:      make(map[string]map[string]AccessResource),
-		postureRules:           make(map[string]map[string]AccessResource),
-		serviceTokens:          make(map[string]map[string]AccessServiceToken),
-		virtualNetworks:        make(map[string]map[string]VirtualNetwork),
-		networkRoutes:          make(map[string]map[string]NetworkRoute),
-		hostnameRoutes:         make(map[string]map[string]HostnameRoute),
-		deviceSettings:         make(map[string]DeviceSettings),
-		defaultDevicePolicies:  make(map[string]DevicePolicy),
-		customDevicePolicies:   make(map[string]map[string]DevicePolicy),
-		gatewayRules:           make(map[string]map[string]GatewayRule),
-		gatewayLists:           make(map[string]map[string]GatewayList),
-	}
+	state := &State{}
+	state.reset()
+	return state
+}
+
+// Reset clears every stored resource and restores the default active token
+// while keeping the remote ID counter monotonically increasing: IDs issued
+// after a reset never collide with IDs issued before it.
+func (s *State) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reset()
+}
+
+// reset reinitializes every collection. nextID is deliberately preserved.
+func (s *State) reset() {
+	s.values = make(map[string]any)
+	s.token = TokenVerification{ID: "stub-token", Status: "active"}
+	s.zones = make(map[string]Zone)
+	s.organizations = make(map[string]Organization)
+	s.tunnels = make(map[string]map[string]Tunnel)
+	s.configs = make(map[string]TunnelConfiguration)
+	s.tunnelTokens = make(map[string]string)
+	s.tunnelManagementTokens = make(map[string]string)
+	s.tunnelConnectors = make(map[string]map[string]TunnelConnector)
+	s.dnsRecords = make(map[string]map[string]DNSRecord)
+	s.accessApps = make(map[string]map[string]AccessResource)
+	s.accessTags = make(map[string]map[string]AccessTag)
+	s.accessPolicies = make(map[string]map[string]AccessResource)
+	s.accessGroups = make(map[string]map[string]AccessResource)
+	s.identityProviders = make(map[string]map[string]AccessResource)
+	s.postureRules = make(map[string]map[string]AccessResource)
+	s.serviceTokens = make(map[string]map[string]AccessServiceToken)
+	s.virtualNetworks = make(map[string]map[string]VirtualNetwork)
+	s.networkRoutes = make(map[string]map[string]NetworkRoute)
+	s.hostnameRoutes = make(map[string]map[string]HostnameRoute)
+	s.deviceSettings = make(map[string]DeviceSettings)
+	s.defaultDevicePolicies = make(map[string]DevicePolicy)
+	s.customDevicePolicies = make(map[string]map[string]DevicePolicy)
+	s.gatewayRules = make(map[string]map[string]GatewayRule)
+	s.gatewayLists = make(map[string]map[string]GatewayList)
 }
 
 // Set stores a value under key.

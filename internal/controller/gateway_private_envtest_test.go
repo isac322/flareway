@@ -341,6 +341,164 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 			g.Expect(settings).To(gomega.Equal(observedDeviceSettings{GatewayProxyEnabled: true, GatewayUDPProxyEnabled: false}))
 		}, 15*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 	})
+
+	ginkgo.It("blocks private listeners while the account gateway proxy is disabled", func() {
+		fixtureID := fixtureCounter.Add(1)
+		namespaceName := fmt.Sprintf("gateway-private-proxy-%d", fixtureID)
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName, Labels: map[string]string{"tenant": "private"}}}
+		gomega.Expect(testClient.Create(testContext, namespace)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(testContext, namespace) })
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
+			Data:       map[string][]byte{"token": []byte("secret")},
+		})).To(gomega.Succeed())
+
+		account := privatePrerequisiteAccount(namespaceName, true)
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: namespaceName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef: corev1.LocalObjectReference{Name: account.Name},
+				Listeners: []v1alpha1.CloudflareTunnelListener{{
+					Name: "private", Exposure: v1alpha1.ExposurePrivate,
+					VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
+				}},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			},
+		}
+		vnet := v1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: namespaceName},
+			Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}},
+			Status: v1alpha1.VirtualNetworkStatus{
+				VirtualNetworkID: "vnet-prod",
+				Conditions:       []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}},
+			},
+		}
+		gateway := privatePrerequisiteIR(namespaceName)
+		reconciler := &GatewayReconciler{
+			Client: testClient, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: &privatePrerequisiteAPI{
+				settings: &flarecloudflare.DeviceSettings{GatewayProxyEnabled: false, GatewayUDPProxyEnabled: true},
+			}},
+		}
+
+		state, err := reconciler.reconcilePrivatePrerequisites(testContext, gateway, tunnel, account, gatewayInputsView{
+			Namespaces: []corev1.Namespace{*namespace}, VirtualNetworks: []v1alpha1.VirtualNetwork{vnet},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(state.Pending).To(gomega.ContainSubstring("gatewayProxyEnabled"))
+		gomega.Expect(gateway.Domains[0].Guard).To(gomega.Equal(ir.GuardBlocked))
+		gomega.Expect(gateway.Domains[0].Access).To(gomega.BeNil())
+	})
+
+	ginkgo.It("blocks private listeners while the referenced virtual network is not ready", func() {
+		fixtureID := fixtureCounter.Add(1)
+		namespaceName := fmt.Sprintf("gateway-private-vnet-%d", fixtureID)
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName, Labels: map[string]string{"tenant": "private"}}}
+		gomega.Expect(testClient.Create(testContext, namespace)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(testContext, namespace) })
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
+			Data:       map[string][]byte{"token": []byte("secret")},
+		})).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			var cachedSecret corev1.Secret
+			return testClient.Get(testContext, types.NamespacedName{Namespace: namespaceName, Name: "token"}, &cachedSecret)
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
+
+		account := privatePrerequisiteAccount(namespaceName, true)
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: namespaceName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef: corev1.LocalObjectReference{Name: account.Name},
+				Listeners: []v1alpha1.CloudflareTunnelListener{{
+					Name: "private", Exposure: v1alpha1.ExposurePrivate,
+					VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
+				}},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			},
+		}
+		unready := v1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: namespaceName},
+			Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}},
+		}
+		gateway := privatePrerequisiteIR(namespaceName)
+		reconciler := &GatewayReconciler{
+			Client: testClient, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: &privatePrerequisiteAPI{}},
+		}
+
+		state, err := reconciler.reconcilePrivatePrerequisites(testContext, gateway, tunnel, account, gatewayInputsView{
+			Namespaces: []corev1.Namespace{*namespace}, VirtualNetworks: []v1alpha1.VirtualNetwork{unready},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(state.Pending).To(gomega.ContainSubstring("requires a ready VirtualNetwork"))
+		gomega.Expect(gateway.Domains[0].Guard).To(gomega.Equal(ir.GuardBlocked))
+		gomega.Expect(gateway.Domains[0].Access).To(gomega.BeNil())
+	})
+
+	ginkgo.It("blocks private listeners when the tunnel disables hostname route creation", func() {
+		fixtureID := fixtureCounter.Add(1)
+		namespaceName := fmt.Sprintf("gateway-private-noroute-%d", fixtureID)
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName, Labels: map[string]string{"tenant": "private"}}}
+		gomega.Expect(testClient.Create(testContext, namespace)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(testContext, namespace) })
+		operatorNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dataplane.DefaultOperatorNamespace}}
+		if err := testClient.Create(testContext, operatorNamespace); err != nil {
+			gomega.Expect(apierrors.IsAlreadyExists(err)).To(gomega.BeTrue())
+		}
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: namespaceName},
+			Data:       map[string][]byte{"token": []byte("secret")},
+		})).To(gomega.Succeed())
+
+		account := privatePrerequisiteAccount(namespaceName, true)
+		disabled := false
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: namespaceName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef: corev1.LocalObjectReference{Name: account.Name},
+				Listeners: []v1alpha1.CloudflareTunnelListener{{
+					Name: "private", Exposure: v1alpha1.ExposurePrivate,
+					VirtualNetworkRef: &corev1.LocalObjectReference{Name: "prod"},
+					HostnameRoute:     v1alpha1.CloudflareTunnelHostnameRouteConfig{Create: &disabled},
+				}},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "11111111-1111-1111-1111-111111111111", OwnershipVerified: true,
+			},
+		}
+		vnet := v1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: "prod", Namespace: namespaceName},
+			Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}},
+			Status: v1alpha1.VirtualNetworkStatus{
+				VirtualNetworkID: "vnet-prod",
+				Conditions:       []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}},
+			},
+		}
+		gateway := privatePrerequisiteIR(namespaceName)
+		reconciler := &GatewayReconciler{
+			Client: testClient, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: &privatePrerequisiteAPI{}},
+		}
+
+		state, err := reconciler.reconcilePrivatePrerequisites(testContext, gateway, tunnel, account, gatewayInputsView{
+			Namespaces: []corev1.Namespace{*namespace}, VirtualNetworks: []v1alpha1.VirtualNetwork{vnet},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(state.Pending).To(gomega.ContainSubstring("requires a ready HostnameRoute"))
+		gomega.Expect(gateway.Domains[0].Guard).To(gomega.Equal(ir.GuardBlocked))
+		gomega.Expect(gateway.Domains[0].Access).To(gomega.BeNil())
+		routeKey := types.NamespacedName{
+			Namespace: dataplane.DefaultOperatorNamespace,
+			Name:      privateHostnameRouteName(namespaceName, tunnel.Name, "private"),
+		}
+		var route v1alpha1.HostnameRoute
+		gomega.Expect(apierrors.IsNotFound(testClient.Get(testContext, routeKey, &route))).To(gomega.BeTrue())
+	})
 })
 
 func setDeviceSettingsStatus(ctx context.Context, object *v1alpha1.DeviceSettings, proxy, udp bool) error {

@@ -4,6 +4,12 @@ KO_DOCKER_REPO ?= ghcr.io/isac322/flareway
 KIND_CLUSTER_NAME ?= flareway-conf
 KIND_NODE_IMAGE ?= kindest/node:v1.35.0
 FLAREWAY_E2E_LABELS ?= public,access
+EXPLORATORY_CHECKS ?= 25
+EXPLORATORY_STEPS ?= 8
+EXPLORATORY_SEED ?= 1
+EXPLORATORY_TEST_TIMEOUT ?= 15m
+EXPLORATORY_ARTIFACT_DIR ?= $(LOCALBIN)/exploratory-artifacts
+EXPLORATORY_TEST_BINARY ?= $(LOCALBIN)/flareway-exploratory.test
 CHART_DIR ?= charts/flareway
 CHART_RELEASE_NAME ?= flareway
 CHART_NAMESPACE ?= flareway-system
@@ -92,6 +98,36 @@ test-unit: ## Run unit tests outside the controller envtest package.
 .PHONY: test-envtest
 test-envtest: setup-envtest ## Run controller tests with envtest.
 	KUBEBUILDER_ASSETS="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test ./internal/controller/...
+
+.PHONY: test-exploratory-compile
+test-exploratory-compile: ## Vet the tagged harness and run its deterministic artifact-safety tests.
+	go vet -tags exploratory ./test/exploratory
+	go test -race -tags exploratory -run '^TestTrace' ./test/exploratory
+
+.PHONY: test-exploratory
+test-exploratory: setup-envtest ## Run bounded state-machine exploration against an isolated envtest control plane.
+	@for value in "$(EXPLORATORY_SEED)" "$(EXPLORATORY_CHECKS)" "$(EXPLORATORY_STEPS)"; do \
+		if [[ ! "$$value" =~ ^[1-9][0-9]*$$ ]]; then \
+			echo "EXPLORATORY_SEED, EXPLORATORY_CHECKS, and EXPLORATORY_STEPS must be positive integers"; \
+			exit 1; \
+		fi; \
+	done
+	@mkdir -p "$(EXPLORATORY_ARTIFACT_DIR)"
+	go test -c -tags exploratory -race -o "$(EXPLORATORY_TEST_BINARY)" ./test/exploratory
+	@assets="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)"; \
+		artifact_dir="$$(cd "$(EXPLORATORY_ARTIFACT_DIR)" && pwd)"; \
+		repository_root="$$(pwd)"; \
+		cd "$$artifact_dir"; \
+		rm -rf "$$artifact_dir/testdata"; \
+		for test_name in TestAccessStateMachine TestGatewayStateMachine TestNetworkRouteStateMachine TestSmokeAccountVerificationRoundTrip; do \
+			KUBEBUILDER_ASSETS="$$assets" \
+			FLAREWAY_REPOSITORY_ROOT="$$repository_root" \
+			FLAREWAY_EXPLORATORY_ARTIFACT_DIR="$$artifact_dir" \
+			"$(EXPLORATORY_TEST_BINARY)" -test.run="^$${test_name}$$" -test.timeout="$(EXPLORATORY_TEST_TIMEOUT)" \
+			-rapid.checks="$(EXPLORATORY_CHECKS)" \
+			-rapid.steps="$(EXPLORATORY_STEPS)" \
+			-rapid.seed="$(EXPLORATORY_SEED)" || exit; \
+		done
 
 .PHONY: test
 test: test-unit test-envtest ## Run unit and envtest test suites.

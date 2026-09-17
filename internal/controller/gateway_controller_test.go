@@ -1811,115 +1811,115 @@ type dataplaneObjectFactory func(namespace, name string) (client.Object, client.
 
 func configMapDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   namespace,
-				Name:        name,
-				Labels:      map[string]string{"foreign": "keep"},
-				Annotations: map[string]string{"foreign": "keep"},
-			},
-			Data: map[string]string{"foreign": "keep"},
-		}, &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Data:       map[string]string{"desired": "value"},
-		}
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Labels:      map[string]string{"foreign": "keep"},
+			Annotations: map[string]string{"foreign": "keep"},
+		},
+		Data: map[string]string{"foreign": "keep"},
+	}, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Data:       map[string]string{"desired": "value"},
+	}
 }
 
 func deploymentDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	currentReplicas := int32(3)
 	desiredReplicas := int32(2)
 	return &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   namespace,
-				Name:        name,
-				Labels:      map[string]string{"foreign": "keep"},
-				Annotations: map[string]string{"foreign": "keep"},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Labels:      map[string]string{"foreign": "keep"},
+			Annotations: map[string]string{"foreign": "keep"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &currentReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "foreign"}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "foreign", Image: "example.invalid/foreign",
+				}}},
 			},
-			Spec: appsv1.DeploymentSpec{
-				Replicas: &currentReplicas,
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "foreign"}},
-					Spec: corev1.PodSpec{Containers: []corev1.Container{{
-						Name: "foreign", Image: "example.invalid/foreign",
-					}}},
-				},
+		},
+	}, &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &desiredReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "desired"}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "desired", Image: "example.invalid/desired",
+				}}},
 			},
-		}, &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Spec: appsv1.DeploymentSpec{
-				Replicas: &desiredReplicas,
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "desired"}},
-					Spec: corev1.PodSpec{Containers: []corev1.Container{{
-						Name: "desired", Image: "example.invalid/desired",
-					}}},
-				},
-			},
-		}
+		},
+	}
 }
 
 func serviceDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   namespace,
-				Name:        name,
-				Labels:      map[string]string{"foreign": "keep"},
-				Annotations: map[string]string{"foreign": "keep"},
-			},
-			Spec: corev1.ServiceSpec{
-				Selector: map[string]string{"app": "foreign"},
-				Ports:    []corev1.ServicePort{{Name: "foreign", Port: 81}},
-			},
-		}, &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Spec: corev1.ServiceSpec{
-				Selector: map[string]string{"app": "desired"},
-				Ports:    []corev1.ServicePort{{Name: "desired", Port: 80}},
-			},
-		}
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Labels:      map[string]string{"foreign": "keep"},
+			Annotations: map[string]string{"foreign": "keep"},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "foreign"},
+			Ports:    []corev1.ServicePort{{Name: "foreign", Port: 81}},
+		},
+	}, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "desired"},
+			Ports:    []corev1.ServicePort{{Name: "desired", Port: 80}},
+		},
+	}
 }
 
 func pdbDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &policyv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   namespace,
-				Name:        name,
-				Labels:      map[string]string{"foreign": "keep"},
-				Annotations: map[string]string{"foreign": "keep"},
-			},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
-				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-			},
-		}, &policyv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
-				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-			},
-		}
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Labels:      map[string]string{"foreign": "keep"},
+			Annotations: map[string]string{"foreign": "keep"},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+		},
+	}, &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+		},
+	}
 }
 
 func networkPolicyDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   namespace,
-				Name:        name,
-				Labels:      map[string]string{"foreign": "keep"},
-				Annotations: map[string]string{"foreign": "keep"},
-			},
-			Spec: networkingv1.NetworkPolicySpec{
-				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
-			},
-		}, &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Spec: networkingv1.NetworkPolicySpec{
-				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			},
-		}
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			Labels:      map[string]string{"foreign": "keep"},
+			Annotations: map[string]string{"foreign": "keep"},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+		},
+	}, &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}
 }
 
 type dataplaneCreateRaceClient struct {
