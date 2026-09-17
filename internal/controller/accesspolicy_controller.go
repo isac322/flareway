@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -468,7 +469,7 @@ func (r *AccessPolicyReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessPolicy accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessPolicy{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.policiesForAccount)).Watches(&v1alpha1.AccessGroup{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Complete(observedReconciler("access-policy", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessPolicy{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.policiesForAccount)).Watches(&v1alpha1.AccessGroup{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.policiesForNamespace)).Complete(observedReconciler("access-policy", r))
 }
 func (r *AccessPolicyReconciler) policiesForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessPolicyList
@@ -484,6 +485,17 @@ func (r *AccessPolicyReconciler) policiesForAccount(ctx context.Context, object 
 func (r *AccessPolicyReconciler) policiesForDependency(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessPolicyList
 	if err := r.List(ctx, &list, client.InNamespace(object.GetNamespace())); err != nil {
+		return nil
+	}
+	out := make([]reconcile.Request, len(list.Items))
+	for i := range list.Items {
+		out[i] = reconcile.Request{NamespacedName: types.NamespacedName{Namespace: list.Items[i].Namespace, Name: list.Items[i].Name}}
+	}
+	return out
+}
+func (r *AccessPolicyReconciler) policiesForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.AccessPolicyList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	out := make([]reconcile.Request, len(list.Items))

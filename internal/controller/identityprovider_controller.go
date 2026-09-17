@@ -976,7 +976,7 @@ func (r *IdentityProviderReconciler) SetupWithManager(manager ctrl.Manager) erro
 	}); err != nil {
 		return fmt.Errorf("index IdentityProvider Secrets: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.IdentityProvider{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.providersForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.providersForSecret)).Complete(observedReconciler("identity-provider", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.IdentityProvider{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.providersForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.providersForSecret)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.providersForNamespace)).Complete(observedReconciler("identity-provider", r))
 }
 
 func (r *IdentityProviderReconciler) providersForAccount(ctx context.Context, object client.Object) []reconcile.Request {
@@ -990,6 +990,14 @@ func (r *IdentityProviderReconciler) providersForAccount(ctx context.Context, ob
 func (r *IdentityProviderReconciler) providersForSecret(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.IdentityProviderList
 	if err := r.List(ctx, &list, client.MatchingFields{identityProviderSecretIndex: object.GetNamespace() + "/" + object.GetName()}); err != nil {
+		return nil
+	}
+	return identityProviderRequests(list.Items)
+}
+
+func (r *IdentityProviderReconciler) providersForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.IdentityProviderList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	return identityProviderRequests(list.Items)

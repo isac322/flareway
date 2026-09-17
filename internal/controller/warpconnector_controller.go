@@ -917,6 +917,7 @@ func (r *WARPConnectorReconciler) SetupWithManager(manager ctrl.Manager) error {
 		Watches(&flarewayv1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorsForAccount)).
 		Watches(&flarewayv1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorForNetworkRoute)).
 		Watches(&flarewayv1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorForHostnameRoute)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorsForNamespace)).
 		Named("warpconnector").
 		Complete(observedReconciler("warp-connector", r))
 }
@@ -951,6 +952,18 @@ func (r *WARPConnectorReconciler) warpConnectorForHostnameRoute(_ context.Contex
 func (r *WARPConnectorReconciler) warpConnectorsForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	list := new(flarewayv1alpha1.WARPConnectorList)
 	if err := r.List(ctx, list, client.MatchingFields{warpConnectorAccountIndex: object.GetName()}); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, len(list.Items))
+	for index := range list.Items {
+		requests[index] = reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[index])}
+	}
+	return requests
+}
+
+func (r *WARPConnectorReconciler) warpConnectorsForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	list := new(flarewayv1alpha1.WARPConnectorList)
+	if err := r.List(ctx, list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	requests := make([]reconcile.Request, len(list.Items))
