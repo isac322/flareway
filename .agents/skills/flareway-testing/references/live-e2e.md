@@ -69,10 +69,31 @@ The edge must deny on uncertainty; tests prove it rather than assume it:
 - After `kubectl delete`, call `waitForObjectDeletion` so finalizers finish
   before dependent remote cleanup — otherwise remote deletes hit dependency
   conflicts.
-- `AfterSuite` deletes the run's `GatewayClass`, `GatewayClassConfig`,
-  `CloudflareAccount`, and namespace, waits for the namespace to disappear,
-  then runs `janitor.SweepPrefix` scoped to the run prefix to remove any
-  remote leftovers.
+- `AfterSuite` drains the run namespace in explicit reverse-dependency tiers
+  discovered through `ServerPreferredResources` and planned by
+  `test/e2e/internal/cleanup`: applications; routes and Gateways; shared
+  policies, groups, and virtual networks; service tokens and other leaves;
+  then remaining CloudflareTunnels and WARPConnectors. Every tier deletes all
+  of its objects, then waits for the whole tier to be empty so finalizers
+  complete. Before the tunnel tier, the HostnameRoutes the Gateway controller
+  generated into the operator namespace (labeled
+  `flareway.bhyoo.com/platform-object=true` and
+  `flareway.bhyoo.com/source-namespace=<run namespace>`) are deleted and
+  awaited — they reference the run's tunnels and would otherwise block tunnel
+  finalizers. A discovered Flareway or Gateway API kind with no tier fails
+  the suite loudly — never skip it silently.
+- The `CloudflareAccount` credential Secret lives in the run namespace, so
+  the Namespace is deleted and awaited only after every namespaced tier has
+  drained; deleting it earlier wedges tunnel finalizers with
+  `CleanupBlocked/CredentialsUnavailable`. `GatewayClass`,
+  `GatewayClassConfig`, and `CloudflareAccount` are deleted and awaited last;
+  the janitor runs only after all of them are gone.
+- A failed stage aborts all later Kubernetes teardown — later tiers, the
+  Namespace, and the cluster fixtures are never touched — because continuing
+  would remove credentials that live dependents still need. The failure fails
+  the suite, and the in-suite janitor is skipped so remote deletes cannot
+  race live resources; leftovers belong to the scheduled janitor. A janitor
+  `ConnectedSkipped` tunnel after a successful drain is also a suite failure.
 
 ## Janitor
 
