@@ -30,6 +30,11 @@ func BuildService(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) *corev1.Serv
 	ports := make([]corev1.ServicePort, 0, len(gw.Listeners))
 	seen := make(map[int32]struct{}, len(gw.Listeners))
 	for i, listener := range gw.Listeners {
+		if listener.Port <= 0 {
+			// Listeners left over from removal can carry a zero port; a
+			// non-positive Service port is rejected by the API server.
+			continue
+		}
 		if _, exists := seen[listener.Port]; exists {
 			continue
 		}
@@ -56,7 +61,7 @@ func BuildService(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) *corev1.Serv
 	}
 
 	serviceType := corev1.ServiceTypeClusterIP
-	if len(gw.Listeners) > 0 && conformanceMode(gw, cfg) {
+	if selector != nil && conformanceMode(gw, cfg) {
 		serviceType = corev1.ServiceTypeLoadBalancer
 		if cfg != nil && cfg.Spec.Conformance.ServiceType != "" {
 			serviceType = cfg.Spec.Conformance.ServiceType

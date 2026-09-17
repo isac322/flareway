@@ -245,6 +245,26 @@ func TestBuildServiceMapsListenerPorts(t *testing.T) {
 	}
 }
 
+func TestBuildServiceSkipsNonPositiveListenerPorts(t *testing.T) {
+	gw := testGateway(true)
+	gw.Listeners = []ir.Listener{
+		{Name: "https", Port: 443, EnvoyPort: 10443, Protocol: "HTTPS", Exposure: ir.ExposurePublic},
+		{Name: "stale", Port: 0, EnvoyPort: 10080, Protocol: "HTTP", Exposure: ir.ExposurePublic},
+	}
+
+	service := BuildService(gw, testConfig(true))
+	if len(service.Spec.Ports) != 1 {
+		t.Fatalf("service ports = %v, want only the valid listener port", service.Spec.Ports)
+	}
+	port := service.Spec.Ports[0]
+	if port.Port != 443 || port.TargetPort.IntVal != 10443 {
+		t.Fatalf("service port = %#v, want 443 -> 10443", port)
+	}
+	if service.Spec.Selector == nil {
+		t.Fatal("service selector = nil, want pod selector for the valid listener")
+	}
+}
+
 func TestGatewayInfrastructureMetadataPropagation(t *testing.T) {
 	gw := testGateway(true)
 	gw.InfrastructureLabels = map[string]string{
@@ -328,6 +348,29 @@ func TestBuildServiceWithNoValidListenersIsFailClosed(t *testing.T) {
 	}
 	if service.Spec.Selector != nil {
 		t.Fatalf("service selector = %v, want nil so no endpoints are selected", service.Spec.Selector)
+	}
+	if len(service.Spec.Ports) != 1 {
+		t.Fatalf("service ports = %v, want one structurally valid fail-closed port", service.Spec.Ports)
+	}
+	port := service.Spec.Ports[0]
+	if port.Name != "health" || port.Port != EnvoyHealthPort || port.TargetPort.IntVal != EnvoyHealthPort {
+		t.Fatalf("fail-closed service port = %#v", port)
+	}
+}
+
+func TestBuildServiceWithOnlyNonPositiveListenerPortsIsFailClosed(t *testing.T) {
+	gw := testGateway(true)
+	gw.Listeners = []ir.Listener{
+		{Name: "stale-zero", Port: 0, EnvoyPort: 10080, Protocol: "HTTP", Exposure: ir.ExposurePublic},
+		{Name: "stale-negative", Port: -1, EnvoyPort: 10443, Protocol: "HTTPS", Exposure: ir.ExposurePublic},
+	}
+
+	service := BuildService(gw, testConfig(true))
+	if service.Spec.Selector != nil {
+		t.Fatalf("service selector = %v, want nil so no endpoints are selected", service.Spec.Selector)
+	}
+	if service.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Fatalf("service type = %s, want %s for all-invalid listeners", service.Spec.Type, corev1.ServiceTypeClusterIP)
 	}
 	if len(service.Spec.Ports) != 1 {
 		t.Fatalf("service ports = %v, want one structurally valid fail-closed port", service.Spec.Ports)
