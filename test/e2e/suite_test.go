@@ -21,6 +21,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,7 +39,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -149,27 +149,31 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 
 var _ = AfterSuite(func(ctx SpecContext) {
 	defer writeLatencies()
-	if kubeClient == nil || namespace == "" {
+	if kubeClient == nil || kubeClientset == nil || namespace == "" {
 		return
 	}
-	deleteObject(ctx, object("gateway.networking.k8s.io/v1", "GatewayClass", "", className, nil))
-	deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "GatewayClassConfig", "", classConfig, nil))
-	deleteObject(ctx, object("flareway.bhyoo.com/v1alpha1", "CloudflareAccount", "", accountName, nil))
-	deleteObject(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
-
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	_, _ = poll.Until(waitCtx, 5*time.Second, func(checkCtx context.Context) (bool, error) {
-		current := &corev1.Namespace{}
-		err := kubeClient.Get(checkCtx, types.NamespacedName{Name: namespace}, current)
-		return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
-	})
-	if cloudflareAPI != nil {
-		report, err := janitor.SweepPrefix(ctx, cloudflareAPI, namespace, 0, time.Now().UTC())
-		Expect(err).NotTo(HaveOccurred())
+	var errs []error
+	if err := teardownSuite(ctx); err != nil {
+		errs = append(errs, err)
+		// Skip the janitor: namespaced CRs may still be live, and deleting
+		// their remote objects now would race the controller's own
+		// finalizers. Leftovers are left for the scheduled janitor, which
+		// sweeps only stale runs.
+		GinkgoWriter.Printf("e2e teardown failed; skipping in-suite janitor so remote cleanup does not race live resources: %v\n", err)
+	} else if cloudflareAPI != nil {
+		janitorCtx, cancel := context.WithTimeout(ctx, teardownJanitorTimeout)
+		defer cancel()
+		report, err := janitor.SweepPrefix(janitorCtx, cloudflareAPI, namespace, 0, time.Now().UTC())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("janitor sweep: %w", err))
+		}
 		GinkgoWriter.Printf("e2e janitor deleted Access applications=%d policies=%d service tokens=%d hostname routes=%d network routes=%d virtual networks=%d DNS records=%d tunnels=%d; connected skipped=%d\n", report.AccessApplicationsDeleted, report.AccessPoliciesDeleted, report.ServiceTokensDeleted, report.HostnameRoutesDeleted, report.NetworkRoutesDeleted, report.VirtualNetworksDeleted, report.DNSRecordsDeleted, report.TunnelsDeleted, report.ConnectedSkipped)
+		if report.ConnectedSkipped > 0 {
+			errs = append(errs, fmt.Errorf("janitor skipped %d connected tunnels under prefix %s: namespaced drain did not converge", report.ConnectedSkipped, namespace))
+		}
 	}
-}, NodeTimeout(7*time.Minute))
+	Expect(errors.Join(errs...)).NotTo(HaveOccurred(), "e2e teardown failed")
+}, NodeTimeout(teardownNodeTimeout))
 
 func createSuiteFixtures(ctx context.Context) error {
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
