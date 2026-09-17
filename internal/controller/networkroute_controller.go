@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"time"
@@ -117,19 +118,19 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return r.finishRemoteError(ctx, object, getErr)
 		}
 		if conflict := validateObservedNetworkRoute(input, remote); conflict != "" {
-			return ctrl.Result{}, r.patchStatus(ctx, object, remote, false, metav1.ConditionFalse, "Conflict", conflict)
+			return ctrl.Result{}, r.patchStatus(ctx, object, remote, false, false, metav1.ConditionFalse, "Conflict", conflict)
 		}
 		lookup, lookupErr := r.resolveNetworkRouteIPLookup(ctx, api, object, account)
 		if lookupErr != nil {
-			return r.finishIPLookupError(ctx, object, remote, false, lookupErr)
+			return r.finishIPLookupError(ctx, object, remote, false, true, lookupErr)
 		}
-		return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, false, metav1.ConditionTrue, "Observed", "Network route is observed without mutation")
+		return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, false, true, metav1.ConditionTrue, "Observed", "Network route is observed without mutation")
 	}
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
 			owned := object.Status.OwnershipVerified || privateCommentOwnedBy(remote.Comment, input.Comment)
-			return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
+			return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, false, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
 		}
 		if privateIsValidationError(err) {
 			return r.finishError(ctx, object, err)
@@ -138,9 +139,9 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	}
 	lookup, lookupErr := r.resolveNetworkRouteIPLookup(ctx, api, object, account)
 	if lookupErr != nil {
-		return r.finishIPLookupError(ctx, object, remote, true, lookupErr)
+		return r.finishIPLookupError(ctx, object, remote, true, true, lookupErr)
 	}
-	return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, true, metav1.ConditionTrue, "Ready", "Network route is synchronized")
+	return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, true, true, metav1.ConditionTrue, "Ready", "Network route is synchronized")
 }
 
 func (r *NetworkRouteReconciler) ensureManaged(ctx context.Context, api flarecloudflare.NetworkRouteAPI, object *v1alpha1.NetworkRoute, input flarecloudflare.NetworkRouteInput) (flarecloudflare.NetworkRoute, error) {
@@ -263,20 +264,26 @@ func (r *NetworkRouteReconciler) checkOverlap(ctx context.Context, object *v1alp
 		otherKey := client.ObjectKeyFromObject(other)
 		if other.Status.RouteID != "" {
 			applied := other.Status.Applied
-			if applied.Network == "" || other.Spec.VirtualNetworkRef != nil && applied.VirtualNetworkID == "" {
-				return privateInvalid("Invalid", "applied NetworkRoute %s has an incomplete status.applied claim", otherKey)
+			claimSource, claimNetwork, claimVirtualNetworkID := "applied", applied.Network, applied.VirtualNetworkID
+			if claimNetwork == "" {
+				claimSource, claimNetwork, claimVirtualNetworkID = "observed", other.Status.Network, other.Status.VirtualNetworkID
 			}
-			otherPrefix, err := parseMaskedPrefix(applied.Network)
+			if claimNetwork == "" {
+				return privateInvalid("Invalid", "NetworkRoute %s has no recorded remote network identity", otherKey)
+			}
+			if other.Spec.VirtualNetworkRef != nil && claimVirtualNetworkID == "" {
+				return privateInvalid("Invalid", "NetworkRoute %s has an incomplete %s claim", otherKey, claimSource)
+			}
+			otherPrefix, err := parseMaskedPrefix(claimNetwork)
 			if err != nil {
-				return privateInvalid("Invalid", "applied NetworkRoute %s has invalid status.applied.network: %v", otherKey, err)
+				return privateInvalid("Invalid", "NetworkRoute %s has invalid %s network %q: %v", otherKey, claimSource, claimNetwork, err)
 			}
-			sameVirtualNetwork := applied.VirtualNetworkID == virtualNetworkID
-			if virtualNetworkID == "" && object.Spec.VirtualNetworkRef == nil &&
-				other.Spec.VirtualNetworkRef == nil && applied.ObservedGeneration == other.Generation {
-				sameVirtualNetwork = true
+			sameVirtualNetwork := claimVirtualNetworkID == virtualNetworkID
+			if virtualNetworkID == "" && object.Spec.VirtualNetworkRef == nil && other.Spec.VirtualNetworkRef == nil {
+				sameVirtualNetwork = claimSource == "observed" || applied.ObservedGeneration == other.Generation
 			}
 			if sameVirtualNetwork && prefixesOverlap(prefix, otherPrefix) {
-				return privateInvalid("Invalid", "network %s overlaps applied NetworkRoute %s network %s in the same virtual network", prefix, otherKey, otherPrefix)
+				return privateInvalid("Invalid", "network %s overlaps %s NetworkRoute %s network %s in the same virtual network", prefix, claimSource, otherKey, otherPrefix)
 			}
 			continue
 		}
@@ -339,14 +346,38 @@ func (r *NetworkRouteReconciler) reconcileDelete(ctx context.Context, object *v1
 			if typeErr != nil {
 				return typeErr
 			}
-			if appliedType := object.Status.Applied.TunnelType; appliedType != "" && appliedType != privateTunnelRemoteType(expectedTunnelType) {
-				return privateInvalid("Conflict", "refusing to delete network route after tunnelRef.kind changed from %q to %q", appliedType, privateTunnelRemoteType(expectedTunnelType))
+			recordedType := object.Status.Applied.TunnelType
+			if recordedType == "" {
+				recordedType = object.Status.TunnelType
 			}
-			expected := flarecloudflare.NetworkRouteInput{
-				Network: object.Status.Applied.Network, TunnelID: object.Status.Applied.TunnelID,
-				TunnelType: expectedTunnelType, VirtualNetworkID: object.Status.Applied.VirtualNetworkID,
+			if recordedType != "" && recordedType != privateTunnelRemoteType(expectedTunnelType) {
+				return privateInvalid("Conflict", "refusing to delete network route after tunnelRef.kind changed from %q to %q", recordedType, privateTunnelRemoteType(expectedTunnelType))
 			}
-			if conflict := validateObservedNetworkRoute(expected, remote); conflict != "" {
+			var candidates []flarecloudflare.NetworkRouteInput
+			if object.Status.Applied.Network != "" {
+				candidates = append(candidates, flarecloudflare.NetworkRouteInput{
+					Network: object.Status.Applied.Network, TunnelID: object.Status.Applied.TunnelID,
+					TunnelType: expectedTunnelType, VirtualNetworkID: object.Status.Applied.VirtualNetworkID,
+				})
+			}
+			if object.Status.Network != "" {
+				candidates = append(candidates, flarecloudflare.NetworkRouteInput{
+					Network: object.Status.Network, TunnelID: object.Status.TunnelID,
+					TunnelType: expectedTunnelType, VirtualNetworkID: object.Status.VirtualNetworkID,
+				})
+			}
+			if len(candidates) == 0 {
+				return privateInvalid("Conflict", "refusing to delete network route %q without a recorded remote identity", remote.ID)
+			}
+			matched := false
+			var conflict string
+			for _, candidate := range candidates {
+				if conflict = validateObservedNetworkRoute(candidate, remote); conflict == "" {
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				return privateInvalid("Conflict", "refusing to delete changed network route: %s", conflict)
 			}
 			if err = ignoreRemoteNotFound(api.DeleteNetworkRoute(ctx, object.Status.RouteID)); err != nil {
@@ -387,7 +418,7 @@ func (r *NetworkRouteReconciler) resolveNetworkRouteIPLookup(ctx context.Context
 		return nil, err
 	}
 	if remote.ID == "" {
-		return nil, privateInvalid("Conflict", "the IP lookup returned a network route without an ID")
+		return nil, errors.New("the IP lookup returned a network route without an ID")
 	}
 	if remote.Deleted {
 		return nil, privateInvalid("Conflict", "the IP lookup returned deleted network route %q", remote.ID)
@@ -408,8 +439,8 @@ func (r *NetworkRouteReconciler) resolveNetworkRouteIPLookup(ctx context.Context
 	}, nil
 }
 
-func (r *NetworkRouteReconciler) finishIPLookupError(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, owned bool, err error) (ctrl.Result, error) {
-	if patchErr := r.patchStatus(ctx, object, remote, owned, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err)); patchErr != nil {
+func (r *NetworkRouteReconciler) finishIPLookupError(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, owned, applied bool, err error) (ctrl.Result, error) {
+	if patchErr := r.patchStatus(ctx, object, remote, owned, applied, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err)); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	if privateIsValidationError(err) {
@@ -421,7 +452,7 @@ func (r *NetworkRouteReconciler) finishIPLookupError(ctx context.Context, object
 	return ctrl.Result{}, err
 }
 func (r *NetworkRouteReconciler) finishError(ctx context.Context, object *v1alpha1.NetworkRoute, err error) (ctrl.Result, error) {
-	patchErr := r.patchStatus(ctx, object, networkRouteFromStatus(object), object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
+	patchErr := r.patchStatus(ctx, object, networkRouteFromStatus(object), object.Status.OwnershipVerified, false, metav1.ConditionFalse, privateErrorReason(err), privateErrorMessage(err))
 	if patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
@@ -435,21 +466,21 @@ func (r *NetworkRouteReconciler) finishError(ctx context.Context, object *v1alph
 }
 
 func (r *NetworkRouteReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.NetworkRoute, err error) (ctrl.Result, error) {
-	if patchErr := r.patchStatus(ctx, object, networkRouteFromStatus(object), object.Status.OwnershipVerified, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, networkRouteFromStatus(object), object.Status.OwnershipVerified, false, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
 }
 
-func (r *NetworkRouteReconciler) patchStatus(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, owned bool, status metav1.ConditionStatus, reason, message string) error {
-	return r.patchStatusInternal(ctx, object, remote, object.Status.IPLookup, false, owned, status, reason, message)
+func (r *NetworkRouteReconciler) patchStatus(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
+	return r.patchStatusInternal(ctx, object, remote, object.Status.IPLookup, false, owned, applied, status, reason, message)
 }
 
-func (r *NetworkRouteReconciler) patchStatusWithIPLookup(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, lookup *v1alpha1.NetworkRouteIPLookupStatus, owned bool, status metav1.ConditionStatus, reason, message string) error {
-	return r.patchStatusInternal(ctx, object, remote, lookup, true, owned, status, reason, message)
+func (r *NetworkRouteReconciler) patchStatusWithIPLookup(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, lookup *v1alpha1.NetworkRouteIPLookupStatus, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
+	return r.patchStatusInternal(ctx, object, remote, lookup, true, owned, applied, status, reason, message)
 }
 
-func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, lookup *v1alpha1.NetworkRouteIPLookupStatus, updateLookup, owned bool, status metav1.ConditionStatus, reason, message string) error {
+func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, lookup *v1alpha1.NetworkRouteIPLookupStatus, updateLookup, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
 	base := client.MergeFrom(object.DeepCopy())
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
@@ -466,7 +497,7 @@ func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object
 		object.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
 		object.Status.OwnershipVerified = owned
 	}
-	if status == metav1.ConditionTrue {
+	if applied && remote.ID != "" {
 		object.Status.Applied = v1alpha1.NetworkRouteAppliedStatus{
 			Network: remote.Network, TunnelID: remote.TunnelID,
 			TunnelType: privateTunnelRemoteType(remote.TunnelType), VirtualNetworkID: remote.VirtualNetworkID,

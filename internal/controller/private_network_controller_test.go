@@ -19,18 +19,22 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
+
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -556,6 +560,400 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		gomega.Expect(testPrivateNetworkCloudflare.count("CreateNetworkRoute")).To(gomega.BeZero())
 		gomega.Expect(testPrivateNetworkCloudflare.count("CreateHostnameRoute")).To(gomega.BeZero())
 	})
+
+	ginkgo.It("keeps the applied claim and isolates peers when the network route IP lookup fails", func() {
+		fixture := newPrivateNetworkFixture("lookup-failure")
+		fixture.create()
+		vnet := fixture.createVirtualNetwork("prod")
+		fixture.waitVirtualNetworkReady(vnet)
+		failing := fixture.networkRoute("failing", "10.96.0.0/12", vnet.Name)
+		failing.Spec.IPLookup = &v1alpha1.NetworkRouteIPLookupSpec{
+			IP:                "192.0.2.1",
+			VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
+		}
+		gomega.Expect(testClient.Create(testContext, failing)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(failing), failing)).To(gomega.Succeed())
+			g.Expect(failing.Status.RouteID).NotTo(gomega.BeEmpty())
+			g.Expect(failing.Status.Applied.Network).To(gomega.Equal("10.96.0.0/12"))
+			g.Expect(failing.Status.Applied.TunnelID).NotTo(gomega.BeEmpty())
+			g.Expect(failing.Status.Applied.VirtualNetworkID).To(gomega.Equal(vnet.Status.VirtualNetworkID))
+			condition := statusutil.FindCondition(failing.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Pending"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(failing), failing)).To(gomega.Succeed())
+			g.Expect(failing.Status.Applied.Network).To(gomega.Equal("10.96.0.0/12"))
+		}).WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		peer := fixture.networkRoute("peer", "10.200.0.0/16", vnet.Name)
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		overlapping := fixture.networkRoute("overlapping", "10.96.128.0/17", vnet.Name)
+		gomega.Expect(testClient.Create(testContext, overlapping)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(overlapping), overlapping)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(overlapping.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("overlaps applied NetworkRoute"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testPrivateNetworkCloudflare.count("LookupNetworkRoute")).To(gomega.BeNumerically(">=", 2))
+	})
+
+	ginkgo.It("retries an IP lookup that returns a network route without an ID", func() {
+		fixture := newPrivateNetworkFixture("idless-lookup")
+		fixture.create()
+		vnet := fixture.createVirtualNetwork("prod")
+		fixture.waitVirtualNetworkReady(vnet)
+		route := fixture.networkRoute("services", "10.96.0.0/12", vnet.Name)
+		route.Spec.IPLookup = &v1alpha1.NetworkRouteIPLookupSpec{
+			IP:                "10.96.1.1",
+			VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
+		}
+		testPrivateNetworkCloudflare.setLookupIDLess(true)
+		ginkgo.DeferCleanup(testPrivateNetworkCloudflare.setLookupIDLess, false)
+		gomega.Expect(testClient.Create(testContext, route)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+			g.Expect(route.Status.RouteID).NotTo(gomega.BeEmpty())
+			g.Expect(route.Status.Applied.Network).To(gomega.Equal("10.96.0.0/12"))
+			condition := statusutil.FindCondition(route.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Pending"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testPrivateNetworkCloudflare.count("LookupNetworkRoute")).To(gomega.BeNumerically(">=", 1))
+
+		testPrivateNetworkCloudflare.setLookupIDLess(false)
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(route.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+			g.Expect(route.Status.IPLookup).NotTo(gomega.BeNil())
+			g.Expect(route.Status.IPLookup.Result).NotTo(gomega.BeNil())
+			g.Expect(route.Status.IPLookup.Result.RouteID).To(gomega.Equal(route.Status.RouteID))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("does not record an applied claim when the managed write fails", func() {
+		fixture := newPrivateNetworkFixture("failed-write")
+		fixture.create()
+		networkRoute := fixture.networkRoute("mismatch-network", "10.150.0.0/16", "")
+		networkRoute.Spec.VirtualNetworkRef = nil
+		networkOwner, err := privateOwnerComment(testContext, testClient, networkRoute, networkRoute.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		testPrivateNetworkCloudflare.putNetworkRoute(flarecloudflare.NetworkRoute{
+			ID: "mismatch-network-remote", Network: "10.150.0.0/16", TunnelID: fixture.tunnelID(),
+			TunnelType: flarecloudflare.NetworkTunnelTypeWARPConnector, Comment: networkOwner,
+		})
+		hostnameRoute := fixture.hostnameRoute("mismatch-hostname", "mismatch.private.internal")
+		hostnameOwner, err := privateOwnerComment(testContext, testClient, hostnameRoute, hostnameRoute.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		testPrivateNetworkCloudflare.putHostnameRoute(flarecloudflare.HostnameRoute{
+			ID: "mismatch-hostname-remote", Hostname: "mismatch.private.internal", TunnelID: fixture.tunnelID(),
+			TunnelType: flarecloudflare.NetworkTunnelTypeWARPConnector, Comment: hostnameOwner,
+		})
+		gomega.Expect(testClient.Create(testContext, networkRoute)).To(gomega.Succeed())
+		gomega.Expect(testClient.Create(testContext, hostnameRoute)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(networkRoute), networkRoute)).To(gomega.Succeed())
+			g.Expect(networkRoute.Status.RouteID).To(gomega.Equal("mismatch-network-remote"))
+			g.Expect(networkRoute.Status.OwnershipVerified).To(gomega.BeTrue())
+			g.Expect(networkRoute.Status.Applied.Network).To(gomega.BeEmpty())
+			condition := statusutil.FindCondition(networkRoute.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Conflict"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("tunnel type"))
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(hostnameRoute), hostnameRoute)).To(gomega.Succeed())
+			g.Expect(hostnameRoute.Status.RouteID).To(gomega.Equal("mismatch-hostname-remote"))
+			g.Expect(hostnameRoute.Status.OwnershipVerified).To(gomega.BeTrue())
+			g.Expect(hostnameRoute.Status.Applied.Hostname).To(gomega.BeEmpty())
+			hostnameCondition := statusutil.FindCondition(hostnameRoute.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(hostnameCondition).NotTo(gomega.BeNil())
+			g.Expect(hostnameCondition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(hostnameCondition.Reason).To(gomega.Equal("Conflict"))
+			g.Expect(hostnameCondition.Message).To(gomega.ContainSubstring("tunnel type"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("deletes a half-persisted network route only after live ownership proof", func() {
+		fixture := newPrivateNetworkFixture("legacy-half-state")
+		fixture.create()
+		vnet := fixture.createVirtualNetwork("prod")
+		fixture.waitVirtualNetworkReady(vnet)
+		seed := func(route *v1alpha1.NetworkRoute, network string) {
+			ownerComment, err := privateOwnerComment(testContext, testClient, route, route.Spec.Comment)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+				g.Expect(route.Finalizers).To(gomega.ContainElement(v1alpha1.NetworkRouteFinalizer))
+				route.Status = v1alpha1.NetworkRouteStatus{
+					RouteID:           "zombie-" + route.Name,
+					Network:           network,
+					TunnelID:          fixture.tunnelID(),
+					TunnelType:        v1alpha1.TunnelRemoteTypeCloudflareTunnel,
+					VirtualNetworkID:  vnet.Status.VirtualNetworkID,
+					Comment:           ownerComment,
+					OwnershipVerified: true,
+				}
+				g.Expect(testClient.Status().Update(testContext, route)).To(gomega.Succeed())
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+				g.Expect(route.Status.RouteID).To(gomega.Equal("zombie-" + route.Name))
+				g.Expect(route.Status.OwnershipVerified).To(gomega.BeTrue())
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		}
+		zombie := fixture.networkRoute("zombie", "10.96.0.0/16", vnet.Name)
+		zombie.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, zombie)).To(gomega.Succeed())
+		seed(zombie, "10.96.0.0/16")
+		zombieOwner, err := privateOwnerComment(testContext, testClient, zombie, zombie.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		peer := fixture.networkRoute("peer", "10.200.0.0/16", vnet.Name)
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		blocked := fixture.networkRoute("blocked", "10.96.128.0/17", vnet.Name)
+		gomega.Expect(testClient.Create(testContext, blocked)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(blocked), blocked)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(blocked.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("overlaps observed NetworkRoute"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		testPrivateNetworkCloudflare.putNetworkRoute(flarecloudflare.NetworkRoute{
+			ID: "zombie-zombie", Network: "10.96.0.0/16", TunnelID: fixture.tunnelID(), VirtualNetworkID: vnet.Status.VirtualNetworkID, Comment: zombieOwner,
+		})
+		gomega.Expect(testClient.Delete(testContext, zombie)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), new(v1alpha1.NetworkRoute)))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Expect(testPrivateNetworkCloudflare.count("DeleteNetworkRoute")).To(gomega.Equal(1))
+
+		changed := fixture.networkRoute("changed", "10.97.0.0/16", vnet.Name)
+		changed.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, changed)).To(gomega.Succeed())
+		seed(changed, "10.97.0.0/16")
+		changedOwner, err := privateOwnerComment(testContext, testClient, changed, changed.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		testPrivateNetworkCloudflare.putNetworkRoute(flarecloudflare.NetworkRoute{
+			ID: "zombie-changed", Network: "10.150.0.0/16", TunnelID: fixture.tunnelID(), VirtualNetworkID: vnet.Status.VirtualNetworkID, Comment: changedOwner,
+		})
+		foreign := fixture.networkRoute("foreign", "10.98.0.0/16", vnet.Name)
+		foreign.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, foreign)).To(gomega.Succeed())
+		seed(foreign, "10.98.0.0/16")
+		testPrivateNetworkCloudflare.putNetworkRoute(flarecloudflare.NetworkRoute{
+			ID: "zombie-foreign", Network: "10.98.0.0/16", TunnelID: fixture.tunnelID(), VirtualNetworkID: vnet.Status.VirtualNetworkID, Comment: "terraform",
+		})
+		gomega.Expect(testClient.Delete(testContext, changed)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, foreign)).To(gomega.Succeed())
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(changed), changed)).To(gomega.Succeed())
+			g.Expect(changed.Finalizers).To(gomega.ContainElement(v1alpha1.NetworkRouteFinalizer))
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(foreign), foreign)).To(gomega.Succeed())
+			g.Expect(foreign.Finalizers).To(gomega.ContainElement(v1alpha1.NetworkRouteFinalizer))
+		}).WithTimeout(2 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testPrivateNetworkCloudflare.count("DeleteNetworkRoute")).To(gomega.Equal(1))
+
+		gone := fixture.networkRoute("gone", "10.99.0.0/16", vnet.Name)
+		gone.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, gone)).To(gomega.Succeed())
+		seed(gone, "10.99.0.0/16")
+		gomega.Expect(testClient.Delete(testContext, gone)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testClient.Get(testContext, client.ObjectKeyFromObject(gone), new(v1alpha1.NetworkRoute)))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Expect(testPrivateNetworkCloudflare.count("DeleteNetworkRoute")).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("keeps a half-persisted wildcard hostname route claim and deletes it from observed identity", func() {
+		fixture := newPrivateNetworkFixture("legacy-hostname")
+		fixture.create()
+		zombie := fixture.hostnameRoute("zombie", "*.private.internal")
+		zombie.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, zombie)).To(gomega.Succeed())
+		zombieOwner, err := privateOwnerComment(testContext, testClient, zombie, zombie.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			g.Expect(zombie.Finalizers).To(gomega.ContainElement(v1alpha1.HostnameRouteFinalizer))
+			zombie.Status = v1alpha1.HostnameRouteStatus{
+				RouteID:           "zombie-hostname-route",
+				Hostname:          "private.internal",
+				TunnelID:          fixture.tunnelID(),
+				TunnelType:        v1alpha1.TunnelRemoteTypeCloudflareTunnel,
+				Comment:           zombieOwner,
+				OwnershipVerified: true,
+			}
+			g.Expect(testClient.Status().Update(testContext, zombie)).To(gomega.Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			g.Expect(zombie.Status.RouteID).To(gomega.Equal("zombie-hostname-route"))
+			g.Expect(zombie.Status.OwnershipVerified).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		peer := fixture.hostnameRoute("peer", "other.internal")
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		blocked := fixture.hostnameRoute("blocked", "x.private.internal")
+		gomega.Expect(testClient.Create(testContext, blocked)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(blocked), blocked)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(blocked.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("overlaps observed HostnameRoute"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		testPrivateNetworkCloudflare.putHostnameRoute(flarecloudflare.HostnameRoute{
+			ID: "zombie-hostname-route", Hostname: "private.internal", TunnelID: fixture.tunnelID(), Comment: zombieOwner,
+		})
+		gomega.Expect(testClient.Delete(testContext, zombie)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), new(v1alpha1.HostnameRoute)))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Expect(testPrivateNetworkCloudflare.count("DeleteHostnameRoute")).To(gomega.Equal(1))
+	})
+
+	ginkgo.It("derives hostname overlap claims from observed identity when spec and remote disagree", func() {
+		fixture := newPrivateNetworkFixture("observed-claim")
+		fixture.create()
+		seed := func(route *v1alpha1.HostnameRoute, observed string) {
+			ownerComment, err := privateOwnerComment(testContext, testClient, route, route.Spec.Comment)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+				g.Expect(route.Finalizers).To(gomega.ContainElement(v1alpha1.HostnameRouteFinalizer))
+				route.Status = v1alpha1.HostnameRouteStatus{
+					RouteID:           "zombie-" + route.Name,
+					Hostname:          observed,
+					TunnelID:          fixture.tunnelID(),
+					TunnelType:        v1alpha1.TunnelRemoteTypeCloudflareTunnel,
+					Comment:           ownerComment,
+					OwnershipVerified: true,
+				}
+				g.Expect(testClient.Status().Update(testContext, route)).To(gomega.Succeed())
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+				g.Expect(route.Status.RouteID).To(gomega.Equal("zombie-" + route.Name))
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		}
+		assertRejected := func(route *v1alpha1.HostnameRoute, message string) {
+			gomega.Expect(testClient.Create(testContext, route)).To(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
+				condition := statusutil.FindCondition(route.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+				g.Expect(condition).NotTo(gomega.BeNil())
+				g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+				g.Expect(condition.Message).To(gomega.ContainSubstring(message))
+			}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		}
+
+		exact := fixture.hostnameRoute("exact", "*.private.internal")
+		exact.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, exact)).To(gomega.Succeed())
+		seed(exact, "exact.private.internal")
+		assertRejected(fixture.hostnameRoute("exact-collision", "exact.private.internal"), "overlaps observed HostnameRoute")
+		peer := fixture.hostnameRoute("peer", "x.private.internal")
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		wild := fixture.hostnameRoute("wild", "wild.private.internal")
+		wild.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, wild)).To(gomega.Succeed())
+		seed(wild, "wild.private.internal")
+		assertRejected(fixture.hostnameRoute("wild-collision", "*.wild.private.internal"), "overlaps observed HostnameRoute")
+
+		malformed := fixture.hostnameRoute("malformed", "ok.private.internal")
+		malformed.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, malformed)).To(gomega.Succeed())
+		seed(malformed, "Not A Hostname")
+		assertRejected(fixture.hostnameRoute("malformed-peer", "unrelated.internal"), "invalid observed hostname")
+	})
+
+	ginkgo.It("refuses to delete a half-persisted hostname route outside the tenant grant", func() {
+		fixture := newPrivateNetworkFixture("delete-grant")
+		fixture.create()
+		var account v1alpha1.CloudflareAccount
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		account.Spec.Grants[1].Hostnames = []string{"allowed.private.internal"}
+		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+			g.Expect(account.Spec.Grants[1].Hostnames).To(gomega.Equal([]string{"allowed.private.internal"}))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		zombie := fixture.hostnameRoute("zombie", "*.private.internal")
+		zombie.Spec.TunnelRef.Name = "missing"
+		gomega.Expect(testClient.Create(testContext, zombie)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			condition := meta.FindStatusCondition(zombie.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("UnsupportedValue"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("hostname"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		zombieOwner, err := privateOwnerComment(testContext, testClient, zombie, zombie.Spec.Comment)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			zombie.Status = v1alpha1.HostnameRouteStatus{
+				RouteID:           "zombie-hostname-route",
+				Hostname:          "private.internal",
+				TunnelID:          fixture.tunnelID(),
+				TunnelType:        v1alpha1.TunnelRemoteTypeCloudflareTunnel,
+				Comment:           zombieOwner,
+				OwnershipVerified: true,
+			}
+			g.Expect(testClient.Status().Update(testContext, zombie)).To(gomega.Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			g.Expect(zombie.Status.RouteID).To(gomega.Equal("zombie-hostname-route"))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		testPrivateNetworkCloudflare.putHostnameRoute(flarecloudflare.HostnameRoute{
+			ID: "zombie-hostname-route", Hostname: "private.internal", TunnelID: fixture.tunnelID(), Comment: zombieOwner,
+		})
+		gomega.Expect(testClient.Delete(testContext, zombie)).To(gomega.Succeed())
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(zombie), zombie)).To(gomega.Succeed())
+			g.Expect(zombie.Finalizers).To(gomega.ContainElement(v1alpha1.HostnameRouteFinalizer))
+		}).WithTimeout(2 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testPrivateNetworkCloudflare.count("DeleteHostnameRoute")).To(gomega.BeZero())
+	})
 })
 
 type privateNetworkFixture struct {
@@ -727,6 +1125,7 @@ type fakePrivateNetworkCloudflare struct {
 	networkRoutes   map[string]flarecloudflare.NetworkRoute
 	hostnameRoutes  map[string]flarecloudflare.HostnameRoute
 	calls           []string
+	lookupIDLess    bool
 }
 
 var _ flarecloudflare.NetworkAPI = (*fakePrivateNetworkCloudflare)(nil)
@@ -745,6 +1144,7 @@ func (f *fakePrivateNetworkCloudflare) reset() {
 	f.networkRoutes = map[string]flarecloudflare.NetworkRoute{}
 	f.hostnameRoutes = map[string]flarecloudflare.HostnameRoute{}
 	f.calls = nil
+	f.lookupIDLess = false
 }
 
 func (f *fakePrivateNetworkCloudflare) Client(_, _ string) (flarecloudflare.NetworkAPI, error) {
@@ -757,7 +1157,11 @@ func (f *fakePrivateNetworkCloudflare) id(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, f.next)
 }
 func (f *fakePrivateNetworkCloudflare) missing(resource, id string) error {
-	return apierrors.NewNotFound(schema.GroupResource{Group: "cloudflare", Resource: resource}, id)
+	return &cloudflaresdk.Error{
+		StatusCode: http.StatusNotFound,
+		Request:    &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/" + resource + "/" + id}},
+		Response:   &http.Response{StatusCode: http.StatusNotFound},
+	}
 }
 
 func (f *fakePrivateNetworkCloudflare) CreateVirtualNetwork(_ context.Context, input flarecloudflare.VirtualNetworkInput) (flarecloudflare.VirtualNetwork, error) {
@@ -868,6 +1272,9 @@ func (f *fakePrivateNetworkCloudflare) LookupNetworkRoute(_ context.Context, inp
 	if result.ID == "" {
 		return flarecloudflare.NetworkRoute{}, f.missing("networkroutes", input.IP)
 	}
+	if f.lookupIDLess {
+		result.ID = ""
+	}
 	return result, nil
 }
 func (f *fakePrivateNetworkCloudflare) DeleteNetworkRoute(_ context.Context, id string) error {
@@ -956,6 +1363,11 @@ func (f *fakePrivateNetworkCloudflare) putHostnameRoute(remote flarecloudflare.H
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hostnameRoutes[remote.ID] = remote
+}
+func (f *fakePrivateNetworkCloudflare) setLookupIDLess(value bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookupIDLess = value
 }
 func (f *fakePrivateNetworkCloudflare) count(call string) int {
 	f.mu.Lock()
