@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -638,6 +639,7 @@ func (r *ZeroTrustOrganizationReconciler) SetupWithManager(manager ctrl.Manager)
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).
 		Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.forOrganizationDependency)).
 		Watches(&v1alpha1.AccessCustomPage{}, handler.EnqueueRequestsFromMapFunc(r.forOrganizationDependency)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
 		Complete(observedReconciler("zero-trust-organization", r))
 }
 

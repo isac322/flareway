@@ -369,7 +369,7 @@ func (r *DevicePostureIntegrationReconciler) SetupWithManager(manager ctrl.Manag
 	}); err != nil {
 		return fmt.Errorf("index DevicePostureIntegration Secrets: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureIntegration{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForSecret)).Complete(observedReconciler("device-posture-integration", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureIntegration{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForSecret)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForNamespace)).Complete(observedReconciler("device-posture-integration", r))
 }
 
 func (r *DevicePostureIntegrationReconciler) integrationsForAccount(ctx context.Context, object client.Object) []reconcile.Request {
@@ -384,6 +384,14 @@ func (r *DevicePostureIntegrationReconciler) integrationsForSecret(ctx context.C
 	var list v1alpha1.DevicePostureIntegrationList
 	key := object.GetNamespace() + "/" + object.GetName()
 	if err := r.List(ctx, &list, client.MatchingFields{devicePostureIntegrationSecretIndex: key}); err != nil {
+		return nil
+	}
+	return devicePostureIntegrationRequests(list.Items)
+}
+
+func (r *DevicePostureIntegrationReconciler) integrationsForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.DevicePostureIntegrationList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	return devicePostureIntegrationRequests(list.Items)

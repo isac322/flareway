@@ -24,6 +24,7 @@ import (
 	"slices"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -561,7 +562,7 @@ func (r *DevicePostureRuleReconciler) SetupWithManager(manager ctrl.Manager) err
 	}); err != nil {
 		return fmt.Errorf("index DevicePostureRule integrations: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureRule{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.rulesForAccount)).Watches(&v1alpha1.DevicePostureIntegration{}, handler.EnqueueRequestsFromMapFunc(r.rulesForIntegration)).Complete(observedReconciler("device-posture-rule", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureRule{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.rulesForAccount)).Watches(&v1alpha1.DevicePostureIntegration{}, handler.EnqueueRequestsFromMapFunc(r.rulesForIntegration)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.rulesForNamespace)).Complete(observedReconciler("device-posture-rule", r))
 }
 
 func (r *DevicePostureRuleReconciler) rulesForAccount(ctx context.Context, object client.Object) []reconcile.Request {
@@ -576,6 +577,14 @@ func (r *DevicePostureRuleReconciler) rulesForIntegration(ctx context.Context, o
 	var list v1alpha1.DevicePostureRuleList
 	key := object.GetNamespace() + "/" + object.GetName()
 	if err := r.List(ctx, &list, client.MatchingFields{devicePostureIntegrationRefIndex: key}); err != nil {
+		return nil
+	}
+	return devicePostureRuleRequests(list.Items)
+}
+
+func (r *DevicePostureRuleReconciler) rulesForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.DevicePostureRuleList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	return devicePostureRuleRequests(list.Items)

@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -380,7 +381,7 @@ func (r *ZeroTrustListReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index ZeroTrustList accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustList{}).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Complete(observedReconciler("zero-trust-list", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustList{}).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Complete(observedReconciler("zero-trust-list", r))
 }
 
 func (r *ZeroTrustListReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

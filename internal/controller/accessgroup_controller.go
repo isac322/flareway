@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -413,7 +414,7 @@ func (r *AccessGroupReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessGroup accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessGroup{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.groupsForAccount)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Complete(observedReconciler("access-group", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessGroup{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.groupsForAccount)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.groupsForNamespace)).Complete(observedReconciler("access-group", r))
 }
 func (r *AccessGroupReconciler) groupsForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessGroupList
@@ -425,6 +426,13 @@ func (r *AccessGroupReconciler) groupsForAccount(ctx context.Context, object cli
 func (r *AccessGroupReconciler) groupsForDependency(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessGroupList
 	if err := r.List(ctx, &list, client.InNamespace(object.GetNamespace())); err != nil {
+		return nil
+	}
+	return accessGroupRequests(list.Items)
+}
+func (r *AccessGroupReconciler) groupsForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.AccessGroupList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	return accessGroupRequests(list.Items)

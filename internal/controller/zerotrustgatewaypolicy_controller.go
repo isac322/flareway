@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -589,7 +590,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) SetupWithManager(manager ctrl.Manager
 	}); err != nil {
 		return fmt.Errorf("index ZeroTrustGatewayPolicy listRefs: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustGatewayPolicy{}).Watches(&v1alpha1.ZeroTrustGatewayPolicy{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forList)).Complete(observedReconciler("zero-trust-gateway-policy", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustGatewayPolicy{}).Watches(&v1alpha1.ZeroTrustGatewayPolicy{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forList)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Complete(observedReconciler("zero-trust-gateway-policy", r))
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

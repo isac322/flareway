@@ -581,11 +581,22 @@ func (r *ServiceTokenReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index ServiceToken accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ServiceToken{}).Owns(&corev1.Secret{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.tokensForAccount)).Complete(observedReconciler("service-token", r))
+	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ServiceToken{}).Owns(&corev1.Secret{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.tokensForAccount)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.tokensForNamespace)).Complete(observedReconciler("service-token", r))
 }
 func (r *ServiceTokenReconciler) tokensForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.ServiceTokenList
 	if err := r.List(ctx, &list, client.MatchingFields{serviceTokenAccountIndex: object.GetName()}); err != nil {
+		return nil
+	}
+	out := make([]reconcile.Request, len(list.Items))
+	for i := range list.Items {
+		out[i] = reconcile.Request{NamespacedName: types.NamespacedName{Namespace: list.Items[i].Namespace, Name: list.Items[i].Name}}
+	}
+	return out
+}
+func (r *ServiceTokenReconciler) tokensForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.ServiceTokenList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
 		return nil
 	}
 	out := make([]reconcile.Request, len(list.Items))
