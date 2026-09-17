@@ -277,6 +277,7 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 			tunnel.Status.DeletedAt != nil || !tunnel.Status.OwnershipVerified ||
 			tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil {
 			message := fmt.Sprintf("Waiting for exact UID-bound ownership of CloudflareTunnel %s", key)
+			retractDataplane := true
 			switch {
 			case tunnel.Status.DeletedAt != nil:
 				message = fmt.Sprintf("CloudflareTunnel %s is remotely deleted and draining its connector dataplane", key)
@@ -290,10 +291,18 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 				message = fmt.Sprintf("CloudflareTunnel %s has not verified remote ownership", key)
 			case authorized && (tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil):
 				message = fmt.Sprintf("CloudflareTunnel %s is waiting for verified connector credentials", key)
+				// A verified owner waiting on connector credentials is a
+				// recoverable convergence gap, not dependency loss: the
+				// published snapshot is still retracted and the Gateway stays
+				// unprogrammed, but the owned dataplane keeps running so a
+				// stale or in-flight credential write cannot drop live traffic.
+				retractDataplane = false
 			}
 			r.clearSnapshot(client.ObjectKeyFromObject(gateway))
-			if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
-				return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
+			if retractDataplane {
+				if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+					return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
+				}
 			}
 			var current gatewayv1.Gateway
 			if err := r.Get(ctx, client.ObjectKeyFromObject(gateway), &current); err != nil {
