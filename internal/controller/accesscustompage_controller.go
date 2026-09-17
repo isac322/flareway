@@ -366,6 +366,7 @@ func (r *AccessCustomPageReconciler) SetupWithManager(manager ctrl.Manager) erro
 		For(&v1alpha1.AccessCustomPage{}).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.pagesForAccount)).
 		Watches(&v1alpha1.AccessApplication{}, handler.EnqueueRequestsFromMapFunc(r.pagesForApplication)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.pagesForNamespace)).
 		Complete(observedReconciler("access-custom-page", r))
 }
 
@@ -391,6 +392,14 @@ func (r *AccessCustomPageReconciler) pagesForApplication(_ context.Context, obje
 		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: ref.ObjectRef.Name}})
 	}
 	return requests
+}
+
+func (r *AccessCustomPageReconciler) pagesForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.AccessCustomPageList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
+		return nil
+	}
+	return accessCustomPageRequests(list.Items)
 }
 
 func accessCustomPageRequests(items []v1alpha1.AccessCustomPage) []reconcile.Request {

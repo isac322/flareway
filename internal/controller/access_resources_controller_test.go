@@ -382,6 +382,106 @@ var _ = ginkgo.Describe("Access resource controllers", ginkgo.Ordered, func() {
 		gomega.Expect(tokenCount).To(gomega.BeZero())
 		gomega.Expect(secretCount).To(gomega.BeZero())
 	})
+
+	ginkgo.It("re-evaluates ServiceToken authorization when namespace labels change", func() {
+		suffix := accessResourceCounter.Add(1)
+		namespace := fmt.Sprintf("access-namespace-watch-%d", suffix)
+		accountName := fmt.Sprintf("access-namespace-account-%d", suffix)
+		credential := types.NamespacedName{Namespace: namespace, Name: "credentials"}
+		gomega.Expect(testClient.Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace, Labels: map[string]string{"access-test": namespace}}})).To(gomega.Succeed())
+		ginkgo.DeferCleanup(forceDeleteAccessNamespace, namespace)
+		gomega.Expect(testClient.Create(testContext, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credential.Name, Namespace: credential.Namespace}, Data: map[string][]byte{"token": []byte("api-token")}})).To(gomega.Succeed())
+		account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: accountName}, Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   fmt.Sprintf("%032x", suffix),
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: credential.Name, Namespace: credential.Namespace, Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:               metav1.LabelSelector{MatchLabels: map[string]string{"access-test": namespace}},
+				Hostnames:                       []string{"*"},
+				Zones:                           []string{"*"},
+				Exposures:                       []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate},
+				AccessPolicyRefs:                v1alpha1.GrantPermissionAllowed,
+				AccessCustomPageRefs:            v1alpha1.GrantPermissionAllowed,
+				DevicePostureIntegrationRefs:    v1alpha1.GrantPermissionAllowed,
+				AccessStandaloneApplicationRefs: v1alpha1.GrantPermissionAllowed,
+				PlatformObjects:                 v1alpha1.GrantPermissionAllowed,
+			}},
+		}}
+		gomega.Expect(testClient.Create(testContext, account)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(context.Background(), account) })
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareAccount
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: accountName}, &current)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted)).To(gomega.BeTrue())
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid)).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		token := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Name: "watched", Namespace: namespace},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef: corev1.LocalObjectReference{Name: accountName}, Name: "watched", Enabled: true, Duration: "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "watched-credentials"},
+				Rotation:         v1alpha1.ServiceTokenRotationSpec{Mode: v1alpha1.ServiceTokenRotationManual, GraceDuration: "24h"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, token)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() { _ = testClient.Delete(context.Background(), token) })
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(token), token)).To(gomega.Succeed())
+			g.Expect(token.Status.TokenID).NotTo(gomega.BeEmpty())
+			g.Expect(statusutil.ConditionTrue(token.Status.Conditions, "Accepted")).To(gomega.BeTrue())
+			g.Expect(statusutil.ConditionTrue(token.Status.Conditions, "Ready")).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		var clientCallsBeforeRevoke int
+		gomega.Eventually(func() bool {
+			testResourceAccessCloudflare.mu.Lock()
+			before := testResourceAccessCloudflare.clientCalls
+			testResourceAccessCloudflare.mu.Unlock()
+			time.Sleep(250 * time.Millisecond)
+			testResourceAccessCloudflare.mu.Lock()
+			after := testResourceAccessCloudflare.clientCalls
+			testResourceAccessCloudflare.mu.Unlock()
+			clientCallsBeforeRevoke = after
+			return before == after
+		}).WithTimeout(5 * time.Second).WithPolling(50 * time.Millisecond).Should(gomega.BeTrue())
+
+		ns := &corev1.Namespace{}
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: namespace}, ns)).To(gomega.Succeed())
+		base := client.MergeFrom(ns.DeepCopy())
+		delete(ns.Labels, "access-test")
+		gomega.Expect(testClient.Patch(testContext, ns, base)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(token), token)).To(gomega.Succeed())
+			accepted := statusutil.FindCondition(token.Status.Conditions, "Accepted")
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(accepted.Reason).To(gomega.Equal("Pending"))
+			g.Expect(accepted.Message).To(gomega.ContainSubstring("RefNotPermitted"))
+			ready := statusutil.FindCondition(token.Status.Conditions, "Ready")
+			g.Expect(ready).NotTo(gomega.BeNil())
+			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(gomega.Equal("Pending"))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Consistently(func() int {
+			testResourceAccessCloudflare.mu.Lock()
+			defer testResourceAccessCloudflare.mu.Unlock()
+			return testResourceAccessCloudflare.clientCalls
+		}).WithTimeout(500 * time.Millisecond).WithPolling(50 * time.Millisecond).Should(gomega.Equal(clientCallsBeforeRevoke))
+
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: namespace}, ns)).To(gomega.Succeed())
+		base = client.MergeFrom(ns.DeepCopy())
+		ns.Labels["access-test"] = namespace
+		gomega.Expect(testClient.Patch(testContext, ns, base)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(token), token)).To(gomega.Succeed())
+			g.Expect(statusutil.ConditionTrue(token.Status.Conditions, "Accepted")).To(gomega.BeTrue())
+			g.Expect(statusutil.ConditionTrue(token.Status.Conditions, "Ready")).To(gomega.BeTrue())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
 })
 
 func TestAccessPolicyRuleRoundTripCoversEveryOfficialVariant(t *testing.T) {

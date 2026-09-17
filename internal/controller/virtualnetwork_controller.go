@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -373,6 +374,7 @@ func (r *VirtualNetworkReconciler) SetupWithManager(manager ctrl.Manager) error 
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworksForAccount)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworkPeers)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworkForNetworkRoute)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworksForNamespace)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(observedReconciler("virtual-network", r))
 }
@@ -409,6 +411,14 @@ func (r *VirtualNetworkReconciler) virtualNetworkForNetworkRoute(_ context.Conte
 		}
 	}
 	return requests
+}
+
+func (r *VirtualNetworkReconciler) virtualNetworksForNamespace(ctx context.Context, object client.Object) []reconcile.Request {
+	var list v1alpha1.VirtualNetworkList
+	if err := r.List(ctx, &list, client.InNamespace(object.GetName())); err != nil {
+		return nil
+	}
+	return virtualNetworkRequests(list.Items)
 }
 
 func (r *VirtualNetworkReconciler) networkRouteReferences(ctx context.Context, object *v1alpha1.VirtualNetwork) (string, error) {
