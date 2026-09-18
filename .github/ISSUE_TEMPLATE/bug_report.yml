@@ -1,0 +1,117 @@
+name: Bug report
+description: Report a problem with Flareway reconciliation, the data plane, or installation.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste Cloudflare account IDs, API tokens, tunnel tokens, or
+        private hostnames into this form. Redact them before submitting —
+        this is a public repository.
+
+        For security vulnerabilities, do not open an issue. Email
+        bhyoo@bhyoo.com instead (see SECURITY.md).
+
+  - type: input
+    id: flareway-version
+    attributes:
+      label: Flareway version or commit
+      description: Release tag (for example v0.1.2) or commit SHA you are running.
+      placeholder: v0.1.2
+    validations:
+      required: true
+
+  - type: input
+    id: kubernetes-version
+    attributes:
+      label: Kubernetes version
+      description: Output of kubectl version --short or your cluster version.
+      placeholder: v1.34.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Helm chart (oci://ghcr.io/isac322/charts/flareway)
+        - Helm chart from checkout (charts/flareway)
+        - Kustomize / kubectl apply from checkout
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gateway-mode
+    attributes:
+      label: CloudflareTunnel mode
+      description: Which mode the affected tunnel runs in.
+      options:
+        - Gateway (managed by a Gateway resource)
+        - Direct (CloudflareTunnel owns the remote cloudflared config)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: exposure
+    attributes:
+      label: Listener exposure
+      options:
+        - Public (proxied DNS to the tunnel hostname)
+        - Private / WARP (private network route)
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The behavior you observed, including error messages.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: The behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal manifests and commands that trigger the problem. Redact account IDs, tokens, and private hostnames.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: status-conditions
+    attributes:
+      label: Status conditions
+      description: |
+        Relevant .status.conditions from the affected Gateway, HTTPRoute,
+        CloudflareTunnel, or other Flareway resources
+        (kubectl get <kind> <name> -o yaml).
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: controller-logs
+    attributes:
+      label: Controller logs
+      description: |
+        Relevant lines from the controller
+        (kubectl -n flareway-system logs deployment/flareway-controller-manager
+        or your release name). Redact tokens and account IDs.
+      render: text
+    validations:
+      required: false
