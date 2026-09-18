@@ -603,7 +603,6 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 				g.Expect(statusutil.ConditionTrue(object.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
 			}
 		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
-		appliedGeneration := route.Status.Applied.ObservedGeneration
 
 		route.Spec.IPLookup = &v1alpha1.NetworkRouteIPLookupSpec{
 			IP:                "10.0.1.5",
@@ -618,7 +617,7 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 			g.Expect(condition.ObservedGeneration).To(gomega.Equal(route.Generation))
 			g.Expect(route.Status.RouteID).NotTo(gomega.BeEmpty())
 			g.Expect(route.Status.Applied.Network).To(gomega.Equal("10.200.0.0/16"))
-			g.Expect(route.Status.Applied.ObservedGeneration).To(gomega.Equal(appliedGeneration))
+			g.Expect(route.Status.Applied.ObservedGeneration).To(gomega.Equal(route.Generation))
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
 			g.Expect(statusutil.ConditionTrue(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
 		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
