@@ -109,6 +109,11 @@ pinned toolchain directive is not rewritten. Requires a working Docker daemon;
 `make verify-generated`, `make verify-container`, and `make lint` are CI gates.
 They complement the pyramid; they do not replace any tier.
 
+`make test-exploratory` is Rapid state-machine search against envtest and
+`test/cfstub`. It is not a pyramid tier and not live e2e. What the machines
+are: `exploratory-tests.md`. When to run them:
+`exploratory-operations.md`.
+
 ## What each tier cannot prove
 
 | Claim | Minimum tier that proves it |

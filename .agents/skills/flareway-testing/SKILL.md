@@ -1,6 +1,6 @@
 ---
 name: flareway-testing
-description: Use when writing, running, or reviewing Flareway tests — unit, envtest, Envoy component, Gateway API conformance, or live Cloudflare e2e. Covers the test pyramid, permanent-test criteria, fail-closed edge assertions, isolated Kind clusters, polling discipline, and e2e cleanup/janitor duties.
+description: Use when writing, running, or reviewing Flareway tests — unit, envtest, Envoy component, Gateway API conformance, live Cloudflare e2e, or Rapid state-machine exploration. Covers the test pyramid, permanent-test criteria, fail-closed edge assertions, isolated Kind clusters, polling discipline, and e2e cleanup/janitor duties.
 ---
 
 # Flareway testing
@@ -20,7 +20,8 @@ it never restates the invariants.
 | Live Cloudflare e2e | `make e2e` / `make test-e2e` | `-tags e2e` Ginkgo suite against the real edge; needs a dedicated test account |
 
 Per-tier detail: `references/test-pyramid.md`. Live e2e contract:
-`references/live-e2e.md`.
+`references/live-e2e.md`. Exploratory suite: `references/exploratory-tests.md`.
+When to run it: `references/exploratory-operations.md`.
 
 ## Permanent-test criteria
 
@@ -65,3 +66,6 @@ fail it:
 - Gateway API surface claims → `make conformance`.
 - Anything claiming the real edge, DNS, Access, or WARP works → live e2e only;
   lower tiers cannot prove it.
+- Lifecycle sequences envtest examples miss → Rapid exploration
+  (`references/exploratory-operations.md`); promote a confirmed counterexample
+  to unit or envtest.
