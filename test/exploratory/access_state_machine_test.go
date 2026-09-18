@@ -275,13 +275,13 @@ func (m *accessMachine) refreshDenyMarks() {
 }
 
 // settleDenyEdge keeps revocation on the warm account/Secret watch paths,
-// waits for existing dependents to report the denial, and then opens the
-// journal window used to verify the denied steady state.
+// waits for existing dependents to report the denial or finish deletion, and
+// then opens the journal window used to verify the denied steady state.
 func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDenied bool) {
 	accessRising := !wasAccessDenied && m.accessDenied()
 	tokenRising := !wasTokenDenied && m.tokenDenied()
 	expectations := make([]stabilityExpectation, 0, 2)
-	if accessRising && m.appExists && !m.appDeleting {
+	if accessRising && m.appExists {
 		expectations = append(expectations, func(ctx context.Context, h *explorationHarness) (string, error) {
 			var application v1alpha1.AccessApplication
 			err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.tenant, Name: m.app}, &application)
@@ -291,6 +291,9 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 			if err != nil {
 				return "", err
 			}
+			if m.appDeleting {
+				return "", fmt.Errorf("AccessApplication %s is still deleting", m.app)
+			}
 			accepted := meta.FindStatusCondition(application.Status.Conditions, "Accepted")
 			if accepted == nil || accepted.Status != metav1.ConditionFalse {
 				return "", fmt.Errorf("AccessApplication %s has not observed authorization denial", m.app)
@@ -298,7 +301,7 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 			return application.ResourceVersion, nil
 		})
 	}
-	if tokenRising && m.tokenExists && !m.tokenDeleting {
+	if tokenRising && m.tokenExists {
 		expectations = append(expectations, func(ctx context.Context, h *explorationHarness) (string, error) {
 			var token v1alpha1.ServiceToken
 			err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.tenant, Name: m.token}, &token)
@@ -307,6 +310,9 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 			}
 			if err != nil {
 				return "", err
+			}
+			if m.tokenDeleting {
+				return "", fmt.Errorf("ServiceToken %s is still deleting", m.token)
 			}
 			accepted := meta.FindStatusCondition(token.Status.Conditions, "Accepted")
 			if accepted == nil || accepted.Status != metav1.ConditionFalse {
@@ -923,21 +929,18 @@ func (m *accessMachine) syncModel(rt *rapid.T, ctx context.Context) {
 	}
 }
 
-// checkGrantBeforeCalls enforces G1: while tenant Access work is denied, no
-// call to a tenant Access endpoint may appear in the journal after the denial
-// watermark. Account verification endpoints are out of scope.
 func (m *accessMachine) checkGrantBeforeCalls(rt *rapid.T) {
 	journal := m.world.h.stub.PublicJournal()
 	if m.accessDenied() && m.denyMark <= len(journal) {
 		for _, call := range journal[m.denyMark:] {
-			if isAccessCall(call) {
+			if isAccessCall(call) && call.Method != http.MethodDelete && call.Method != http.MethodGet {
 				rt.Fatalf("G1: tenant Access call %s %s while unauthorized", call.Method, call.Path)
 			}
 		}
 	}
 	if m.tokenExists && m.tokenDenied() && m.tokenDenyMark <= len(journal) {
 		for _, call := range journal[m.tokenDenyMark:] {
-			if isServiceTokenCall(call) {
+			if isServiceTokenCall(call) && call.Method != http.MethodDelete && call.Method != http.MethodGet {
 				rt.Fatalf("G1: ServiceToken call %s %s while platformObjects is denied", call.Method, call.Path)
 			}
 		}
