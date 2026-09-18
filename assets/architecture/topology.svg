@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="t d" font-family="-apple-system, 'Helvetica Neue', Arial, sans-serif">
+  <title id="t">Flareway cluster topology</title>
+  <desc id="d">One Kubernetes node runs the single-replica flareway controller pod and a data-plane pod containing cloudflared, Envoy, and a CoreDNS sidecar chip. The cluster wall is sealed: an inbound arrow is blocked at the wall, and the only passage is one outbound channel that cloudflared opens to the Cloudflare edge. Beyond the edge the path forks: PUBLIC to Internet users via a proxied CNAME, and PRIVATE to a WARP device via a VirtualNetwork private route. Envoy forwards to a Kubernetes Service and pods.</desc>
+
+  <defs>
+    <marker id="aN" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#172B4D"/>
+    </marker>
+    <marker id="aO" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#E77B35"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1600" height="900" fill="#FFFAF2"/>
+
+  <!-- header -->
+  <g transform="translate(48,26) scale(0.34)">
+    <path fill="#E77B35" d="M28 108 C18 108 10 100 10 89 C10 79 16 70 25 67 C23 63 22 59 22 55 C22 44 31 35 42 35 C46 35 50 36 53 38 C58 25 69 17 81 20 C94 23 103 35 102 48 C116 52 122 64 118 78 C121 96 112 108 99 108 L84 108 L84 58 L44 58 L44 108 Z"/>
+    <path fill="#E77B35" fill-rule="evenodd" d="M50 66 L71 73 L71 112 L50 105 Z M62 87 h5 v6 h-5 Z"/>
+  </g>
+  <text x="104" y="58" font-size="30" font-weight="700" fill="#172B4D">flareway</text>
+  <text x="104" y="86" font-size="16" fill="#172B4D" opacity="0.75">Expose a Pod publicly or privately — open nothing inbound.</text>
+
+  <!-- ===================== sealed cluster wall ===================== -->
+  <rect x="140" y="120" width="860" height="740" rx="18" fill="#F7F1E5" stroke="#172B4D" stroke-width="5"/>
+  <text x="168" y="148" font-size="17" font-weight="700" fill="#172B4D">Kubernetes cluster</text>
+  <!-- the single doorway in the wall -->
+  <rect x="991" y="276" width="18" height="80" fill="#FFFAF2"/>
+
+  <!-- ===================== blocked inbound ===================== -->
+  <text x="72" y="424" font-size="14" font-weight="700" fill="#172B4D" text-anchor="middle">inbound</text>
+  <line x1="24" y1="450" x2="110" y2="450" stroke="#172B4D" stroke-width="4" marker-end="url(#aN)"/>
+  <circle cx="130" cy="450" r="16" fill="#FFFFFF" stroke="#172B4D" stroke-width="3"/>
+  <line x1="120" y1="440" x2="140" y2="460" stroke="#172B4D" stroke-width="4"/>
+  <line x1="120" y1="460" x2="140" y2="440" stroke="#172B4D" stroke-width="4"/>
+  <text x="72" y="492" font-size="16" font-weight="700" fill="#172B4D" text-anchor="middle">no inbound</text>
+  <text x="72" y="514" font-size="14" fill="#172B4D" text-anchor="middle">no public IPs</text>
+
+  <!-- ===================== single node ===================== -->
+  <rect x="180" y="185" width="800" height="430" rx="12" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
+  <text x="196" y="213" font-size="14" font-weight="700" fill="#172B4D" letter-spacing="2">NODE</text>
+
+  <!-- controller pod -->
+  <rect x="210" y="240" width="250" height="320" rx="10" fill="#FFFAF2" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="226" y="266" font-size="14" font-weight="700" fill="#172B4D">pod · flareway-controller</text>
+  <rect x="235" y="300" width="200" height="110" rx="8" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
+  <text x="335" y="348" font-size="15" font-weight="700" fill="#172B4D" text-anchor="middle">controller</text>
+  <text x="335" y="372" font-size="14" fill="#172B4D" text-anchor="middle">single replica</text>
+
+  <!-- data-plane pod -->
+  <rect x="500" y="240" width="450" height="320" rx="10" fill="#FFFAF2" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="516" y="266" font-size="14" font-weight="700" fill="#172B4D">pod · data-plane</text>
+
+  <rect x="525" y="285" width="400" height="75" rx="8" fill="#FFFFFF" stroke="#E77B35" stroke-width="2.5"/>
+  <text x="725" y="331" font-size="16" font-weight="700" fill="#172B4D" text-anchor="middle">cloudflared</text>
+
+  <line x1="640" y1="360" x2="640" y2="414" stroke="#172B4D" stroke-width="2" marker-end="url(#aN)"/>
+  <text x="654" y="392" font-size="14" fill="#172B4D">loopback</text>
+
+  <rect x="525" y="420" width="250" height="115" rx="8" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
+  <text x="650" y="483" font-size="15" font-weight="700" fill="#172B4D" text-anchor="middle">Envoy</text>
+
+  <line x1="776" y1="451" x2="798" y2="451" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="2 3"/>
+  <rect x="800" y="430" width="125" height="42" rx="21" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="862" y="457" font-size="14" fill="#172B4D" text-anchor="middle">CoreDNS</text>
+
+  <!-- controller -> Envoy xDS -->
+  <line x1="435" y1="370" x2="525" y2="470" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="7 5" marker-end="url(#aN)"/>
+  <text x="478" y="408" font-size="14" fill="#172B4D" text-anchor="middle">xDS</text>
+
+  <!-- controller -> Cloudflare API (routed above the node, out through the cluster wall) -->
+  <path d="M420,300 L420,150 L1268,150 L1268,232" fill="none" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="7 5" marker-end="url(#aN)"/>
+  <text x="860" y="140" font-size="14" fill="#172B4D" text-anchor="middle">Cloudflare API</text>
+
+  <!-- ===================== Service + pods ===================== -->
+  <line x1="650" y1="535" x2="650" y2="686" stroke="#172B4D" stroke-width="2" marker-end="url(#aN)"/>
+  <rect x="560" y="690" width="150" height="60" rx="8" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
+  <text x="635" y="727" font-size="15" font-weight="700" fill="#172B4D" text-anchor="middle">Service</text>
+  <line x1="710" y1="720" x2="756" y2="720" stroke="#172B4D" stroke-width="2" marker-end="url(#aN)"/>
+  <rect x="772" y="700" width="150" height="60" rx="8" fill="#FFFAF2" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <rect x="762" y="690" width="150" height="60" rx="8" fill="#FFFAF2" stroke="#172B4D" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="837" y="727" font-size="14" fill="#172B4D" text-anchor="middle">Pods</text>
+
+  <!-- ===================== 1:1:1 chip ===================== -->
+  <rect x="180" y="762" width="500" height="46" rx="23" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
+  <text x="430" y="791" font-size="14" fill="#172B4D" text-anchor="middle">Gateway : CloudflareTunnel : data-plane Deployment = 1 : 1 : 1</text>
+
+  <!-- ===================== the one outbound channel ===================== -->
+  <path d="M925,322 L1198,318" fill="none" stroke="#F5D3B8" stroke-width="18" stroke-linecap="round"/>
+  <path d="M925,322 L1198,318" fill="none" stroke="#E77B35" stroke-width="6" marker-end="url(#aO)"/>
+  <circle cx="925" cy="322" r="5" fill="#E77B35"/>
+  <text x="1100" y="350" font-size="14" font-weight="700" fill="#172B4D" text-anchor="middle">Cloudflare Tunnel</text>
+  <text x="1100" y="370" font-size="14" fill="#172B4D" text-anchor="middle">outbound-established</text>
+
+  <!-- ===================== Cloudflare edge ===================== -->
+  <g transform="translate(1200,235) scale(1.5)">
+    <path fill="#E77B35" d="M28 108 C18 108 10 100 10 89 C10 79 16 70 25 67 C23 63 22 59 22 55 C22 44 31 35 42 35 C46 35 50 36 53 38 C58 25 69 17 81 20 C94 23 103 35 102 48 C116 52 122 64 118 78 C121 96 112 108 99 108 L84 108 L84 58 L44 58 L44 108 Z"/>
+    <path fill="#E77B35" fill-rule="evenodd" d="M50 66 L71 73 L71 112 L50 105 Z M62 87 h5 v6 h-5 Z"/>
+  </g>
+  <text x="1290" y="438" font-size="17" font-weight="700" fill="#172B4D" text-anchor="middle">Cloudflare edge</text>
+  <text x="1290" y="460" font-size="14" fill="#172B4D" text-anchor="middle">edge TLS</text>
+
+  <!-- ===================== PUBLIC fork ===================== -->
+  <rect x="1440" y="100" width="90" height="55" rx="5" fill="#FFFFFF" stroke="#172B4D" stroke-width="2"/>
+  <rect x="1430" y="155" width="110" height="8" rx="4" fill="#172B4D"/>
+  <text x="1485" y="188" font-size="14" fill="#172B4D" text-anchor="middle">Internet users</text>
+  <line x1="1450" y1="165" x2="1342" y2="268" stroke="#E77B35" stroke-width="2.5" marker-end="url(#aO)"/>
+  <text x="1440" y="232" font-size="15" font-weight="700" fill="#E77B35" text-anchor="middle">PUBLIC</text>
+  <text x="1440" y="254" font-size="14" fill="#172B4D" text-anchor="middle">proxied CNAME</text>
+
+  <!-- ===================== PRIVATE fork ===================== -->
+  <rect x="1450" y="692" width="64" height="100" rx="10" fill="#FFFFFF" stroke="#172B4D" stroke-width="2"/>
+  <line x1="1470" y1="704" x2="1494" y2="704" stroke="#172B4D" stroke-width="2"/>
+  <text x="1482" y="820" font-size="14" fill="#172B4D" text-anchor="middle">WARP device</text>
+  <line x1="1482" y1="692" x2="1362" y2="402" stroke="#172B4D" stroke-width="2.5" marker-end="url(#aN)"/>
+  <text x="1390" y="520" font-size="15" font-weight="700" fill="#172B4D" text-anchor="end">PRIVATE</text>
+  <text x="1390" y="542" font-size="14" fill="#172B4D" text-anchor="end">VirtualNetwork</text>
+  <text x="1390" y="564" font-size="14" fill="#172B4D" text-anchor="end">private route</text>
+</svg>
