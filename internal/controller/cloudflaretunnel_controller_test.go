@@ -650,6 +650,131 @@ func TestTunnelGatewayBindingsRequireHostnameAndZone(t *testing.T) {
 	g.Expect(err).To(gomega.MatchError("zone not found for hostname app.example.test"))
 }
 
+// countingTunnelReader is a deterministic client.Reader that serves one
+// CloudflareTunnel and counts Get calls, proving when the status-preservation
+// path performs a live read.
+type countingTunnelReader struct {
+	reads  int
+	tunnel *v1alpha1.CloudflareTunnel
+}
+
+func (r *countingTunnelReader) Get(_ context.Context, _ client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+	r.reads++
+	if r.tunnel == nil {
+		return apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, "tunnel")
+	}
+	r.tunnel.DeepCopyInto(object.(*v1alpha1.CloudflareTunnel))
+	return nil
+}
+
+func (r *countingTunnelReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return errors.New("unexpected List")
+}
+
+func TestPreserveTunnelStatusFieldsReadsLiveOnlyOnOmission(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	created := metav1.NewTime(time.Unix(100, 0))
+	live := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: "tenant"},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "remote-id", AccountID: "account-id", Name: "remote",
+			TunnelType: v1alpha1.TunnelRemoteTypeCloudflareTunnel, ConfigSource: v1alpha1.TunnelConfigSourceCloudflare,
+			ConnectorState: v1alpha1.ConnectorStateHealthy, CreatedAt: &created, DeletedAt: &created,
+			OwnershipVerified: true, ObservedGeneration: 3,
+			ConnectorTokenSecretRef:  &corev1.LocalObjectReference{Name: "flareway-tunnel-tunnel"},
+			ManagementTokenSecretRef: &corev1.LocalObjectReference{Name: "flareway-tunnel-tunnel-management"},
+			Clients:                  []v1alpha1.CloudflareTunnelClientStatus{{ID: "client-1"}},
+			Addresses:                []gatewayv1.GatewayStatusAddress{{Value: "remote-id.cfargotunnel.com"}},
+			DNSRecords: []v1alpha1.CloudflareTunnelDNSRecordStatus{{
+				Hostname: "app.example.test", RecordID: "record-1", ZoneID: "zone-1",
+			}},
+			GatewayRef:    &corev1.LocalObjectReference{Name: "gateway"},
+			GatewayUID:    "uid-1",
+			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Remote: 4, CreatedAt: &created},
+		},
+	}
+	tunnel := live.DeepCopy()
+	tunnel.Spec.ManagementToken = &v1alpha1.CloudflareTunnelManagementTokenRequest{
+		Resources: []v1alpha1.CloudflareTunnelManagementResource{v1alpha1.CloudflareTunnelManagementResourceLogs},
+	}
+
+	// A complete outgoing document never reads live.
+	reader := &countingTunnelReader{tunnel: live}
+	reconciler := &CloudflareTunnelReconciler{APIReader: reader}
+	full, err := tunnelOwnedStatusMap(tunnel, live.Status)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(reconciler.preserveTunnelStatusFields(ctx, tunnel, full, tunnelStatusClear{})).To(gomega.Succeed())
+	g.Expect(reader.reads).To(gomega.Equal(0))
+
+	// A stale document that omits protected fields performs exactly one live
+	// read and restores every omitted field.
+	stale, err := tunnelOwnedStatusMap(tunnel, v1alpha1.CloudflareTunnelStatus{})
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(reconciler.preserveTunnelStatusFields(ctx, tunnel, stale, tunnelStatusClear{})).To(gomega.Succeed())
+	g.Expect(reader.reads).To(gomega.Equal(1))
+	g.Expect(stale["tunnelId"]).To(gomega.Equal("remote-id"))
+	g.Expect(stale["ownershipVerified"]).To(gomega.Equal(true))
+	g.Expect(stale["connectorTokenSecretRef"]).To(gomega.Equal(map[string]any{"name": "flareway-tunnel-tunnel"}))
+	g.Expect(stale["managementTokenSecretRef"]).To(gomega.Equal(map[string]any{"name": "flareway-tunnel-tunnel-management"}))
+	g.Expect(stale["clients"]).To(gomega.HaveLen(1))
+	g.Expect(stale["addresses"]).To(gomega.HaveLen(1))
+	g.Expect(stale["dnsRecords"]).To(gomega.HaveLen(1))
+	g.Expect(stale["configVersion"]).To(gomega.Equal(map[string]any{"remote": int64(4), "createdAt": created.Time.UTC().Format(time.RFC3339)}))
+	g.Expect(stale["gatewayRef"]).To(gomega.Equal(map[string]any{"name": "gateway"}))
+	g.Expect(stale["gatewayUid"]).To(gomega.Equal("uid-1"))
+	g.Expect(stale["deletedAt"]).To(gomega.Equal(created.Time.UTC().Format(time.RFC3339)))
+
+	// Declared clear intent permits authoritative empty values without a live read.
+	revokedStatus := live.Status.DeepCopy()
+	revokedStatus.ConnectorTokenSecretRef = nil
+	revokedStatus.ManagementTokenSecretRef = nil
+	revokedStatus.OwnershipVerified = false
+	revokedStatus.DNSRecords = nil
+	revokedStatus.Clients = nil
+	revokedStatus.Addresses = nil
+	revokedStatus.GatewayRef = nil
+	revokedStatus.GatewayUID = ""
+	revokedStatus.DeletedAt = nil
+	revoked, err := tunnelOwnedStatusMap(tunnel, *revokedStatus)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(reconciler.preserveTunnelStatusFields(ctx, tunnel, revoked, tunnelStatusClear{Credentials: true, Ownership: true, GatewayBinding: true, DeletedAt: true, DNSRecords: true, Clients: true, Addresses: true})).To(gomega.Succeed())
+	g.Expect(reader.reads).To(gomega.Equal(1))
+	g.Expect(revoked).NotTo(gomega.HaveKey("connectorTokenSecretRef"))
+	g.Expect(revoked).NotTo(gomega.HaveKey("managementTokenSecretRef"))
+	g.Expect(revoked).NotTo(gomega.HaveKey("ownershipVerified"))
+	g.Expect(revoked).NotTo(gomega.HaveKey("gatewayRef"))
+	g.Expect(revoked).NotTo(gomega.HaveKey("gatewayUid"))
+	g.Expect(revoked).NotTo(gomega.HaveKey("deletedAt"))
+	g.Expect(revoked["dnsRecords"]).To(gomega.BeEmpty())
+
+	// A never-adopted tunnel — ownershipVerified=false and no published
+	// configVersion — is legitimate state and must not read live.
+	neverAdopted := live.DeepCopy()
+	neverAdopted.Status = v1alpha1.CloudflareTunnelStatus{}
+	unverified := *revokedStatus
+	unverified.ConnectorTokenSecretRef = &corev1.LocalObjectReference{Name: "flareway-tunnel-tunnel"}
+	unverified.ManagementTokenSecretRef = &corev1.LocalObjectReference{Name: "flareway-tunnel-tunnel-management"}
+	unverified.Clients = live.Status.Clients
+	unverified.Addresses = live.Status.Addresses
+	unverified.DNSRecords = live.Status.DNSRecords
+	unverified.GatewayRef = &corev1.LocalObjectReference{Name: "gateway"}
+	unverified.GatewayUID = "uid-1"
+	unverified.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{}
+	unverifiedDoc, err := tunnelOwnedStatusMap(neverAdopted, unverified)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(reconciler.preserveTunnelStatusFields(ctx, neverAdopted, unverifiedDoc, tunnelStatusClear{})).To(gomega.Succeed())
+	g.Expect(reader.reads).To(gomega.Equal(1))
+	g.Expect(unverifiedDoc).NotTo(gomega.HaveKey("ownershipVerified"))
+	g.Expect(unverifiedDoc).NotTo(gomega.HaveKey("configVersion"))
+
+	// A nil APIReader fails closed instead of silently reading the stale cache.
+	noReader := &CloudflareTunnelReconciler{}
+	omitted, err := tunnelOwnedStatusMap(tunnel, v1alpha1.CloudflareTunnelStatus{})
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(noReader.preserveTunnelStatusFields(ctx, tunnel, omitted, tunnelStatusClear{})).To(gomega.MatchError(gomega.ContainSubstring("APIReader")))
+}
+
 var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 	ginkgo.BeforeAll(func() {
 		ensureSystemNamespace("kube-system")
@@ -1755,6 +1880,101 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(accepted.Reason).To(gomega.Equal(authz.ReasonRefNotPermitted))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElement("UpdateTunnelConfiguration"))
+	})
+
+	ginkgo.It("preserves live credential and identity fields against a stale status apply", func() {
+		fixture := newTunnelFixture("preserve", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeManaged)
+		fixture.tunnel.Spec.ManagementToken = &v1alpha1.CloudflareTunnelManagementTokenRequest{
+			Resources: []v1alpha1.CloudflareTunnelManagementResource{v1alpha1.CloudflareTunnelManagementResourceLogs},
+		}
+		fixture.create()
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.TunnelID).NotTo(gomega.BeEmpty())
+			g.Expect(tunnel.Status.OwnershipVerified).To(gomega.BeTrue())
+			g.Expect(tunnel.Status.ConnectorTokenSecretRef).NotTo(gomega.BeNil())
+			g.Expect(tunnel.Status.ManagementTokenSecretRef).NotTo(gomega.BeNil())
+			g.Expect(tunnel.Status.DNSRecords).NotTo(gomega.BeEmpty())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		// A status apply built from a stale cached object omits every protected
+		// field; preservation must restore the live values into the document.
+		reconciler := &CloudflareTunnelReconciler{Client: testClient, APIReader: testAPIReader}
+		staleMap, err := tunnelOwnedStatusMap(&tunnel, v1alpha1.CloudflareTunnelStatus{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(reconciler.preserveTunnelStatusFields(testContext, &tunnel, staleMap, tunnelStatusClear{})).To(gomega.Succeed())
+		gomega.Expect(staleMap["tunnelId"]).To(gomega.Equal(tunnel.Status.TunnelID))
+		gomega.Expect(staleMap["ownershipVerified"]).To(gomega.Equal(true))
+		gomega.Expect(staleMap["connectorTokenSecretRef"]).NotTo(gomega.BeNil())
+		gomega.Expect(staleMap["managementTokenSecretRef"]).NotTo(gomega.BeNil())
+		gomega.Expect(staleMap["dnsRecords"]).NotTo(gomega.BeEmpty())
+
+		// The same stale document applied under the flareway-tunnel manager must
+		// not delete the live fields either.
+		gomega.Expect(reconciler.patchOwnedStatus(testContext, &tunnel, v1alpha1.CloudflareTunnelStatus{}, tunnelStatusClear{})).To(gomega.Succeed())
+
+		// Read the live object immediately so a later reconciler self-heal
+		// cannot mask an erasure.
+		var current v1alpha1.CloudflareTunnel
+		gomega.Expect(testAPIReader.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+		gomega.Expect(current.Status.TunnelID).To(gomega.Equal(tunnel.Status.TunnelID))
+		gomega.Expect(current.Status.OwnershipVerified).To(gomega.BeTrue())
+		gomega.Expect(current.Status.ConnectorTokenSecretRef).To(gomega.Equal(tunnel.Status.ConnectorTokenSecretRef))
+		gomega.Expect(current.Status.ManagementTokenSecretRef).To(gomega.Equal(tunnel.Status.ManagementTokenSecretRef))
+		gomega.Expect(current.Status.DNSRecords).To(gomega.Equal(tunnel.Status.DNSRecords))
+
+		// The ObserveOnly transition is the explicit revocation path: it must
+		// still clear credential refs, verified ownership, and DNS records.
+		testTunnelCloudflare.PutTunnel(flarecloudflare.Tunnel{ID: "observed-preserve", Name: "observed-preserve"})
+		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+		before := tunnel.DeepCopy()
+		tunnel.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+		tunnel.Spec.Tunnel.ExternalRef = &v1alpha1.CloudflareTunnelExternalReference{TunnelID: "observed-preserve"}
+		gomega.Expect(testClient.Patch(testContext, &tunnel, client.MergeFrom(before))).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			g.Expect(current.Status.OwnershipVerified).To(gomega.BeFalse())
+			g.Expect(current.Status.ConnectorTokenSecretRef).To(gomega.BeNil())
+			g.Expect(current.Status.ManagementTokenSecretRef).To(gomega.BeNil())
+			g.Expect(current.Status.DNSRecords).To(gomega.BeEmpty())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("preserves a recorded remote deletion against a stale status apply", func() {
+		fixture := newTunnelFixture("deleted", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeManaged)
+		fixture.create()
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.TunnelID).NotTo(gomega.BeEmpty())
+			g.Expect(tunnel.Status.OwnershipVerified).To(gomega.BeTrue())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		// A remote deletion is a conflict: the recorded deletedAt must land in
+		// status and keep the Gateway dataplane gates fail-closed.
+		testTunnelCloudflare.MarkTunnelDeleted(tunnel.Status.TunnelID)
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.DeletedAt).NotTo(gomega.BeNil())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		// A status apply built from a stale cached object omits deletedAt;
+		// preservation must restore the live value into the document before the
+		// apply, independent of reconciler timing.
+		reconciler := &CloudflareTunnelReconciler{Client: testClient, APIReader: testAPIReader}
+		staleMap, err := tunnelOwnedStatusMap(&tunnel, v1alpha1.CloudflareTunnelStatus{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(reconciler.preserveTunnelStatusFields(testContext, &tunnel, staleMap, tunnelStatusClear{})).To(gomega.Succeed())
+		gomega.Expect(staleMap["deletedAt"]).To(gomega.Equal(tunnel.Status.DeletedAt.Time.UTC().Format(time.RFC3339)))
+
+		gomega.Expect(reconciler.patchOwnedStatus(testContext, &tunnel, v1alpha1.CloudflareTunnelStatus{}, tunnelStatusClear{})).To(gomega.Succeed())
+		var current v1alpha1.CloudflareTunnel
+		gomega.Expect(testAPIReader.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+		gomega.Expect(current.Status.DeletedAt).To(gomega.Equal(tunnel.Status.DeletedAt))
 	})
 })
 
