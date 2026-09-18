@@ -189,6 +189,7 @@ func (s *audRevocationState) prune(prefix string, active map[string]struct{}, ce
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=cloudflaretunnels;accessapplications,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=cloudflareaccounts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=cloudflaretunnels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=virtualnetworks;networkroutes;hostnameroutes,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=devicesettings,verbs=get;list;watch
@@ -211,14 +212,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Get(ctx, types.NamespacedName{Name: string(gateway.Spec.GatewayClassName)}, &gatewayClass); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.clearSnapshot(req.NamespacedName)
-			r.clearAUDRevocationsForGateway(req.NamespacedName, revocationCeiling)
+			if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if gatewayClass.Spec.ControllerName != gatewayapi.ControllerName {
 		r.clearSnapshot(req.NamespacedName)
-		r.clearAUDRevocationsForGateway(req.NamespacedName, revocationCeiling)
+		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 	}
 	if r.Snapshots == nil {
@@ -227,9 +232,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	cfg, err := r.loadGatewayClassConfig(ctx, &gatewayClass)
 	if err != nil {
+		if isGatewayClassConfigInvalid(err) {
+			r.clearSnapshot(req.NamespacedName)
+			if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.rejectGatewayAdmission(ctx, &gateway, string(gatewayv1.GatewayReasonInvalidParameters), err.Error(), "GatewayClass parametersRef cannot be resolved"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
-	rejected, err := r.rejectDirectTunnelAttachment(ctx, &gateway, cfg, revocationCeiling)
+	rejected, err := r.rejectDirectTunnelAttachment(ctx, &gateway, cfg)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -237,13 +252,33 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 	tunnel, account, effectiveConfig, created, err := r.resolveCloudflareContext(ctx, &gateway, cfg)
+	accountMissing := false
 	if err != nil {
-		return ctrl.Result{}, err
+		var missingTunnel *missingExplicitTunnelError
+		var missingAccount *missingCloudflareAccountError
+		switch {
+		case errors.As(err, &missingTunnel):
+			r.clearSnapshot(req.NamespacedName)
+			if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.rejectGatewayAdmission(ctx, &gateway, string(gatewayv1.GatewayReasonInvalidParameters), err.Error(), "Gateway configuration references a CloudflareTunnel that does not exist"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		case errors.As(err, &missingAccount):
+			accountMissing = true
+		default:
+			return ctrl.Result{}, err
+		}
 	}
 	if tunnel != nil && tunnel.Spec.Configuration.Mode == v1alpha1.CloudflareTunnelConfigurationModeDirect {
+		reason, acceptedMessage, programmedMessage := directTunnelRejection(client.ObjectKeyFromObject(tunnel))
 		r.clearSnapshot(req.NamespacedName)
-		r.clearAUDRevocationsForGateway(req.NamespacedName, revocationCeiling)
-		if err := r.rejectGatewayDirectTunnel(ctx, &gateway, client.ObjectKeyFromObject(tunnel)); err != nil {
+		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.rejectGatewayAdmission(ctx, &gateway, reason, acceptedMessage, programmedMessage); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -280,6 +315,50 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.prepareGatewayStatus(&statuses.Gateway, &gateway)
+	if accepted := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted)); accepted != nil && accepted.Status == metav1.ConditionFalse {
+		// A Gateway the translator rejected can never be programmed: retract
+		// the published snapshot and the owned dataplane in every mode —
+		// including conformance mode — and record the rejection without
+		// publishing a new snapshot. AUD revocation latches and owned child
+		// resources are deliberately retained.
+		r.clearSnapshot(req.NamespacedName)
+		statuses.Gateway.Addresses = nil
+		now := metav1.Now()
+		if r.Now != nil {
+			now = metav1.NewTime(r.Now())
+		}
+		meta.SetStatusCondition(&statuses.Gateway.Conditions, metav1.Condition{
+			Type:               string(gatewayv1.GatewayConditionProgrammed),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			Reason:             string(gatewayv1.GatewayReasonInvalid),
+			Message:            "Gateway configuration is invalid",
+			LastTransitionTime: now,
+		})
+		for index := range statuses.Gateway.Listeners {
+			meta.SetStatusCondition(&statuses.Gateway.Listeners[index].Conditions, metav1.Condition{
+				Type:               string(gatewayv1.ListenerConditionProgrammed),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: gateway.Generation,
+				Reason:             string(gatewayv1.ListenerReasonInvalid),
+				Message:            "Listener configuration is invalid",
+				LastTransitionTime: now,
+			})
+		}
+		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, req.NamespacedName); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -298,7 +377,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if !compiled.ConformanceMode && (tunnel == nil || account == nil || compiled.Cloudflare == nil) {
+		r.clearSnapshot(req.NamespacedName)
 		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, "CloudflareTunnel and CloudflareAccount are required")
+		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -307,6 +390,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
+		}
+		if accountMissing {
+			// The referenced CloudflareAccount is confirmed absent: stop
+			// polling and rely on the CloudflareAccount watch to re-enqueue
+			// this Gateway when the account is recreated.
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
@@ -475,7 +564,6 @@ func (r *GatewayReconciler) rejectDirectTunnelAttachment(
 	ctx context.Context,
 	gateway *gatewayv1.Gateway,
 	cfg *v1alpha1.GatewayClassConfig,
-	revocationCeiling uint64,
 ) (bool, error) {
 	tunnelName, explicit, supported := referencedTunnelName(gateway)
 	if !supported || (cfg.Spec.ConformanceMode && !explicit) {
@@ -496,17 +584,36 @@ func (r *GatewayReconciler) rejectDirectTunnelAttachment(
 		return false, nil
 	}
 	r.clearSnapshot(client.ObjectKeyFromObject(gateway))
-	r.clearAUDRevocationsForGateway(client.ObjectKeyFromObject(gateway), revocationCeiling)
-	if err := r.rejectGatewayDirectTunnel(ctx, gateway, tunnelKey); err != nil {
+	if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+		return false, err
+	}
+	reason, acceptedMessage, programmedMessage := directTunnelRejection(tunnelKey)
+	if err := r.rejectGatewayAdmission(ctx, gateway, reason, acceptedMessage, programmedMessage); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (r *GatewayReconciler) rejectGatewayDirectTunnel(
+// directTunnelRejection returns the single source for the Accepted reason and
+// the Accepted/Programmed messages recorded when a Gateway references a
+// Direct-mode CloudflareTunnel. Both the pre-resolution admission check and
+// the post-resolution guard must emit identical status text.
+func directTunnelRejection(tunnelKey types.NamespacedName) (reason, acceptedMessage, programmedMessage string) {
+	return gatewayReasonUnsupportedValue,
+		fmt.Sprintf("CloudflareTunnel %s uses Direct configuration mode and cannot be attached to a Gateway", tunnelKey),
+		"Gateway configuration references a Direct-mode CloudflareTunnel"
+}
+
+// rejectGatewayAdmission terminally rejects a Gateway whose referenced
+// parameters cannot be resolved or programmed: it retracts addresses and
+// listener status and records the rejection on the Accepted and Programmed
+// conditions. Callers clear the published snapshot and retract the owned
+// dataplane first; AUD revocation latches and owned child resources are
+// deliberately retained.
+func (r *GatewayReconciler) rejectGatewayAdmission(
 	ctx context.Context,
 	gateway *gatewayv1.Gateway,
-	tunnelKey types.NamespacedName,
+	acceptedReason, acceptedMessage, programmedMessage string,
 ) error {
 	desired := gateway.DeepCopy().Status
 	desired.Addresses = nil
@@ -519,8 +626,8 @@ func (r *GatewayReconciler) rejectGatewayDirectTunnel(
 		Type:               string(gatewayv1.GatewayConditionAccepted),
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: gateway.Generation,
-		Reason:             gatewayReasonUnsupportedValue,
-		Message:            fmt.Sprintf("CloudflareTunnel %s uses Direct configuration mode and cannot be attached to a Gateway", tunnelKey),
+		Reason:             acceptedReason,
+		Message:            acceptedMessage,
 		LastTransitionTime: now,
 	})
 	meta.SetStatusCondition(&desired.Conditions, metav1.Condition{
@@ -528,10 +635,27 @@ func (r *GatewayReconciler) rejectGatewayDirectTunnel(
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: gateway.Generation,
 		Reason:             string(gatewayv1.GatewayReasonInvalid),
-		Message:            "Gateway configuration references a Direct-mode CloudflareTunnel",
+		Message:            programmedMessage,
 		LastTransitionTime: now,
 	})
 	return r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gateway), desired)
+}
+
+// invalidGatewayClassConfigError marks a GatewayClass parametersRef that can
+// never resolve: either an unsupported group/kind or a GatewayClassConfig that
+// is confirmed missing. Transient API failures stay plain wrapped errors so
+// callers keep retrying them.
+type invalidGatewayClassConfigError struct {
+	message string
+}
+
+func (e *invalidGatewayClassConfigError) Error() string { return e.message }
+
+// isGatewayClassConfigInvalid reports whether err is a confirmed unresolvable
+// GatewayClass parametersRef rather than a transient lookup failure.
+func isGatewayClassConfigInvalid(err error) bool {
+	var invalid *invalidGatewayClassConfigError
+	return errors.As(err, &invalid)
 }
 
 func (r *GatewayReconciler) loadGatewayClassConfig(ctx context.Context, gatewayClass *gatewayv1.GatewayClass) (*v1alpha1.GatewayClassConfig, error) {
@@ -540,11 +664,14 @@ func (r *GatewayReconciler) loadGatewayClassConfig(ctx context.Context, gatewayC
 		return defaultGatewayClassConfig(), nil
 	}
 	if string(ref.Group) != v1alpha1.Group || string(ref.Kind) != "GatewayClassConfig" {
-		return nil, fmt.Errorf("the GatewayClass %q has unsupported parametersRef %s/%s", gatewayClass.Name, ref.Group, ref.Kind)
+		return nil, &invalidGatewayClassConfigError{message: fmt.Sprintf("the GatewayClass %q has unsupported parametersRef %s/%s", gatewayClass.Name, ref.Group, ref.Kind)}
 	}
 
 	var cfg v1alpha1.GatewayClassConfig
 	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name}, &cfg); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, &invalidGatewayClassConfigError{message: fmt.Sprintf("the GatewayClassConfig %q referenced by GatewayClass %q was not found", ref.Name, gatewayClass.Name)}
+		}
 		return nil, fmt.Errorf("get GatewayClassConfig %q: %w", ref.Name, err)
 	}
 	return &cfg, nil
@@ -974,6 +1101,54 @@ func (r *GatewayReconciler) clearSnapshot(key types.NamespacedName) {
 		r.Snapshots.ClearSnapshot(key.String())
 	}
 	observability.Default.DeleteGateway(key.String())
+}
+
+// retractGatewayDataplane scales the dataplane Deployment of a retracted
+// Gateway to zero so a cleared snapshot cannot keep serving traffic through
+// full replicas. A missing Deployment is success. A Deployment controlled by
+// a different owner — including a recreated Gateway with a different UID — is
+// left untouched and surfaced through the log and a Warning event; the
+// rejection still completes because mutating foreign workloads is never safe.
+// Transient API failures are returned so the caller retries.
+func (r *GatewayReconciler) retractGatewayDataplane(ctx context.Context, gateway *gatewayv1.Gateway) error {
+	if gateway == nil || gateway.UID == "" {
+		// Only an exact, non-empty Gateway UID may authorize scaling: without
+		// one there is no ownership to prove, so the dataplane stays untouched.
+		return nil
+	}
+	key := types.NamespacedName{
+		Namespace: gateway.Namespace,
+		Name:      dataplane.ResourceName(&ir.Gateway{Key: client.ObjectKeyFromObject(gateway)}),
+	}
+	var deployment appsv1.Deployment
+	if err := r.Get(ctx, key, &deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get dataplane Deployment %s: %w", key, err)
+	}
+	expected := metav1.NewControllerRef(gateway, schema.GroupVersion{Group: gatewayv1.GroupVersion.Group, Version: gatewayv1.GroupVersion.Version}.WithKind("Gateway"))
+	if !sameControllerIdentity(metav1.GetControllerOf(&deployment), expected) {
+		ctrl.LoggerFrom(ctx).Info(
+			"Leaving dataplane Deployment untouched during Gateway retraction: not controlled by this Gateway UID",
+			"gateway", client.ObjectKeyFromObject(gateway), "gatewayUID", gateway.UID, "deployment", key,
+		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(gateway, nil, corev1.EventTypeWarning, "ForeignDataplane", "RetractGateway",
+				"Dataplane Deployment %s is not controlled by Gateway UID %s and was left running", key, gateway.UID)
+		}
+		return nil
+	}
+	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
+		return nil
+	}
+	before := deployment.DeepCopy()
+	zero := int32(0)
+	deployment.Spec.Replicas = &zero
+	if err := r.Patch(ctx, &deployment, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("scale dataplane Deployment %s to zero: %w", key, err)
+	}
+	return nil
 }
 
 func (r *GatewayReconciler) serviceAddresses(ctx context.Context, gateway *ir.Gateway) ([]gatewayv1.GatewayStatusAddress, bool, string, error) {
@@ -1455,6 +1630,8 @@ func sameControllerIdentity(actual, expected *metav1.OwnerReference) bool {
 		actual.APIVersion == expected.APIVersion &&
 		actual.Kind == expected.Kind &&
 		actual.Name == expected.Name &&
+		actual.UID != "" &&
+		expected.UID != "" &&
 		actual.UID == expected.UID &&
 		actual.Controller != nil &&
 		*actual.Controller
@@ -1548,6 +1725,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&gatewayv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayClassToGateways)).
 		Watches(&v1alpha1.GatewayClassConfig{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayClassConfigToGateways)).
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToGateways)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.mapAccountToGateways)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToGateways)).
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToGateways)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.mapVirtualNetworkToGateways)).

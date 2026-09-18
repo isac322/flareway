@@ -134,7 +134,8 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		if object.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
 			message = "Custom device profile was explicitly adopted; whole-list ownership will be applied"
 		}
-		pending := deviceProfileStatus(object, remote.PolicyID, true, desired, nil, nil, metav1.ConditionFalse, "Pending", message)
+		// Checkpoint ownership only: desired lists become applied status after remote list synchronization.
+		pending := deviceProfileStatus(object, remote.PolicyID, true, lastAppliedDeviceProfile(object), nil, nil, metav1.ConditionFalse, "Pending", message)
 		if err := r.patchStatus(ctx, object, pending); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1109,22 +1110,32 @@ func deviceProfileInvalid(reason, format string, args ...any) error {
 func (r *DeviceProfileReconciler) finishError(ctx context.Context, object *v1alpha1.DeviceProfile, err error) (ctrl.Result, error) {
 	var problem *deviceProfileProblem
 	if errors.As(err, &problem) {
-		status := deviceProfileStatus(object, object.Status.ProfileID, object.Status.OwnershipVerified, aggregatedDeviceProfile{}, nil, nil, metav1.ConditionFalse, problem.reason, problem.message)
+		status := deviceProfileStatus(object, object.Status.ProfileID, object.Status.OwnershipVerified, lastAppliedDeviceProfile(object), nil, nil, metav1.ConditionFalse, problem.reason, problem.message)
 		return ctrl.Result{}, r.patchStatus(ctx, object, status)
 	}
 	return r.finishRemoteError(ctx, object, err)
 }
 
 func (r *DeviceProfileReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.DeviceProfile, err error) (ctrl.Result, error) {
-	status := deviceProfileStatus(object, object.Status.ProfileID, object.Status.OwnershipVerified, aggregatedDeviceProfile{}, nil, nil, metav1.ConditionFalse, "Pending", err.Error())
+	status := deviceProfileStatus(object, object.Status.ProfileID, object.Status.OwnershipVerified, lastAppliedDeviceProfile(object), nil, nil, metav1.ConditionFalse, "Pending", err.Error())
 	_ = r.patchStatus(ctx, object, status)
 	return ctrl.Result{}, err
 }
 
 func (r *DeviceProfileReconciler) finishConflict(ctx context.Context, object *v1alpha1.DeviceProfile, profileID string, conflicts []string) (ctrl.Result, error) {
 	message := "another Managed DeviceProfile targets the same remote profile: " + strings.Join(conflicts, ", ")
-	status := deviceProfileStatus(object, profileID, object.Status.OwnershipVerified, aggregatedDeviceProfile{}, conflicts, nil, metav1.ConditionFalse, "Conflict", message)
+	status := deviceProfileStatus(object, profileID, object.Status.OwnershipVerified, lastAppliedDeviceProfile(object), conflicts, nil, metav1.ConditionFalse, "Conflict", message)
 	return ctrl.Result{}, r.patchStatus(ctx, object, status)
+}
+
+// lastAppliedDeviceProfile re-publishes the last confirmed applied lists so a
+// failure before remote replacement does not read as a successful withdrawal.
+func lastAppliedDeviceProfile(object *v1alpha1.DeviceProfile) aggregatedDeviceProfile {
+	return aggregatedDeviceProfile{
+		appliedInclude:  object.Status.AppliedInclude,
+		appliedExclude:  object.Status.AppliedExclude,
+		appliedFallback: object.Status.AppliedFallback,
+	}
 }
 
 func deviceProfileStatus(object *v1alpha1.DeviceProfile, profileID string, ownership bool, desired aggregatedDeviceProfile, conflicts []string, wouldApply *v1alpha1.DeviceProfileWouldApplyStatus, conditionStatus metav1.ConditionStatus, reason, message string) v1alpha1.DeviceProfileStatus {

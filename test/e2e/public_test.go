@@ -64,10 +64,16 @@ var _ = Describe("Public Cloudflare edge", Label("public"), Ordered, func() {
 	}, NodeTimeout(time.Minute))
 
 	AfterAll(func(ctx SpecContext) {
+		// Route and Gateway first so the controller-created CloudflareTunnel
+		// can drain, then wait for every finalizer so the suite-level
+		// CloudflareAccount is still available during remote cleanup.
 		deleteObject(ctx, route)
-		deleteObject(ctx, tunnel)
 		deleteObject(ctx, gateway)
-	}, NodeTimeout(time.Minute))
+		deleteObject(ctx, tunnel)
+		waitForObjectDeletion(ctx, route)
+		waitForObjectDeletion(ctx, gateway)
+		waitForObjectDeletion(ctx, tunnel)
+	}, NodeTimeout(5*time.Minute))
 
 	It("programs DNS, tunnel, cloudflared, Envoy, and backend truthfully", func(ctx SpecContext) {
 		programCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)

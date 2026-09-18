@@ -66,6 +66,8 @@ jobs:
           cache: true
       - name: Test
         run: make test
+      - name: Compile exploratory harness
+        run: make test-exploratory-compile
 
   test-envoy:
     name: Envoy component tests

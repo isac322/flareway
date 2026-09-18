@@ -241,7 +241,7 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 			return nil, nil, cfg, false, fmt.Errorf("get CloudflareTunnel %s: %w", key, err)
 		}
 		if explicit {
-			return nil, nil, cfg, false, fmt.Errorf("referenced CloudflareTunnel %s was not found", key)
+			return nil, nil, cfg, false, &missingExplicitTunnelError{key: key}
 		}
 		if cfg.Spec.AccountRef == nil || cfg.Spec.AccountRef.Name == "" {
 			return nil, nil, cfg, false, errors.New("the GatewayClassConfig accountRef is required in Cloudflare mode")
@@ -277,6 +277,7 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 			tunnel.Status.DeletedAt != nil || !tunnel.Status.OwnershipVerified ||
 			tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil {
 			message := fmt.Sprintf("Waiting for exact UID-bound ownership of CloudflareTunnel %s", key)
+			retractDataplane := true
 			switch {
 			case tunnel.Status.DeletedAt != nil:
 				message = fmt.Sprintf("CloudflareTunnel %s is remotely deleted and draining its connector dataplane", key)
@@ -290,8 +291,19 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 				message = fmt.Sprintf("CloudflareTunnel %s has not verified remote ownership", key)
 			case authorized && (tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil):
 				message = fmt.Sprintf("CloudflareTunnel %s is waiting for verified connector credentials", key)
+				// A verified owner waiting on connector credentials is a
+				// recoverable convergence gap, not dependency loss: the
+				// published snapshot is still retracted and the Gateway stays
+				// unprogrammed, but the owned dataplane keeps running so a
+				// stale or in-flight credential write cannot drop live traffic.
+				retractDataplane = false
 			}
 			r.clearSnapshot(client.ObjectKeyFromObject(gateway))
+			if retractDataplane {
+				if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+					return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
+				}
+			}
 			var current gatewayv1.Gateway
 			if err := r.Get(ctx, client.ObjectKeyFromObject(gateway), &current); err != nil {
 				if apierrors.IsNotFound(err) {
@@ -318,9 +330,42 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, errors.New("the CloudflareTunnel accountRef is empty")
 	}
 	if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account); err != nil {
+		if apierrors.IsNotFound(err) {
+			// A missing CloudflareAccount is dependency loss, not a hard
+			// failure: the Gateway stays Accepted but unprogrammed while the
+			// account is absent. The typed error lets Reconcile stop polling;
+			// the CloudflareAccount watch re-enqueues the Gateway when the
+			// account is recreated.
+			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, &missingCloudflareAccountError{name: tunnel.Spec.AccountRef.Name}
+		}
 		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, fmt.Errorf("get CloudflareAccount %q: %w", tunnel.Spec.AccountRef.Name, err)
 	}
 	return &tunnel, &account, effectiveGatewayConfig(cfg, &tunnel), false, nil
+}
+
+// missingExplicitTunnelError reports that a Gateway explicitly referenced a
+// CloudflareTunnel that does not exist. Unlike the implicit tunnel named after
+// the Gateway, an explicit reference is never auto-provisioned, so the Gateway
+// is rejected instead of creating a replacement.
+type missingExplicitTunnelError struct {
+	key types.NamespacedName
+}
+
+func (e *missingExplicitTunnelError) Error() string {
+	return fmt.Sprintf("referenced CloudflareTunnel %s was not found", e.key)
+}
+
+// missingCloudflareAccountError reports that the CloudflareAccount referenced
+// by the resolved CloudflareTunnel is confirmed absent. Unlike a missing
+// explicit tunnel this is not an admission rejection: the Gateway stays
+// Accepted but unprogrammed, and the typed error lets Reconcile stop polling
+// because the CloudflareAccount watch re-enqueues it on recreation.
+type missingCloudflareAccountError struct {
+	name string
+}
+
+func (e *missingCloudflareAccountError) Error() string {
+	return fmt.Sprintf("referenced CloudflareAccount %q was not found", e.name)
 }
 
 func referencedTunnelName(gateway *gatewayv1.Gateway) (name string, explicit, supported bool) {
@@ -892,6 +937,25 @@ func (r *GatewayReconciler) mapTunnelToGateways(ctx context.Context, object clie
 		if supported && (name == tunnel.Name || (name == "" && gateways.Items[index].Name == tunnel.Name)) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&gateways.Items[index])})
 		}
+	}
+	return deduplicateRequests(requests)
+}
+
+// mapAccountToGateways enqueues every Gateway whose referenced CloudflareTunnel
+// uses the changed CloudflareAccount so a recreated account revives Gateways
+// that stopped polling while the account was absent.
+func (r *GatewayReconciler) mapAccountToGateways(ctx context.Context, object client.Object) []reconcile.Request {
+	var tunnels v1alpha1.CloudflareTunnelList
+	if err := r.List(ctx, &tunnels); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Unable to list CloudflareTunnels for CloudflareAccount", "account", client.ObjectKeyFromObject(object))
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for index := range tunnels.Items {
+		if tunnels.Items[index].Spec.AccountRef.Name != object.GetName() {
+			continue
+		}
+		requests = append(requests, r.mapTunnelToGateways(ctx, &tunnels.Items[index])...)
 	}
 	return deduplicateRequests(requests)
 }

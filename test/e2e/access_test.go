@@ -184,6 +184,15 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		} {
 			deleteObject(ctx, value)
 		}
+		// The controller-created CloudflareTunnels must finish remote cleanup
+		// while the suite-level CloudflareAccount still exists.
+		for _, value := range []*unstructured.Unstructured{
+			mixedRoute, accessRoute,
+			mixedGateway, accessGateway,
+			mixedTunnel, accessTunnel,
+		} {
+			waitForObjectDeletion(ctx, value)
+		}
 		for _, value := range []*unstructured.Unstructured{denyPolicy, servicePolicy} {
 			deleteObject(ctx, value)
 		}
@@ -192,7 +201,7 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		}
 		deleteObject(ctx, serviceToken)
 		waitForObjectDeletion(ctx, serviceToken)
-	}, NodeTimeout(4*time.Minute))
+	}, NodeTimeout(5*time.Minute))
 
 	It("denies unauthenticated and forged assertions while accepting a service token", func(ctx SpecContext) {
 		status, responseHeaders, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)

@@ -51,6 +51,60 @@ func (s *Server) Journal() []Call {
 	return calls
 }
 
+// PublicCall is the artifact-safe projection of a journaled call. It keeps
+// only the method and the allowlisted route shape; account IDs, tokens,
+// hostnames, and query values are replaced by placeholders so persisted
+// artifacts never contain tenant-identifying raw values.
+type PublicCall struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+}
+
+// PublicJournal returns the artifact projection of the journal in arrival
+// order. Unlike Journal it never carries bodies or query strings, and every
+// path segment outside the Cloudflare API literal allowlist is masked.
+func (s *Server) PublicJournal() []PublicCall {
+	calls := s.Journal()
+
+	projected := make([]PublicCall, 0, len(calls))
+	for _, call := range calls {
+		projected = append(projected, PublicCall{Method: call.Method, Path: publicPath(call.Path)})
+	}
+	return projected
+}
+
+// publicPathSegments is the allowlist of literal Cloudflare API path segments
+// that may appear in a public artifact. Every other segment is masked.
+var publicPathSegments = map[string]bool{
+	"access": true, "accounts": true, "apps": true, "cfd_tunnel": true,
+	"configurations": true, "connections": true, "connectors": true,
+	"devices": true, "dns_records": true, "exclude": true,
+	"fallback_domains": true, "gateway": true, "groups": true, "hostname": true,
+	"identity_providers": true, "include": true, "items": true, "lists": true,
+	"management": true, "organizations": true, "policies": true, "policy": true,
+	"posture": true, "refresh": true, "revoke_tokens": true, "rotate": true,
+	"routes": true, "rules": true, "service_tokens": true, "settings": true,
+	"tags": true, "teamnet": true, "token": true, "tokens": true, "user": true,
+	"verify": true, "virtual_networks": true, "zerotrust": true, "zones": true,
+}
+
+func publicPath(path string) string {
+	path = strings.TrimPrefix(path, "/client/v4")
+	path, _, _ = strings.Cut(path, "?")
+
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if segment != "" && !publicPathSegments[segment] {
+			segments[i] = "{id}"
+		}
+	}
+	projected := strings.Join(segments, "/")
+	if projected == "" {
+		return "/"
+	}
+	return projected
+}
+
 // AssertOrder verifies that each path regular expression appears after the
 // previous expression. Calls between expected entries are allowed.
 func (s *Server) AssertOrder(t testing.TB, pathRegex ...string) {

@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -347,11 +348,16 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		calls := remote.Calls()
 		gomega.Expect(indexOfAccessCall(calls, "Delete:"+created.ID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+bypassTag)))
 	})
-	ginkgo.It("treats deleting and stale-generation private routes as TargetNotFound", func() {
+	ginkgo.It("treats deleting and stale-generation private routes as target loss", func() {
 		accepted := metav1.Condition{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}
 		route := v1alpha1.NetworkRoute{
-			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant", Generation: 2},
-			Status:     v1alpha1.NetworkRouteStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{accepted}},
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant", Generation: 2, Labels: map[string]string{"route": "allowed"}},
+			Spec: v1alpha1.NetworkRouteSpec{
+				AccountRef:        corev1.LocalObjectReference{Name: "account"},
+				Network:           "10.96.0.0/16",
+				AllowedNamespaces: v1alpha1.AllowedNamespaces{From: v1alpha1.AllowedNamespaceFromSame},
+			},
+			Status: v1alpha1.NetworkRouteStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{accepted}},
 		}
 		application := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant"},
@@ -363,17 +369,33 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 				})},
 			},
 		}
-		failure := validatePrivateRouteLifecycle(gatewayapi.Inputs{NetworkRoutes: []v1alpha1.NetworkRoute{route}}, application)
-		gomega.Expect(failure).NotTo(gomega.BeNil())
+		inputs := gatewayapi.Inputs{
+			CloudflareAccount: &v1alpha1.CloudflareAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "account"},
+				Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "tenant"}},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+					PrivateRoutes:     &v1alpha1.CloudflarePrivateRouteGrant{NetworkRouteSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"route": "allowed"}}},
+				}}},
+			},
+			Namespaces:    []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "tenant"}}}},
+			NetworkRoutes: []v1alpha1.NetworkRoute{route},
+		}
+		failure := gatewayapi.CompilePrivateDestinations(inputs, application)
+		gomega.Expect(failure.Accepted).To(gomega.BeFalse())
 		gomega.Expect(failure.Reason).To(gomega.Equal("TargetNotFound"))
-		gomega.Expect(failure.Message).To(gomega.ContainSubstring("current generation"))
+		gomega.Expect(failure.TargetLoss).To(gomega.Equal(gatewayapi.AccessTargetLossNetworkRoute))
 
+		deletingRoute := route
+		deletingRoute.Status.ObservedGeneration = deletingRoute.Generation
 		now := metav1.Now()
-		route.Status.ObservedGeneration = route.Generation
-		route.DeletionTimestamp = &now
-		failure = validatePrivateRouteLifecycle(gatewayapi.Inputs{NetworkRoutes: []v1alpha1.NetworkRoute{route}}, application)
-		gomega.Expect(failure).NotTo(gomega.BeNil())
-		gomega.Expect(failure.Message).To(gomega.ContainSubstring("deleting"))
+		deletingRoute.DeletionTimestamp = &now
+		inputs.NetworkRoutes = []v1alpha1.NetworkRoute{deletingRoute}
+		failure = gatewayapi.CompilePrivateDestinations(inputs, application)
+		gomega.Expect(failure.Accepted).To(gomega.BeFalse())
+		gomega.Expect(failure.Message).To(gomega.ContainSubstring("is deleting"))
+		gomega.Expect(failure.Reason).To(gomega.Equal("TargetNotFound"))
+		gomega.Expect(failure.TargetLoss).To(gomega.Equal(gatewayapi.AccessTargetLossNetworkRoute))
 	})
 
 	ginkgo.It("keeps Tunnel teardown blocked by the private-tunnel ledger until Managed+Delete cleanup completes", func() {
@@ -872,6 +894,67 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("maps GatewayClass and GatewayClassConfig events to the target applications", func() {
+		fixture := newAccessFixture("class-map", false, false)
+		fixture.create()
+		reconciler := &AccessApplicationReconciler{Client: testClient}
+		expected := reconcile.Request{NamespacedName: fixture.applicationKey}
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var gatewayClass gatewayv1.GatewayClass
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.gatewayClass}, &gatewayClass)).To(gomega.Succeed())
+			g.Expect(reconciler.mapGatewayClassToApplications(testContext, &gatewayClass)).To(gomega.ContainElement(expected))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var config v1alpha1.GatewayClassConfig
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.config}, &config)).To(gomega.Succeed())
+			g.Expect(reconciler.mapGatewayClassConfigToApplications(testContext, &config)).To(gomega.ContainElement(expected))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("invalidates the AUD handoff and status when the GatewayClassConfig disappears without deleting the remote application", func() {
+		fixture := newAccessFixture("config-loss", false, false)
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		programAccessFixture(fixture, &application, 1)
+		parentID := application.Status.ApplicationID
+
+		gomega.Expect(testClient.Delete(testContext, &v1alpha1.GatewayClassConfig{ObjectMeta: metav1.ObjectMeta{Name: fixture.config}})).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Annotations[accessApplicationRevocationAnnotation]).NotTo(gomega.BeEmpty())
+			programmed := findCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+			g.Expect(programmed).NotTo(gomega.BeNil())
+			g.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(programmed.Reason).To(gomega.Equal("InvalidParameters"))
+			var secret corev1.Secret
+			err := testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret)
+			g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		applyBlockedAfterLatch(fixture, &application)
+		// TokensRevoked is persisted only after every claim acknowledges a fresh
+		// Blocked version, so it proves the reconciler consumed the handshake and
+		// ran the post-ack delete-vs-block decision.
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			var latch accessRevocationLatch
+			g.Expect(json.Unmarshal([]byte(application.Annotations[accessApplicationRevocationAnnotation]), &latch)).To(gomega.Succeed())
+			g.Expect(latch.TokensRevoked).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).To(gomega.ContainElement("Revoke:" + parentID))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		// The acknowledged pass requeues after accessApplicationRequeue; spanning two
+		// cycles observes that pass and the next one deciding to keep the parent.
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).To(gomega.Equal(parentID))
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Delete:" + parentID))
+		}).WithTimeout(2 * accessApplicationRequeue).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("deletes the AUD first, waits for Blocked, then deletes child applications before the parent", func() {
 		fixture := newAccessFixture("carveout-delete", true, true)
 		testAccessCloudflare.PutTag("customer-retained")
@@ -980,6 +1063,209 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			var current v1alpha1.AccessApplication
 			return apierrors.IsNotFound(testClient.Get(testContext, fixture.applicationKey, &current))
 		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
+	})
+
+	ginkgo.It("maps AUD handoff Secrets and Namespaces back to their applications", func() {
+		fixture := newAccessFixture("watch-map", false, false)
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		reconciler := &AccessApplicationReconciler{Client: testClient}
+		expected := reconcile.Request{NamespacedName: fixture.applicationKey}
+		var handoff corev1.Secret
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{
+			Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey),
+		}, &handoff)).To(gomega.Succeed())
+		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, &handoff)).To(gomega.Equal([]reconcile.Request{expected}))
+
+		foreign := handoff.DeepCopy()
+		foreign.Name = "aud-foreign"
+		foreign.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey] = []byte("other/foreign")
+		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, foreign)).To(gomega.BeEmpty())
+		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: accessApplicationAUDNamespace, Name: "unrelated",
+		}})).To(gomega.BeEmpty())
+
+		gomega.Expect(reconciler.mapNamespaceToApplications(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fixture.namespace}})).To(gomega.Equal([]reconcile.Request{expected}))
+		gomega.Expect(reconciler.mapNamespaceToApplications(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system"}})).To(gomega.BeEmpty())
+	})
+
+	ginkgo.It("revokes and retains the remote application when its AccessPolicy is deleted", func() {
+		fixture := newAccessFixture("policy-loss", false, false)
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		programAccessFixture(fixture, &application, 1)
+		parentID := application.Status.ApplicationID
+
+		policy := &v1alpha1.AccessPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "managed-allow", Namespace: fixture.namespace},
+			Spec: v1alpha1.AccessPolicySpec{
+				AccountRef: corev1.LocalObjectReference{Name: fixture.account},
+				Name:       "managed-allow", Decision: v1alpha1.AccessPolicyDecisionAllow,
+				Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, policy)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(policy), policy)).To(gomega.Succeed())
+			g.Expect(policy.Status.PolicyID).NotTo(gomega.BeEmpty())
+			accepted := findCondition(policy.Status.Conditions, accessApplicationConditionAccepted)
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		before := application.DeepCopy()
+		application.Spec.Policies = []v1alpha1.AccessApplicationPolicyReference{{PolicyRef: &v1alpha1.NamespacedLocalObjectReference{Name: policy.Name}}}
+		gomega.Expect(testClient.Patch(testContext, &application, client.MergeFrom(before))).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testAccessCloudflare.Input(parentID).Policies).To(gomega.Equal(
+				[]flarecloudflare.AccessApplicationPolicyAttachment{{ID: policy.Status.PolicyID, Precedence: 1}},
+			))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Expect(testClient.Delete(testContext, policy)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Annotations[accessApplicationRevocationAnnotation]).NotTo(gomega.BeEmpty())
+			programmed := findCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+			g.Expect(programmed).NotTo(gomega.BeNil())
+			g.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(programmed.Message).To(gomega.ContainSubstring("AccessPolicy"))
+			var secret corev1.Secret
+			err := testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret)
+			g.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		applyBlockedAfterLatch(fixture, &application)
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			var latch accessRevocationLatch
+			g.Expect(json.Unmarshal([]byte(application.Annotations[accessApplicationRevocationAnnotation]), &latch)).To(gomega.Succeed())
+			g.Expect(latch.TokensRevoked).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).To(gomega.ContainElement("Revoke:" + parentID))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		// Policy loss is not target loss: the acknowledged pass must keep the
+		// remote application instead of deleting it.
+		gomega.Consistently(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).To(gomega.Equal(parentID))
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Delete:" + parentID))
+		}).WithTimeout(2 * accessApplicationRequeue).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("prunes the bypass child when its HTTPRoute carve-out rule is removed", func() {
+		fixture := newAccessFixture("carveout-prune", true, true)
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		programAccessFixture(fixture, &application, 1)
+		parentID := application.Status.ApplicationID
+		childID := application.Status.BypassApplications[0].ApplicationID
+		bypassTag := firstTagWithPrefix(testAccessCloudflare.Input(childID).Tags, accessBypassTagPrefix)
+		gomega.Expect(bypassTag).NotTo(gomega.BeEmpty())
+
+		var route gatewayv1.HTTPRoute
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Namespace: fixture.namespace, Name: "routes"}, &route)).To(gomega.Succeed())
+		base := client.MergeFrom(route.DeepCopy())
+		route.Spec.Rules = route.Spec.Rules[:1]
+		gomega.Expect(testClient.Patch(testContext, &route, base)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.BypassApplications).To(gomega.BeEmpty())
+			programmed := findCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+			g.Expect(programmed).NotTo(gomega.BeNil())
+			g.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+			g.Expect(testAccessCloudflare.Has(childID)).To(gomega.BeFalse())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		calls := testAccessCloudflare.Calls()
+		gomega.Expect(indexOfAccessCall(calls, "Delete:"+childID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+bypassTag)))
+		gomega.Expect(testAccessCloudflare.Tags()).To(gomega.ContainElement(accessManagedTag))
+	})
+
+	ginkgo.It("orphans a declared bypass child instead of deleting it when pruned", func() {
+		remote := newFakeAccessApplicationCloudflare()
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, "owner")
+		parentName := "tenant/parent"
+		orphanName := bypassChildApplicationName(parentName, "api.example.test", "/orphan")
+		deleteName := bypassChildApplicationName(parentName, "api.example.test", "/delete")
+		orphanTag := accessBypassTag(ownerTag, orphanName)
+		deleteTag := accessBypassTag(ownerTag, deleteName)
+		for _, tagName := range []string{accessManagedTag, ownerTag, orphanTag, deleteTag} {
+			remote.PutTag(tagName)
+		}
+		remote.Put(flarecloudflare.AccessApplication{ID: "orphan-child", Name: orphanName, Tags: []string{accessManagedTag, ownerTag, orphanTag}})
+		remote.Put(flarecloudflare.AccessApplication{ID: "delete-child", Name: deleteName, Tags: []string{accessManagedTag, ownerTag, deleteTag}})
+
+		application := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: "tenant"},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "account"}, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Application: v1alpha1.AccessApplicationSettings{Name: parentName},
+			},
+			Status: v1alpha1.AccessApplicationStatus{
+				ApplicationID: "parent-id",
+				BypassApplications: []v1alpha1.AccessBypassApplicationStatus{
+					{Hostname: "api.example.test", Path: "/orphan", ApplicationID: "orphan-child", Name: orphanName, DeletionPolicy: v1alpha1.DeletionPolicyOrphan},
+					{Hostname: "api.example.test", Path: "/delete", ApplicationID: "delete-child", Name: deleteName, DeletionPolicy: v1alpha1.DeletionPolicyDelete},
+				},
+			},
+		}
+		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+			testContext, remote, flarecloudflare.AccessScope{}, application, nil, ownerTag, "cluster-id",
+		)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(children).To(gomega.BeEmpty())
+		gomega.Expect(remote.Has("orphan-child")).To(gomega.BeTrue())
+		gomega.Expect(remote.Has("delete-child")).To(gomega.BeFalse())
+		gomega.Expect(remote.Input("orphan-child").Tags).To(gomega.BeEmpty())
+		calls := remote.Calls()
+		gomega.Expect(calls).NotTo(gomega.ContainElement("Delete:orphan-child"))
+		gomega.Expect(indexOfAccessCall(calls, "Update:orphan-child")).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+orphanTag)))
+		gomega.Expect(indexOfAccessCall(calls, "Delete:delete-child")).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+deleteTag)))
+	})
+
+	ginkgo.It("revokes tokens and orphans every remote application on deletion under DeletionPolicy Orphan", func() {
+		fixture := newAccessFixture("carveout-orphan", true, true)
+		fixture.application.Spec.DeletionPolicy = v1alpha1.DeletionPolicyOrphan
+		fixture.create()
+		var application v1alpha1.AccessApplication
+		programAccessFixture(fixture, &application, 1)
+		parentID := application.Status.ApplicationID
+		childID := application.Status.BypassApplications[0].ApplicationID
+
+		gomega.Expect(testClient.Delete(testContext, &application)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			var secret corev1.Secret
+			return apierrors.IsNotFound(testClient.Get(testContext, types.NamespacedName{Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey)}, &secret))
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(applyAccessTunnelHandshake(&tunnel, v1alpha1.CloudflareTunnelHostnameStatus{
+			Hostname: fixture.hostname, ProtectionDomain: application.Status.DataPlanes[0].ProtectionDomain,
+			AccessApplication: fixture.namespace + "/access", Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+		}, 2)).To(gomega.Succeed())
+
+		gomega.Eventually(func() bool {
+			var current v1alpha1.AccessApplication
+			return apierrors.IsNotFound(testClient.Get(testContext, fixture.applicationKey, &current))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
+		calls := testAccessCloudflare.Calls()
+		gomega.Expect(calls).To(gomega.ContainElements("Revoke:"+parentID, "Revoke:"+childID))
+		gomega.Expect(accessCallsWithPrefix(calls, "Delete:")).To(gomega.BeEmpty())
+		gomega.Expect(accessCallsWithPrefix(calls, "DeleteTag:")).To(gomega.BeEmpty())
+		gomega.Expect(testAccessCloudflare.Has(parentID)).To(gomega.BeTrue())
+		gomega.Expect(testAccessCloudflare.Has(childID)).To(gomega.BeTrue())
 	})
 })
 

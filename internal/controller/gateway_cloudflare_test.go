@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
@@ -668,5 +670,285 @@ func TestRetainAccessRevocationDomainAfterTargetDisappears(t *testing.T) {
 		statuses[0].AccessApplication != "apps/access" || statuses[0].Guard != v1alpha1.HostnameGuardBlocked ||
 		statuses[0].AppliedVersion != 5 {
 		t.Fatalf("retained Blocked handshake = %#v", statuses)
+	}
+}
+
+func TestGatewayCloudflareContextWaitsForVerifiedConnectorCredentials(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	key := types.NamespacedName{Namespace: "apps", Name: "edge"}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: "gateway-uid", Generation: 2},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+		}}},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: key.Namespace, UID: "tunnel-uid"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			OwnershipVerified: true,
+			GatewayRef:        &corev1.LocalObjectReference{Name: gateway.Name},
+			GatewayUID:        gateway.UID,
+		},
+	}
+	snapshots := newFakeSnapshotPublisher()
+	snapshots.versions[key.String()] = "stale"
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(gateway, tunnel).
+		WithObjects(gateway, tunnel).
+		Build()
+	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
+
+	selectedTunnel, account, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), gateway, defaultGatewayClassConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || account != nil || selectedTunnel == nil {
+		t.Fatalf("credential wait resolution stopped=%v account=%#v tunnel=%#v", stop, account, selectedTunnel)
+	}
+	if snapshots.Version(key.String()) != "" {
+		t.Fatal("credential wait retained the published xDS snapshot")
+	}
+	var observed gatewayv1.Gateway
+	if err := kube.Get(context.Background(), key, &observed); err != nil {
+		t.Fatal(err)
+	}
+	programmed := meta.FindStatusCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if programmed == nil || programmed.Status != metav1.ConditionFalse ||
+		!strings.Contains(programmed.Message, "waiting for verified connector credentials") {
+		t.Fatalf("credential wait Programmed condition = %#v", programmed)
+	}
+	if len(observed.Status.Addresses) != 0 {
+		t.Fatalf("credential wait retained Gateway addresses: %#v", observed.Status.Addresses)
+	}
+}
+
+func TestGatewayCloudflareContextBlocksSuccessorUntilPriorDataplaneDrains(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	key := types.NamespacedName{Namespace: "apps", Name: "successor"}
+	tunnelInfrastructure := &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+		Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+	}}
+	prior := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "prior", Namespace: key.Namespace, UID: "prior-uid",
+			DeletionTimestamp: &metav1.Time{Time: time.Unix(200, 0)},
+			Finalizers:        []string{"test.flareway.dev/hold"},
+		},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: tunnelInfrastructure},
+	}
+	successor := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: "successor-uid", Generation: 1},
+		Spec:       gatewayv1.GatewaySpec{Infrastructure: tunnelInfrastructure},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: key.Namespace, UID: "tunnel-uid"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID:                "remote-id",
+			OwnershipVerified:       true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "shared-token"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: prior.Name},
+			GatewayUID:              prior.UID,
+		},
+	}
+	replicas := int32(1)
+	priorDataplane := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "flareway-gw-" + prior.Name, Namespace: key.Namespace,
+			Labels:          map[string]string{dataplaneGatewayLabel: key.Namespace + "--" + prior.Name},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(prior, gatewayControllerGVK())},
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+	snapshots := newFakeSnapshotPublisher()
+	snapshots.versions[key.String()] = "stale"
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(successor, tunnel).
+		WithObjects(prior, successor, tunnel, priorDataplane).
+		Build()
+	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
+
+	_, account, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), successor, defaultGatewayClassConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || account != nil {
+		t.Fatalf("drain-blocked successor resolution stopped=%v account=%#v", stop, account)
+	}
+	if snapshots.Version(key.String()) != "" {
+		t.Fatal("drain-blocked successor retained the published xDS snapshot")
+	}
+	var observed gatewayv1.Gateway
+	if err := kube.Get(context.Background(), key, &observed); err != nil {
+		t.Fatal(err)
+	}
+	programmed := meta.FindStatusCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if programmed == nil || programmed.Status != metav1.ConditionFalse ||
+		!strings.Contains(programmed.Message, "draining its prior Gateway UID dataplane") {
+		t.Fatalf("drain-blocked Programmed condition = %#v", programmed)
+	}
+
+	// Draining the recorded owner's dataplane is the Tunnel controller's job:
+	// the Gateway reconciler must not scale a Deployment owned by the prior UID.
+	var preserved appsv1.Deployment
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(priorDataplane), &preserved); err != nil {
+		t.Fatal(err)
+	}
+	if preserved.Spec.Replicas == nil || *preserved.Spec.Replicas != 1 {
+		t.Fatalf("prior owner dataplane replicas = %v, want 1", preserved.Spec.Replicas)
+	}
+}
+
+// ackDetailPublisher adds the optional ACKDetails diagnostic surface the
+// programming gate uses to explain a pending Envoy ACK.
+type ackDetailPublisher struct {
+	*fakeSnapshotPublisher
+	details string
+}
+
+func (p *ackDetailPublisher) ACKDetails(_, _ string) string { return p.details }
+
+func TestGatewayCloudflareGateReportsEveryLagDimension(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	key := types.NamespacedName{Namespace: "apps", Name: "edge"}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: "gateway-uid"},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+		}}},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: key.Namespace, UID: "tunnel-uid"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DNS:              v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeManaged},
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID:                "remote-id",
+			OwnershipVerified:       true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "shared-token"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: gateway.Name},
+			GatewayUID:              gateway.UID,
+		},
+	}
+	pendingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "dataplane-0", Namespace: key.Namespace,
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: key.Name},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	succeededPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "dataplane-done", Namespace: key.Namespace,
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: key.Name},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	snapshots := &ackDetailPublisher{fakeSnapshotPublisher: newFakeSnapshotPublisher(), details: "version 4 != 5"}
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gateway, tunnel, pendingPod, succeededPod).
+		Build()
+	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots, Prober: &staticGatewayProber{ready: true}}
+	compiled := &ir.Gateway{
+		Key:       key,
+		UID:       gateway.UID,
+		Listeners: []ir.Listener{{Name: "http", Hostname: "app.example.com", Exposure: ir.ExposurePublic}},
+	}
+
+	ready, lagging, dnsReady, err := reconciler.cloudflareGate(context.Background(), compiled, tunnel, "0", "snapshot-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready || dnsReady || len(lagging) != 1 || lagging[0] != "remote configuration version is not available" {
+		t.Fatalf("missing remote version gate = ready %v, lagging %v, dnsReady %v", ready, lagging, dnsReady)
+	}
+
+	ready, lagging, dnsReady, err = reconciler.cloudflareGate(context.Background(), compiled, tunnel, "6", "snapshot-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready || dnsReady {
+		t.Fatalf("incomplete gate reported ready: lagging %v, dnsReady %v", lagging, dnsReady)
+	}
+	for _, want := range []string{"dataplane-0(no Pod IP)", "Envoy xDS ACK (version 4 != 5)", "managed DNS records"} {
+		if !slices.Contains(lagging, want) {
+			t.Fatalf("lagging %v missing %q", lagging, want)
+		}
+	}
+	for _, entry := range lagging {
+		if strings.Contains(entry, succeededPod.Name) {
+			t.Fatalf("terminal Pod counted as a lagging dataplane: %v", lagging)
+		}
+	}
+}
+
+func TestGatewayModeTunnelDefersRemoteConfigurationToTheGatewayWriter(t *testing.T) {
+	remote := newFakeTunnelCloudflareFactory()
+	remote.accountID = "account-id"
+	remote.PutTunnel(RemoteTunnel{
+		ID: "remote-id", AccountTag: "account-id", Name: "edge",
+		Type:         flarecloudflare.TunnelTypeCloudflared,
+		ConfigSource: flarecloudflare.TunnelConfigSourceCloudflare,
+		Status:       flarecloudflare.TunnelStatusHealthy,
+	})
+	remote.SetConfigVersion("remote-id", 9)
+	tunnel := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps"}}
+	account := &v1alpha1.CloudflareAccount{Spec: v1alpha1.CloudflareAccountSpec{AccountID: "account-id"}}
+	status := v1alpha1.CloudflareTunnelStatus{TunnelID: "remote-id"}
+
+	reconciler := new(CloudflareTunnelReconciler)
+	if err := reconciler.reconcileConfiguration(
+		context.Background(), remote, tunnel, account,
+		v1alpha1.CloudflareTunnelConfigurationModeGateway, &status, metav1.Now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls := remote.Calls(); len(calls) != 0 {
+		t.Fatalf("Gateway-mode reconciliation touched remote configuration before the first applied version: %v", calls)
+	}
+	if status.ConfigVersion.Remote != 0 {
+		t.Fatalf("Gateway-mode reconciliation projected remote version %d before the first applied version", status.ConfigVersion.Remote)
 	}
 }

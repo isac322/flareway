@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -386,6 +387,121 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 		gomega.Expect(testDeviceProfileCloudflare.hasCustom(profileID)).To(gomega.BeFalse())
 		gomega.Expect(testDeviceProfileCloudflare.callsSnapshot()).To(gomega.ContainElement("DeleteCustom"))
 	})
+
+	ginkgo.It("retains the last applied lists when dependency resolution fails", func() {
+		fixture := newDeviceProfileFixture("dependency-loss")
+		fixture.create()
+		profile := fixture.profile(v1alpha1.ManagementPolicyManaged)
+		profile.Spec.SplitTunnel.Static = []v1alpha1.DeviceProfileSplitTunnelEntry{{Host: new("app.example.com"), Description: "public app"}}
+		profile.Spec.FallbackDomains.Static = []v1alpha1.DeviceProfileFallbackDomain{{Suffix: "corp.example", DNSServer: []string{"10.0.0.53"}}}
+		gomega.Expect(testClient.Create(testContext, profile)).To(gomega.Succeed())
+
+		var appliedInclude []v1alpha1.DeviceProfileAppliedSplitTunnelEntry
+		var appliedFallback []v1alpha1.DeviceProfileAppliedFallbackDomain
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.DeviceProfile
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(current.Status.Conditions, v1alpha1.DeviceProfileConditionReady)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(current.Status.AppliedInclude).NotTo(gomega.BeEmpty())
+			g.Expect(current.Status.AppliedFallback).NotTo(gomega.BeEmpty())
+			appliedInclude = current.Status.AppliedInclude
+			appliedFallback = current.Status.AppliedFallback
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		var current v1alpha1.DeviceProfile
+		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+		current.Spec.Profile.Fields = &v1alpha1.DeviceProfileFields{VirtualNetworks: &v1alpha1.DeviceProfileVirtualNetworks{
+			DefaultRef:  corev1.LocalObjectReference{Name: "missing-vnet"},
+			AllowedRefs: []corev1.LocalObjectReference{{Name: "missing-vnet"}},
+		}}
+		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var failed v1alpha1.DeviceProfile
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &failed)).To(gomega.Succeed())
+			for _, conditionType := range []string{v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady} {
+				condition := statusutil.FindCondition(failed.Status.Conditions, conditionType)
+				g.Expect(condition).NotTo(gomega.BeNil())
+				g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(condition.ObservedGeneration).To(gomega.Equal(failed.Generation))
+			}
+			g.Expect(failed.Status.AppliedInclude).To(gomega.Equal(appliedInclude))
+			g.Expect(failed.Status.AppliedFallback).To(gomega.Equal(appliedFallback))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("retains the last applied lists when remote synchronization fails", func() {
+		fixture := newDeviceProfileFixture("sync-loss")
+		fixture.create()
+		profile := fixture.profile(v1alpha1.ManagementPolicyManaged)
+		profile.Spec.SplitTunnel.Static = []v1alpha1.DeviceProfileSplitTunnelEntry{{Host: new("app.example.com"), Description: "public app"}}
+		gomega.Expect(testClient.Create(testContext, profile)).To(gomega.Succeed())
+
+		var appliedInclude []v1alpha1.DeviceProfileAppliedSplitTunnelEntry
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.DeviceProfile
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(current.Status.Conditions, v1alpha1.DeviceProfileConditionReady)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(current.Status.AppliedInclude).NotTo(gomega.BeEmpty())
+			appliedInclude = current.Status.AppliedInclude
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		testDeviceProfileCloudflare.fail("ReplaceInclude", errors.New("injected replace failure"))
+		var current v1alpha1.DeviceProfile
+		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+		current.Spec.SplitTunnel.Static = append(current.Spec.SplitTunnel.Static, v1alpha1.DeviceProfileSplitTunnelEntry{Host: new("extra.example.com")})
+		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var failed v1alpha1.DeviceProfile
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &failed)).To(gomega.Succeed())
+			for _, conditionType := range []string{v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady} {
+				condition := statusutil.FindCondition(failed.Status.Conditions, conditionType)
+				g.Expect(condition).NotTo(gomega.BeNil())
+				g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(condition.ObservedGeneration).To(gomega.Equal(failed.Generation))
+			}
+			g.Expect(failed.Status.AppliedInclude).To(gomega.Equal(appliedInclude))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testDeviceProfileCloudflare.includeSnapshot(flarecloudflare.DeviceProfileRef{Kind: flarecloudflare.DeviceProfileKindDefault, ID: "default-profile"})).To(gomega.Equal([]flarecloudflare.SplitTunnelEntry{{Host: "app.example.com", Description: "public app"}}))
+	})
+	ginkgo.It("keeps desired lists out of status when the first custom sync fails after acquisition", func() {
+		fixture := newDeviceProfileFixture("first-sync-loss")
+		fixture.create()
+		testDeviceProfileCloudflare.fail("GetInclude", errors.New("injected include read failure"))
+		profile := fixture.customProfile(v1alpha1.DeletionPolicyOrphan)
+		profile.Spec.SplitTunnel.Static = []v1alpha1.DeviceProfileSplitTunnelEntry{{Host: new("app.example.com"), Description: "public app"}}
+		profile.Spec.FallbackDomains.Static = []v1alpha1.DeviceProfileFallbackDomain{{Suffix: "corp.example", DNSServer: []string{"10.0.0.53"}}}
+		gomega.Expect(testClient.Create(testContext, profile)).To(gomega.Succeed())
+
+		var profileID string
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.DeviceProfile
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+			for _, conditionType := range []string{v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady} {
+				condition := statusutil.FindCondition(current.Status.Conditions, conditionType)
+				g.Expect(condition).NotTo(gomega.BeNil())
+				g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(condition.ObservedGeneration).To(gomega.Equal(current.Generation))
+			}
+			g.Expect(current.Status.ProfileID).NotTo(gomega.BeEmpty())
+			g.Expect(current.Status.OwnershipVerified).To(gomega.BeTrue())
+			g.Expect(current.Status.AppliedInclude).To(gomega.BeEmpty())
+			g.Expect(current.Status.AppliedExclude).To(gomega.BeEmpty())
+			g.Expect(current.Status.AppliedFallback).To(gomega.BeEmpty())
+			profileID = current.Status.ProfileID
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testDeviceProfileCloudflare.callCount("CreateCustom")).To(gomega.Equal(1))
+		// The injected read failure must leave the acquired profile unconverged: no
+		// successful list replacement may have landed under this profile's ref.
+		ref := flarecloudflare.DeviceProfileRef{Kind: flarecloudflare.DeviceProfileKindCustom, ID: profileID}
+		gomega.Expect(testDeviceProfileCloudflare.includeSnapshot(ref)).To(gomega.BeEmpty())
+		gomega.Expect(testDeviceProfileCloudflare.fallbackSnapshot(ref)).To(gomega.BeEmpty())
+	})
 })
 
 type deviceProfileFixture struct {
@@ -465,6 +581,7 @@ type fakeDeviceProfileCloudflare struct {
 	include        map[string][]flarecloudflare.SplitTunnelEntry
 	exclude        map[string][]flarecloudflare.SplitTunnelEntry
 	fallback       map[string][]flarecloudflare.FallbackDomain
+	failures       map[string]error
 	calls          []string
 	next           int
 }
@@ -483,6 +600,7 @@ func (f *fakeDeviceProfileCloudflare) reset() {
 	f.include = map[string][]flarecloudflare.SplitTunnelEntry{}
 	f.exclude = map[string][]flarecloudflare.SplitTunnelEntry{}
 	f.fallback = map[string][]flarecloudflare.FallbackDomain{}
+	f.failures = map[string]error{}
 	f.calls = nil
 	f.next = 0
 }
@@ -558,12 +676,18 @@ func (f *fakeDeviceProfileCloudflare) DeleteCustomDeviceProfile(_ context.Contex
 func (f *fakeDeviceProfileCloudflare) GetDeviceProfileInclude(_ context.Context, ref flarecloudflare.DeviceProfileRef) ([]flarecloudflare.SplitTunnelEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.failures["GetInclude"]; err != nil {
+		return nil, err
+	}
 	return slices.Clone(f.include[deviceProfileRefKey(ref)]), nil
 }
 
 func (f *fakeDeviceProfileCloudflare) ReplaceDeviceProfileInclude(_ context.Context, ref flarecloudflare.DeviceProfileRef, entries []flarecloudflare.SplitTunnelEntry) ([]flarecloudflare.SplitTunnelEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.failures["ReplaceInclude"]; err != nil {
+		return nil, err
+	}
 	f.calls = append(f.calls, "ReplaceInclude")
 	f.include[deviceProfileRefKey(ref)] = slices.Clone(entries)
 	return slices.Clone(entries), nil
@@ -637,6 +761,25 @@ func (f *fakeDeviceProfileCloudflare) callCount(name string) int {
 	}
 	return count
 }
+
+func (f *fakeDeviceProfileCloudflare) fail(name string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failures[name] = err
+}
+
+func (f *fakeDeviceProfileCloudflare) fallbackSnapshot(ref flarecloudflare.DeviceProfileRef) []flarecloudflare.FallbackDomain {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.fallback[deviceProfileRefKey(ref)])
+}
+
+func (f *fakeDeviceProfileCloudflare) includeSnapshot(ref flarecloudflare.DeviceProfileRef) []flarecloudflare.SplitTunnelEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.include[deviceProfileRefKey(ref)])
+}
+
 func applyFakeProfileInput(profile *flarecloudflare.DeviceProfile, input flarecloudflare.DeviceProfileInput) {
 	if input.Name != nil {
 		profile.Name = *input.Name

@@ -491,6 +491,250 @@ func TestWARPConnectorCreateCheckpointUsesNormalizedName(t *testing.T) {
 	}
 }
 
+func TestWARPConnectorObserveOnlyRejectsFailoverRequest(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 18, 0, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	remote.connector = flarecloudflare.WARPConnector{ID: "external-warp", AccountTag: "account-id", Name: "site-warp", Status: flarecloudflare.TunnelStatusHealthy, TunnelType: flarecloudflare.TunnelTypeWARPConnector}
+	remote.configuration = flarecloudflare.WARPConnectorConfiguration{TunnelID: "external-warp", Mode: flarecloudflare.WARPConnectorHAModeLocal, Local: &flarecloudflare.WARPConnectorLocalConfiguration{VIPs: []string{"192.0.2.20"}}}
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	object.Spec.ManagementPolicy = flarewayv1alpha1.ManagementPolicyObserveOnly
+	object.Spec.ExternalRef = &flarewayv1alpha1.WARPConnectorExternalReference{TunnelID: "external-warp"}
+	object.Spec.HighAvailability = flarewayv1alpha1.WARPConnectorHighAvailability{Enabled: new(true), Mode: flarewayv1alpha1.WARPConnectorHAModeLocal, Local: &flarewayv1alpha1.WARPConnectorLocalHAConfig{VIPs: []flarewayv1alpha1.WARPConnectorVirtualIP{{Address: "192.0.2.20"}}}}
+	object.Spec.Failover = &flarewayv1alpha1.WARPConnectorFailoverRequest{ClientID: "client-00", RequestID: "request-1"}
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+	reconcileWARPConnector(ctx, t, reconciler, request, "add finalizer")
+	reconcileWARPConnector(ctx, t, reconciler, request, "reject ObserveOnly failover")
+
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	accepted := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != "Invalid" ||
+		!strings.Contains(accepted.Message, "ObserveOnly") || current.Status.Failover != nil || remote.failovers != 0 {
+		t.Fatalf("ObserveOnly failover was applied: accepted=%#v failover=%#v calls=%d", accepted, current.Status.Failover, remote.failovers)
+	}
+}
+
+func TestWARPConnectorFailoverToUnlinkedClientStaysPending(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 18, 30, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	object.Spec.HighAvailability = flarewayv1alpha1.WARPConnectorHighAvailability{
+		Enabled: new(true), Mode: flarewayv1alpha1.WARPConnectorHAModeLocal,
+		Local: &flarewayv1alpha1.WARPConnectorLocalHAConfig{VIPs: []flarewayv1alpha1.WARPConnectorVirtualIP{{Address: "192.0.2.10"}}},
+	}
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+	reconcileWARPConnector(ctx, t, reconciler, request, "add finalizer")
+	reconcileWARPConnector(ctx, t, reconciler, request, "prepare create recovery")
+	reconcileWARPConnector(ctx, t, reconciler, request, "create and configure")
+
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Spec.Failover = &flarewayv1alpha1.WARPConnectorFailoverRequest{ClientID: "ghost-client", RequestID: "request-1"}
+	if err := kube.Update(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWARPConnector(ctx, t, reconciler, request, "reject failover to unlinked client")
+
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	accepted := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != "Pending" ||
+		!strings.Contains(accepted.Message, "ghost-client") || current.Status.Failover != nil || remote.failovers != 0 {
+		t.Fatalf("failover to an unlinked client was applied: accepted=%#v failover=%#v calls=%d", accepted, current.Status.Failover, remote.failovers)
+	}
+}
+
+func TestWARPConnectorSteadyStateRejectsForeignRemote(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*fakeWARPConnectorCloudflare)
+		wantReason string
+	}{
+		{name: "deleted remote", mutate: func(remote *fakeWARPConnectorCloudflare) {
+			remote.connector.DeletedAt = new(time.Now())
+		}, wantReason: "Conflict"},
+		{name: "tunnel type", mutate: func(remote *fakeWARPConnectorCloudflare) {
+			remote.connector.TunnelType = flarecloudflare.TunnelTypeCloudflared
+		}, wantReason: "TunnelTypeMismatch"},
+		{name: "account", mutate: func(remote *fakeWARPConnectorCloudflare) {
+			remote.connector.AccountTag = "other-account"
+		}, wantReason: "Conflict"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			clock := time.Date(2026, time.September, 14, 19, 0, 0, 0, time.UTC)
+			remote := newFakeWARPConnectorCloudflare()
+			remote.connector = flarecloudflare.WARPConnector{
+				ID: "foreign-warp", AccountTag: "account-id", Name: "site-warp",
+				Status: flarecloudflare.TunnelStatusInactive, TunnelType: flarecloudflare.TunnelTypeWARPConnector,
+			}
+			test.mutate(remote)
+			kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+			object.Finalizers = []string{flarewayv1alpha1.WARPConnectorFinalizer}
+			if err := kube.Create(ctx, object); err != nil {
+				t.Fatal(err)
+			}
+			var checkpointed flarewayv1alpha1.WARPConnector
+			if err := kube.Get(ctx, client.ObjectKeyFromObject(object), &checkpointed); err != nil {
+				t.Fatal(err)
+			}
+			checkpointed.Status.TunnelID = "foreign-warp"
+			checkpointed.Status.OwnershipVerified = true
+			if err := kube.Status().Update(ctx, &checkpointed); err != nil {
+				t.Fatal(err)
+			}
+			request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+			reconcileWARPConnector(ctx, t, reconciler, request, "reject foreign remote")
+
+			var current flarewayv1alpha1.WARPConnector
+			if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			accepted := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted)
+			if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != test.wantReason ||
+				remote.creates != 0 || remote.nameUpdates != 0 || remote.configurationUpdates != 0 || remote.failovers != 0 {
+				t.Fatalf("foreign remote was not rejected: accepted=%#v remote=%#v", accepted, remote)
+			}
+		})
+	}
+}
+
+func TestWARPConnectorTokenSecretOwnedByAnotherObjectConflicts(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 19, 30, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+	reconcileWARPConnector(ctx, t, reconciler, request, "add finalizer")
+	reconcileWARPConnector(ctx, t, reconciler, request, "prepare create recovery")
+
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: warpConnectorSecretPrefix + object.Name, Namespace: object.Namespace,
+	}, Data: map[string][]byte{flarewayv1alpha1.WARPConnectorTokenSecretKey: []byte("foreign-token")}}
+	if err := kube.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWARPConnector(ctx, t, reconciler, request, "reject foreign token Secret")
+
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	accepted := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != "Conflict" ||
+		!strings.Contains(accepted.Message, "not owned") || remote.tokenGets != 0 {
+		t.Fatalf("foreign token Secret was not rejected: accepted=%#v tokenGets=%d", accepted, remote.tokenGets)
+	}
+	var persisted corev1.Secret
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(foreign), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if string(persisted.Data[flarewayv1alpha1.WARPConnectorTokenSecretKey]) != "foreign-token" || len(persisted.OwnerReferences) != 0 {
+		t.Fatalf("foreign token Secret was rewritten: %#v", persisted)
+	}
+}
+
+func TestWARPConnectorOrphanDeletionRetainsRemote(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 20, 0, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+	reconcileWARPConnector(ctx, t, reconciler, request, "add finalizer")
+	reconcileWARPConnector(ctx, t, reconciler, request, "prepare create recovery")
+	reconcileWARPConnector(ctx, t, reconciler, request, "create and configure")
+
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWARPConnector(ctx, t, reconciler, request, "record orphaned remote")
+	reconcileWARPConnector(ctx, t, reconciler, request, "remove finalizer")
+	if remote.deletes != 0 {
+		t.Fatalf("orphaned WARP Connector deleted the remote: %d", remote.deletes)
+	}
+	if remote.connector.Deleted() {
+		t.Fatal("orphaned remote connector was marked deleted")
+	}
+	if err := kube.Get(ctx, request.NamespacedName, new(flarewayv1alpha1.WARPConnector)); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphaned WARPConnector still exists after finalization: %v", err)
+	}
+}
+
+func TestWARPConnectorDeletionBlockedByReferencingRoute(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 20, 30, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	object.Spec.DeletionPolicy = flarewayv1alpha1.DeletionPolicyDelete
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}
+	reconcileWARPConnector(ctx, t, reconciler, request, "add finalizer")
+	reconcileWARPConnector(ctx, t, reconciler, request, "prepare create recovery")
+	reconcileWARPConnector(ctx, t, reconciler, request, "create and configure")
+
+	route := &flarewayv1alpha1.NetworkRoute{ObjectMeta: metav1.ObjectMeta{Name: "referencing", Namespace: "tenant"}, Spec: flarewayv1alpha1.NetworkRouteSpec{
+		AccountRef: corev1.LocalObjectReference{Name: "account"}, Network: "10.96.0.0/12",
+		TunnelRef: flarewayv1alpha1.TunnelReference{Kind: flarewayv1alpha1.TunnelReferenceKindWARPConnector, Name: object.Name},
+	}}
+	if err := kube.Create(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWARPConnector(ctx, t, reconciler, request, "block deletion on referencing route")
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	blocked := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked)
+	if blocked == nil || blocked.Status != metav1.ConditionTrue || !strings.Contains(blocked.Message, "NetworkRoute tenant/referencing") ||
+		remote.deletes != 0 {
+		t.Fatalf("deletion was not blocked by the referencing route: blocked=%#v deletes=%d", blocked, remote.deletes)
+	}
+
+	if err := kube.Delete(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	reconcileWARPConnector(ctx, t, reconciler, request, "delete remote after route removal")
+	if remote.deletes != 1 {
+		t.Fatalf("remote delete calls = %d", remote.deletes)
+	}
+	if err := kube.Get(ctx, request.NamespacedName, new(flarewayv1alpha1.WARPConnector)); !apierrors.IsNotFound(err) {
+		t.Fatalf("WARPConnector still exists after finalization: %v", err)
+	}
+}
+
 func newWARPConnectorTestReconciler(t *testing.T, remote *fakeWARPConnectorCloudflare, clock time.Time) (client.Client, *WARPConnectorReconciler, *flarewayv1alpha1.WARPConnector) {
 	t.Helper()
 	scheme := runtime.NewScheme()

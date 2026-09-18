@@ -45,7 +45,7 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 		return result
 	}
 	if in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt != nil {
-		return accessFailure("TargetNotFound", "CloudflareTunnel is remotely deleted and private destinations are unavailable while it drains")
+		return accessLossFailure("CloudflareTunnel is remotely deleted and private destinations are unavailable while it drains", AccessTargetLossTunnel)
 	}
 	if in.CloudflareAccount == nil {
 		return accessFailure("TargetNotFound", "CloudflareAccount is required for private destinations")
@@ -74,13 +74,16 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 		if private.NetworkRouteRef != nil {
 			route := networkRouteByName(in.NetworkRoutes, application.Namespace, private.NetworkRouteRef.Name)
 			if route == nil {
-				return accessFailure("TargetNotFound", fmt.Sprintf("NetworkRoute %s/%s was not found", application.Namespace, private.NetworkRouteRef.Name))
+				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s was not found", application.Namespace, private.NetworkRouteRef.Name), AccessTargetLossNetworkRoute)
+			}
+			if !route.DeletionTimestamp.IsZero() {
+				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossNetworkRoute)
 			}
 			if failure := authorizePrivateRoute(in, application, applicationNamespace, route.Namespace, route.Spec.AccountRef.Name, route.Spec.AllowedNamespaces, authz.PrivateRouteNetwork, route.Labels); failure != nil {
 				return *failure
 			}
 			if !networkRouteAppliedCurrent(route) {
-				return accessFailure("TargetNotFound", fmt.Sprintf("NetworkRoute %s/%s is not ready", route.Namespace, route.Name))
+				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossNetworkRoute)
 			}
 			cidr, err := resolvedPrivateCIDR(route.Status.Applied.Network, private.CIDR)
 			if err != nil {
@@ -96,13 +99,16 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 
 		route := hostnameRouteByName(in.HostnameRoutes, application.Namespace, private.HostnameRouteRef.Name)
 		if route == nil {
-			return accessFailure("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s was not found", application.Namespace, private.HostnameRouteRef.Name))
+			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s was not found", application.Namespace, private.HostnameRouteRef.Name), AccessTargetLossHostnameRoute)
+		}
+		if !route.DeletionTimestamp.IsZero() {
+			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossHostnameRoute)
 		}
 		if failure := authorizePrivateRoute(in, application, applicationNamespace, route.Namespace, route.Spec.AccountRef.Name, route.Spec.AllowedNamespaces, authz.PrivateRouteHostname, route.Labels); failure != nil {
 			return *failure
 		}
 		if !hostnameRouteAppliedCurrent(route) {
-			return accessFailure("TargetNotFound", fmt.Sprintf("HostnameRoute %s/%s is not ready", route.Namespace, route.Name))
+			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossHostnameRoute)
 		}
 		appendCompiledDestination(&result, seenDestination, AccessDestination{
 			Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: normalizePrivateHostname(route.Status.Applied.Hostname), PortRange: private.PortRange,

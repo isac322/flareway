@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
@@ -175,14 +176,252 @@ func TestEstablishedTransientOwnerBlocksNewAdopters(t *testing.T) {
 	}
 }
 
+func TestEstablishedTransientSingletonOwnerBlocksNewAdopters(t *testing.T) {
+	accountID := "0123456789abcdef0123456789abcdef"
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: accountID,
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"platform": "true"}},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue},
+		}},
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "platform", Labels: map[string]string{"platform": "true"}}}
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+
+	ownerSettings := v1alpha1.DeviceSettings{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-settings", CreationTimestamp: older},
+		Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		Status:     v1alpha1.DeviceSettingsStatus{Conditions: []metav1.Condition{{Type: v1alpha1.DeviceSettingsConditionAccepted, Status: metav1.ConditionFalse, Reason: "CloudflareError"}}},
+	}
+	newSettings := &v1alpha1.DeviceSettings{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-settings", CreationTimestamp: newer},
+		Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	reader := &globalArbitrationReader{account: account, namespace: namespace, deviceSettings: []v1alpha1.DeviceSettings{ownerSettings}}
+	if err := (&DeviceSettingsReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newSettings, accountID); privateErrorReason(err) != "Conflict" {
+		t.Fatalf("new DeviceSettings adopter was not blocked by transiently failing established owner: %v", err)
+	}
+
+	ownerOrganization := v1alpha1.ZeroTrustOrganization{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-organization", CreationTimestamp: older},
+		Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		Status:     v1alpha1.ZeroTrustOrganizationStatus{Conditions: []metav1.Condition{{Type: v1alpha1.ZeroTrustOrganizationConditionAccepted, Status: metav1.ConditionFalse, Reason: "CloudflareError"}}},
+	}
+	newOrganization := &v1alpha1.ZeroTrustOrganization{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-organization", CreationTimestamp: newer},
+		Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	reader.organizations = []v1alpha1.ZeroTrustOrganization{ownerOrganization}
+	if err := (&ZeroTrustOrganizationReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newOrganization, accountID, flarecloudflare.AccessScope{}); privateErrorReason(err) != "Conflict" {
+		t.Fatalf("new ZeroTrustOrganization adopter was not blocked by transiently failing established owner: %v", err)
+	}
+}
+
+func TestSingletonArbitrationPropagatesReaderErrors(t *testing.T) {
+	accountID := "0123456789abcdef0123456789abcdef"
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: accountID,
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"platform": "true"}},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue},
+		}},
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "platform", Labels: map[string]string{"platform": "true"}}}
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+
+	ownerSettings := v1alpha1.DeviceSettings{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-settings", CreationTimestamp: older},
+		Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	newSettings := &v1alpha1.DeviceSettings{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-settings", CreationTimestamp: newer},
+		Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	ownerOrganization := v1alpha1.ZeroTrustOrganization{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-organization", CreationTimestamp: older},
+		Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	newOrganization := &v1alpha1.ZeroTrustOrganization{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-organization", CreationTimestamp: newer},
+		Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+
+	getErr := errors.New("indeterminate get failure")
+	reader := &globalArbitrationReader{
+		account: account, namespace: namespace, getError: getErr,
+		deviceSettings: []v1alpha1.DeviceSettings{ownerSettings},
+		organizations:  []v1alpha1.ZeroTrustOrganization{ownerOrganization},
+	}
+	if err := (&DeviceSettingsReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newSettings, accountID); !errors.Is(err, getErr) {
+		t.Fatalf("DeviceSettings arbitration did not propagate the account reader error: %v", err)
+	}
+	if err := (&ZeroTrustOrganizationReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newOrganization, accountID, flarecloudflare.AccessScope{}); !errors.Is(err, getErr) {
+		t.Fatalf("ZeroTrustOrganization arbitration did not propagate the account reader error: %v", err)
+	}
+
+	listErr := errors.New("indeterminate list failure")
+	reader.getError = nil
+	reader.listError = listErr
+	if err := (&DeviceSettingsReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newSettings, accountID); !errors.Is(err, listErr) {
+		t.Fatalf("DeviceSettings arbitration did not propagate the list reader error: %v", err)
+	}
+	if err := (&ZeroTrustOrganizationReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newOrganization, accountID, flarecloudflare.AccessScope{}); !errors.Is(err, listErr) {
+		t.Fatalf("ZeroTrustOrganization arbitration did not propagate the list reader error: %v", err)
+	}
+}
+
+func TestSingletonArbitrationSkipsIneligibleContenders(t *testing.T) {
+	accountID := "0123456789abcdef0123456789abcdef"
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: accountID,
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"platform": "true"}},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue},
+		}},
+	}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "platform", Labels: map[string]string{"platform": "true"}}}
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+	deleting := metav1.NewTime(time.Now().Add(-time.Second))
+
+	newSettings := &v1alpha1.DeviceSettings{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-settings", CreationTimestamp: newer},
+		Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+	newOrganization := &v1alpha1.ZeroTrustOrganization{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "new-organization", CreationTimestamp: newer},
+		Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+	}
+
+	settingsOwner := func() v1alpha1.DeviceSettings {
+		return v1alpha1.DeviceSettings{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-settings", CreationTimestamp: older},
+			Spec:       v1alpha1.DeviceSettingsSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		}
+	}
+	organizationOwner := func() v1alpha1.ZeroTrustOrganization {
+		return v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace.Name, UID: "owner-organization", CreationTimestamp: older},
+			Spec:       v1alpha1.ZeroTrustOrganizationSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		}
+	}
+
+	cases := []struct {
+		name           string
+		mutateSettings func(*v1alpha1.DeviceSettings)
+		mutateOrg      func(*v1alpha1.ZeroTrustOrganization)
+		account        *v1alpha1.CloudflareAccount
+		namespace      *corev1.Namespace
+	}{
+		{
+			name: "observe only owner releases the writer role",
+			mutateSettings: func(owner *v1alpha1.DeviceSettings) {
+				owner.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+			},
+			mutateOrg: func(owner *v1alpha1.ZeroTrustOrganization) {
+				owner.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+			},
+			account:   account,
+			namespace: namespace,
+		},
+		{
+			name: "deleting owner releases the writer role",
+			mutateSettings: func(owner *v1alpha1.DeviceSettings) {
+				owner.DeletionTimestamp = &deleting
+			},
+			mutateOrg: func(owner *v1alpha1.ZeroTrustOrganization) {
+				owner.DeletionTimestamp = &deleting
+			},
+			account:   account,
+			namespace: namespace,
+		},
+		{
+			name: "unauthorized owner does not block valid contenders",
+			account: func() *v1alpha1.CloudflareAccount {
+				denied := account.DeepCopy()
+				denied.Spec.Grants[0].PlatformObjects = v1alpha1.GrantPermissionDenied
+				return denied
+			}(),
+			namespace: namespace,
+		},
+		{
+			name:      "missing account does not block valid contenders",
+			account:   nil,
+			namespace: namespace,
+		},
+		{
+			name:      "missing namespace does not block valid contenders",
+			account:   account,
+			namespace: nil,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ownerSettings := settingsOwner()
+			if testCase.mutateSettings != nil {
+				testCase.mutateSettings(&ownerSettings)
+			}
+			reader := &globalArbitrationReader{
+				account: testCase.account, namespace: testCase.namespace,
+				deviceSettings: []v1alpha1.DeviceSettings{ownerSettings},
+			}
+			if err := (&DeviceSettingsReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newSettings, accountID); err != nil {
+				t.Fatalf("ineligible DeviceSettings contender blocked a valid writer: %v", err)
+			}
+
+			ownerOrganization := organizationOwner()
+			if testCase.mutateOrg != nil {
+				testCase.mutateOrg(&ownerOrganization)
+			}
+			reader = &globalArbitrationReader{
+				account: testCase.account, namespace: testCase.namespace,
+				organizations: []v1alpha1.ZeroTrustOrganization{ownerOrganization},
+			}
+			if err := (&ZeroTrustOrganizationReconciler{APIReader: reader}).checkSingleWriter(context.Background(), newOrganization, accountID, flarecloudflare.AccessScope{}); err != nil {
+				t.Fatalf("ineligible ZeroTrustOrganization contender blocked a valid writer: %v", err)
+			}
+		})
+	}
+}
+
 type globalArbitrationReader struct {
-	account   *v1alpha1.CloudflareAccount
-	namespace *corev1.Namespace
-	lists     []v1alpha1.ZeroTrustList
-	policies  []v1alpha1.ZeroTrustGatewayPolicy
+	account        *v1alpha1.CloudflareAccount
+	namespace      *corev1.Namespace
+	lists          []v1alpha1.ZeroTrustList
+	policies       []v1alpha1.ZeroTrustGatewayPolicy
+	deviceSettings []v1alpha1.DeviceSettings
+	organizations  []v1alpha1.ZeroTrustOrganization
+	getError       error
+	listError      error
 }
 
 func (r *globalArbitrationReader) Get(_ context.Context, key client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+	if r.getError != nil {
+		return r.getError
+	}
 	switch target := object.(type) {
 	case *v1alpha1.CloudflareAccount:
 		if r.account != nil && key.Name == r.account.Name {
@@ -199,11 +438,18 @@ func (r *globalArbitrationReader) Get(_ context.Context, key client.ObjectKey, o
 }
 
 func (r *globalArbitrationReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	if r.listError != nil {
+		return r.listError
+	}
 	switch target := list.(type) {
 	case *v1alpha1.ZeroTrustListList:
 		target.Items = append([]v1alpha1.ZeroTrustList(nil), r.lists...)
 	case *v1alpha1.ZeroTrustGatewayPolicyList:
 		target.Items = append([]v1alpha1.ZeroTrustGatewayPolicy(nil), r.policies...)
+	case *v1alpha1.DeviceSettingsList:
+		target.Items = append([]v1alpha1.DeviceSettings(nil), r.deviceSettings...)
+	case *v1alpha1.ZeroTrustOrganizationList:
+		target.Items = append([]v1alpha1.ZeroTrustOrganization(nil), r.organizations...)
 	default:
 		return apierrors.NewNotFound(schema.GroupResource{Group: "test", Resource: "lists"}, "")
 	}

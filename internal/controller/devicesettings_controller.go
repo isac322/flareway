@@ -118,8 +118,11 @@ func (r *DeviceSettingsReconciler) checkSingleWriter(ctx context.Context, object
 			effectiveGlobalManagementPolicy(other.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged {
 			continue
 		}
-		otherAccountID, eligible := globalContenderAccountID(ctx, reader, other.Namespace, other.Spec.AccountRef.Name, other.Status.Conditions, false)
-		if !eligible || otherAccountID != accountID {
+		otherAccount, eligible, err := globalContenderAccount(ctx, reader, other.Namespace, other.Spec.AccountRef.Name)
+		if err != nil {
+			return err
+		}
+		if !eligible || otherAccount.Spec.AccountID != accountID {
 			continue
 		}
 		otherKey := client.ObjectKeyFromObject(other)
