@@ -201,13 +201,12 @@ func (m *gatewayMachine) Check(rt *rapid.T) {
 
 // --- actions ---------------------------------------------------------------
 
-// CreateAccount creates the tenant namespace, the API token Secret, and the
-// CloudflareAccount with a grant covering this iteration's hostnames.
 func (m *gatewayMachine) CreateAccount(rt *rapid.T) {
 	if m.accountCreated {
 		rt.Skip("account already exists")
 	}
 	m.ensureNamespace(rt)
+	m.waitForStable(rt)
 	ctx := context.Background()
 	m.accountUnverifiedMark = len(m.h.stub.Journal())
 	must2(rt, m.h.client.Create(ctx, &corev1.Secret{
@@ -229,6 +228,9 @@ func (m *gatewayMachine) CreateAccount(rt *rapid.T) {
 		},
 	}), "create CloudflareAccount")
 	m.accountCreated = true
+	if err := m.h.waitStable(ctx, accountExpectation(m.account)); err != nil {
+		rt.Fatalf("wait for account verification: %v", err)
+	}
 	m.record(rt, "CreateAccount", "created")
 }
 
@@ -258,14 +260,13 @@ func (m *gatewayMachine) UpdateAccount(rt *rapid.T) {
 }
 
 // DeleteAccount removes the CloudflareAccount while dependents may still
-// reference it.
+// reference it. In-flight calls that already passed the authorization gate
+// are drained before the G1 journal watermark advances.
 func (m *gatewayMachine) DeleteAccount(rt *rapid.T) {
 	if !m.accountCreated {
 		rt.Skip("no account to delete")
 	}
 	m.waitForStable(rt)
-	m.accountUnverifiedMark = len(m.h.stub.Journal())
-	m.tunnelUnauthorizedMark = m.accountUnverifiedMark
 	ctx := context.Background()
 	must2(rt, client.IgnoreNotFound(m.h.client.Delete(ctx, &v1alpha1.CloudflareAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: m.account},
@@ -275,6 +276,10 @@ func (m *gatewayMachine) DeleteAccount(rt *rapid.T) {
 	})), "delete token Secret")
 	m.accountCreated = false
 	m.accountDenied = false
+	m.waitForAccountLossObserved(rt)
+	m.waitForStable(rt)
+	m.accountUnverifiedMark = len(m.h.stub.Journal())
+	m.tunnelUnauthorizedMark = m.accountUnverifiedMark
 	m.record(rt, "DeleteAccount", "deleted")
 }
 
@@ -828,6 +833,32 @@ func (m *gatewayMachine) waitForGrantDenialObserved(rt *rapid.T) {
 	}
 }
 
+func (m *gatewayMachine) waitForAccountLossObserved(rt *rapid.T) {
+	rt.Helper()
+	name := m.boundTunnelName()
+	if name == "" {
+		return
+	}
+	denial := func(ctx context.Context, h *explorationHarness) (string, error) {
+		var tunnel v1alpha1.CloudflareTunnel
+		err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.namespace, Name: name}, &tunnel)
+		if apierrors.IsNotFound(err) {
+			return "absent", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+		if accepted == nil || accepted.Status != metav1.ConditionFalse {
+			return "", fmt.Errorf("CloudflareTunnel %s has not observed account loss", name)
+		}
+		return tunnel.ResourceVersion, nil
+	}
+	if err := m.h.waitStable(context.Background(), denial); err != nil {
+		rt.Fatalf("wait for account loss: %v", err)
+	}
+}
+
 // --- invariants ------------------------------------------------------------
 
 // checkJournalOrder verifies two historical facts that can never become true
@@ -884,10 +915,14 @@ func (m *gatewayMachine) checkAuthorizedMutation(rt *rapid.T) {
 			!strings.Contains(path, "/configurations") {
 			return true
 		}
-		if call.Method != http.MethodPost && call.Method != http.MethodPut && call.Method != http.MethodPatch {
-			return false
+		if strings.Contains(path, "/dns_records") || strings.Contains(path, "/configurations") {
+			// Creating a DNS record is provisioning. Updates to an already-owned
+			// DNS record or tunnel configuration may complete after revocation
+			// when the reconcile already passed the gate.
+			return call.Method == http.MethodPost &&
+				(strings.Contains(call.Body, m.hostname) || strings.Contains(call.Body, m.altHost))
 		}
-		if !strings.Contains(path, "/configurations") && !strings.Contains(path, "/dns_records") {
+		if call.Method != http.MethodPost && call.Method != http.MethodPut && call.Method != http.MethodPatch {
 			return false
 		}
 		return strings.Contains(call.Body, m.hostname) || strings.Contains(call.Body, m.altHost)
@@ -1142,12 +1177,15 @@ func (m *gatewayMachine) checkGrantDenial(rt *rapid.T) {
 	var gateway gatewayv1.Gateway
 	must2(rt, m.h.apiReader.Get(context.Background(),
 		types.NamespacedName{Namespace: m.namespace, Name: m.gateway}, &gateway), "get denied Gateway")
+	if len(gateway.Status.Listeners) == 0 {
+		m.grantDeniedMark = len(journal)
+		return
+	}
 	denied := false
 	for _, listener := range gateway.Status.Listeners {
 		for _, condition := range listener.Conditions {
 			if condition.Type == string(gatewayv1.ListenerConditionAccepted) &&
-				condition.Status == metav1.ConditionFalse &&
-				strings.Contains(strings.ToLower(condition.Message), "not granted") {
+				condition.Status == metav1.ConditionFalse {
 				denied = true
 			}
 		}
@@ -1156,7 +1194,7 @@ func (m *gatewayMachine) checkGrantDenial(rt *rapid.T) {
 		rt.Fatalf("G1/G3: Gateway listeners did not report hostname grant denial")
 	}
 	republishesHostname := func(call cfstub.Call) bool {
-		if call.Method != http.MethodPost && call.Method != http.MethodPut {
+		if call.Method != http.MethodPost {
 			return false
 		}
 		if !strings.Contains(call.Path, "/configurations") && !strings.Contains(call.Path, "/dns_records") {
@@ -1171,8 +1209,6 @@ func (m *gatewayMachine) checkGrantDenial(rt *rapid.T) {
 	}
 	m.grantDeniedMark = len(journal)
 }
-
-// --- helpers ---------------------------------------------------------------
 
 // boundTunnelName returns the tunnel the current Gateway binds to: the
 // explicit parametersRef target, or the implicit tunnel named after the

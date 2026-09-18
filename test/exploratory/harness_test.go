@@ -24,13 +24,16 @@ package exploratory
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/cloudflare-go/v7/option"
 	"github.com/go-logr/logr"
 	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -81,6 +84,10 @@ type explorationHarness struct {
 	manager ctrl.Manager
 	cancel  context.CancelFunc
 	done    chan error
+
+	// inflight counts Cloudflare HTTP requests the production client has
+	// started but not finished. Journal length alone cannot see those calls.
+	inflight atomic.Int64
 }
 
 // stabilityExpectation observes one aspect of the system. The returned string
@@ -129,6 +136,10 @@ func newExplorationHarness(t *testing.T) *explorationHarness {
 		flarecloudflare.WithBaseURL(h.stub.URL),
 		flarecloudflare.WithLimiter(rate.NewLimiter(rate.Inf, 0)),
 		flarecloudflare.WithListLimiter(rate.NewLimiter(rate.Inf, 0)),
+		flarecloudflare.WithRequestOptions(
+			option.WithHTTPClient(&http.Client{Transport: &inflightTransport{n: &h.inflight}}),
+			option.WithMiddleware(h.trackCloudflareCalls),
+		),
 	)
 
 	h.startManager(t)
@@ -147,10 +158,10 @@ func (h *explorationHarness) resetIteration(t *testing.T) {
 }
 
 // waitStable polls every expectation plus the stub journal signature until all
-// expectations succeed and the combined signature is unchanged for
-// stabilityConsecutive consecutive observations, or ctx times out. A context
-// without a deadline is bounded by stabilityMaxWait. Recorded stub contract
-// violations fail immediately.
+// expectations succeed, no Cloudflare HTTP call is in flight, and the combined
+// signature is unchanged for stabilityConsecutive consecutive observations, or
+// ctx times out. A context without a deadline is bounded by stabilityMaxWait.
+// Recorded stub contract violations fail immediately.
 func (h *explorationHarness) waitStable(ctx context.Context, expectations ...stabilityExpectation) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -169,6 +180,10 @@ func (h *explorationHarness) waitStable(ctx context.Context, expectations ...sta
 
 		var signature strings.Builder
 		var errs []error
+		if inflight := h.inflight.Load(); inflight > 0 {
+			errs = append(errs, fmt.Errorf("%d in-flight Cloudflare API calls", inflight))
+			fmt.Fprintf(&signature, "inflight=%d;", inflight)
+		}
 		for index, expectation := range expectations {
 			fingerprint, err := expectation(ctx, h)
 			fmt.Fprintf(&signature, "e%d=%s;", index, fingerprint)
@@ -199,6 +214,22 @@ func (h *explorationHarness) waitStable(ctx context.Context, expectations ...sta
 		case <-time.After(stabilityPollInterval):
 		}
 	}
+}
+
+func (h *explorationHarness) trackCloudflareCalls(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+	h.inflight.Add(1)
+	defer h.inflight.Add(-1)
+	return next(req)
+}
+
+type inflightTransport struct {
+	n *atomic.Int64
+}
+
+func (t *inflightTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.n.Add(1)
+	defer t.n.Add(-1)
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // restartManager stops the current manager and starts a fresh one against the

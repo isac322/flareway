@@ -728,6 +728,10 @@ func (m *networkMachine) RemoteDrift(rt *rapid.T) {
 	candidates := make([]candidate, 0, len(m.routes)+len(m.vnets))
 	ctx := context.Background()
 	for name, route := range m.routes {
+		account, ok := m.accounts[route.account]
+		if !ok || account.deleted || !account.granted {
+			continue
+		}
 		if route.deleted || route.policy != v1alpha1.ManagementPolicyManaged || m.faultOutstanding(route.account, "route") {
 			continue
 		}
@@ -742,6 +746,10 @@ func (m *networkMachine) RemoteDrift(rt *rapid.T) {
 		}
 	}
 	for name, vnet := range m.vnets {
+		account, ok := m.accounts[vnet.account]
+		if !ok || account.deleted || !account.granted {
+			continue
+		}
 		if vnet.deleted || vnet.policy != v1alpha1.ManagementPolicyManaged || m.faultOutstanding(vnet.account, "vnet") {
 			continue
 		}
