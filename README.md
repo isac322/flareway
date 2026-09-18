@@ -42,15 +42,17 @@ support yet — see [Conformance and testing](#conformance-and-testing).
 ## How it works
 
 Each `Gateway` maps to one `CloudflareTunnel` and one data-plane Deployment.
-The pod runs three containers:
+The pod runs `cloudflared` and Envoy, plus a CoreDNS sidecar when the Gateway
+has private listeners:
 
 - `cloudflared` opens outbound QUIC/HTTP2 connections to Cloudflare's edge.
   No inbound ports or public IPs are required.
 - Envoy receives decrypted requests from `cloudflared` over loopback and
   applies the routing rules the controller streams to it over xDS (Delta ADS):
   path, header, query, and method matching, rewrites, and weighted backends.
-- A CoreDNS sidecar resolves private hostnames to `127.0.0.1` so WARP private
-  traffic also flows through Envoy.
+- A CoreDNS sidecar is added for Gateways with private listeners. It resolves
+  private hostnames to `127.0.0.1` so WARP private traffic also flows through
+  Envoy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/layers-dark.svg">
