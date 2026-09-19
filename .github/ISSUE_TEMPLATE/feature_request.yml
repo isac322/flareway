@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability or API surface for Flareway.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that Flareway cannot express today? Describe the scenario, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: surface
+    attributes:
+      label: Cloudflare or Gateway API surface involved
+      description: |
+        Which surface does this touch — for example a Cloudflare product
+        (Tunnel, Access, WARP, DNS, Zero Trust settings), a Gateway API
+        resource (Gateway, HTTPRoute, policy attachment), or an existing
+        Flareway CRD group?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: |
+        How you imagine it working: a new CRD, new fields on an existing
+        kind, a new listener behavior, a controller flag. Sketch the
+        resource or config if you can.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, including workarounds you use today, and why they fall short.
+    validations:
+      required: false
