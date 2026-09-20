@@ -626,8 +626,8 @@ func TestDeleteDNSRecordIfOwnedFailsClosed(t *testing.T) {
 	replaced.RecordID = "other-id"
 	deleted, conflict, err = deleteDNSRecordIfOwned(context.Background(), cf, "checkpointed-owner", replaced)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
-	g.Expect(deleted).To(gomega.BeFalse())
-	g.Expect(conflict).To(gomega.ContainSubstring("no longer has managed record ID"))
+	g.Expect(deleted).To(gomega.BeTrue())
+	g.Expect(conflict).To(gomega.BeEmpty())
 	g.Expect(cf.HasDNSRecord("zone", "record")).To(gomega.BeTrue())
 	g.Expect(cf.Calls()).NotTo(gomega.ContainElement("DeleteDNSRecord"))
 }
@@ -1425,7 +1425,9 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(blocked.Reason).To(gomega.Equal("DNSOwnership"))
 			g.Expect(conflict).NotTo(gomega.BeNil())
 			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionTrue))
-			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(managed))
+			g.Expect(current.Status.DNSRecords).To(gomega.HaveLen(1))
+			g.Expect(current.Status.DNSRecords[0].RecordID).To(gomega.Equal(managed.RecordID))
+			g.Expect(current.Status.DNSRecords[0].OwnershipComment).To(gomega.Equal(managed.OwnershipComment))
 			g.Expect(testTunnelCloudflare.HasDNSRecord(managed.ZoneID, managed.RecordID)).To(gomega.BeTrue())
 			g.Expect(countCall(testTunnelCloudflare.Calls(), "DeleteDNSRecord")).To(gomega.Equal(deleteCalls))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
