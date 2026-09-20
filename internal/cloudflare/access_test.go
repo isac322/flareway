@@ -410,6 +410,26 @@ func TestAccessApplicationClientRoutesScopesCapturesSaaSSecretAndRevokes(t *test
 	}
 }
 
+func TestAccessTagClientListsStoredTags(t *testing.T) {
+	server := cfstub.New(t)
+	client := New("top-secret", "account-1", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+	ctx := context.Background()
+
+	for _, name := range []string{"beta-tag", "alpha-tag"} {
+		if _, err := client.CreateAccessTag(ctx, name); err != nil {
+			t.Fatalf("create Access tag %q: %v", name, err)
+		}
+	}
+
+	tags, err := client.ListAccessTags(ctx)
+	if err != nil {
+		t.Fatalf("ListAccessTags: %v", err)
+	}
+	if len(tags) != 2 || tags[0].Name != "alpha-tag" || tags[1].Name != "beta-tag" {
+		t.Fatalf("ListAccessTags = %#v", tags)
+	}
+}
+
 func TestAccessApplicationMatchesInputIgnoresSecretsAndResponseMetadata(t *testing.T) {
 	t.Parallel()
 	input := AccessApplicationInput{
