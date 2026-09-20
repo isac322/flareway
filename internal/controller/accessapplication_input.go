@@ -253,7 +253,7 @@ func (r *AccessApplicationReconciler) resolveSCIMAuthenticationMethod(
 		if namespace == "" {
 			namespace = application.Namespace
 		}
-		if err := authorizeAccessReference(ctx, r.Client, application.Namespace, namespace, account); err != nil {
+		if err := authorizeAccessReference(ctx, r.Client, application.Namespace, namespace, account, "ServiceToken"); err != nil {
 			return flarecloudflare.AccessSCIMAuthenticationInput{}, err
 		}
 		var token v1alpha1.ServiceToken
