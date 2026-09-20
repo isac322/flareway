@@ -32,7 +32,7 @@ func TestAckTrackerRequiresEveryExpectedType(t *testing.T) {
 	tracker.ExpectSnapshot(node, version, map[string]string{
 		resourcev3.ListenerType: "listener",
 		resourcev3.RouteType:    "route",
-	})
+	}, nil)
 
 	listenerRequest := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
 	tracker.OnRequest(7, listenerRequest)
@@ -59,7 +59,7 @@ func TestAckTrackerIgnoresUnsubscribedTypes(t *testing.T) {
 		resourcev3.ListenerType: "listener",
 		resourcev3.RouteType:    "route",
 		resourcev3.SecretType:   "secret",
-	})
+	}, nil)
 
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
 	tracker.OnResponse(7,
@@ -82,7 +82,7 @@ func TestAckTrackerAcceptsReconnectInitialResourceVersions(t *testing.T) {
 	tracker := NewAckTracker()
 	node := "default/gateway"
 	version := "v1"
-	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint})
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint}, nil)
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{
 		Node:    &corev3.Node{Cluster: node},
 		TypeUrl: resourcev3.ClusterType,
@@ -96,7 +96,7 @@ func TestAckTrackerAcceptsReconnectInitialResourceVersions(t *testing.T) {
 	}
 
 	mismatch := NewAckTracker()
-	mismatch.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint})
+	mismatch.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: fingerprint}, nil)
 	mismatch.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{
 		Node:                    &corev3.Node{Cluster: node},
 		TypeUrl:                 resourcev3.ListenerType,
@@ -114,7 +114,7 @@ func TestAckTrackerNewSubscriptionRequiresACK(t *testing.T) {
 	tracker.ExpectSnapshot(node, version, map[string]string{
 		resourcev3.ListenerType: "listener",
 		resourcev3.RouteType:    "route",
-	})
+	}, nil)
 
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
 	tracker.OnResponse(7,
@@ -145,7 +145,7 @@ func TestAckTrackerStreamCloseDropsExpectationWithoutSubscriber(t *testing.T) {
 	tracker.ExpectSnapshot(node, version, map[string]string{
 		resourcev3.ListenerType: "listener",
 		resourcev3.RouteType:    "route",
-	})
+	}, nil)
 
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
 	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
@@ -167,7 +167,7 @@ func TestAckTrackerStreamCloseKeepsExpectationWithRemainingSubscriber(t *testing
 	tracker := NewAckTracker()
 	node := "default/gateway"
 	version := "v1"
-	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.RouteType: "route"})
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.RouteType: "route"}, nil)
 
 	tracker.OnRequest(7, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
 	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.RouteType})
@@ -189,7 +189,7 @@ func TestAckTrackerRequiresLiveStreamForNonEmptySnapshot(t *testing.T) {
 	tracker := NewAckTracker()
 	node := "default/gateway"
 	version := "v1"
-	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"})
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"}, nil)
 	if tracker.IsACKed(node, version) {
 		t.Fatal("snapshot converged without a live xDS stream")
 	}
@@ -222,7 +222,7 @@ func TestAckTrackerForgetPreservesLiveStreamIdentity(t *testing.T) {
 	node := "default/gateway"
 	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
 	tracker.OnRequest(7, request)
-	tracker.ExpectSnapshot(node, "v1", map[string]string{resourcev3.ListenerType: "listener-v1"})
+	tracker.ExpectSnapshot(node, "v1", map[string]string{resourcev3.ListenerType: "listener-v1"}, nil)
 	tracker.OnResponse(7, request, &discoveryv3.DeltaDiscoveryResponse{
 		TypeUrl: resourcev3.ListenerType, SystemVersionInfo: "v1", Nonce: "nack",
 	})
@@ -232,11 +232,11 @@ func TestAckTrackerForgetPreservesLiveStreamIdentity(t *testing.T) {
 	})
 
 	tracker.Forget(node)
-	if _, ok := tracker.nacks[node]; ok {
+	if _, ok := tracker.LastNACK(node); ok {
 		t.Fatal("Forget retained a stale NACK")
 	}
 
-	tracker.ExpectSnapshot(node, "v2", map[string]string{resourcev3.ListenerType: "listener-v2"})
+	tracker.ExpectSnapshot(node, "v2", map[string]string{resourcev3.ListenerType: "listener-v2"}, nil)
 	tracker.OnResponse(7,
 		&discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType},
 		&discoveryv3.DeltaDiscoveryResponse{
@@ -256,7 +256,7 @@ func TestAckTrackerCorrelatesNodeLessFollowupResponsesToStream(t *testing.T) {
 	node := "default/gateway"
 	version := "v1"
 	streamID := int64(17)
-	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"})
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"}, nil)
 
 	tracker.OnRequest(streamID, &discoveryv3.DeltaDiscoveryRequest{
 		Node:    &corev3.Node{Cluster: node},
@@ -284,7 +284,7 @@ func TestAckTrackerRecordsNACKAndRecovers(t *testing.T) {
 	tracker := NewAckTracker()
 	node := "default/gateway"
 	version := "v2"
-	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"})
+	tracker.ExpectSnapshot(node, version, map[string]string{resourcev3.ListenerType: "listener"}, nil)
 	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType}
 	tracker.OnResponse(8, request, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "3"})
 	tracker.OnRequest(8, &discoveryv3.DeltaDiscoveryRequest{
@@ -311,7 +311,7 @@ func TestAckTrackerRecordsNACKAndRecovers(t *testing.T) {
 
 func TestAckTrackerEmptySnapshotConverges(t *testing.T) {
 	tracker := NewAckTracker()
-	tracker.ExpectSnapshot("default/invalid", "empty-v1", nil)
+	tracker.ExpectSnapshot("default/invalid", "empty-v1", nil, nil)
 	if !tracker.IsACKed("default/invalid", "empty-v1") {
 		t.Fatal("empty snapshot should converge immediately")
 	}
@@ -323,7 +323,7 @@ func TestAckTrackerExpectsOnlyChangedDeltaTypes(t *testing.T) {
 	tracker.ExpectSnapshot(node, "v1", map[string]string{
 		resourcev3.ListenerType: "listener-a",
 		resourcev3.EndpointType: "endpoint-a",
-	})
+	}, nil)
 	for streamID, typeURL := range []string{resourcev3.ListenerType, resourcev3.EndpointType} {
 		nonce := typeURL + "-v1"
 		request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: typeURL}
@@ -337,15 +337,15 @@ func TestAckTrackerExpectsOnlyChangedDeltaTypes(t *testing.T) {
 	tracker.ExpectSnapshot(node, "v2", map[string]string{
 		resourcev3.ListenerType: "listener-a",
 		resourcev3.EndpointType: "endpoint-b",
-	})
+	}, nil)
 	request := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.EndpointType}
-	tracker.OnResponse(3, request, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.EndpointType, SystemVersionInfo: "v2", Nonce: "endpoint-v2"})
-	tracker.OnRequest(3, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "endpoint-v2"})
+	tracker.OnResponse(1, request, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.EndpointType, SystemVersionInfo: "v2", Nonce: "endpoint-v2"})
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "endpoint-v2"})
 	if !tracker.IsACKed(node, "v2") {
 		t.Fatal("unchanged Listener type incorrectly required a v2 ACK")
 	}
 
-	tracker.ExpectSnapshot(node, "v3", map[string]string{resourcev3.ListenerType: "listener-a"})
+	tracker.ExpectSnapshot(node, "v3", map[string]string{resourcev3.ListenerType: "listener-a"}, nil)
 	if !tracker.IsACKed(node, "v3") {
 		t.Fatal("resource type absent from the new snapshot blocked convergence")
 	}
