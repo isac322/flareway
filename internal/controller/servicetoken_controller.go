@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -94,7 +95,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		id = object.Spec.ExternalRef.TokenID
 		remote, getErr := api.GetServiceToken(ctx, scope, id)
 		if getErr != nil {
-			return ctrl.Result{}, getErr
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, getErr)
 		}
 		if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionFalse, "Conflict", "remote service token name does not match expectation", serviceTokenStatusUpdate{})
@@ -121,7 +122,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		if recoveredID != "" {
 			remote, getErr := api.GetServiceToken(ctx, scope, recoveredID)
 			if getErr != nil {
-				return ctrl.Result{}, getErr
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, getErr)
 			}
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Recovered", "Recovered service token ownership from its Secret", serviceTokenStatusUpdate{OwnershipVerified: true})
 		}
@@ -136,7 +137,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			id = object.Spec.ExternalRef.TokenID
 			remote, err = api.GetServiceToken(ctx, scope, id)
 			if err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 			}
 			if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 				return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionFalse, "Conflict", "remote service token name does not match adoption expectation", serviceTokenStatusUpdate{})
@@ -144,7 +145,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			if !serviceTokenMatchesInput(remote, input) {
 				remote, err = api.UpdateServiceToken(ctx, scope, id, input)
 				if err != nil {
-					return ctrl.Result{}, err
+					return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 				}
 			}
 			previousExpiry, secretErr := r.cleanupPreviousCredentials(ctx, object)
@@ -164,7 +165,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 
 		issued, createErr := api.CreateServiceToken(ctx, scope, input)
 		if createErr != nil {
-			return ctrl.Result{}, createErr
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, createErr)
 		}
 		if err = r.writeInitialSecret(ctx, object, issued.ID, issued.ClientID, issued.ClientSecret); err != nil {
 			return ctrl.Result{}, err
@@ -178,7 +179,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 
 	remote, err = api.GetServiceToken(ctx, scope, id)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 	}
 	if !object.Status.OwnershipVerified {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionFalse, "Conflict", "remote service token ID is not verified as owned or adopted", serviceTokenStatusUpdate{})
@@ -186,7 +187,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if !serviceTokenMatchesInput(remote, input) {
 		remote, err = api.UpdateServiceToken(ctx, scope, id, input)
 		if err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 		}
 		if err = r.clearRefreshExpiry(ctx, object); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
@@ -228,7 +229,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 
 			issued, rotateErr := api.RotateServiceToken(ctx, id, previousExpiryAt)
 			if rotateErr != nil {
-				return ctrl.Result{}, rotateErr
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, rotateErr)
 			}
 			rotatedAt := r.now()
 			if err = r.writeRotatedSecret(ctx, object, issued.ID, issued.ClientID, issued.ClientSecret, previousExpiryAt, rotatedAt); err != nil {
@@ -250,7 +251,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		!remote.ExpiresAt.IsZero() && !remote.ExpiresAt.After(r.now().Add(serviceTokenRefreshWindow(remote.Duration))) {
 		remote, err = api.RefreshServiceToken(ctx, id)
 		if err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 		}
 		if !remote.ExpiresAt.IsZero() {
 			if err = r.recordRefreshExpiry(ctx, object, remote.ExpiresAt); err != nil {
@@ -494,17 +495,17 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete && object.Status.TokenID != "" && object.Status.OwnershipVerified {
 		api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 		if err != nil {
-			return err
+			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 		}
 		scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
 		if scopeErr != nil {
 			if object.Status.ZoneID == "" {
-				return scopeErr
+				return r.patchCleanupBlocked(ctx, object, "Invalid", scopeErr)
 			}
 			scope.ZoneID = object.Status.ZoneID
 		}
 		if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
-			return err
+			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 		}
 	}
 	base := client.MergeFrom(object.DeepCopy())
@@ -536,6 +537,43 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
 	return r.Status().Patch(ctx, object, base)
+}
+
+// finishRemoteError reports a failed remote call on the object's conditions.
+// A typed 404 revokes acceptance because the remote object is gone; any other
+// failure is transient, so the existing Accepted condition and the recorded
+// remote identifiers are preserved while Ready flips to False.
+func (r *ServiceTokenReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.ServiceToken, err error) error {
+	conditions := []metav1.Condition{
+		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteError", err.Error()),
+	}
+	if flarecloudflare.IsNotFound(err) {
+		conditions = []metav1.Condition{
+			accessCondition(object.Generation, "Accepted", metav1.ConditionFalse, "RemoteMissing", err.Error()),
+			accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteMissing", err.Error()),
+		}
+	}
+	base := client.MergeFrom(object.DeepCopy())
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
+	if patchErr := r.Status().Patch(ctx, object, base); patchErr != nil {
+		return errors.Join(err, patchErr)
+	}
+	return err
+}
+
+func (r *ServiceTokenReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.ServiceToken, reason string, cause error) error {
+	base := client.MergeFrom(object.DeepCopy())
+	message := cause.Error()
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
+		accessCondition(object.Generation, "CleanupBlocked", metav1.ConditionTrue, reason, message),
+		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "CleanupBlocked", message),
+	)
+	if patchErr := r.Status().Patch(ctx, object, base); patchErr != nil {
+		return errors.Join(cause, patchErr)
+	}
+	return cause
 }
 
 func serviceTokenRefreshWindow(duration string) time.Duration {

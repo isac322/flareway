@@ -96,7 +96,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
 		remote, getErr := api.GetIdentityProvider(ctx, object.Spec.ExternalRef.IDPID)
 		if getErr != nil {
-			return ctrl.Result{}, getErr
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, getErr)
 		}
 		if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 			return ctrl.Result{}, r.patchStatus(ctx, object, remote, nil, metav1.ConditionFalse, "Conflict", "remote identity provider name does not match expectation")
@@ -128,7 +128,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if id == "" {
 		pendingRemote, pending, pendingErr := r.resumeSCIMCreateIntent(ctx, api, object, input)
 		if pendingErr != nil {
-			return ctrl.Result{}, pendingErr
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, pendingErr)
 		}
 		if pending {
 			if pendingRemote.ID == "" {
@@ -143,7 +143,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if object.Spec.SCIMConfig != nil && (id == "" || !object.Status.OwnershipVerified) {
 		recoveredID, recoverErr := r.recoverSCIMProviderID(ctx, object)
 		if recoverErr != nil {
-			return ctrl.Result{}, recoverErr
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, recoverErr)
 		}
 		if recoveredID != "" {
 			if id != "" && id != recoveredID {
@@ -152,7 +152,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 			id = recoveredID
 			remote, err = api.GetIdentityProvider(ctx, id)
 			if err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 			}
 			recovered = true
 		}
@@ -162,7 +162,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 			id = object.Spec.ExternalRef.IDPID
 			remote, err = api.GetIdentityProvider(ctx, id)
 			if err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 			}
 			if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 				return ctrl.Result{}, r.patchStatus(ctx, object, remote, nil, metav1.ConditionFalse, "Conflict", "remote identity provider name does not match adoption expectation")
@@ -187,7 +187,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 				switch createState {
 				case identityProviderSCIMCreatePrepared:
 					if pendingErr != nil && !pendingOccupied {
-						return ctrl.Result{}, pendingErr
+						return ctrl.Result{}, r.finishRemoteError(ctx, object, pendingErr)
 					}
 					if pendingOccupied {
 						conflictErr := r.setSCIMCreateIntentState(ctx, object, pendingName, identityProviderSCIMCreatePrepared, identityProviderSCIMCreateConflict)
@@ -202,7 +202,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 					remote, err = api.CreateIdentityProvider(ctx, createInput)
 				case identityProviderSCIMCreateIssued:
 					if pendingErr != nil {
-						return ctrl.Result{}, pendingErr
+						return ctrl.Result{}, r.finishRemoteError(ctx, object, pendingErr)
 					}
 					if pendingFound {
 						remote = pendingRemote
@@ -216,7 +216,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 				remote, err = api.CreateIdentityProvider(ctx, createInput)
 			}
 			if err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 			}
 			created = true
 			id = remote.ID
@@ -245,7 +245,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		if remote.ID == "" {
 			remote, err = api.GetIdentityProvider(ctx, id)
 			if err != nil {
-				return ctrl.Result{}, err
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 			}
 		}
 		if recovered {
@@ -264,7 +264,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		if input.SAMLCertificateSetID == "" {
 			certificate, certificateErr := api.CreateIdentityProviderSAMLCertificate(ctx, id)
 			if certificateErr != nil {
-				return ctrl.Result{}, certificateErr
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, certificateErr)
 			}
 			input.SAMLCertificateSetID = certificate.ID
 			remote.SAMLCertificateSetID = certificate.ID
@@ -282,7 +282,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		}
 		remote, err = api.UpdateIdentityProvider(ctx, id, input)
 		if err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 		}
 		if enablingSCIM {
 			if err = r.captureSCIMSecret(ctx, object, id, remote.SCIMSecret); err != nil {
@@ -299,7 +299,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 			if identityProviderRemoteSCIMEnabled(remote.SCIMConfig) {
 				if prepareErr := r.prepareSCIMSecretForEnable(ctx, object, remote.ID); prepareErr == nil {
 					if _, disableErr := api.UpdateIdentityProvider(ctx, id, identityProviderInputWithSCIMEnabled(input, false)); disableErr != nil {
-						return ctrl.Result{}, disableErr
+						return ctrl.Result{}, r.finishRemoteError(ctx, object, disableErr)
 					}
 					return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 				}
@@ -834,7 +834,7 @@ func (r *IdentityProviderReconciler) reconcileDelete(ctx context.Context, object
 		if id == "" {
 			recoveredID, err := r.recoverSCIMProviderIDForDeletion(ctx, object)
 			if err != nil {
-				return err
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
 			if recoveredID != "" {
 				id = recoveredID
@@ -844,23 +844,23 @@ func (r *IdentityProviderReconciler) reconcileDelete(ctx context.Context, object
 		var err error
 		pendingName, pendingState, err = r.recoverSCIMCreateIntentForDeletion(ctx, object)
 		if err != nil {
-			return err
+			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 		}
 	}
 	if shouldDeleteRemote && ((id != "" && ownershipVerified) || (pendingName != "" && pendingState == identityProviderSCIMCreateIssued)) {
 		api, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 		if err != nil {
-			return err
+			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 		}
 		if id != "" && ownershipVerified {
 			remote, getErr := api.GetIdentityProvider(ctx, id)
 			if getErr != nil {
 				if err = ignoreRemoteNotFound(getErr); err != nil {
-					return err
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 				}
 			} else if !remote.ReadOnly {
 				if err = ignoreRemoteNotFound(api.DeleteIdentityProvider(ctx, id)); err != nil {
-					return err
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 				}
 			}
 		}
@@ -877,11 +877,11 @@ func (r *IdentityProviderReconciler) reconcileDelete(ctx context.Context, object
 			}
 			pendingRemote, found, _, findErr := findPendingSCIMIdentityProvider(ctx, api, input)
 			if findErr != nil {
-				return findErr
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", findErr)
 			}
 			if found && pendingRemote.ID != id && !pendingRemote.ReadOnly {
 				if err = ignoreRemoteNotFound(api.DeleteIdentityProvider(ctx, pendingRemote.ID)); err != nil {
-					return err
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 				}
 			}
 		}
@@ -916,6 +916,42 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 		return nil
 	}
 	return r.Status().Patch(ctx, object, base)
+}
+// finishRemoteError reports a failed remote call on the object's conditions.
+// A typed 404 revokes acceptance because the remote object is gone; any other
+// failure is transient, so the existing Accepted condition and the recorded
+// remote identifiers are preserved while Ready flips to False.
+func (r *IdentityProviderReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.IdentityProvider, err error) error {
+	conditions := []metav1.Condition{
+		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteError", err.Error()),
+	}
+	if flarecloudflare.IsNotFound(err) {
+		conditions = []metav1.Condition{
+			accessCondition(object.Generation, "Accepted", metav1.ConditionFalse, "RemoteMissing", err.Error()),
+			accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteMissing", err.Error()),
+		}
+	}
+	base := client.MergeFrom(object.DeepCopy())
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
+	if patchErr := r.Status().Patch(ctx, object, base); patchErr != nil {
+		return errors.Join(err, patchErr)
+	}
+	return err
+}
+
+func (r *IdentityProviderReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.IdentityProvider, reason string, cause error) error {
+	base := client.MergeFrom(object.DeepCopy())
+	message := cause.Error()
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
+		accessCondition(object.Generation, "CleanupBlocked", metav1.ConditionTrue, reason, message),
+		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "CleanupBlocked", message),
+	)
+	if patchErr := r.Status().Patch(ctx, object, base); patchErr != nil {
+		return errors.Join(cause, patchErr)
+	}
+	return cause
 }
 
 func identityProviderSAMLCertificateStatus(value *flarecloudflare.IdentityProviderSAMLCertificateSet) *v1alpha1.IdentityProviderSAMLCertificateSetStatus {
