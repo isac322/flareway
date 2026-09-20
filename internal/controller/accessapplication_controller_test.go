@@ -1097,6 +1097,11 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 	ginkgo.It("revokes and retains the remote application when its AccessPolicy is deleted", func() {
 		fixture := newAccessFixture("policy-loss", false, false)
 		fixture.create()
+		var account v1alpha1.CloudflareAccount
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.account}, &account)).To(gomega.Succeed())
+		beforeAccount := account.DeepCopy()
+		account.Spec.Grants[0].PlatformObjects = v1alpha1.GrantPermissionAllowed
+		gomega.Expect(testClient.Patch(testContext, &account, client.MergeFrom(beforeAccount))).To(gomega.Succeed())
 		var application v1alpha1.AccessApplication
 		programAccessFixture(fixture, &application, 1)
 		parentID := application.Status.ApplicationID
