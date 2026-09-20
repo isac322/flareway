@@ -1,0 +1,104 @@
+package controller
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/gatewayapi"
+)
+
+func TestAccessApplicationInvalidationClearsRemoteProjection(t *testing.T) {
+	now := time.Unix(1, 0)
+	r := &AccessApplicationReconciler{Now: func() time.Time { return now }}
+	application := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", Generation: 3}, Status: v1alpha1.AccessApplicationStatus{
+		Type: v1alpha1.AccessApplicationTypeSelfHosted, OwnershipVerified: true, Domain: "old.example", ZoneID: "zone", Tags: []string{"managed"},
+	}}
+	status := r.desiredStatus(application, gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound"}, "", nil, false)
+	if status.Type != "" || status.OwnershipVerified || status.Domain != "" || status.ZoneID != "" || len(status.Tags) != 0 {
+		t.Fatalf("deleted remote projection retained: %#v", status)
+	}
+}
+
+func TestAccessApplicationUnprogrammedConditionsUsePendingReason(t *testing.T) {
+	r := &AccessApplicationReconciler{Now: time.Now}
+	application := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", Generation: 1}}
+	status := r.desiredStatus(application, gatewayapi.AccessApplicationCompilation{Accepted: true, Reason: "Accepted", OriginJWTEnforced: true}, "remote", nil, false)
+	programmed := conditionByType(status.Conditions, accessApplicationConditionProgrammed)
+	origin := conditionByType(status.Conditions, v1alpha1.AccessApplicationConditionOriginJWTEnforced)
+	if programmed == nil || programmed.Status != metav1.ConditionFalse || programmed.Reason != "Pending" {
+		t.Fatalf("programmed condition = %#v", programmed)
+	}
+	if origin == nil || origin.Status != metav1.ConditionFalse || origin.Reason != "Pending" {
+		t.Fatalf("origin condition = %#v", origin)
+	}
+}
+
+
+func TestAccessApplicationInvalidationClearsProjectionAfterRemoteDeletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil { t.Fatal(err) }
+	if err := v1alpha1.AddToScheme(scheme); err != nil { t.Fatal(err) }
+	remote := newFakeAccessApplicationCloudflare()
+	remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Domain: "old.example", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))}})
+	application := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", UID: "app-uid", Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[]}`}}, Spec: v1alpha1.AccessApplicationSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete}, Status: v1alpha1.AccessApplicationStatus{ApplicationID: "remote-id", Type: v1alpha1.AccessApplicationTypeSelfHosted, OwnershipVerified: true, Domain: "old.example", ZoneID: "zone", Tags: []string{"managed"}, Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "old.example"}}, DataPlanes: []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "tunnel", ProtectionDomain: "public"}}}}
+	account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: "account", Generation: 1}, Spec: v1alpha1.CloudflareAccountSpec{AccountID: "0123456789abcdef0123456789abcdef", Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: "token", Namespace: "tenant", Key: "token"}}, Grants: []v1alpha1.CloudflareAccountGrant{{NamespaceSelector: metav1.LabelSelector{}, Hostnames: []string{"*"}, Zones: []string{"*"}, Exposures: []v1alpha1.Exposure{v1alpha1.ExposurePublic}}}}, Status: v1alpha1.CloudflareAccountStatus{Verified: v1alpha1.CloudflareAccountVerifiedStatus{Zones: []v1alpha1.CloudflareVerifiedZone{{ID: "zone", Name: "old.example"}}}, Conditions: []metav1.Condition{{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, ObservedGeneration: 1}, {Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, ObservedGeneration: 1}}}}
+	credential := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("token")}}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}}
+	clusterNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.AccessApplication{}).WithObjects(application, account, credential, namespace, clusterNamespace).Build()
+	var current v1alpha1.AccessApplication
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "tenant", Name: "app"}, &current); err != nil { t.Fatal(err) }
+	r := &AccessApplicationReconciler{Client: kube, Scheme: scheme, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil }, Now: time.Now}
+	application = &current
+	if _, err := r.reconcileInvalidation(context.Background(), application, rejectedCompilationLoss("target missing", gatewayapi.AccessTargetLossGateway)); err != nil { t.Fatal(err) }
+	var stored v1alpha1.AccessApplication
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "tenant", Name: "app"}, &stored); err != nil { t.Fatal(err) }
+	if remote.Has("remote-id") { t.Fatal("managed remote Access application was not deleted") }
+	if stored.Status.OwnershipVerified || stored.Status.Type != "" || stored.Status.Domain != "" || stored.Status.ZoneID != "" || len(stored.Status.Tags) != 0 { t.Fatalf("remote projection retained: %#v", stored.Status) }
+	if len(stored.Status.Destinations) == 0 || len(stored.Status.DataPlanes) == 0 { t.Fatal("revocation projection was not retained") }
+}
+func TestAccessApplicationDeleteBlocksForMissingPublisherAndRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil { t.Fatal(err) }
+	if err := v1alpha1.AddToScheme(scheme); err != nil { t.Fatal(err) }
+	if err := gatewayv1.Install(scheme); err != nil { t.Fatal(err) }
+	uid := types.UID("recorded")
+	now := metav1.NewTime(time.Unix(10, 0))
+	application := &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", Generation: 1, DeletionTimestamp: &now, Finalizers: []string{v1alpha1.AccessApplicationFinalizer},
+			Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"gateway","protectionDomain":"public","hostname":"app.example","baselineVersion":1}]}`}},
+		Spec: v1alpha1.AccessApplicationSpec{ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant"}, Status: v1alpha1.CloudflareTunnelStatus{
+		GatewayRef: &corev1.LocalObjectReference{Name: "gateway"}, GatewayUID: uid,
+		ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 2, Desired: 2},
+		Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "app.example", ProtectionDomain: "public", AccessApplication: "tenant/app", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 2}},
+	}}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.AccessApplication{}, &v1alpha1.CloudflareTunnel{}).WithObjects(application, tunnel).Build()
+	r := &AccessApplicationReconciler{Client: kube, Scheme: scheme, Now: func() time.Time { return now.Time }}
+	if _, err := r.reconcileDelete(context.Background(), application); err != nil { t.Fatal(err) }
+	var blocked v1alpha1.AccessApplication
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: "tenant", Name: "app"}, &blocked); err != nil { t.Fatal(err) }
+	condition := conditionByType(blocked.Status.Conditions, accessApplicationConditionCleanupBlocked)
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "RevocationPublisherUnavailable" { t.Fatalf("missing publisher diagnostic = %#v", condition) }
+	if len(blocked.Finalizers) == 0 { t.Fatal("finalizer removed while publisher was unavailable") }
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant", UID: uid}}
+	if err := kube.Create(context.Background(), gateway); err != nil { t.Fatal(err) }
+	tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+	if err := kube.Status().Update(context.Background(), tunnel); err != nil { t.Fatal(err) }
+	if _, err := r.reconcileDelete(context.Background(), &blocked); err != nil { t.Fatal(err) }
+}
+func conditionByType(conditions []metav1.Condition, conditionType string) *metav1.Condition {
+	for i := range conditions { if conditions[i].Type == conditionType { return &conditions[i] } }
+	return nil
+}
