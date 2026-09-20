@@ -1508,7 +1508,10 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
 			g.Expect(current.Status.GatewayRef).To(gomega.BeNil())
-			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(managed))
+			g.Expect(current.Status.DNSRecords).To(gomega.HaveLen(1))
+			g.Expect(current.Status.DNSRecords[0].Hostname).To(gomega.Equal(managed.Hostname))
+			g.Expect(current.Status.DNSRecords[0].RecordID).To(gomega.Equal(managed.RecordID))
+			g.Expect(current.Status.DNSRecords[0].OwnershipComment).To(gomega.Equal(managed.OwnershipComment))
 		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
 
 		replicas := int32(1)
