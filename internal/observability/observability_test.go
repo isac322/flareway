@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -175,6 +176,32 @@ func TestEventingClientEmitsPersistedTransitionsOnce(t *testing.T) {
 		t.Fatalf("cleanup event = %q", event)
 	}
 }
+
+func TestEventingClientStatusApplyEmitsTransitionEvent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add Flareway scheme: %v", err)
+	}
+	object := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "apply-status"}}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(object).WithObjects(object).Build()
+	recorder := record.NewFakeRecorder(10)
+	eventing := NewEventingClient(base, base, recorder)
+	apply := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "flareway.bhyoo.com/v1alpha1",
+		"kind":       "AccessApplication",
+		"metadata": map[string]any{"namespace": "apps", "name": "apply-status"},
+		"status": map[string]any{"conditions": []any{map[string]any{
+			"type": "CleanupBlocked", "status": "True", "reason": "DependenciesRemain",
+		}}},
+	}}
+	if err := eventing.Status().Apply(context.Background(), client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner("test")); err != nil {
+		t.Fatalf("status apply: %v", err)
+	}
+	if event := receiveEvent(t, recorder); !strings.Contains(event, EventReasonCleanupBlocked) {
+		t.Fatalf("status apply event = %q", event)
+	}
+}
+
 
 func receiveEvent(t *testing.T, recorder *record.FakeRecorder) string {
 	t.Helper()

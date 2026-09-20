@@ -636,7 +636,7 @@ func (r *WARPConnectorReconciler) reconcileDelete(ctx context.Context, object *f
 	}
 	if len(references) > 0 {
 		message := "WARP Connector is still referenced by " + strings.Join(references, ", ")
-		if err := r.patchCleanupBlocked(ctx, object, message); err != nil {
+		if err := r.patchCleanupBlocked(ctx, object, "Referenced", message); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: warpConnectorRequeue}, nil
@@ -653,9 +653,17 @@ func (r *WARPConnectorReconciler) reconcileDelete(ctx context.Context, object *f
 	if needsRemoteDelete {
 		api, _, err := r.clientForObject(ctx, object)
 		if err != nil {
+			patchErr := r.patchCleanupBlocked(ctx, object, "ClientError", fmt.Sprintf("failed to resolve Cloudflare client for deletion: %v", err))
+			if patchErr != nil {
+				return ctrl.Result{}, errors.Join(err, patchErr)
+			}
 			return ctrl.Result{}, err
 		}
 		if _, err := api.DeleteWARPConnector(ctx, object.Status.TunnelID); err != nil && !flarecloudflare.IsNotFound(err) {
+			patchErr := r.patchCleanupBlocked(ctx, object, "DeleteFailed", fmt.Sprintf("remote WARP Connector deletion failed: %v", err))
+			if patchErr != nil {
+				return ctrl.Result{}, errors.Join(err, patchErr)
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -692,11 +700,11 @@ func (r *WARPConnectorReconciler) routeReferences(ctx context.Context, object *f
 	return references, nil
 }
 
-func (r *WARPConnectorReconciler) patchCleanupBlocked(ctx context.Context, object *flarewayv1alpha1.WARPConnector, message string) error {
+func (r *WARPConnectorReconciler) patchCleanupBlocked(ctx context.Context, object *flarewayv1alpha1.WARPConnector, reason, message string) error {
 	base := client.MergeFrom(object.DeepCopy())
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked, metav1.ConditionTrue, "Referenced", message),
+		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked, metav1.ConditionTrue, reason, message),
 		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionReady, metav1.ConditionFalse, "CleanupBlocked", message),
 	)
 	return r.Status().Patch(ctx, object, base)
