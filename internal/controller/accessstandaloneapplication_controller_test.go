@@ -20,9 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
@@ -447,6 +451,156 @@ var _ = ginkgo.Describe("AccessStandaloneApplication Controller", func() {
 		gomega.Expect(fixture.remote.creates).To(gomega.Equal(creates))
 		gomega.Expect(testAPIReader.Get(testContext, secretKey, &corev1.Secret{})).To(gomega.HaveOccurred())
 	})
+
+	ginkgo.It("retries transient external reference lookups and treats only a genuine 404 as TargetNotFound", func() {
+		fixture := newStandaloneControllerFixture("transient-ref")
+		fixture.createPrerequisites()
+
+		transient := standaloneCloudflareError(http.StatusServiceUnavailable)
+		notFound := standaloneCloudflareError(http.StatusNotFound)
+
+		cases := []struct {
+			name  string
+			apply func(*v1alpha1.AccessStandaloneApplication)
+			fail  func(error)
+		}{
+			{
+				name: "policy",
+				apply: func(application *v1alpha1.AccessStandaloneApplication) {
+					application.Spec.Policies = []v1alpha1.AccessApplicationPolicyReference{{
+						ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "external-policy"},
+					}}
+				},
+				fail: fixture.remote.failPolicyLookup,
+			},
+			{
+				name: "identity-provider",
+				apply: func(application *v1alpha1.AccessStandaloneApplication) {
+					application.Spec.Application.AllowedIDPRefs = []v1alpha1.AccessIdentityProviderReference{{ExternalID: "external-idp"}}
+				},
+				fail: fixture.remote.failIDPLookup,
+			},
+			{
+				name: "custom-page",
+				apply: func(application *v1alpha1.AccessStandaloneApplication) {
+					application.Spec.Application.CustomPageRefs = []v1alpha1.AccessCustomPageReference{{ExternalID: "external-page"}}
+				},
+				fail: fixture.remote.failCustomPageLookup,
+			},
+		}
+
+		for _, testCase := range cases {
+			application := &v1alpha1.AccessStandaloneApplication{
+				ObjectMeta: metav1.ObjectMeta{Name: testCase.name, Namespace: fixture.namespace},
+				Spec: v1alpha1.AccessStandaloneApplicationSpec{
+					AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
+					Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+					Application: v1alpha1.AccessApplicationSettings{Name: testCase.name},
+					Bookmark:    &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://" + testCase.name + ".example.test/"},
+				},
+			}
+			testCase.apply(application)
+			gomega.Expect(testClient.Create(testContext, application)).To(gomega.Succeed())
+
+			testCase.fail(transient)
+			gomega.Eventually(func() bool {
+				_, reconcileErr := fixture.reconciler.Reconcile(testContext, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(application)})
+				statusCode, isCloudflareError := flarecloudflare.StatusCode(reconcileErr)
+				return isCloudflareError && statusCode == http.StatusServiceUnavailable
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.BeTrue())
+			gomega.Eventually(func(g gomega.Gomega) {
+				var current v1alpha1.AccessStandaloneApplication
+				g.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(application), &current)).To(gomega.Succeed())
+				ready := statusutil.FindCondition(current.Status.Conditions, "Ready")
+				g.Expect(ready).NotTo(gomega.BeNil())
+				g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(ready.Reason).To(gomega.Equal("CloudflareError"))
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+			testCase.fail(nil)
+			fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+				g.Expect(statusutil.ConditionTrue(current.Status.Conditions, "Ready")).To(gomega.BeTrue())
+			})
+
+			testCase.fail(notFound)
+			fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+				ready := statusutil.FindCondition(current.Status.Conditions, "Ready")
+				g.Expect(ready).NotTo(gomega.BeNil())
+				g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+				g.Expect(ready.Reason).To(gomega.Equal("TargetNotFound"))
+				g.Expect(statusutil.ConditionFalse(current.Status.Conditions, "Accepted")).To(gomega.BeTrue())
+			})
+			testCase.fail(nil)
+		}
+	})
+
+	ginkgo.It("repairs remote drift that lands inside the update confirmation window, including after a restart", func() {
+		fixture := newStandaloneControllerFixture("update-window")
+		fixture.createPrerequisites()
+
+		application := &v1alpha1.AccessStandaloneApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "bookmark", Namespace: fixture.namespace},
+			Spec: v1alpha1.AccessStandaloneApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
+				Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+				Application: v1alpha1.AccessApplicationSettings{Name: "bookmark"},
+				Bookmark:    &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://bookmark.example.test/"},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, application)).To(gomega.Succeed())
+		fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, "Ready")).To(gomega.BeTrue())
+		})
+		gomega.Expect(fixture.remote.updateCallCount()).To(gomega.BeZero())
+
+		restarted := func() *AccessStandaloneApplicationReconciler {
+			return &AccessStandaloneApplicationReconciler{
+				Client: testClient, Scheme: testClient.Scheme(),
+				NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return fixture.remote, nil },
+			}
+		}
+		drift := func(domain string) {
+			remote := fixture.remote.application(application.Status.ApplicationID)
+			remote.Domain = domain
+			fixture.remote.put(remote)
+		}
+		updatesReach := func(reconciler *AccessStandaloneApplicationReconciler, count int) {
+			gomega.Eventually(func(g gomega.Gomega) {
+				_, err := reconciler.Reconcile(testContext, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(application)})
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				g.Expect(fixture.remote.updateCallCount()).To(gomega.Equal(count))
+			}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+		}
+
+		// Drift outside the confirmation window is repaired immediately.
+		drift("https://drifted.example.test/")
+		updatesReach(fixture.reconciler, 1)
+		fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, "Ready")).To(gomega.BeTrue())
+		})
+
+		// Drift inside the confirmation window is repaired on the next reconcile.
+		base := client.MergeFrom(application.DeepCopy())
+		application.Spec.Bookmark.URL = "https://bookmark-v2.example.test/"
+		gomega.Expect(testClient.Patch(testContext, application, base)).To(gomega.Succeed())
+		updatesReach(fixture.reconciler, 2)
+		drift("https://window.example.test/")
+		updatesReach(fixture.reconciler, 3)
+		fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, "Ready")).To(gomega.BeTrue())
+			g.Expect(fixture.remote.application(current.Status.ApplicationID).Domain).To(gomega.Equal("https://bookmark-v2.example.test/"))
+		})
+
+		// A process restart inside the confirmation window does not strand drift.
+		drift("https://restart.example.test/")
+		updatesReach(restarted(), 4)
+		drift("https://restart-window.example.test/")
+		updatesReach(restarted(), 5)
+		fixture.reconcileUntil(application, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+			g.Expect(statusutil.ConditionTrue(current.Status.Conditions, "Ready")).To(gomega.BeTrue())
+			g.Expect(fixture.remote.application(current.Status.ApplicationID).Domain).To(gomega.Equal("https://bookmark-v2.example.test/"))
+		})
+	})
 })
 
 type standaloneControllerFixture struct {
@@ -547,6 +701,9 @@ type fakeStandaloneCloudflare struct {
 	lastUpdateInput        flarecloudflare.AccessApplicationInput
 	lastCreateInput        flarecloudflare.AccessApplicationInput
 	updateFailures         int
+	policyLookupErr        error
+	idpLookupErr           error
+	customPageLookupErr    error
 }
 
 func (f *fakeStandaloneCloudflare) CreateAccessApplication(_ context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplicationCreateResult, error) {
@@ -627,6 +784,30 @@ func (f *fakeStandaloneCloudflare) DeleteAccessApplication(_ context.Context, _ 
 }
 func (f *fakeStandaloneCloudflare) RevokeAccessApplicationTokens(context.Context, flarecloudflare.AccessScope, string) error {
 	return nil
+}
+func (f *fakeStandaloneCloudflare) GetAccessPolicy(_ context.Context, id string) (flarecloudflare.AccessPolicy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.policyLookupErr != nil {
+		return flarecloudflare.AccessPolicy{}, f.policyLookupErr
+	}
+	return flarecloudflare.AccessPolicy{ID: id}, nil
+}
+func (f *fakeStandaloneCloudflare) GetIdentityProvider(_ context.Context, id string) (flarecloudflare.IdentityProvider, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.idpLookupErr != nil {
+		return flarecloudflare.IdentityProvider{}, f.idpLookupErr
+	}
+	return flarecloudflare.IdentityProvider{ID: id}, nil
+}
+func (f *fakeStandaloneCloudflare) GetAccessCustomPage(_ context.Context, id string) (flarecloudflare.AccessCustomPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.customPageLookupErr != nil {
+		return flarecloudflare.AccessCustomPage{}, f.customPageLookupErr
+	}
+	return flarecloudflare.AccessCustomPage{AccessCustomPageSummary: flarecloudflare.AccessCustomPageSummary{ID: id}}, nil
 }
 func (f *fakeStandaloneCloudflare) GetAccessTag(_ context.Context, name string) (flarecloudflare.AccessTag, error) {
 	f.mu.Lock()
@@ -714,6 +895,24 @@ func (f *fakeStandaloneCloudflare) failNextUpdates(count int) {
 	f.updateFailures = count
 }
 
+func (f *fakeStandaloneCloudflare) failPolicyLookup(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.policyLookupErr = err
+}
+
+func (f *fakeStandaloneCloudflare) failIDPLookup(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.idpLookupErr = err
+}
+
+func (f *fakeStandaloneCloudflare) failCustomPageLookup(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.customPageLookupErr = err
+}
+
 func (f *fakeStandaloneCloudflare) lastCreate() flarecloudflare.AccessApplicationInput {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -762,4 +961,14 @@ func fakeStandaloneApplication(id string, input flarecloudflare.AccessApplicatio
 		application.SaaSApp = &flarecloudflare.AccessSaaSApplication{AuthType: input.SaaSApp.AuthType, ClientID: "saas-client-id", PublicKey: input.SaaSApp.PublicKey, RedirectURIs: input.SaaSApp.RedirectURIs, Scopes: input.SaaSApp.Scopes}
 	}
 	return application
+}
+
+// standaloneCloudflareError builds a Cloudflare API error whose Error() is safe
+// to call: apierror.Error.Error dereferences Request and Response.
+func standaloneCloudflareError(statusCode int) error {
+	return &cloudflaresdk.Error{
+		StatusCode: statusCode,
+		Request:    httptest.NewRequest(http.MethodGet, "https://api.cloudflare.test/client/v4", nil),
+		Response:   &http.Response{StatusCode: statusCode},
+	}
 }
