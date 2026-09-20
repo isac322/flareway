@@ -28,6 +28,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -57,7 +58,7 @@ const (
 	accessApplicationAccountIndex         = "flareway.accessApplication.account"
 	accessApplicationAUDNamespace         = "flareway-system"
 	accessApplicationRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
-	accessRevocationPublisherUnavailable = "RevocationPublisherUnavailable"
+	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
 	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
 	accessApplicationPrivateTunnelsKey    = "tunnels"
 	accessApplicationAUDReadyKey          = "ready"
@@ -180,7 +181,9 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		}
 		if !acknowledged {
 			status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
-			if reason == "" { reason = "RevocationPending" }
+			if reason == "" {
+				reason = "RevocationPending"
+			}
 			setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, reason, message, r.now())
 			return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 		}
@@ -1375,21 +1378,30 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 	if !controllerutil.ContainsFinalizer(application, v1alpha1.AccessApplicationFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
-		if err := r.latchRevocation(ctx, application); err != nil {
+	programmed := meta.FindStatusCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+	if programmed == nil || programmed.Status != metav1.ConditionFalse || programmed.ObservedGeneration != application.Generation {
+		status := *application.Status.DeepCopy()
+		setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "Pending", "Access application deletion is pending", r.now())
+		if err := r.patchStatus(ctx, application, status); err != nil {
 			return ctrl.Result{}, err
 		}
+		application.Status = status
+	}
+	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
+		if err := r.latchRevocation(ctx, application); err != nil {
+			return r.finishDeleteError(ctx, application, err)
+		}
 		if err := r.deleteAUDSecrets(ctx, application); err != nil {
-			return ctrl.Result{}, err
+			return r.finishDeleteError(ctx, application, err)
 		}
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
 	if err := r.deleteAUDSecrets(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	blocked, message, reason, err := r.revocationAcknowledged(ctx, application)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	if !blocked {
 		status := *application.Status.DeepCopy()
@@ -1410,16 +1422,16 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
 	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
 		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
 		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
-			return ctrl.Result{}, err
+			return r.finishDeleteError(ctx, application, err)
 		}
 	}
 	if err := r.deletePrivateTunnelLedger(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	before := application.DeepCopy()
 	controllerutil.RemoveFinalizer(application, v1alpha1.AccessApplicationFinalizer)
@@ -1427,6 +1439,14 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		return ctrl.Result{}, fmt.Errorf("remove AccessApplication finalizer: %w", err)
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *AccessApplicationReconciler) finishDeleteError(ctx context.Context, application *v1alpha1.AccessApplication, cause error) (ctrl.Result, error) {
+	status := *application.Status.DeepCopy()
+	now := r.now()
+	setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, metav1.ConditionTrue, "RemoteError", cause.Error(), now)
+	setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "CleanupBlocked", "Access application deletion is blocked", now)
+	return ctrl.Result{}, errors.Join(cause, r.patchStatus(ctx, application, status))
 }
 
 func accessStatusHostnames(destinations []v1alpha1.AccessApplicationDestinationStatus) []string {
@@ -1649,9 +1669,9 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 		kind := gatewayv1.Kind(ancestor.Kind)
 		namespace := gatewayv1.Namespace(ancestor.Namespace)
 		ancestors = append(ancestors, gatewayv1.PolicyAncestorStatus{
-			AncestorRef: gatewayv1.ParentReference{Group: &group, Kind: &kind, Namespace: &namespace, Name: gatewayv1.ObjectName(ancestor.Name)},
+			AncestorRef:    gatewayv1.ParentReference{Group: &group, Kind: &kind, Namespace: &namespace, Name: gatewayv1.ObjectName(ancestor.Name)},
 			ControllerName: gatewayapi.ControllerName,
-			Conditions: slices.Clone(conditions[:3]),
+			Conditions:     slices.Clone(conditions[:3]),
 		})
 	}
 	status.Ancestors = gatewaystatus.ReplacePolicyAncestorStatuses(status.Ancestors, gatewayapi.ControllerName, now, ancestors...)
