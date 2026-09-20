@@ -19,7 +19,9 @@ package observability
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -104,7 +106,16 @@ func (writer *eventingStatusWriter) emit(after client.Object, before runtime.Obj
 }
 
 func (writer *eventingStatusWriter) Apply(ctx context.Context, object runtime.ApplyConfiguration, options ...client.SubResourceApplyOption) error {
-	return writer.SubResourceWriter.Apply(ctx, object, options...)
+	before := writer.readApplyCurrent(ctx, object)
+	if err := writer.SubResourceWriter.Apply(ctx, object, options...); err != nil {
+		return err
+	}
+	after := writer.readApplyCurrent(ctx, object)
+	if before == nil || after == nil {
+		return nil
+	}
+	EmitConditionTransitions(writer.recorder, after, before, after)
+	return nil
 }
 
 func (writer *eventingStatusWriter) readCurrent(ctx context.Context, object client.Object) runtime.Object {
@@ -119,6 +130,58 @@ func (writer *eventingStatusWriter) readCurrent(ctx context.Context, object clie
 		return nil
 	}
 	return current
+}
+
+type pointerApplyConfigurationMeta interface {
+	GetName() *string
+	GetNamespace() *string
+	GetKind() *string
+	GetAPIVersion() *string
+}
+
+type stringApplyConfigurationMeta interface {
+	GetName() string
+	GetNamespace() string
+	GetKind() string
+	GetAPIVersion() string
+}
+
+func (writer *eventingStatusWriter) readApplyCurrent(ctx context.Context, object runtime.ApplyConfiguration) *unstructured.Unstructured {
+	name, namespace, kind, apiVersion, ok := applyConfigurationMetadata(object)
+	if !ok {
+		return nil
+	}
+	groupVersion, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return nil
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(groupVersion.WithKind(kind))
+	if err := writer.reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, current); err != nil {
+		return nil
+	}
+	return current
+}
+
+func applyConfigurationMetadata(object runtime.ApplyConfiguration) (name, namespace, kind, apiVersion string, ok bool) {
+	switch meta := object.(type) {
+	case pointerApplyConfigurationMeta:
+		if meta.GetName() == nil || meta.GetKind() == nil || meta.GetAPIVersion() == nil {
+			return "", "", "", "", false
+		}
+		namespaceValue := ""
+		if meta.GetNamespace() != nil {
+			namespaceValue = *meta.GetNamespace()
+		}
+		return *meta.GetName(), namespaceValue, *meta.GetKind(), *meta.GetAPIVersion(), true
+	case stringApplyConfigurationMeta:
+		if meta.GetName() == "" || meta.GetKind() == "" || meta.GetAPIVersion() == "" {
+			return "", "", "", "", false
+		}
+		return meta.GetName(), meta.GetNamespace(), meta.GetKind(), meta.GetAPIVersion(), true
+	default:
+		return "", "", "", "", false
+	}
 }
 
 type eventingSubResourceClient struct {

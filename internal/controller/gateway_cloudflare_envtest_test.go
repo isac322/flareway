@@ -919,7 +919,7 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(testClient.Create(testContext, forged)).To(gomega.Succeed())
 		gomega.Expect(reconciler.mapSecretToGateways(testContext, forged)).To(gomega.BeEmpty())
 
-		gomega.Expect(testClient.Delete(testContext, &audSecret)).To(gomega.Succeed())
+		gomega.Expect(client.IgnoreNotFound(testClient.Delete(testContext, &audSecret))).To(gomega.Succeed())
 		gomega.Eventually(func() bool {
 			current := &corev1.Secret{}
 			return apierrors.IsNotFound(testClient.Get(testContext, client.ObjectKeyFromObject(&audSecret), current))
