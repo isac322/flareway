@@ -142,7 +142,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	wouldApply := mergeOrganizationDiff(organizationWouldApply, dohWouldApply)
 	if effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
 		if absent {
-			observed = flarecloudflare.Organization{}
+			return r.finishError(ctx, object, privateInvalid("TargetNotFound", "the Cloudflare Zero Trust organization was not found"))
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, object, observed, observedDOH, wouldApply, object.Status.ObservedUserRevocationRequest, metav1.ConditionTrue, "Observed", "Zero Trust organization is observed without mutation")
 	}
