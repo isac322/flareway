@@ -211,7 +211,6 @@ func Translate(in Inputs) (*ir.Gateway, Statuses) {
 	for _, translated := range listeners {
 		gatewayStatus.Listeners = append(gatewayStatus.Listeners, listenerStatus(in.Gateway, translated, now))
 	}
-	gatewayStatus.Addresses = gatewayAddresses(in)
 	outStatuses.Gateway = gatewayStatus
 	return out, outStatuses
 }
@@ -1027,33 +1026,6 @@ func finalizeIR(out *ir.Gateway) {
 		})
 	}
 }
-func gatewayAddresses(in Inputs) []gatewayv1.GatewayStatusAddress {
-	if in.GatewayClassConfig != nil && !in.GatewayClassConfig.Spec.ConformanceMode &&
-		in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt != nil {
-		return nil
-	}
-	name := "flareway-gw-" + in.Gateway.Name
-	for i := range in.Services {
-		service := &in.Services[i]
-		if service.Namespace != in.Gateway.Namespace || service.Name != name {
-			continue
-		}
-		if service.Spec.Type == corev1.ServiceTypeClusterIP && service.Spec.ClusterIP != "" && service.Spec.ClusterIP != corev1.ClusterIPNone {
-			return []gatewayv1.GatewayStatusAddress{{Type: new(gatewayv1.IPAddressType), Value: service.Spec.ClusterIP}}
-		}
-		for _, ingress := range service.Status.LoadBalancer.Ingress {
-			if ingress.IP != "" {
-				return []gatewayv1.GatewayStatusAddress{{Type: new(gatewayv1.IPAddressType), Value: ingress.IP}}
-			}
-			if ingress.Hostname != "" {
-				return []gatewayv1.GatewayStatusAddress{{Type: new(gatewayv1.HostnameAddressType), Value: ingress.Hostname}}
-			}
-		}
-		return nil
-	}
-	return nil
-}
-
 func conditionStatus(value bool) metav1.ConditionStatus {
 	if value {
 		return metav1.ConditionTrue

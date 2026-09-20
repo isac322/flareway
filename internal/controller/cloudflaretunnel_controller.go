@@ -54,6 +54,8 @@ const (
 	tunnelFieldManager     = "flareway-tunnel"
 	tunnelRequeue          = 2 * time.Second
 	tunnelObservationLimit = int64(16)
+	dnsRecordStateReady    = "Ready"
+	dnsRecordStateConflict = "Conflict"
 
 	gatewayTunnelIndex     = "flareway.gateway.cloudflareTunnel"
 	tunnelAccountIndex     = "flareway.cloudflareTunnel.account"
@@ -1006,6 +1008,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 		if len(records) > 1 {
 			conflicts = append(conflicts, fmt.Sprintf("multiple DNS records already exist for %s", host.Hostname))
 			if previous, ok := previousByHostname[host.Hostname]; ok {
+				previous.State = dnsRecordStateConflict
 				result = append(result, previous)
 			}
 			continue
@@ -1022,6 +1025,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 			if !dnsRecordOwnedByGateway(record.Comment, tunnel, clusterID, gatewayName) {
 				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (comment %q)", host.Hostname, record.Comment))
 				if previous, ok := previousByHostname[host.Hostname]; ok {
+					previous.State = dnsRecordStateConflict
 					result = append(result, previous)
 				}
 				continue
@@ -1034,6 +1038,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 				if !deleted {
 					conflicts = append(conflicts, conflict)
 					if previous, ok := previousByHostname[host.Hostname]; ok {
+						previous.State = dnsRecordStateConflict
 						result = append(result, previous)
 					}
 					continue
@@ -1094,7 +1099,7 @@ func dnsRecordStatus(zoneID string, record RemoteDNSRecord) v1alpha1.CloudflareT
 	proxiable := record.Proxiable
 	return v1alpha1.CloudflareTunnelDNSRecordStatus{
 		Hostname: record.Name, RecordID: record.ID, ZoneID: zoneID,
-		OwnershipComment: record.Comment, State: "Ready",
+		OwnershipComment: record.Comment, State: dnsRecordStateReady,
 		TTL: record.TTL, Proxied: &proxied, Proxiable: &proxiable,
 		Settings:  dnsStatusSettings(record.Settings),
 		CreatedOn: timeStatus(record.CreatedOn), ModifiedOn: timeStatus(record.ModifiedOn),
@@ -1767,12 +1772,6 @@ func deleteDNSRecordIfOwned(
 	if len(records) == 0 {
 		return true, "", nil
 	}
-	if expectedComment == "" {
-		return false, fmt.Sprintf(
-			"DNS record %s (%s) has no checkpointed ownership comment",
-			expected.Hostname, expected.RecordID,
-		), nil
-	}
 	for _, current := range records {
 		if current.ID != expected.RecordID {
 			continue
@@ -1780,6 +1779,12 @@ func deleteDNSRecordIfOwned(
 		currentName, err := flarecloudflare.NormalizeDNSHostname(current.Name)
 		if err != nil {
 			return false, "", fmt.Errorf("normalize current DNS hostname %q: %w", current.Name, err)
+		}
+		if expectedComment == "" {
+			return false, fmt.Sprintf(
+				"DNS record %s (%s) has no checkpointed ownership comment",
+				expected.Hostname, expected.RecordID,
+			), nil
 		}
 		if currentName != expectedName || current.Comment != expectedComment {
 			return false, fmt.Sprintf(
@@ -1792,10 +1797,7 @@ func deleteDNSRecordIfOwned(
 		}
 		return true, "", nil
 	}
-	return false, fmt.Sprintf(
-		"DNS record %s no longer has managed record ID %s",
-		expected.Hostname, expected.RecordID,
-	), nil
+	return true, "", nil
 }
 
 func dnsOwnershipComment(tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayName string) string {
