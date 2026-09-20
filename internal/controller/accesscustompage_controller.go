@@ -81,7 +81,7 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 
 	api, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		return ctrl.Result{}, r.finishError(ctx, object, "Pending", err)
+		return ctrl.Result{}, r.finishError(ctx, object, privateErrorReason(err), err)
 	}
 	input, err := r.customPageInput(ctx, object)
 	if err != nil {
