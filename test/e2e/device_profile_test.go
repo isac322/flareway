@@ -60,7 +60,8 @@ var _ = Describe("Account-global device profile", Label("account-global"), func(
 			profileTarget["match"] = fmt.Sprintf("identity.email == \"flareway-e2e-%s@example.invalid\"", runID)
 			profileTarget["precedence"] = int64(999999)
 			profileTarget["fields"] = map[string]any{
-				"name": remoteName, "description": "Flareway isolated e2e profile", "enabled": true,
+				"name": remoteName, "enabled": true,
+				"description": "Flareway isolated e2e profile " + names.CreatedMarkerPrefix + time.Now().UTC().Format(time.RFC3339),
 			}
 		}
 		desiredInclude := []cfapi.SplitTunnelEntry{
