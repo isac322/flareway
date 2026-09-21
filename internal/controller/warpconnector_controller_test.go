@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -735,6 +736,36 @@ func TestWARPConnectorDeletionBlockedByReferencingRoute(t *testing.T) {
 	}
 }
 
+func TestWARPConnectorDeletionFailurePatchesCleanupBlocked(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeWARPConnectorCloudflare()
+	remote.deleteErr = errors.New("remote delete unavailable")
+	kube, reconciler, object := newWARPConnectorTestReconciler(t, remote, clock)
+	object.Spec.DeletionPolicy = flarewayv1alpha1.DeletionPolicyDelete
+	object.Finalizers = []string{flarewayv1alpha1.WARPConnectorFinalizer}
+	object.Status.TunnelID = "warp-id"
+	object.Status.OwnershipVerified = true
+	object.Status.Conditions = []metav1.Condition{{
+		Type: flarewayv1alpha1.WARPConnectorConditionReady, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+	if err := kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileDelete(ctx, object); err == nil {
+		t.Fatal("expected remote deletion error")
+	}
+	var current flarewayv1alpha1.WARPConnector
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(object), &current); err != nil {
+		t.Fatal(err)
+	}
+	blocked := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked)
+	ready := meta.FindStatusCondition(current.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionReady)
+	if blocked == nil || blocked.Status != metav1.ConditionTrue || blocked.Reason != "DeleteFailed" || ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("remote deletion failure status = blocked=%#v ready=%#v", blocked, ready)
+	}
+}
+
 func newWARPConnectorTestReconciler(t *testing.T, remote *fakeWARPConnectorCloudflare, clock time.Time) (client.Client, *WARPConnectorReconciler, *flarewayv1alpha1.WARPConnector) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -799,6 +830,7 @@ type fakeWARPConnectorCloudflare struct {
 	tokenGets            int
 	clientLists          int
 	deletes              int
+	deleteErr            error
 	failedOverClient     string
 }
 
@@ -822,6 +854,9 @@ func (fake *fakeWARPConnectorCloudflare) ListWARPConnectors(context.Context, fla
 
 func (fake *fakeWARPConnectorCloudflare) DeleteWARPConnector(_ context.Context, _ string) (flarecloudflare.WARPConnector, error) {
 	fake.deletes++
+	if fake.deleteErr != nil {
+		return flarecloudflare.WARPConnector{}, fake.deleteErr
+	}
 	fake.connector.DeletedAt = new(time.Now())
 	return fake.connector, nil
 }

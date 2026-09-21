@@ -253,7 +253,7 @@ func (r *AccessApplicationReconciler) resolveSCIMAuthenticationMethod(
 		if namespace == "" {
 			namespace = application.Namespace
 		}
-		if err := authorizeAccessReference(ctx, r.Client, application.Namespace, namespace, account); err != nil {
+		if err := authorizeAccessReference(ctx, r.Client, application.Namespace, namespace, account, "ServiceToken"); err != nil {
 			return flarecloudflare.AccessSCIMAuthenticationInput{}, err
 		}
 		var token v1alpha1.ServiceToken
@@ -328,6 +328,7 @@ func remoteApplicationInput(
 	remoteDestinations := make([]flarecloudflare.AccessApplicationDestination, 0, len(destinations))
 	domain := ""
 	privateDomain := ""
+	privateOnly := len(destinations) > 0
 	for _, destination := range destinations {
 		protocol := flarecloudflare.AccessApplicationL4Protocol("")
 		if destination.L4Protocol != nil {
@@ -345,11 +346,16 @@ func remoteApplicationInput(
 		if privateDomain == "" && destination.Type == v1alpha1.AccessApplicationDestinationPrivate && destination.Hostname != "" {
 			privateDomain = destination.Hostname
 		}
+		if destination.Type != v1alpha1.AccessApplicationDestinationPrivate {
+			privateOnly = false
+		}
 	}
-	if domain == "" {
+	// Cloudflare rejects a top-level domain that is not one of the public
+	// destinations, so private-only applications must omit it entirely.
+	if domain == "" && !privateOnly {
 		domain = privateDomain
 	}
-	if domain == "" {
+	if domain == "" && !privateOnly {
 		domain = ownerTag + ".private.flareway.invalid"
 	}
 	policies := make([]flarecloudflare.AccessApplicationPolicyAttachment, len(policyIDs))

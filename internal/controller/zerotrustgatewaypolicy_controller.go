@@ -192,20 +192,28 @@ func gatewayListTokenCharacter(value byte) bool {
 
 func observeGatewayRule(ctx context.Context, api flarecloudflare.GatewayRuleAPI, object *v1alpha1.ZeroTrustGatewayPolicy) (flarecloudflare.GatewayRule, error) {
 	id := object.Status.RuleID
-	if object.Spec.ExternalRef != nil {
+	authoritative := object.Spec.ExternalRef != nil
+	if authoritative {
 		id = object.Spec.ExternalRef.RuleID
 	}
 	if id != "" {
 		remote, err := api.GetGatewayRule(ctx, id)
 		if err != nil {
-			return flarecloudflare.GatewayRule{}, err
-		}
-		if !object.Status.OwnershipVerified {
-			if expected := object.Spec.Adoption.Expect.Name; expected != "" && remote.Name != expected {
-				return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "remote Gateway rule name %q does not match expectation %q", remote.Name, expected)
+			if authoritative || ignoreRemoteNotFound(err) != nil {
+				return flarecloudflare.GatewayRule{}, err
 			}
+			// The cached remote ID no longer resolves; fall through to
+			// rediscovery by spec.name.
+		} else if authoritative || remote.Name == object.Spec.Name {
+			if !object.Status.OwnershipVerified {
+				if expected := object.Spec.Adoption.Expect.Name; expected != "" && remote.Name != expected {
+					return flarecloudflare.GatewayRule{}, privateInvalid("Conflict", "remote Gateway rule name %q does not match expectation %q", remote.Name, expected)
+				}
+			}
+			return remote, nil
 		}
-		return remote, nil
+		// A name-based observation may only reuse the cached ID while the
+		// remote name still matches spec.name; otherwise rediscover below.
 	}
 	rules, err := api.ListGatewayRules(ctx)
 	if err != nil {

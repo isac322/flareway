@@ -31,7 +31,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +48,8 @@ import (
 
 	"github.com/isac322/flareway/test/e2e/internal/poll"
 	e2ereport "github.com/isac322/flareway/test/e2e/internal/report"
+
+	"github.com/isac322/flareway/api/v1alpha1"
 )
 
 var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
@@ -150,6 +154,14 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 		if !configuration.WARPDevice {
 			return
 		}
+		// The AccessApplication publishes its revocation through the Gateway
+		// data plane, so it must be fully gone before the Gateway and tunnel
+		// disappear; otherwise its finalizer blocks and the remote Access
+		// policy stays in use.
+		for _, value := range []*unstructured.Unstructured{accessApplication, allowPolicy} {
+			deleteObject(ctx, value)
+			waitForObjectDeletion(ctx, value)
+		}
 		for index := len(created) - 1; index >= 0; index-- {
 			deleteObject(ctx, created[index])
 		}
@@ -191,8 +203,21 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			GinkgoWriter.Println("private WARP result: blocked: plan")
 			return
 		}
+		if err != nil {
+			GinkgoWriter.Printf("private readiness failure; Gateway: %s; Tunnel: %s; AccessApplication: %s; VirtualNetwork: %s; HostnameRoute: %s\n",
+				statusSummary(gateway), statusSummary(tunnel), statusSummary(accessApplication), statusSummary(virtualNetwork), statusSummary(hostnameRoute))
+		}
 		Expect(err).NotTo(HaveOccurred(), "private Gateway did not become Programmed and no account-plan blocker was reported")
 		recordLatency("private-warp-programmed", duration)
+
+		if !bindRunnerVirtualNetwork(ctx, virtualNetwork) {
+			writePrivateWARPResult(e2ereport.PrivateWARPResult{
+				Result: e2ereport.PrivateWARPBlockedPlan,
+				Reason: "Cloudflare requires a closed-beta entitlement to select the run's virtual network on a device profile",
+			})
+			GinkgoWriter.Println("private WARP result: blocked: plan (device profile virtual network selection unavailable)")
+			return
+		}
 
 		dnsCtx, dnsCancel := context.WithTimeout(ctx, 90*time.Second)
 		defer dnsCancel()
@@ -206,6 +231,10 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			return len(addresses) > 0 && allSyntheticPrivateAddresses(addresses), nil
 		})
 		if err != nil {
+			// A blocked classification is not a spec failure, so neither the
+			// Ginkgo writer nor stdout survives; keep the evidence as an
+			// artifact beside the classification.
+			writeRunnerDNSDiagnostics(runnerDNSDiagnostics(ctx, privateHostname))
 			writePrivateWARPResult(e2ereport.PrivateWARPResult{
 				Result: e2ereport.PrivateWARPBlockedRunner,
 				Reason: "runner DNS did not return Cloudflare private-hostname synthetic addresses",
@@ -321,6 +350,28 @@ func messagesFromConditions(conditions []any) []string {
 	return messages
 }
 
+// runnerDNSDiagnostics records why the runner's resolver did not return a
+// Cloudflare synthetic address: which resolver answered, what the WARP client
+// reports, and whether the hostname is still handled locally.
+func runnerDNSDiagnostics(ctx context.Context, hostname string) string {
+	diagnosticCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var summary strings.Builder
+	for _, diagnostic := range [][]string{
+		{"warp-cli", "--accept-tos", "status"},
+		{"warp-cli", "--accept-tos", "settings"},
+		{"resolvectl", "status"},
+		{"resolvectl", "query", hostname},
+	} {
+		output, err := exec.CommandContext(diagnosticCtx, diagnostic[0], diagnostic[1:]...).CombinedOutput()
+		fmt.Fprintf(&summary, "$ %s\n%s\n", strings.Join(diagnostic, " "), output)
+		if err != nil {
+			fmt.Fprintf(&summary, "(exit: %v)\n", err)
+		}
+	}
+	return summary.String()
+}
+
 func resolvePrivateHostname(ctx context.Context, resolver *net.Resolver, hostname string) ([]netip.Addr, error) {
 	addresses, err := resolver.LookupNetIP(ctx, "ip", hostname)
 	if err != nil {
@@ -384,8 +435,9 @@ func privateAccessTargetReady(ctx context.Context, application *unstructured.Uns
 		if !ok {
 			continue
 		}
-		if destination["type"] == "private" && destination["hostname"] == hostname &&
-			destination["portRange"] == "443" && destination["l4Protocol"] == "tcp" {
+		if destination["type"] == string(v1alpha1.AccessApplicationDestinationPrivate) &&
+			destination["hostname"] == hostname && destination["portRange"] == "443" &&
+			destination["l4Protocol"] == string(v1alpha1.AccessL4ProtocolTCP) {
 			return true, nil
 		}
 	}
@@ -444,6 +496,34 @@ func privateHTTPSRequest(ctx context.Context, hostname, path string) (int, strin
 	return status, body, nil
 }
 
+// bindRunnerVirtualNetwork scopes the registered WARP device to the virtual
+// network this run created and reports whether the account may do so.
+// Cloudflare matches a private destination by virtual network, so a device
+// that stays in the account default network never resolves this run's private
+// hostname.
+func bindRunnerVirtualNetwork(ctx context.Context, network *unstructured.Unstructured) bool {
+	current := network.DeepCopy()
+	Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(network), current)).To(Succeed())
+	identifier, found, err := unstructured.NestedString(current.Object, "status", "virtualNetworkId")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(found).To(BeTrue(), "VirtualNetwork status carries no remote identifier")
+	command := exec.CommandContext(ctx, "bash", filepath.Join("..", "..", "hack", "e2e-warp-runner.sh"), "bind-vnet", identifier)
+	output, err := command.CombinedOutput()
+	GinkgoWriter.Printf("%s", output)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 3 {
+		return false
+	}
+	Expect(err).NotTo(HaveOccurred(), "bind the WARP runner to virtual network %s: %s", identifier, output)
+	return true
+}
+
 func writePrivateWARPResult(result e2ereport.PrivateWARPResult) {
 	Expect(e2ereport.WritePrivateWARP(privateWARPArtifactPath(), result)).To(Succeed())
+}
+
+func writeRunnerDNSDiagnostics(summary string) {
+	path := filepath.Join("..", "..", "artifacts", "e2e-private-warp-dns.txt")
+	Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
+	Expect(os.WriteFile(path, []byte(summary), 0o644)).To(Succeed())
 }
