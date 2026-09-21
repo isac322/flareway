@@ -20,6 +20,13 @@ MAX_COMPRESSED_IMAGE_SIZE_BYTES ?= 67108864
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
+# Extra flags for `go test` invocations that CI parameterizes.
+GO_TEST_FLAGS ?=
+# `-exec true` links each test binary and hands it to `true` instead of running
+# it; `-count=1` keeps those unexecuted runs out of the Go test result cache so
+# a later real run still executes the tests.
+COMPILE_ONLY_TEST_FLAGS := -count=1 -exec true
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -140,7 +147,20 @@ test-envoy: $(LOCALBIN) ## Run Envoy component tests without rewriting the pinne
 	cp go.mod "$$mod"; \
 	cp go.sum "$${mod%.mod}.sum"; \
 	go mod edit -modfile="$$mod" -toolchain=none; \
-	go test -modfile="$$mod" -tags envoy ./test/envoy/...
+	go test $(GO_TEST_FLAGS) -modfile="$$mod" -tags envoy ./test/envoy/...
+
+.PHONY: warm-build-cache
+warm-build-cache: ## Compile every Go artifact CI builds, populating the shared Go build cache.
+	go build ./...
+	go vet ./...
+	go test $(COMPILE_ONLY_TEST_FLAGS) ./...
+	go vet -tags exploratory ./test/exploratory
+	go test $(COMPILE_ONLY_TEST_FLAGS) -race -tags exploratory ./test/exploratory
+	go test $(COMPILE_ONLY_TEST_FLAGS) -tags e2e ./test/e2e
+	$(MAKE) test-envoy GO_TEST_FLAGS='$(COMPILE_ONLY_TEST_FLAGS)'
+	CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./cmd
+	CGO_ENABLED=0 GOOS=linux go test -c -tags conformance -o /dev/null ./test/conformance
+	$(MAKE) controller-gen golangci-lint kustomize kind ko helm cosign envtest cloud-provider-kind
 
 .PHONY: kind-up
 kind-up: kind ## Create the conformance Kind cluster if it does not exist.

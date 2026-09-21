@@ -55,5 +55,5 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("deleted Access applications=%d policies=%d service tokens=%d DNS records=%d tunnels=%d; skipped connected tunnels=%d\n", report.AccessApplicationsDeleted, report.AccessPoliciesDeleted, report.ServiceTokensDeleted, report.DNSRecordsDeleted, report.TunnelsDeleted, report.ConnectedSkipped)
+	fmt.Printf("deleted Access applications=%d policies=%d service tokens=%d device registrations=%d device profiles=%d DNS records=%d tunnels=%d; skipped connected tunnels=%d\n", report.AccessApplicationsDeleted, report.AccessPoliciesDeleted, report.ServiceTokensDeleted, report.DeviceRegistrationsDeleted, report.DeviceProfilesDeleted, report.DNSRecordsDeleted, report.TunnelsDeleted, report.ConnectedSkipped)
 }
