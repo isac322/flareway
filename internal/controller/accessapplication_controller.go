@@ -1219,7 +1219,7 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 				status.ProtectionDomain == claim.ProtectionDomain &&
 				status.AccessApplication == applicationKey &&
 				status.Guard == v1alpha1.HostnameGuardBlocked &&
-				status.AppliedVersion > claim.BaselineVersion &&
+				versionAcknowledged(status, tunnel, claim) &&
 				status.AppliedVersion == tunnel.Status.ConfigVersion.Applied &&
 				tunnel.Status.ConfigVersion.Desired == tunnel.Status.ConfigVersion.Applied {
 				acknowledged = true
@@ -1238,6 +1238,42 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 		}
 	}
 	return true, "Every Access protection domain acknowledged a fresh Blocked version", "", nil
+}
+
+// versionAcknowledged reports whether the tunnel has published the Blocked
+// transition. A public protection domain appears in the remote tunnel
+// configuration, so revocation requires a version newer than the latched
+// baseline. A private protection domain is deliberately absent from that
+// configuration: the block is enforced by the data plane on loopback, and the
+// remote version can never advance for it, so a settled version at or above
+// the baseline is the strongest evidence that exists.
+func versionAcknowledged(
+	status v1alpha1.CloudflareTunnelHostnameStatus,
+	tunnel *v1alpha1.CloudflareTunnel,
+	claim accessRevocationClaim,
+) bool {
+	if status.AppliedVersion > claim.BaselineVersion {
+		return true
+	}
+	return status.AppliedVersion == claim.BaselineVersion &&
+		protectionDomainExposure(tunnel, claim.ProtectionDomain) == v1alpha1.ExposurePrivate
+}
+
+// protectionDomainExposure reports the listener exposure that owns the
+// protection domain, or the empty exposure when the tunnel no longer records
+// it.
+func protectionDomainExposure(tunnel *v1alpha1.CloudflareTunnel, domain string) v1alpha1.Exposure {
+	if tunnel == nil {
+		return ""
+	}
+	for _, listener := range tunnel.Status.Listeners {
+		for _, protectionDomain := range listener.ProtectionDomains {
+			if protectionDomain.Name == domain {
+				return listener.Exposure
+			}
+		}
+	}
+	return ""
 }
 
 func accessRevocationPublisherAvailable(ctx context.Context, reader client.Reader, tunnel *v1alpha1.CloudflareTunnel) (bool, error) {
