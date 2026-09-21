@@ -177,6 +177,21 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			return
 		}
 
+		// Cloudflare refuses to create an application that authenticates via
+		// WARP until the account declares a Cloudflare One Client
+		// authentication session duration, so record that prerequisite
+		// instead of waiting for a readiness that cannot arrive.
+		organization, err := cloudflareAPI.GetZeroTrustOrganization(ctx)
+		Expect(err).NotTo(HaveOccurred(), "read Zero Trust organization settings")
+		if organization.WARPAuthSessionDuration == "" {
+			writePrivateWARPResult(e2ereport.PrivateWARPResult{
+				Result: e2ereport.PrivateWARPBlockedPlan,
+				Reason: "the account declares no Cloudflare One Client authentication session duration, which Cloudflare requires before an application may authenticate via WARP",
+			})
+			GinkgoWriter.Println("private WARP result: blocked: plan (account declares no WARP authentication session duration)")
+			return
+		}
+
 		programCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
 		planBlocked := false
