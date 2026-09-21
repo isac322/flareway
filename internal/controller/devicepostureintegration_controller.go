@@ -97,7 +97,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		id := object.Spec.ExternalRef.IntegrationID
 		remote, getErr := api.GetDevicePostureIntegration(ctx, id)
 		if getErr != nil {
-			return ctrl.Result{}, getErr
+			return r.finishRemoteError(ctx, object, getErr)
 		}
 		if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 			return ctrl.Result{}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionFalse, "Conflict", "remote device posture integration name does not match expectation")
@@ -125,7 +125,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 			id = object.Spec.ExternalRef.IntegrationID
 			remote, err = api.GetDevicePostureIntegration(ctx, id)
 			if err != nil {
-				return ctrl.Result{}, err
+				return r.finishRemoteError(ctx, object, err)
 			}
 			if object.Spec.Adoption.Expect.Name != "" && remote.Name != object.Spec.Adoption.Expect.Name {
 				return ctrl.Result{}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionFalse, "Conflict", "remote device posture integration name does not match adoption expectation")
@@ -133,13 +133,13 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 			if !devicePostureIntegrationMatches(input, remote) || credentialsChanged {
 				remote, err = api.UpdateDevicePostureIntegration(ctx, id, input)
 				if err != nil {
-					return ctrl.Result{}, err
+					return r.finishRemoteError(ctx, object, err)
 				}
 			}
 		} else {
 			remote, err = api.CreateDevicePostureIntegration(ctx, input)
 			if err != nil {
-				return ctrl.Result{}, err
+				return r.finishRemoteError(ctx, object, err)
 			}
 			id = remote.ID
 		}
@@ -149,12 +149,12 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		}
 		remote, err = api.GetDevicePostureIntegration(ctx, id)
 		if err != nil {
-			return ctrl.Result{}, err
+			return r.finishRemoteError(ctx, object, err)
 		}
 		if !devicePostureIntegrationMatches(input, remote) || credentialsChanged {
 			remote, err = api.UpdateDevicePostureIntegration(ctx, id, input)
 			if err != nil {
-				return ctrl.Result{}, err
+				return r.finishRemoteError(ctx, object, err)
 			}
 		}
 	}
@@ -334,6 +334,31 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 		return nil
 	}
 	return r.Status().Patch(ctx, object, client.MergeFrom(baseObject))
+}
+
+// finishRemoteError records the remote failure before returning it for retry.
+// A missing remote object fails closed with Accepted=False; a transient error
+// preserves an established Accepted=True so dependents are not torn down by a
+// temporary Cloudflare outage. The remote argument stays nil so a failed call
+// never stamps ownership or changes the recorded ID.
+func (r *DevicePostureIntegrationReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.DevicePostureIntegration, err error) (ctrl.Result, error) {
+	reason := "CloudflareError"
+	if flarecloudflare.IsNotFound(err) {
+		reason = "RemoteMissing"
+	}
+	conditions := []metav1.Condition{accessCondition(object.Generation, "Ready", metav1.ConditionFalse, reason, err.Error())}
+	if reason == "RemoteMissing" || !metaConditionTrue(object.Status.Conditions, "Accepted") {
+		conditions = append([]metav1.Condition{accessCondition(object.Generation, "Accepted", metav1.ConditionFalse, reason, err.Error())}, conditions...)
+	}
+	baseObject := object.DeepCopy()
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
+	if !reflect.DeepEqual(baseObject.Status, object.Status) {
+		if patchErr := r.Status().Patch(ctx, object, client.MergeFrom(baseObject)); patchErr != nil {
+			return ctrl.Result{}, patchErr
+		}
+	}
+	return ctrl.Result{}, err
 }
 
 func (r *DevicePostureIntegrationReconciler) now() time.Time {
