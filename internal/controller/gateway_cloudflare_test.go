@@ -416,10 +416,15 @@ func TestGatewayCloudflareDNSGate(t *testing.T) {
 	if publicDNSReady(gateway, tunnel) {
 		t.Fatal("managed DNS reported ready without the public record")
 	}
-	tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "ONE.EXAMPLE.COM"}}
+	tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "ONE.EXAMPLE.COM", State: dnsRecordStateReady}}
 	if !publicDNSReady(gateway, tunnel) {
 		t.Fatal("managed DNS did not accept the matching public record")
 	}
+	tunnel.Status.DNSRecords[0].State = dnsRecordStateConflict
+	if publicDNSReady(gateway, tunnel) {
+		t.Fatal("active DNS conflict incorrectly opened the programming gate")
+	}
+	tunnel.Status.DNSRecords[0].State = dnsRecordStateReady
 	tunnel.Spec.DNS.Mode = v1alpha1.DNSModeExternal
 	if !publicDNSReady(&ir.Gateway{}, tunnel) {
 		t.Fatal("private-only Gateway should not require public DNS records")

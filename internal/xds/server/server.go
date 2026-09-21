@@ -32,12 +32,15 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
-
+	
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	xdslog "github.com/envoyproxy/go-control-plane/pkg/log"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -174,7 +177,7 @@ func (s *Server) SetSnapshot(ctx context.Context, node string, snapshot *cachev3
 	if err != nil {
 		return fmt.Errorf("inspect xDS snapshot for %s: %w", node, err)
 	}
-	s.tracker.ExpectSnapshot(node, version, fingerprints)
+	s.tracker.ExpectSnapshot(node, version, fingerprints, snapshotRequiredTypes(snapshot))
 	if err := s.cache.SetSnapshot(ctx, node, snapshot); err != nil {
 		return fmt.Errorf("publish xDS snapshot for %s: %w", node, err)
 	}
@@ -257,6 +260,33 @@ func fingerprintVersionMap(versionMap map[string]string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func snapshotRequiredTypes(snapshot *cachev3.Snapshot) map[string]struct{} {
+	required := make(map[string]struct{})
+	for _, typeURL := range []resourcev3.Type{resourcev3.ListenerType, resourcev3.ClusterType} {
+		if len(snapshot.GetResources(typeURL)) > 0 { required[string(typeURL)] = struct{}{} }
+	}
+	for typeURL := range cachev3.GetAllResourceReferences(snapshot.Resources) {
+		if len(snapshot.GetResources(typeURL)) > 0 { required[string(typeURL)] = struct{}{} }
+	}
+	for _, item := range snapshot.GetResources(resourcev3.ListenerType) { if listener, ok := item.(*listenerv3.Listener); ok { listenerSDSRequired(listener, snapshot, required) } }
+	for _, item := range snapshot.GetResources(resourcev3.ClusterType) { if cluster, ok := item.(*clusterv3.Cluster); ok { clusterSDSRequired(cluster, snapshot, required) } }
+	return required
+}
+
+func markSecretReference(name string, snapshot *cachev3.Snapshot, required map[string]struct{}) {
+	if _, ok := snapshot.GetResources(resourcev3.SecretType)[name]; ok { required[string(resourcev3.SecretType)] = struct{}{} }
+}
+
+func listenerSDSRequired(listener *listenerv3.Listener, snapshot *cachev3.Snapshot, required map[string]struct{}) {
+	chains := listener.GetFilterChains(); if listener.GetDefaultFilterChain() != nil { chains = append(chains, listener.GetDefaultFilterChain()) }
+	for _, chain := range chains { socket := chain.GetTransportSocket(); if socket == nil { continue }; typed := socket.GetTypedConfig(); if typed == nil { continue }; ctx := &tlsv3.DownstreamTlsContext{}; if typed.UnmarshalTo(ctx) != nil { continue }; for _, cfg := range ctx.GetCommonTlsContext().GetTlsCertificateSdsSecretConfigs() { markSecretReference(cfg.GetName(), snapshot, required) }; if cfg := ctx.GetCommonTlsContext().GetValidationContextSdsSecretConfig(); cfg != nil { markSecretReference(cfg.GetName(), snapshot, required) }; if combined := ctx.GetCommonTlsContext().GetCombinedValidationContext(); combined != nil { if cfg := combined.GetValidationContextSdsSecretConfig(); cfg != nil { markSecretReference(cfg.GetName(), snapshot, required) } } }
+}
+
+func clusterSDSRequired(cluster *clusterv3.Cluster, snapshot *cachev3.Snapshot, required map[string]struct{}) {
+	socket := cluster.GetTransportSocket(); if socket == nil { return }; typed := socket.GetTypedConfig(); if typed == nil { return }; ctx := &tlsv3.UpstreamTlsContext{}; if typed.UnmarshalTo(ctx) != nil { return }; common := ctx.GetCommonTlsContext(); for _, cfg := range common.GetTlsCertificateSdsSecretConfigs() { markSecretReference(cfg.GetName(), snapshot, required) }; if cfg := common.GetValidationContextSdsSecretConfig(); cfg != nil { markSecretReference(cfg.GetName(), snapshot, required) }
+	if combined := common.GetCombinedValidationContext(); combined != nil { if cfg := combined.GetValidationContextSdsSecretConfig(); cfg != nil { markSecretReference(cfg.GetName(), snapshot, required) } }
 }
 
 type loggerAdapter struct {

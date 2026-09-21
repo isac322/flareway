@@ -56,7 +56,7 @@ type AccessStandaloneApplicationReconciler struct {
 	Now                 func() time.Time
 
 	pendingUpdateMu          sync.Mutex
-	pendingUpdateGenerations map[types.UID]int64
+	pendingUpdateGenerations map[types.UID]standaloneApplicationUpdate
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessstandaloneapplications;accesspolicies;identityproviders;accesscustompages;servicetokens;cloudflareaccounts,verbs=get;list;watch
@@ -96,7 +96,11 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	}
 	input, err := r.applicationInput(ctx, object, account, api)
 	if err != nil {
-		return r.finishError(ctx, object, accessValidationReason(err), err)
+		var validation accessValidationError
+		if errors.As(err, &validation) || standaloneApplicationIsValidationError(err) {
+			return r.finishError(ctx, object, accessValidationReason(err), err)
+		}
+		return r.finishRemoteError(ctx, object, err)
 	}
 
 	if effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
@@ -230,16 +234,12 @@ func (r *AccessStandaloneApplicationReconciler) ensureManaged(ctx context.Contex
 	return remote, secretRef, nil
 }
 
-func standaloneApplicationStatusUpdatePending(object *v1alpha1.AccessStandaloneApplication) bool {
-	if object.Status.ObservedGeneration != object.Generation {
-		return false
-	}
-	for index := range object.Status.Conditions {
-		condition := object.Status.Conditions[index]
-		if condition.Type == "Ready" && condition.Status == metav1.ConditionFalse && condition.Reason == "Updating" && condition.ObservedGeneration == object.Generation {
-			return true
-		}
-	}
+type standaloneApplicationUpdate struct {
+	generation          int64
+	awaitingObservation bool
+}
+
+func standaloneApplicationStatusUpdatePending(_ *v1alpha1.AccessStandaloneApplication) bool {
 	return false
 }
 
@@ -249,7 +249,7 @@ func (r *AccessStandaloneApplicationReconciler) observeStandaloneApplicationGene
 	}
 	r.pendingUpdateMu.Lock()
 	defer r.pendingUpdateMu.Unlock()
-	if generation, found := r.pendingUpdateGenerations[object.UID]; found && generation < object.Generation {
+	if pending, found := r.pendingUpdateGenerations[object.UID]; found && pending.generation < object.Generation {
 		r.deleteStandaloneApplicationUpdateLocked(object.UID)
 	}
 }
@@ -260,8 +260,16 @@ func (r *AccessStandaloneApplicationReconciler) standaloneApplicationGenerationU
 	}
 	r.pendingUpdateMu.Lock()
 	defer r.pendingUpdateMu.Unlock()
-	generation, found := r.pendingUpdateGenerations[object.UID]
-	return found && generation == object.Generation
+	pending, found := r.pendingUpdateGenerations[object.UID]
+	if !found || pending.generation != object.Generation {
+		return false
+	}
+	if pending.awaitingObservation {
+		pending.awaitingObservation = false
+		r.pendingUpdateGenerations[object.UID] = pending
+		return true
+	}
+	return false
 }
 
 func (r *AccessStandaloneApplicationReconciler) markStandaloneApplicationUpdate(object *v1alpha1.AccessStandaloneApplication) {
@@ -271,10 +279,11 @@ func (r *AccessStandaloneApplicationReconciler) markStandaloneApplicationUpdate(
 	r.pendingUpdateMu.Lock()
 	defer r.pendingUpdateMu.Unlock()
 	if r.pendingUpdateGenerations == nil {
-		r.pendingUpdateGenerations = make(map[types.UID]int64)
+		r.pendingUpdateGenerations = make(map[types.UID]standaloneApplicationUpdate)
 	}
-	if generation, found := r.pendingUpdateGenerations[object.UID]; !found || generation <= object.Generation {
-		r.pendingUpdateGenerations[object.UID] = object.Generation
+	r.pendingUpdateGenerations[object.UID] = standaloneApplicationUpdate{
+		generation:          object.Generation,
+		awaitingObservation: true,
 	}
 }
 
@@ -284,7 +293,7 @@ func (r *AccessStandaloneApplicationReconciler) clearStandaloneApplicationUpdate
 	}
 	r.pendingUpdateMu.Lock()
 	defer r.pendingUpdateMu.Unlock()
-	if generation, found := r.pendingUpdateGenerations[object.UID]; found && generation <= object.Generation {
+	if pending, found := r.pendingUpdateGenerations[object.UID]; found && pending.generation <= object.Generation {
 		r.deleteStandaloneApplicationUpdateLocked(object.UID)
 	}
 }
@@ -462,7 +471,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicy(ctx cont
 	if reference.ExternalRef != nil {
 		policy, err := api.GetAccessPolicy(ctx, reference.ExternalRef.PolicyID)
 		if err != nil {
-			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", reference.ExternalRef.PolicyID, err)}
+			if flarecloudflare.IsNotFound(err) {
+				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", reference.ExternalRef.PolicyID, err)}
+			}
+			return "", err
 		}
 		return policy.ID, nil
 	}
@@ -478,7 +490,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicy(ctx cont
 	}
 	var policy v1alpha1.AccessPolicy
 	if err := r.Get(ctx, types.NamespacedName{Namespace: targetNamespace, Name: reference.PolicyRef.Name}, &policy); err != nil {
-		return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get AccessPolicy %s/%s: %v", targetNamespace, reference.PolicyRef.Name, err)}
+		if apierrors.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get AccessPolicy %s/%s: %v", targetNamespace, reference.PolicyRef.Name, err)}
+		}
+		return "", err
 	}
 	if err := validateAccessReference(namespace, targetNamespace, "AccessPolicy", account.Name, policy.DeletionTimestamp, policy.Status.Conditions, policy.Spec.AccountRef.Name); err != nil {
 		return "", err
@@ -505,13 +520,19 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneIDP(ctx context
 	if reference.ExternalID != "" {
 		provider, err := api.GetIdentityProvider(ctx, reference.ExternalID)
 		if err != nil {
-			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", reference.ExternalID, err)}
+			if flarecloudflare.IsNotFound(err) {
+				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", reference.ExternalID, err)}
+			}
+			return "", err
 		}
 		return provider.ID, nil
 	}
 	var provider v1alpha1.IdentityProvider
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: reference.Name}, &provider); err != nil {
-		return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get IdentityProvider %s/%s: %v", namespace, reference.Name, err)}
+		if apierrors.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get IdentityProvider %s/%s: %v", namespace, reference.Name, err)}
+		}
+		return "", err
 	}
 	if err := validateAccessReference(namespace, namespace, "IdentityProvider", account.Name, provider.DeletionTimestamp, provider.Status.Conditions, provider.Spec.AccountRef.Name); err != nil {
 		return "", err
@@ -527,7 +548,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneCustomPages(ctx
 	for _, reference := range references {
 		if reference.ExternalID != "" {
 			if _, err := api.GetAccessCustomPage(ctx, reference.ExternalID); err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", reference.ExternalID, err)}
+				if flarecloudflare.IsNotFound(err) {
+					return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", reference.ExternalID, err)}
+				}
+				return nil, err
 			}
 			result = append(result, reference.ExternalID)
 			continue
@@ -544,9 +568,9 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneCustomPages(ctx
 		}
 		var page v1alpha1.AccessCustomPage
 		if err := r.Get(ctx, types.NamespacedName{Namespace: targetNamespace, Name: reference.ObjectRef.Name}, &page); err != nil {
-			return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get AccessCustomPage %s/%s: %v", targetNamespace, reference.ObjectRef.Name, err)}
-		}
-		if err := validateAccessReference(namespace, targetNamespace, "AccessCustomPage", account.Name, page.DeletionTimestamp, page.Status.Conditions, page.Spec.AccountRef.Name); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("get AccessCustomPage %s/%s: %v", targetNamespace, reference.ObjectRef.Name, err)}
+			}
 			return nil, err
 		}
 		if page.Status.CustomPageID == "" {
