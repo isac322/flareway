@@ -25,7 +25,7 @@ import (
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 )
 
-// NACK is the last rejected Delta xDS response for a node.
+// NACK is the last rejected Delta xDS response for a stream.
 type NACK struct {
 	Version string
 	TypeURL string
@@ -37,16 +37,31 @@ type pendingResponse struct {
 	version string
 }
 
+// streamAck records the response version a stream acknowledged and the
+// resource fingerprint that response carried. The fingerprint is the
+// convergence evidence: an ACK for an older version still proves the stream
+// holds the current resources when the type's fingerprint is unchanged.
+type streamAck struct {
+	version     string
+	fingerprint string
+}
+
 type expectedSnapshot struct {
 	version string
-	types   map[string]struct{}
+	// required holds the snapshot resource types a conformant Envoy is
+	// guaranteed to subscribe to (bootstrap LDS/CDS plus every type referenced
+	// by a delivered resource). Required types block convergence even before
+	// the stream's subscription arrives; unreferenced types never will be
+	// subscribed and must not block.
+	required map[string]struct{}
 }
 
 // AckTracker correlates Delta response nonces with later ACK/NACK requests and
-// reports convergence after every subscribed resource type changed by a
-// snapshot has been ACKed. Only types present in a node's active Delta
-// subscriptions can receive a response, so unsubscribed types never block
-// convergence.
+// reports convergence once every live stream for a node has ACKed the current
+// resource fingerprint of each type it subscribes to or is required to
+// subscribe to. ACK and NACK state is owned per stream: one Envoy replica can
+// neither converge nor clear the rejection of a peer, and a closed stream's
+// records are never inherited by its replacement.
 type AckTracker struct {
 	mu            sync.RWMutex
 	pending       map[int64]map[string]map[string]pendingResponse
@@ -54,8 +69,8 @@ type AckTracker struct {
 	subscriptions map[int64]map[string]struct{}
 	expected      map[string]expectedSnapshot
 	fingerprints  map[string]map[string]string
-	acked         map[string]map[string]string
-	nacks         map[string]NACK
+	acked         map[int64]map[string]streamAck
+	nacks         map[int64]NACK
 }
 
 // NewAckTracker returns an empty, concurrency-safe tracker.
@@ -66,26 +81,27 @@ func NewAckTracker() *AckTracker {
 		subscriptions: make(map[int64]map[string]struct{}),
 		expected:      make(map[string]expectedSnapshot),
 		fingerprints:  make(map[string]map[string]string),
-		acked:         make(map[string]map[string]string),
-		nacks:         make(map[string]NACK),
+		acked:         make(map[int64]map[string]streamAck),
+		nacks:         make(map[int64]NACK),
 	}
 }
 
-// ExpectSnapshot records only present resource types whose per-resource
-// fingerprint changed. Delta xDS emits no response for unchanged types, and
-// removed types do not block Gateway convergence. Changed types block
-// convergence only while at least one stream for the node subscribes to them.
-func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[string]string) {
+// ExpectSnapshot records the snapshot's per-type resource fingerprints and the
+// set of required type URLs. Convergence is judged per stream against the
+// fingerprint of every present type the stream subscribes to or must
+// subscribe to, so an unchanged type never demands a new ACK while a
+// republished snapshot still requires proof from every live stream.
+func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[string]string, required map[string]struct{}) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	previous := t.fingerprints[node]
 	if expected, ok := t.expected[node]; ok && expected.version == version && sameFingerprints(previous, fingerprints) {
 		return
 	}
-	changed := make(map[string]struct{})
-	for typeURL, fingerprint := range fingerprints {
-		if previous[typeURL] != fingerprint {
-			changed[typeURL] = struct{}{}
+	requiredPresent := make(map[string]struct{}, len(required))
+	for typeURL := range required {
+		if _, ok := fingerprints[typeURL]; ok {
+			requiredPresent[typeURL] = struct{}{}
 		}
 	}
 	current := make(map[string]string, len(fingerprints))
@@ -93,8 +109,12 @@ func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[strin
 		current[typeURL] = fingerprint
 	}
 	t.fingerprints[node] = current
-	t.expected[node] = expectedSnapshot{version: version, types: changed}
-	delete(t.nacks, node)
+	t.expected[node] = expectedSnapshot{version: version, required: requiredPresent}
+	for streamID, streamNode := range t.nodes {
+		if streamNode == node {
+			delete(t.nacks, streamID)
+		}
+	}
 }
 
 // OnResponse records the nonce/version tuple immediately before transmission.
@@ -148,7 +168,7 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	}
 	t.subscribeLocked(streamID, req.GetTypeUrl())
 	if req.GetResponseNonce() == "" {
-		t.acceptInitialVersionsLocked(node, req.GetTypeUrl(), req.GetInitialResourceVersions())
+		t.acceptInitialVersionsLocked(streamID, node, req.GetTypeUrl(), req.GetInitialResourceVersions())
 		return
 	}
 	byType := t.pending[streamID]
@@ -169,24 +189,33 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	}
 
 	if req.GetErrorDetail() != nil {
-		t.nacks[pending.node] = NACK{
+		t.nacks[streamID] = NACK{
 			Version: pending.version,
 			TypeURL: req.GetTypeUrl(),
 			Detail:  req.GetErrorDetail().GetMessage(),
 		}
-		if byAckType := t.acked[pending.node]; byAckType != nil {
+		if byAckType := t.acked[streamID]; byAckType != nil {
 			delete(byAckType, req.GetTypeUrl())
 		}
 		return
 	}
-	byAckType := t.acked[pending.node]
-	if byAckType == nil {
-		byAckType = make(map[string]string)
-		t.acked[pending.node] = byAckType
+	// Record the fingerprint the ACKed response carried. An ACK for a stale
+	// version still proves the stream holds current resources when the type's
+	// fingerprint is unchanged, so only the expected version's ACK is
+	// recorded; anything older is ignored.
+	if expected, ok := t.expected[pending.node]; ok && expected.version == pending.version {
+		byAckType := t.acked[streamID]
+		if byAckType == nil {
+			byAckType = make(map[string]streamAck)
+			t.acked[streamID] = byAckType
+		}
+		byAckType[req.GetTypeUrl()] = streamAck{
+			version:     pending.version,
+			fingerprint: t.fingerprints[pending.node][req.GetTypeUrl()],
+		}
 	}
-	byAckType[req.GetTypeUrl()] = pending.version
-	if nack, ok := t.nacks[pending.node]; ok && nack.Version == pending.version && nack.TypeURL == req.GetTypeUrl() {
-		delete(t.nacks, pending.node)
+	if nack, ok := t.nacks[streamID]; ok && nack.Version == pending.version && nack.TypeURL == req.GetTypeUrl() {
+		delete(t.nacks, streamID)
 	}
 }
 
@@ -194,7 +223,7 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 // reports it already holds the exact current resource versions. The snapshot
 // cache emits no response in that case, so the initial versions are the only
 // protocol evidence available for convergence.
-func (t *AckTracker) acceptInitialVersionsLocked(node, typeURL string, versions map[string]string) {
+func (t *AckTracker) acceptInitialVersionsLocked(streamID int64, node, typeURL string, versions map[string]string) {
 	if node == "" || typeURL == "" || len(versions) == 0 {
 		return
 	}
@@ -202,33 +231,32 @@ func (t *AckTracker) acceptInitialVersionsLocked(node, typeURL string, versions 
 	if !ok {
 		return
 	}
-	if _, changed := expected.types[typeURL]; !changed {
-		return
-	}
 	fingerprint, err := fingerprintVersionMap(versions)
-	if err != nil || fingerprint != t.fingerprints[node][typeURL] {
+	if err != nil || fingerprint == "" || fingerprint != t.fingerprints[node][typeURL] {
 		return
 	}
-	byType := t.acked[node]
+	byType := t.acked[streamID]
 	if byType == nil {
-		byType = make(map[string]string)
-		t.acked[node] = byType
+		byType = make(map[string]streamAck)
+		t.acked[streamID] = byType
 	}
-	byType[typeURL] = expected.version
-	if nack, found := t.nacks[node]; found && nack.Version == expected.version && nack.TypeURL == typeURL {
-		delete(t.nacks, node)
+	byType[typeURL] = streamAck{version: expected.version, fingerprint: fingerprint}
+	if nack, found := t.nacks[streamID]; found && nack.Version == expected.version && nack.TypeURL == typeURL {
+		delete(t.nacks, streamID)
 	}
 }
 
-// OnStreamClosed forgets nonce correlation and subscription state for a
-// disconnected stream. Changed types lose their convergence expectation once
-// no remaining stream for the node subscribes to them.
+// OnStreamClosed forgets nonce correlation, subscription, and convergence
+// state for a disconnected stream. The stream's ACK and NACK records die with
+// it so a replacement stream starts unproven and cannot inherit them.
 func (t *AckTracker) OnStreamClosed(streamID int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.pending, streamID)
 	delete(t.nodes, streamID)
 	delete(t.subscriptions, streamID)
+	delete(t.acked, streamID)
+	delete(t.nacks, streamID)
 }
 
 // Forget removes every convergence record associated with node while keeping
@@ -239,9 +267,13 @@ func (t *AckTracker) Forget(node string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.expected, node)
-	delete(t.acked, node)
 	delete(t.fingerprints, node)
-	delete(t.nacks, node)
+	for streamID, streamNode := range t.nodes {
+		if streamNode == node {
+			delete(t.acked, streamID)
+			delete(t.nacks, streamID)
+		}
+	}
 	for streamID, byType := range t.pending {
 		for typeURL, byNonce := range byType {
 			for nonce, pending := range byNonce {
@@ -259,10 +291,13 @@ func (t *AckTracker) Forget(node string) {
 	}
 }
 
-// IsACKed reports whether every changed resource type that at least one of
-// node's streams subscribes to has ACKed the exact version. An empty expected
-// set is already converged; a non-empty set requires a live stream so a dead
-// or disconnected Envoy cannot converge vacuously.
+// IsACKed reports whether every live stream for node has proven it holds the
+// requested snapshot: for each resource type present in the snapshot, a
+// subscribed stream must have ACKed the current fingerprint, and a required
+// type must be subscribed and ACKed even if its subscription has not arrived
+// yet. A snapshot carrying no resources is converged immediately; a non-empty
+// snapshot requires at least one live stream so a dead or disconnected Envoy
+// cannot converge vacuously.
 func (t *AckTracker) IsACKed(node, version string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -270,16 +305,30 @@ func (t *AckTracker) IsACKed(node, version string) bool {
 	if !ok || expected.version != version {
 		return false
 	}
-	if len(expected.types) > 0 && !t.hasStreamLocked(node) {
+	present := t.fingerprints[node]
+	if len(present) == 0 {
+		return true
+	}
+	if !t.hasStreamLocked(node) {
 		return false
 	}
-	acked := t.acked[node]
-	for typeURL := range expected.types {
-		if !t.subscribedLocked(node, typeURL) {
+	for streamID, streamNode := range t.nodes {
+		if streamNode != node {
 			continue
 		}
-		if acked[typeURL] != version {
+		if nack, ok := t.nacks[streamID]; ok && nack.Version == version {
 			return false
+		}
+		acked := t.acked[streamID]
+		for typeURL, fingerprint := range present {
+			_, required := expected.required[typeURL]
+			_, subscribed := t.subscriptions[streamID][typeURL]
+			if !subscribed && !required {
+				continue
+			}
+			if acked[typeURL].fingerprint != fingerprint {
+				return false
+			}
 		}
 	}
 	return true
@@ -310,22 +359,22 @@ func (t *AckTracker) hasStreamLocked(node string) bool {
 	return false
 }
 
-// subscribedLocked reports whether any stream associated with node subscribes
-// to typeURL. Callers must hold t.mu.
-func (t *AckTracker) subscribedLocked(node, typeURL string) bool {
+// streamIDsLocked returns the live stream IDs for node in ascending order so
+// aggregated output is deterministic. Callers must hold t.mu.
+func (t *AckTracker) streamIDsLocked(node string) []int64 {
+	ids := make([]int64, 0, len(t.nodes))
 	for streamID, streamNode := range t.nodes {
-		if streamNode != node {
-			continue
-		}
-		if _, ok := t.subscriptions[streamID][typeURL]; ok {
-			return true
+		if streamNode == node {
+			ids = append(ids, streamID)
 		}
 	}
-	return false
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // ConvergenceDetails returns a concise, non-sensitive explanation when the
-// requested snapshot has not converged.
+// requested snapshot has not converged. Stream identity is never exposed: the
+// message aggregates stream count and the worst per-type state only.
 func (t *AckTracker) ConvergenceDetails(node, version string) string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -336,38 +385,67 @@ func (t *AckTracker) ConvergenceDetails(node, version string) string {
 	if expected.version != version {
 		return fmt.Sprintf("expected version %s, requested %s", shortVersion(expected.version), shortVersion(version))
 	}
-	streams := 0
-	for _, streamNode := range t.nodes {
-		if streamNode == node {
-			streams++
-		}
-	}
-	if len(expected.types) > 0 && streams == 0 {
+	streams := t.streamIDsLocked(node)
+	present := t.fingerprints[node]
+	if len(present) > 0 && len(streams) == 0 {
 		return "no live xDS stream"
 	}
-	missing := make([]string, 0, len(expected.types))
-	for typeURL := range expected.types {
-		if !t.subscribedLocked(node, typeURL) {
-			continue
+	for _, streamID := range streams {
+		if nack, found := t.nacks[streamID]; found && nack.Version == version {
+			return fmt.Sprintf("NACK %s: %s", shortTypeURL(nack.TypeURL), nack.Detail)
 		}
-		ackedVersion := t.acked[node][typeURL]
-		if ackedVersion != version {
-			state := "no ACK"
-			if ackedVersion != "" {
-				state = "got " + shortVersion(ackedVersion)
+	}
+	// Per type, report the worst state across streams: a required type no
+	// stream has subscribed to yet outranks a missing ACK, which outranks a
+	// stale ACK.
+	const (
+		staleAck = iota
+		noAck
+		notSubscribed
+	)
+	worst := make(map[string]int, len(present))
+	for _, streamID := range streams {
+		for typeURL, fingerprint := range present {
+			_, required := expected.required[typeURL]
+			_, subscribed := t.subscriptions[streamID][typeURL]
+			if !subscribed && !required {
+				continue
 			}
-			missing = append(missing, fmt.Sprintf("%s(%s)", shortTypeURL(typeURL), state))
+			ack := t.acked[streamID][typeURL]
+			if ack.fingerprint == fingerprint {
+				continue
+			}
+			state := noAck
+			switch {
+			case !subscribed:
+				state = notSubscribed
+			case ack.version != "" || ack.fingerprint != "":
+				state = staleAck
+			}
+			if state > worst[typeURL] {
+				worst[typeURL] = state
+			}
 		}
+	}
+	missing := make([]string, 0, len(worst))
+	for typeURL, state := range worst {
+		var detail string
+		switch state {
+		case notSubscribed:
+			detail = "not subscribed"
+		case staleAck:
+			detail = "stale ACK"
+		default:
+			detail = "no ACK"
+		}
+		missing = append(missing, fmt.Sprintf("%s(%s)", shortTypeURL(typeURL), detail))
 	}
 	sort.Strings(missing)
-	if nack, found := t.nacks[node]; found && nack.Version == version {
-		return fmt.Sprintf("NACK %s: %s", shortTypeURL(nack.TypeURL), nack.Detail)
-	}
 	if len(missing) > 0 {
 		return fmt.Sprintf(
 			"want %s, %d live stream(s), missing %s",
 			shortVersion(version),
-			streams,
+			len(streams),
 			strings.Join(missing, ","),
 		)
 	}
@@ -400,14 +478,19 @@ func sameFingerprints(left, right map[string]string) bool {
 	return true
 }
 
-// LastNACK returns the last rejection for the currently expected snapshot.
+// LastNACK returns the earliest live stream's rejection for the currently
+// expected snapshot.
 func (t *AckTracker) LastNACK(node string) (NACK, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	nack, ok := t.nacks[node]
-	expected, expectedOK := t.expected[node]
-	if !ok || !expectedOK || nack.Version != expected.version {
+	expected, ok := t.expected[node]
+	if !ok {
 		return NACK{}, false
 	}
-	return nack, true
+	for _, streamID := range t.streamIDsLocked(node) {
+		if nack, found := t.nacks[streamID]; found && nack.Version == expected.version {
+			return nack, true
+		}
+	}
+	return NACK{}, false
 }
