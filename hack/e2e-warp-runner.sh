@@ -411,15 +411,23 @@ cleanup() {
 # a device left in the account default network never resolves the run's private
 # hostname.
 bind_vnet() {
-  local vnet_id="$1" profile_id
+  local vnet_id="$1" profile_id diagnostics
   require_env
   [[ -n "${vnet_id}" ]] || fail "bind-vnet requires a virtual network id"
   profile_id="$(state_get PROFILE_ID)"
   [[ -n "${profile_id}" ]] || fail "bind-vnet requires a bootstrapped device profile"
-  cf_api PATCH "/accounts/${CF_ACCOUNT_ID}/devices/policy/${profile_id}" \
+  if ! diagnostics="$(cf_api PATCH "/accounts/${CF_ACCOUNT_ID}/devices/policy/${profile_id}" \
     "$(jq -cn --arg vnet "${vnet_id}" \
-      '{virtual_networks: {allowed: [$vnet], default: $vnet}}')" \
-    >/dev/null || fail "device profile virtual network update failed"
+      '{virtual_networks: {allowed: [$vnet], default: $vnet}}')" 2>&1 >/dev/null)"; then
+    # 2612 reports that per-profile virtual network selection is gated behind a
+    # closed beta on this account, which no test-side change can satisfy.
+    if [[ "${diagnostics}" == *2612* ]]; then
+      log "device profile virtual network selection is unavailable on this account"
+      exit 3
+    fi
+    printf '%s\n' "${diagnostics}" >&2
+    fail "device profile virtual network update failed"
+  fi
   log "bound device profile ${profile_id} to virtual network ${vnet_id}"
 }
 
