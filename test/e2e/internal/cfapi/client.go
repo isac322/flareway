@@ -195,6 +195,13 @@ type FallbackDomain struct {
 	DNSServer   []string `json:"dns_server,omitempty"`
 }
 
+// ZeroTrustOrganization carries the account-wide Zero Trust settings that the
+// private WARP prerequisites depend on.
+type ZeroTrustOrganization struct {
+	AuthDomain              string `json:"auth_domain"`
+	WARPAuthSessionDuration string `json:"warp_auth_session_duration"`
+}
+
 type zone struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -239,6 +246,15 @@ func (c *Client) ResolveZone(ctx context.Context, name string) error {
 		}
 	}
 	return fmt.Errorf("cloudflare zone %q was not found in account %q", name, c.accountID)
+}
+
+// GetZeroTrustOrganization reads the account-wide Zero Trust settings.
+func (c *Client) GetZeroTrustOrganization(ctx context.Context) (ZeroTrustOrganization, error) {
+	var organization ZeroTrustOrganization
+	if err := c.get(ctx, "/accounts/"+url.PathEscape(c.accountID)+"/access/organizations", &organization); err != nil {
+		return ZeroTrustOrganization{}, err
+	}
+	return organization, nil
 }
 
 // ListTunnels returns all non-deleted tunnels in the configured account.
