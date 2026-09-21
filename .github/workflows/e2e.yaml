@@ -39,6 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: cloudflare-e2e
+    env:
+      E2E_LABELS: ${{ github.event_name == 'schedule' && 'public,access,warp' || inputs.labels || 'public,access' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,13 +98,25 @@ jobs:
             kubectl apply -f -
           kubectl -n flareway-system rollout status \
             deployment/flareway-controller-manager --timeout=5m
+      - name: Bootstrap WARP runner
+        id: warp
+        if: contains(env.E2E_LABELS, 'warp')
+        env:
+          FLAREWAY_E2E_CF_API_TOKEN: ${{ secrets.FLAREWAY_E2E_CF_API_TOKEN }}
+          FLAREWAY_E2E_CF_ACCOUNT_ID: ${{ secrets.FLAREWAY_E2E_CF_ACCOUNT_ID }}
+        run: |
+          if bash hack/e2e-warp-runner.sh bootstrap; then
+            echo "warp_device=1" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::WARP runner bootstrap failed; private WARP spec will report blocked: runner"
+          fi
       - name: Run end-to-end tests
         env:
           FLAREWAY_E2E_CF_API_TOKEN: ${{ secrets.FLAREWAY_E2E_CF_API_TOKEN }}
           FLAREWAY_E2E_CF_ACCOUNT_ID: ${{ secrets.FLAREWAY_E2E_CF_ACCOUNT_ID }}
           FLAREWAY_E2E_ZONE: ${{ secrets.FLAREWAY_E2E_ZONE }}
-          FLAREWAY_E2E_LABELS: ${{ github.event_name == 'schedule' && 'public,access,warp' || inputs.labels || 'public,access' }}
-          FLAREWAY_E2E_WARP_DEVICE: ${{ vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
+          FLAREWAY_E2E_LABELS: ${{ env.E2E_LABELS }}
+          FLAREWAY_E2E_WARP_DEVICE: ${{ steps.warp.outputs.warp_device || vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
           FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER: ${{ vars.FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER }}
           FLAREWAY_E2E_DEVICE_PROFILE_KIND: ${{ github.event_name == 'workflow_dispatch' && inputs.device_profile_kind || 'Custom' }}
           FLAREWAY_E2E_ALLOW_DEFAULT_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.device_profile_kind == 'Default' && '1' || '0' }}
@@ -110,8 +124,8 @@ jobs:
       - name: Classify private WARP result
         if: always()
         env:
-          REQUESTED_LABELS: ${{ github.event_name == 'schedule' && 'public,access,warp' || inputs.labels || 'public,access' }}
-          WARP_DEVICE: ${{ vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
+          REQUESTED_LABELS: ${{ env.E2E_LABELS }}
+          WARP_DEVICE: ${{ steps.warp.outputs.warp_device || vars.FLAREWAY_E2E_WARP_DEVICE || '0' }}
         run: |
           python3 - <<'PY'
           import json
@@ -145,12 +159,21 @@ jobs:
                   summary.write(f"\n{report['reason']}\n")
           print(f"private WARP classification: {result}")
           PY
+      - name: Clean up WARP runner
+        if: always() && contains(env.E2E_LABELS, 'warp')
+        env:
+          FLAREWAY_E2E_CF_API_TOKEN: ${{ secrets.FLAREWAY_E2E_CF_API_TOKEN }}
+          FLAREWAY_E2E_CF_ACCOUNT_ID: ${{ secrets.FLAREWAY_E2E_CF_ACCOUNT_ID }}
+        run: bash hack/e2e-warp-runner.sh cleanup
       - name: Collect controller diagnostics
         if: always()
         run: |
           mkdir -p artifacts/cluster
           kubectl -n flareway-system logs deployment/flareway-controller-manager \
             --all-containers --ignore-errors > artifacts/cluster/controller.log 2>&1 || true
+          kubectl logs -A -l flareway.bhyoo.com/gateway \
+            --all-containers --prefix --ignore-errors \
+            > artifacts/cluster/dataplane.log 2>&1 || true
           kubectl get \
             cloudflareaccounts,cloudflaretunnels,accessapplications,accesspolicies,accessgroups,identityproviders,deviceposturerules,servicetokens,virtualnetworks,networkroutes,hostnameroutes,deviceprofiles,devicesettings,zerotrustorganizations,zerotrustgatewaypolicies,zerotrustlists,gateways,httproutes \
             -A -o yaml > artifacts/cluster/resources.yaml 2>&1 || true
@@ -168,7 +191,7 @@ jobs:
               r'(\s*[":=]\s*)("[^"]*"|[^\s,}]+)'
           )
           bearer = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
-          for name in ("controller.log", "resources.yaml", "events.txt"):
+          for name in ("controller.log", "dataplane.log", "resources.yaml", "events.txt"):
               path = Path("artifacts/cluster") / name
               if path.exists():
                   redacted = sensitive.sub(r'\1\2"[REDACTED]"', path.read_text())
