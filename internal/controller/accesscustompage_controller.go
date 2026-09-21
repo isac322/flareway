@@ -25,6 +25,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,7 +56,7 @@ type AccessCustomPageReconciler struct {
 	Recorder            recorder.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages;accessapplications;cloudflareaccounts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages;accessapplications;accessstandaloneapplications;cloudflareaccounts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages,verbs=create;update;patch;delete
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages/finalizers,verbs=update
@@ -241,23 +242,39 @@ func (r *AccessCustomPageReconciler) referencingApplications(ctx context.Context
 	references := make([]string, 0)
 	for index := range applications.Items {
 		application := &applications.Items[index]
-		for _, ref := range application.Spec.Application.CustomPageRefs {
-			matches := ref.ExternalID != "" && ref.ExternalID == page.Status.CustomPageID
-			if ref.ObjectRef != nil {
-				namespace := ref.ObjectRef.Namespace
-				if namespace == "" {
-					namespace = application.Namespace
-				}
-				matches = matches || namespace == page.Namespace && ref.ObjectRef.Name == page.Name
-			}
-			if matches {
-				references = append(references, application.Namespace+"/"+application.Name)
-				break
-			}
+		if customPageIsReferenced(application.Spec.Application, application.Namespace, page) {
+			references = append(references, application.Namespace+"/"+application.Name)
+		}
+	}
+	var standaloneApplications v1alpha1.AccessStandaloneApplicationList
+	if err := r.List(ctx, &standaloneApplications); err != nil {
+		return nil, fmt.Errorf("list AccessStandaloneApplications referencing custom page: %w", err)
+	}
+	for index := range standaloneApplications.Items {
+		application := &standaloneApplications.Items[index]
+		if customPageIsReferenced(application.Spec.Application, application.Namespace, page) {
+			references = append(references, application.Namespace+"/"+application.Name)
 		}
 	}
 	slices.Sort(references)
-	return references, nil
+	return slices.Compact(references), nil
+}
+
+func customPageIsReferenced(settings v1alpha1.AccessApplicationSettings, applicationNamespace string, page *v1alpha1.AccessCustomPage) bool {
+	for _, ref := range settings.CustomPageRefs {
+		matches := ref.ExternalID != "" && ref.ExternalID == page.Status.CustomPageID
+		if ref.ObjectRef != nil {
+			namespace := ref.ObjectRef.Namespace
+			if namespace == "" {
+				namespace = applicationNamespace
+			}
+			matches = matches || namespace == page.Namespace && ref.ObjectRef.Name == page.Name
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
 }
 
 func customPageDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionPolicy {
@@ -269,7 +286,6 @@ func customPageDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionP
 
 func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool) error {
 	base := client.MergeFrom(object.DeepCopy())
-	previousGeneration := object.Status.ObservedGeneration
 	if remote.ID != "" {
 		object.Status.CustomPageID = remote.ID
 		object.Status.OwnershipVerified = owned
@@ -289,8 +305,15 @@ func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1
 		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "TemplateWarnings", formatCustomPageWarnings(warnings)))
 	case len(drift) > 0:
 		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "DriftDetected", "Observed custom page differs in "+strings.Join(drift, ", ")))
-	case warningsObserved || previousGeneration != object.Generation:
-		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionFalse, "Healthy", "No custom page drift or template warnings were detected"))
+	default:
+		degraded := accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionFalse, "Healthy", "No custom page drift or template warnings were detected")
+		if previous := meta.FindStatusCondition(object.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); !warningsObserved && previous != nil && previous.Status == metav1.ConditionTrue && previous.Reason == "TemplateWarnings" {
+			// GET cannot re-observe template warnings; keep the last observed signal.
+			degraded.Status = metav1.ConditionTrue
+			degraded.Reason = previous.Reason
+			degraded.Message = previous.Message
+		}
+		conditions = append(conditions, degraded)
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
@@ -366,6 +389,7 @@ func (r *AccessCustomPageReconciler) SetupWithManager(manager ctrl.Manager) erro
 		For(&v1alpha1.AccessCustomPage{}).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.pagesForAccount)).
 		Watches(&v1alpha1.AccessApplication{}, handler.EnqueueRequestsFromMapFunc(r.pagesForApplication)).
+		Watches(&v1alpha1.AccessStandaloneApplication{}, handler.EnqueueRequestsFromMapFunc(r.pagesForStandaloneApplication)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.pagesForNamespace)).
 		Complete(observedReconciler("access-custom-page", r))
 }
@@ -380,14 +404,23 @@ func (r *AccessCustomPageReconciler) pagesForAccount(ctx context.Context, object
 
 func (r *AccessCustomPageReconciler) pagesForApplication(_ context.Context, object client.Object) []reconcile.Request {
 	application := object.(*v1alpha1.AccessApplication)
-	requests := make([]reconcile.Request, 0, len(application.Spec.Application.CustomPageRefs))
-	for _, ref := range application.Spec.Application.CustomPageRefs {
+	return pagesForCustomPageRefs(application.Namespace, application.Spec.Application.CustomPageRefs)
+}
+
+func (r *AccessCustomPageReconciler) pagesForStandaloneApplication(_ context.Context, object client.Object) []reconcile.Request {
+	application := object.(*v1alpha1.AccessStandaloneApplication)
+	return pagesForCustomPageRefs(application.Namespace, application.Spec.Application.CustomPageRefs)
+}
+
+func pagesForCustomPageRefs(defaultNamespace string, refs []v1alpha1.AccessCustomPageReference) []reconcile.Request {
+	requests := make([]reconcile.Request, 0, len(refs))
+	for _, ref := range refs {
 		if ref.ObjectRef == nil {
 			continue
 		}
 		namespace := ref.ObjectRef.Namespace
 		if namespace == "" {
-			namespace = application.Namespace
+			namespace = defaultNamespace
 		}
 		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: ref.ObjectRef.Name}})
 	}
