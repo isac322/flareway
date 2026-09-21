@@ -77,7 +77,7 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	scope := flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "Pending", err.Error())
+		_ = r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
 	}
 	scope, err = accessGroupScope(object.Spec.Zone, account.Status.Verified.Zones)
@@ -423,9 +423,9 @@ func (r *AccessGroupReconciler) groupsForAccount(ctx context.Context, object cli
 	}
 	return accessGroupRequests(list.Items)
 }
-func (r *AccessGroupReconciler) groupsForDependency(ctx context.Context, object client.Object) []reconcile.Request {
+func (r *AccessGroupReconciler) groupsForDependency(ctx context.Context, _ client.Object) []reconcile.Request {
 	var list v1alpha1.AccessGroupList
-	if err := r.List(ctx, &list, client.InNamespace(object.GetNamespace())); err != nil {
+	if err := r.List(ctx, &list); err != nil {
 		return nil
 	}
 	return accessGroupRequests(list.Items)

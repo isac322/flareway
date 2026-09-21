@@ -83,7 +83,7 @@ func accessClientForAccount(
 	}
 	decision := authz.Evaluate(account, namespace, operation)
 	if !decision.Allowed {
-		return nil, nil, fmt.Errorf("%s: %s", decision.Reason, decision.Message)
+		return nil, nil, privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
 	}
 
 	ref := account.Spec.Credentials.APITokenSecretRef
@@ -240,7 +240,7 @@ func resolveAccessRule(ctx context.Context, kube client.Client, namespace string
 	}
 }
 
-func authorizeAccessReference(ctx context.Context, kube client.Client, sourceNamespace, targetNamespace string, account *v1alpha1.CloudflareAccount) error {
+func authorizeAccessReference(ctx context.Context, kube client.Client, sourceNamespace, targetNamespace string, account *v1alpha1.CloudflareAccount, kind string) error {
 	if targetNamespace == sourceNamespace {
 		return nil
 	}
@@ -248,9 +248,16 @@ func authorizeAccessReference(ctx context.Context, kube client.Client, sourceNam
 	if err := kube.Get(ctx, types.NamespacedName{Name: sourceNamespace}, namespace); err != nil {
 		return err
 	}
-	decision := authz.Evaluate(account, namespace, authz.Request{AccessPolicyRef: true})
+	var request authz.Request
+	switch kind {
+	case "AccessCustomPage":
+		request.AccessCustomPageRef = true
+	default:
+		request.AccessPolicyRef = true
+	}
+	decision := authz.Evaluate(account, namespace, request)
 	if !decision.Allowed {
-		return fmt.Errorf("%s: %s", decision.Reason, decision.Message)
+		return privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
 	}
 	return nil
 }
@@ -276,7 +283,7 @@ func resolveGroupID(ctx context.Context, kube client.Client, namespace string, a
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(namespace, ref)
-	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account, "AccessGroup"); err != nil {
 		return "", err
 	}
 	var object v1alpha1.AccessGroup
@@ -300,7 +307,7 @@ func resolveIDPID(ctx context.Context, kube client.Client, namespace string, acc
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(namespace, ref)
-	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account, "IdentityProvider"); err != nil {
 		return "", err
 	}
 	var object v1alpha1.IdentityProvider
@@ -324,7 +331,7 @@ func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace st
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(namespace, ref)
-	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account, "ServiceToken"); err != nil {
 		return "", err
 	}
 	var object v1alpha1.ServiceToken
@@ -348,7 +355,7 @@ func resolvePostureID(ctx context.Context, kube client.Client, namespace string,
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(namespace, ref)
-	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account, "DevicePostureRule"); err != nil {
 		return "", err
 	}
 	var object v1alpha1.DevicePostureRule
@@ -373,7 +380,7 @@ func resolveListID(ctx context.Context, kube client.Client, namespace string, ac
 	}
 	ref := *rule.ListRef
 	targetNamespace := referenceNamespace(namespace, ref)
-	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, kube, namespace, targetNamespace, account, "ZeroTrustList"); err != nil {
 		return "", err
 	}
 	object := &unstructured.Unstructured{}

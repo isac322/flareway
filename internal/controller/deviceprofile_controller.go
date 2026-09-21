@@ -231,7 +231,10 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 			if !decision.Allowed {
 				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "the NetworkRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
 			}
-			value := route.Spec.Network
+			value := route.Status.Applied.Network
+			if value == "" {
+				continue
+			}
 			candidates = append(candidates, splitCandidate{entry: v1alpha1.DeviceProfileSplitTunnelEntry{Address: &value, Description: "NetworkRoute " + route.Namespace + "/" + route.Name}, provenance: "NetworkRoute/" + route.Namespace + "/" + route.Name, priority: 1})
 		}
 	}
@@ -256,11 +259,14 @@ func (r *DeviceProfileReconciler) aggregate(ctx context.Context, profile *v1alph
 			if !allowed {
 				return aggregatedDeviceProfile{}, deviceProfileInvalid("RefNotPermitted", "the HostnameRoute %s/%s does not allow namespace %q", route.Namespace, route.Name, namespace.Name)
 			}
-			decision := authz.Evaluate(account, namespace, authz.Request{Hostname: route.Spec.Hostname, Exposure: v1alpha1.ExposurePrivate, PrivateRoute: &authz.PrivateRouteRequest{Kind: authz.PrivateRouteHostname, Labels: route.Labels}})
+			value := route.Status.Applied.Hostname
+			if value == "" {
+				continue
+			}
+			decision := authz.Evaluate(account, namespace, authz.Request{Hostname: value, Exposure: v1alpha1.ExposurePrivate, PrivateRoute: &authz.PrivateRouteRequest{Kind: authz.PrivateRouteHostname, Labels: route.Labels}})
 			if !decision.Allowed {
 				return aggregatedDeviceProfile{}, deviceProfileInvalid(decision.Reason, "the HostnameRoute %s/%s: %s", route.Namespace, route.Name, decision.Message)
 			}
-			value := route.Spec.Hostname
 			candidates = append(candidates, splitCandidate{entry: v1alpha1.DeviceProfileSplitTunnelEntry{Host: &value, Description: "HostnameRoute " + route.Namespace + "/" + route.Name}, provenance: "HostnameRoute/" + route.Namespace + "/" + route.Name, priority: 1})
 		}
 	}
