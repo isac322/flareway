@@ -406,6 +406,22 @@ cleanup() {
   fi
   return "${rc}"
 }
+# bind-vnet VNET_ID scopes this run's device profile to the virtual network the
+# run created. Cloudflare matches a private destination by virtual network, so
+# a device left in the account default network never resolves the run's private
+# hostname.
+bind_vnet() {
+  local vnet_id="$1" profile_id
+  require_env
+  [[ -n "${vnet_id}" ]] || fail "bind-vnet requires a virtual network id"
+  profile_id="$(state_get PROFILE_ID)"
+  [[ -n "${profile_id}" ]] || fail "bind-vnet requires a bootstrapped device profile"
+  cf_api PATCH "/accounts/${CF_ACCOUNT_ID}/devices/policy/${profile_id}" \
+    "$(jq -cn --arg vnet "${vnet_id}" \
+      '{virtual_networks: {allowed: [$vnet], default: $vnet}}')" \
+    >/dev/null || fail "device profile virtual network update failed"
+  log "bound device profile ${profile_id} to virtual network ${vnet_id}"
+}
 
 action="${1:-}"
 case "${action}" in
@@ -413,10 +429,13 @@ case "${action}" in
     trap 'rc=$?; if ((rc != 0)) && [[ -f "${STATE_FILE}" ]]; then log "bootstrap failed; cleaning up partial state"; cleanup || true; fi' EXIT
     bootstrap
     ;;
+  bind-vnet)
+    bind_vnet "${2:-}"
+    ;;
   cleanup)
     cleanup
     ;;
   *)
-    fail "usage: $0 {bootstrap|cleanup}"
+    fail "usage: $0 {bootstrap|bind-vnet VNET_ID|cleanup}"
     ;;
 esac
