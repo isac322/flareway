@@ -957,3 +957,43 @@ func TestGatewayModeTunnelDefersRemoteConfigurationToTheGatewayWriter(t *testing
 		t.Fatalf("Gateway-mode reconciliation projected remote version %d before the first applied version", status.ConfigVersion.Remote)
 	}
 }
+
+func TestDesiredTunnelListenersReportsEachProtectionDomainOnce(t *testing.T) {
+	// A wildcard listener carrying several hosts produces one ir domain per
+	// host, and hosts needing no Access claim reuse the listener's base domain
+	// verbatim. ProtectionDomains is +listMapKey=name, so emitting those
+	// one-for-one makes the status unpatchable: server-side apply rejects it
+	// with "duplicate entries for key [name=...]", the Gateway reconcile fails
+	// before route status is written, and every HTTPRoute on that listener
+	// keeps an empty status while its traffic keeps flowing.
+	gateway := &ir.Gateway{
+		Listeners: []ir.Listener{{Name: "ws-preview", Exposure: ir.ExposurePublic}},
+		Domains: []ir.ProtectionDomain{
+			{Name: "ws-preview", ListenerName: "ws-preview", EnvoyPort: 18080, VirtualHosts: []ir.VirtualHost{{Hostname: "a.example.com"}}},
+			{Name: "ws-preview", ListenerName: "ws-preview", EnvoyPort: 18080, VirtualHosts: []ir.VirtualHost{{Hostname: "b.example.com"}}},
+			{Name: "ws-preview", ListenerName: "ws-preview", EnvoyPort: 18080, VirtualHosts: []ir.VirtualHost{{Hostname: "c.example.com"}}},
+			{Name: "ws-preview-protected", ListenerName: "ws-preview", EnvoyPort: 18081, Protected: true},
+		},
+	}
+
+	listeners := desiredTunnelListeners(gateway)
+	if len(listeners) != 1 {
+		t.Fatalf("expected one listener status, got %d", len(listeners))
+	}
+
+	seen := make(map[string]int)
+	for _, domain := range listeners[0].ProtectionDomains {
+		seen[domain.Name]++
+	}
+	for name, count := range seen {
+		if count > 1 {
+			t.Errorf("protection domain %q reported %d times; the list is keyed by name and will be rejected by server-side apply", name, count)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected the two distinct protection domains, got %v", seen)
+	}
+	if _, ok := seen["ws-preview-protected"]; !ok {
+		t.Error("deduplication dropped a distinct protection domain")
+	}
+}

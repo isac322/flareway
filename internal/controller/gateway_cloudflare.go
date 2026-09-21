@@ -777,10 +777,26 @@ func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelList
 				status.Binding = v1alpha1.ListenerBindingPodIP
 			}
 		}
+		// One ir.ProtectionDomain is produced per virtual host, and hosts that
+		// need no Access claim reuse the listener's base domain verbatim --
+		// same name, same port, same guard. A wildcard listener therefore
+		// yields as many identically named domains as it has hosts.
+		//
+		// ProtectionDomains is +listMapKey=name, so emitting them one-for-one
+		// makes the whole status object unpatchable: server-side apply rejects
+		// it with "duplicate entries for key [name=...]" and the Gateway
+		// reconcile fails before any route status is written. Report each
+		// distinct protection domain once instead.
+		seen := make(map[string]struct{}, len(gateway.Domains))
 		for _, domain := range gateway.Domains {
-			if domain.ListenerName == listener.Name {
-				status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+			if domain.ListenerName != listener.Name {
+				continue
 			}
+			if _, duplicate := seen[domain.Name]; duplicate {
+				continue
+			}
+			seen[domain.Name] = struct{}{}
+			status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
 		}
 		result = append(result, status)
 	}
