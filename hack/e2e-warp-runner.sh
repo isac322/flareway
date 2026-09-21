@@ -272,6 +272,17 @@ bootstrap() {
       {"host":"flareway.internal","description":"flareway e2e private hostnames"}]' \
     >/dev/null || fail "split-tunnel include list update failed"
 
+  # Cloudflare's default Local Domain Fallback list contains "internal", so a
+  # query for the private hostname would go to the runner's local resolver and
+  # never receive a synthetic address. This profile keeps every other default
+  # suffix local and sends only the e2e suffix to Cloudflare.
+  cf_api PUT "/accounts/${CF_ACCOUNT_ID}/devices/policy/${profile_id}/fallback_domains" \
+    '[{"suffix":"corp"},{"suffix":"domain"},{"suffix":"home"},{"suffix":"home.arpa"},
+      {"suffix":"host"},{"suffix":"intranet"},{"suffix":"invalid"},{"suffix":"lan"},
+      {"suffix":"local"},{"suffix":"localdomain"},{"suffix":"localhost"},
+      {"suffix":"private"},{"suffix":"test"}]' \
+    >/dev/null || fail "local domain fallback update failed"
+
   log "writing ${MDM_FILE} and restarting warp-svc"
   sudo mkdir -p "$(dirname "${MDM_FILE}")"
   printf '%s\n' \
