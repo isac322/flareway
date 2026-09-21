@@ -137,6 +137,70 @@ func TestAccessApplicationDeleteBlocksForMissingPublisherAndRecovers(t *testing.
 		t.Fatal(err)
 	}
 }
+
+func TestAccessApplicationDeleteConvergesForSettledPrivateBlock(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		exposure        v1alpha1.Exposure
+		expectFinalizer bool
+	}{
+		{name: "private block is acknowledged at the settled version", exposure: v1alpha1.ExposurePrivate, expectFinalizer: false},
+		{name: "public block still requires a newer version", exposure: v1alpha1.ExposurePublic, expectFinalizer: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, v1alpha1.AddToScheme, gatewayv1.Install} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			uid := types.UID("recorded")
+			now := metav1.NewTime(time.Unix(10, 0))
+			application := &v1alpha1.AccessApplication{
+				ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", Generation: 1, DeletionTimestamp: &now, Finalizers: []string{v1alpha1.AccessApplicationFinalizer},
+					Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"gateway","protectionDomain":"domain","hostname":"app.internal","baselineVersion":1}]}`}},
+				Spec: v1alpha1.AccessApplicationSpec{ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly},
+			}
+			tunnel := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant"}, Status: v1alpha1.CloudflareTunnelStatus{
+				GatewayRef: &corev1.LocalObjectReference{Name: "gateway"}, GatewayUID: uid,
+				ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 1, Desired: 1},
+				Listeners: []v1alpha1.CloudflareTunnelListenerStatus{{
+					Name: "listener", Exposure: testCase.exposure,
+					ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{Name: "domain"}},
+				}},
+				Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+					Hostname: "app.internal", ProtectionDomain: "domain", AccessApplication: "tenant/app",
+					Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 1,
+				}},
+			}}
+			gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant", UID: uid}}
+			kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&v1alpha1.AccessApplication{}, &v1alpha1.CloudflareTunnel{}).
+				WithObjects(application, tunnel, gateway).Build()
+			r := &AccessApplicationReconciler{Client: kube, Scheme: scheme, Now: func() time.Time { return now.Time }}
+			if _, err := r.reconcileDelete(context.Background(), application); err != nil {
+				t.Fatal(err)
+			}
+			var stored v1alpha1.AccessApplication
+			err := kube.Get(context.Background(), types.NamespacedName{Namespace: "tenant", Name: "app"}, &stored)
+			if testCase.expectFinalizer {
+				if err != nil {
+					t.Fatalf("get application: %v", err)
+				}
+				if len(stored.Finalizers) == 0 {
+					t.Fatal("public revocation released the finalizer without a newer acknowledged version")
+				}
+				return
+			}
+			if err == nil && len(stored.Finalizers) != 0 {
+				t.Fatalf("private revocation kept finalizers %v at the settled version", stored.Finalizers)
+			}
+			if err != nil && !apierrors.IsNotFound(err) {
+				t.Fatalf("get application: %v", err)
+			}
+		})
+	}
+}
 func conditionByType(conditions []metav1.Condition, conditionType string) *metav1.Condition {
 	for i := range conditions {
 		if conditions[i].Type == conditionType {
