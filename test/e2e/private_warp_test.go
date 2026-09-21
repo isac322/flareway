@@ -31,7 +31,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -220,9 +222,10 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			return len(addresses) > 0 && allSyntheticPrivateAddresses(addresses), nil
 		})
 		if err != nil {
-			// A blocked classification is not a spec failure, so Ginkgo would
-			// discard buffered writer output; print the evidence directly.
-			fmt.Printf("runner DNS diagnostics for %s:\n%s", privateHostname, runnerDNSDiagnostics(ctx, privateHostname))
+			// A blocked classification is not a spec failure, so neither the
+			// Ginkgo writer nor stdout survives; keep the evidence as an
+			// artifact beside the classification.
+			writeRunnerDNSDiagnostics(runnerDNSDiagnostics(ctx, privateHostname))
 			writePrivateWARPResult(e2ereport.PrivateWARPResult{
 				Result: e2ereport.PrivateWARPBlockedRunner,
 				Reason: "runner DNS did not return Cloudflare private-hostname synthetic addresses",
@@ -486,4 +489,10 @@ func privateHTTPSRequest(ctx context.Context, hostname, path string) (int, strin
 
 func writePrivateWARPResult(result e2ereport.PrivateWARPResult) {
 	Expect(e2ereport.WritePrivateWARP(privateWARPArtifactPath(), result)).To(Succeed())
+}
+
+func writeRunnerDNSDiagnostics(summary string) {
+	path := filepath.Join("..", "..", "artifacts", "e2e-private-warp-dns.txt")
+	Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
+	Expect(os.WriteFile(path, []byte(summary), 0o644)).To(Succeed())
 }
