@@ -107,7 +107,13 @@ func DNSRecordComment(clusterID, namespace, gatewayName string) string {
 // DNSRecordCommentWithText appends a human comment without exceeding the
 // Cloudflare DNS comment limit. The ownership marker is never truncated.
 func DNSRecordCommentWithText(clusterID, namespace, gatewayName, text string) string {
-	owner := DNSRecordComment(clusterID, namespace, gatewayName)
+	return dnsRecordCommentWithText(DNSRecordComment(clusterID, namespace, gatewayName), text)
+}
+
+// dnsRecordCommentWithText appends a human comment to an ownership marker
+// without exceeding the Cloudflare DNS comment limit. The marker is never
+// truncated.
+func dnsRecordCommentWithText(owner, text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" || text == ManagedByTag {
 		return owner
@@ -155,4 +161,30 @@ func IsOwnedBy(markers []string, expected string) bool {
 func IsOwnedDNSRecord(record DNSRecord, expectedComment string) bool {
 	return expectedComment != "" &&
 		(record.Comment == expectedComment || strings.HasPrefix(record.Comment, expectedComment+dnsRecordCommentSeparator))
+}
+
+// OwnedDNSRecordCheck is the input for strict DNS record ownership checks.
+type OwnedDNSRecordCheck struct {
+	Record          DNSRecord
+	ExpectedComment string
+	// ExpectedTarget is the expected CNAME target, normally
+	// "<tunnelID>.cfargotunnel.com". An empty value skips the content check.
+	ExpectedTarget string
+}
+
+// IsOwnedDNSRecordStrict reports whether a DNS record is owned by this
+// controller: it must carry the expected comment marker and, when
+// ExpectedTarget is set, must be a CNAME whose content equals ExpectedTarget
+// (case-insensitive, trailing root label ignored). The content check stops a
+// forged marker from claiming foreign records. Destructive write paths must
+// always populate ExpectedTarget.
+func IsOwnedDNSRecordStrict(check OwnedDNSRecordCheck) bool {
+	if !IsOwnedDNSRecord(check.Record, check.ExpectedComment) {
+		return false
+	}
+	if check.ExpectedTarget == "" {
+		return true
+	}
+	return strings.EqualFold(check.Record.Type, "CNAME") &&
+		DNSHostnamesEqual(check.Record.Content, check.ExpectedTarget)
 }

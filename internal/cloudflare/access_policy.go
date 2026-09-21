@@ -157,7 +157,7 @@ func (client *Client) GetAccessPolicy(ctx context.Context, id string) (AccessPol
 
 // ListAccessPolicies lists account-level reusable policies.
 func (client *Client) ListAccessPolicies(ctx context.Context) ([]AccessPolicy, error) {
-	pager := client.sdk.ZeroTrust.Access.Policies.ListAutoPaging(ctx, zero_trust.AccessPolicyListParams{AccountID: cloudflaresdk.F(client.accountID), PerPage: cloudflaresdk.F(int64(100))})
+	pager := client.sdk.ZeroTrust.Access.Policies.ListAutoPaging(ctx, zero_trust.AccessPolicyListParams{AccountID: cloudflaresdk.F(client.accountID), PerPage: cloudflaresdk.F(int64(accessListPerPage))})
 	var out []AccessPolicy
 	for pager.Next() {
 		policy, err := accessPolicyFromListResponse(pager.Current())

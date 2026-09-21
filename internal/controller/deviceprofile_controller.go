@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,15 +33,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 	statusutil "github.com/isac322/flareway/internal/gatewayapi/status"
 )
 
@@ -76,6 +81,9 @@ type DeviceProfileReconciler struct {
 	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewDeviceProfileCloudflareClient
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=deviceprofiles,verbs=get;list;watch;create;update;patch;delete
@@ -123,6 +131,25 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishRemoteError(ctx, object, err)
 	} else if len(conflicts) > 0 {
 		return r.finishConflict(ctx, object, profileID, conflicts)
+	}
+	var decision gateDecision
+	if effectiveDeviceProfileManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged {
+		clusterID := gateClusterID(ctx, r.Client)
+		decision = evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+			Kind: "DeviceProfile", Namespace: object.Namespace, Name: object.Name,
+			UID: object.UID, RemoteID: profileID,
+			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Spec: struct {
+				Spec     any `json:"spec"`
+				Input    any `json:"input"`
+				Include  any `json:"include"`
+				Exclude  any `json:"exclude"`
+				Fallback any `json:"fallback"`
+			}{Spec: object.Spec, Input: input, Include: desired.include, Exclude: desired.exclude, Fallback: desired.fallback},
+		}, object.Status.AppliedHash, object.Status.AppliedAt, time.Now())
+		if decision.Open {
+			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+		}
 	}
 
 	remote, acquired, err := r.resolveRemoteProfile(ctx, api, object, input)
@@ -175,7 +202,13 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishRemoteError(ctx, object, err)
 	}
 	status := deviceProfileStatus(object, profileID, true, desired, nil, nil, metav1.ConditionTrue, "Ready", "Device profile fields and whole lists are synchronized")
-	return ctrl.Result{}, r.patchStatus(ctx, object, status)
+	if decision.DesiredHash != "" {
+		status.AppliedHash = decision.DesiredHash
+		appliedAt := metav1.Now()
+		status.AppliedAt = &appliedAt
+	}
+	clearGate(r.Invalidator, "DeviceProfile", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, r.patchStatus(ctx, object, status)
 }
 
 type aggregatedDeviceProfile struct {
@@ -1158,6 +1191,8 @@ func deviceProfileStatus(object *v1alpha1.DeviceProfile, profileID string, owner
 			metav1.Condition{Type: v1alpha1.DeviceProfileConditionReady, Status: conditionStatus, Reason: reason, Message: message, ObservedGeneration: object.Generation},
 		),
 		ObservedGeneration: object.Generation,
+		AppliedHash:        object.Status.AppliedHash,
+		AppliedAt:          object.Status.AppliedAt,
 	}
 }
 
@@ -1230,8 +1265,8 @@ func (r *DeviceProfileReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index DeviceProfile account credential Secrets: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.DeviceProfile{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.DeviceProfile{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.profilesForAccount)).
 		Watches(&v1alpha1.DeviceProfile{}, handler.EnqueueRequestsFromMapFunc(r.profilesForProfilePeer)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.profilesForCredentialSecret)).
@@ -1240,8 +1275,11 @@ func (r *DeviceProfileReconciler) SetupWithManager(manager ctrl.Manager) error {
 		Watches(&v1alpha1.AccessApplication{}, handler.EnqueueRequestsFromMapFunc(r.profilesForAccessApplication)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.profilesForVirtualNetwork)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.profilesForNamespace)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("device-profile", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("device-profile", r))
 }
 
 func (r *DeviceProfileReconciler) profilesForAccount(ctx context.Context, object client.Object) []reconcile.Request {

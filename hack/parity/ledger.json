@@ -14609,11 +14609,11 @@
       "officialPath": "GET /zones/{zone_id}/dns_records#comment.{exact,absent,present,...}",
       "officialType": "string",
       "required": "optional",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "PARTIAL",
       "owner": "dns-record",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/dns.go:DNSRecord for official GET /zones/{zone_id}/dns_records#comment.{exact,absent,present,...}.",
-      "rationale": "Not a Flareway resource-schema requirement. Cloudflare server-side comment filtering (exact, contains, present, absent). Flareway filters ownership comments client-side via dnsRecordOwnedByGateway."
+      "disposition": "mapped",
+      "currentMapping": "internal/cloudflare/dns.go: ListDNSRecordsByComment(ctx, zoneID, commentContains) -> dns.RecordListParams.Comment.Contains. Evidence: internal/cloudflare/dns.go:DNSRecord.",
+      "rationale": "Flareway uses the server-side comment.contains filter to list a zone's Flareway-owned records in one request for the periodic drift sweep. The exact/present/absent variants remain unused because ownership markers are prefix-shaped, so contains is the only variant that matches the marker scheme."
     },
     {
       "key": "DNSRecordAudit::request::GET /zones/{zone_id}/dns_records#content.{exact,contains,...}",

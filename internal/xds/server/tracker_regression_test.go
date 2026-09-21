@@ -62,10 +62,14 @@ func TestAckTrackerReplacementStreamStartsUnproven(t *testing.T) {
 	tracker.OnRequest(1, request)
 	tracker.OnResponse(1, request, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "a"})
 	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "a"})
-	if !tracker.IsACKed(node, version) { t.Fatal("initial stream did not converge") }
+	if !tracker.IsACKed(node, version) {
+		t.Fatal("initial stream did not converge")
+	}
 	tracker.OnStreamClosed(1)
 	tracker.OnRequest(2, request)
-	if tracker.IsACKed(node, version) { t.Fatal("replacement stream inherited the closed stream ACK") }
+	if tracker.IsACKed(node, version) {
+		t.Fatal("replacement stream inherited the closed stream ACK")
+	}
 }
 
 func TestAckTrackerRequiredReferenceBlocksBeforeSubscription(t *testing.T) {
@@ -75,5 +79,7 @@ func TestAckTrackerRequiredReferenceBlocksBeforeSubscription(t *testing.T) {
 	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ListenerType})
 	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType}, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ListenerType, SystemVersionInfo: version, Nonce: "a"})
 	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ListenerType, ResponseNonce: "a"})
-	if tracker.IsACKed(node, version) { t.Fatal("required route converged before its subscription and ACK") }
+	if tracker.IsACKed(node, version) {
+		t.Fatal("required route converged before its subscription and ACK")
+	}
 }

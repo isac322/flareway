@@ -456,6 +456,9 @@ func (s *Server) listDNSRecords(w http.ResponseWriter, r *http.Request) {
 		if value := firstQuery(query.Get("comment.exact"), query.Get("comment")); value != "" && record.Comment != value {
 			continue
 		}
+		if value := query.Get("comment.contains"); value != "" && !strings.Contains(strings.ToLower(record.Comment), strings.ToLower(value)) {
+			continue
+		}
 		if tags := query["tag"]; len(tags) > 0 && !recordHasTags(record, tags, query.Get("tag-match")) {
 			continue
 		}

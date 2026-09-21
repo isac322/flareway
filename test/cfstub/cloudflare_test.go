@@ -92,6 +92,37 @@ func TestCloudflareEndpointsPreserveStateAndVersions(t *testing.T) {
 	)
 }
 
+func TestListDNSRecordsFiltersByCommentContains(t *testing.T) {
+	server := New(t)
+	server.State.AddZone(Zone{ID: "zone-1", Name: "example.com", AccountID: "account-1"})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-1", ZoneID: "zone-1", Type: "CNAME", Name: "a.example.com",
+		Content: "a.cfargotunnel.com", Comment: "flareway gw-a",
+	})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-2", ZoneID: "zone-1", Type: "CNAME", Name: "b.example.com",
+		Content: "b.cfargotunnel.com", Comment: "FLAREWAY gw-b",
+	})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-3", ZoneID: "zone-1", Type: "A", Name: "manual.example.com",
+		Content: "192.0.2.1", Comment: "manual-admin-record",
+	})
+
+	// Negative case: a record whose comment does not contain the filter must be
+	// excluded. If the stub ignored comment.contains this returns all three.
+	var records []DNSRecord
+	requestResult(t, server, http.MethodGet, "/zones/zone-1/dns_records?comment.contains=flareway", nil, &records)
+	if len(records) != 2 || records[0].ID != "rec-1" || records[1].ID != "rec-2" {
+		t.Fatalf("comment.contains=flareway records = %#v", records)
+	}
+
+	// comment.exact and comment.contains compose with AND semantics.
+	requestResult(t, server, http.MethodGet, "/zones/zone-1/dns_records?comment.exact=flareway+gw-a&comment.contains=gw", nil, &records)
+	if len(records) != 1 || records[0].ID != "rec-1" {
+		t.Fatalf("comment.exact+comment.contains records = %#v", records)
+	}
+}
+
 func TestCloudflareEndpointsSupportClientV4PrefixAndFaults(t *testing.T) {
 	server := New(t)
 	server.Fault(http.MethodGet, `^/user/tokens/verify$`, Fault{

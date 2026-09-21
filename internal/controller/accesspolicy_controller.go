@@ -23,19 +23,26 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
+	"github.com/isac322/flareway/internal/observability"
 )
 
 const accessPolicyAccountIndex = accessAccountIndex + ".accessPolicy"
@@ -46,6 +53,11 @@ type AccessPolicyReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Recorder            recorder.EventRecorder
+	DriftPolicy         DriftPolicy
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesspolicies;accessgroups;identityproviders;deviceposturerules;servicetokens;cloudflareaccounts,verbs=get;list;watch
@@ -120,6 +132,24 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, &remote, owned, wouldApply, metav1.ConditionTrue, "Observed", message)
 	}
 
+	// T1 gate: the managed path below reads the remote policy before any
+	// write. ObserveOnly above stays ungated (safety condition 9). Adoption
+	// reads are T0 by construction: the gate only opens once status.policyId
+	// is bound and the applied hash matches.
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "AccessPolicy", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.PolicyID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+
 	policyID := object.Status.PolicyID
 	owned := object.Status.OwnershipVerified
 	var remote flarecloudflare.AccessPolicy
@@ -176,6 +206,29 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return r.finishAccessPolicyError(ctx, object, "CloudflareError", err)
 		}
 		if !flarecloudflare.AccessPolicyMatchesInput(remote, input) {
+			// A previously synchronized policy that no longer matches the desired
+			// input was changed out of band; surface it before overwriting.
+			if metaConditionTrue(object.Status.Conditions, "Ready") {
+				action := "overwriting with desired configuration"
+				if r.DriftPolicy == DriftPolicyHold {
+					action = "automatic overwrite held by drift policy"
+				}
+				message := fmt.Sprintf("Access policy changed out of band: remote policy %s differs from applied state; %s", policyID, action)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(object, nil, corev1.EventTypeWarning, observability.EventReasonOutOfBandChange, "ReconcileAccessPolicy", "%s", message)
+				}
+				observability.ObserveDrift("AccessPolicy", observability.DriftCaseMismatch)
+				if r.DriftPolicy == DriftPolicyHold {
+					return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, owned, nil, metav1.ConditionFalse, "DriftHold", message)
+				}
+			} else if r.DriftPolicy == DriftPolicyHold {
+				// A DriftHold latched at this generation keeps holding until the
+				// spec changes (stale condition ObservedGeneration) or the
+				// remote state is repaired to match the desired input.
+				if held := meta.FindStatusCondition(object.Status.Conditions, "Ready"); held != nil && held.Reason == "DriftHold" && held.ObservedGeneration == object.Generation {
+					return ctrl.Result{}, nil
+				}
+			}
 			remote, err = api.UpdateAccessPolicy(ctx, policyID, input)
 			if err != nil {
 				return r.finishAccessPolicyError(ctx, object, accessPolicyErrorReason(err), err)
@@ -185,7 +238,11 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if remote.ID == "" {
 		remote.ID = policyID
 	}
-	return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, &remote, owned, nil, metav1.ConditionTrue, "Ready", "Access policy is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "AccessPolicy", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchAccessPolicyStatus(ctx, object, &remote, owned, nil, metav1.ConditionTrue, "Ready", "Access policy is synchronized")
 }
 
 func accessPolicyInput(spec v1alpha1.AccessPolicySpec, name string, include, require, exclude []flarecloudflare.ResolvedAccessRule) flarecloudflare.AccessPolicyInput {
@@ -490,6 +547,8 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 			current.Status.Observed = observed
 			current.Status.WouldApply = wouldApply
 		}
+		current.Status.AppliedHash = object.Status.AppliedHash
+		current.Status.AppliedAt = object.Status.AppliedAt
 		current.Status.ObservedGeneration = generation
 		current.Status.Conditions = mergeAccessConditions(current.Status.Conditions, r.now(), accessCondition(generation, "Accepted", status, reason, message), accessCondition(generation, "Ready", status, reason, message))
 		if err := r.Status().Patch(ctx, current, base); err != nil {
@@ -552,7 +611,11 @@ func (r *AccessPolicyReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessPolicy accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessPolicy{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.policiesForAccount)).Watches(&v1alpha1.AccessGroup{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.policiesForNamespace)).Complete(observedReconciler("access-policy", r))
+	b := ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessPolicy{}, builder.WithPredicates(desiredStateChangedPredicate)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.policiesForAccount)).Watches(&v1alpha1.AccessGroup{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.policiesForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.policiesForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("access-policy", r))
 }
 func (r *AccessPolicyReconciler) policiesForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessPolicyList

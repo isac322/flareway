@@ -28,14 +28,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -50,6 +54,9 @@ type AccessInfrastructureTargetReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessinfrastructuretargets;virtualnetworks;cloudflareaccounts,verbs=get;list;watch
@@ -103,6 +110,27 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 		return r.finishObserved(ctx, object, remote, nil, metav1.ConditionTrue, "Observed", "Infrastructure target is observed without mutation")
 	}
 
+	// T1 gate: the managed path below reads the remote target before any
+	// write. ObserveOnly above stays ungated (safety condition 9). Adoption
+	// reads inside ensureManaged are T0 by construction: the gate only
+	// opens once status.targetId is bound and the applied hash matches.
+	clusterID, err := flarecloudflare.ClusterID(ctx, r.readClient())
+	if err != nil {
+		return r.finishError(ctx, object, "Pending", err)
+	}
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "AccessInfrastructureTarget", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.TargetID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if infrastructureTargetIsValidationError(err) {
@@ -110,7 +138,11 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 		}
 		return r.finishRemoteError(ctx, object, err)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized", decision.DesiredHash, &appliedAt)
 }
 
 func (r *AccessInfrastructureTargetReconciler) ensureManaged(ctx context.Context, api flarecloudflare.AccessInfrastructureTargetAPI, object *v1alpha1.AccessInfrastructureTarget, input flarecloudflare.AccessInfrastructureTargetInput) (flarecloudflare.AccessInfrastructureTarget, error) {
@@ -242,7 +274,7 @@ func (r *AccessInfrastructureTargetReconciler) reconcileDelete(ctx context.Conte
 
 func (r *AccessInfrastructureTargetReconciler) finishError(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, reason string, err error) (ctrl.Result, error) {
 	remote := infrastructureTargetFromStatus(object.Status)
-	if patchErr := r.patchStatus(ctx, object, remote, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, metav1.ConditionFalse, reason, err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, remote, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, metav1.ConditionFalse, reason, err.Error(), object.Status.AppliedHash, object.Status.AppliedAt); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	if infrastructureTargetIsValidationError(err) {
@@ -252,7 +284,7 @@ func (r *AccessInfrastructureTargetReconciler) finishError(ctx context.Context, 
 }
 
 func (r *AccessInfrastructureTargetReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, err error) (ctrl.Result, error) {
-	if patchErr := r.patchStatus(ctx, object, infrastructureTargetFromStatus(object.Status), object.Status.OwnershipVerified, nil, metav1.ConditionFalse, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, infrastructureTargetFromStatus(object.Status), object.Status.OwnershipVerified, nil, metav1.ConditionFalse, metav1.ConditionFalse, "CloudflareError", err.Error(), object.Status.AppliedHash, object.Status.AppliedAt); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
@@ -260,11 +292,13 @@ func (r *AccessInfrastructureTargetReconciler) finishRemoteError(ctx context.Con
 
 func (r *AccessInfrastructureTargetReconciler) finishObserved(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, ready metav1.ConditionStatus, reason, message string) (ctrl.Result, error) {
 	owned := object.Status.OwnershipVerified && object.Status.TargetID == remote.ID
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, wouldApply, metav1.ConditionTrue, ready, reason, message)
+	return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, wouldApply, metav1.ConditionTrue, ready, reason, message, object.Status.AppliedHash, object.Status.AppliedAt)
 }
 
-func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, owned bool, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, accepted, ready metav1.ConditionStatus, reason, message string) error {
+func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, owned bool, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
 	base := client.MergeFrom(object.DeepCopy())
+	object.Status.AppliedHash = appliedHash
+	object.Status.AppliedAt = appliedAt
 	if remote.ID != "" {
 		object.Status.TargetID = remote.ID
 		object.Status.OwnershipVerified = owned
@@ -388,12 +422,15 @@ func (r *AccessInfrastructureTargetReconciler) SetupWithManager(manager ctrl.Man
 	}); err != nil {
 		return fmt.Errorf("index AccessInfrastructureTarget virtualNetworkRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.AccessInfrastructureTarget{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.AccessInfrastructureTarget{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.targetsForAccount)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.targetsForVirtualNetwork)).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allInfrastructureTargets)).
-		Complete(observedReconciler("access-infrastructure-target", r))
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allInfrastructureTargets))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("access-infrastructure-target", r))
 }
 
 func infrastructureTargetVNetKey(namespace string, reference v1alpha1.NamespacedLocalObjectReference) types.NamespacedName {

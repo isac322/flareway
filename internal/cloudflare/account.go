@@ -86,7 +86,7 @@ func (client *Client) VerifyToken(ctx context.Context) (TokenVerification, error
 func (client *Client) ListZones(ctx context.Context) ([]Zone, error) {
 	pager := client.sdk.Zones.ListAutoPaging(ctx, zones.ZoneListParams{
 		Account: cloudflaresdk.F(zones.ZoneListParamsAccount{ID: cloudflaresdk.F(client.accountID)}),
-		PerPage: cloudflaresdk.F(50.0),
+		PerPage: cloudflaresdk.F(float64(zoneListPerPage)),
 	})
 
 	result := make([]Zone, 0)

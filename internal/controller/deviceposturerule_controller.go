@@ -29,14 +29,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -50,6 +54,9 @@ type DevicePostureRuleReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=deviceposturerules;devicepostureintegrations;cloudflareaccounts,verbs=get;list;watch
@@ -117,6 +124,20 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	}
 	input := flarecloudflare.DevicePostureRuleInput{Name: name, Type: object.Spec.Type, Description: description, Schedule: object.Spec.Schedule, Expiration: object.Spec.Expiration, Match: object.Spec.Match, Input: object.Spec.Input, ConnectionID: connectionID}
 
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+		Kind: "DevicePostureRule", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.RuleID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+
 	id := object.Status.RuleID
 	var remote flarecloudflare.DevicePostureRule
 	if id == "" {
@@ -157,7 +178,11 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 			}
 		}
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture rule is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "DevicePostureRule", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture rule is synchronized")
 }
 
 func (r *DevicePostureRuleReconciler) resolveIntegrationID(ctx context.Context, object *v1alpha1.DevicePostureRule, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI) (string, error) {
@@ -587,7 +612,15 @@ func (r *DevicePostureRuleReconciler) SetupWithManager(manager ctrl.Manager) err
 	}); err != nil {
 		return fmt.Errorf("index DevicePostureRule integrations: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureRule{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.rulesForAccount)).Watches(&v1alpha1.DevicePostureIntegration{}, handler.EnqueueRequestsFromMapFunc(r.rulesForIntegration)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.rulesForNamespace)).Complete(observedReconciler("device-posture-rule", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.DevicePostureRule{}, builder.WithPredicates(desiredStateChangedPredicate)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.rulesForAccount)).
+		Watches(&v1alpha1.DevicePostureIntegration{}, handler.EnqueueRequestsFromMapFunc(r.rulesForIntegration)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.rulesForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("device-posture-rule", r))
 }
 
 func (r *DevicePostureRuleReconciler) rulesForAccount(ctx context.Context, object client.Object) []reconcile.Request {

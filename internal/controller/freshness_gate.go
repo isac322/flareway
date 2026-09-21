@@ -1,0 +1,201 @@
+/*
+Copyright 2026 Byeonghoon Yoo.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
+	"github.com/isac322/flareway/internal/observability"
+)
+
+// gateInput is the canonical desired-hash input shared by every gated
+// reconciler. Only spec-derived values, Kubernetes identity, and remote
+// identifiers belong here.
+//
+// Status fields must never appear. A status value that oscillates would flip
+// the hash on every pass, and the gate would stay shut forever while still
+// paying the cost of recomputing it.
+type gateInput struct {
+	// Kind is the CRD kind and doubles as the bounded metric label.
+	Kind string
+	// Namespace and Name identify the object for the invalidation latch.
+	Namespace string
+	Name      string
+	// UID distinguishes a recreated object from its predecessor.
+	UID types.UID
+	// RemoteID is the Cloudflare identifier this object is bound to. An empty
+	// value is legitimate before the remote object exists; it simply produces a
+	// different hash than the bound state.
+	RemoteID string
+	// AccountID and ClusterID bind the hash to one tenant and one cluster so a
+	// restored backup in a different cluster cannot inherit a converged gate.
+	AccountID string
+	ClusterID string
+	// Spec is the spec-derived desired state. Callers pass the object's spec or
+	// the compiled input they are about to send to Cloudflare.
+	Spec any
+}
+
+// gateDecision carries the freshness verdict together with the desired hash the
+// caller must persist once the remote write succeeds.
+type gateDecision struct {
+	freshness.Gate
+	// DesiredHash is empty when the hash could not be computed, in which case
+	// Gate.Open is false and the caller takes the normal remote path.
+	DesiredHash string
+}
+
+// gateHashFailureDecision labels the one verdict this helper reaches without
+// calling freshness.Policy.Evaluate: the desired hash could not be computed.
+const gateHashFailureDecision = string(freshness.DecisionClosedHash)
+
+// evaluateGate decides whether a reconciler may skip its remote reads this
+// pass. It is the single implementation of the desired-hash gate; reconcilers
+// call it rather than repeating the hash, latch, and metric plumbing.
+//
+// The gate only ever suppresses reads. A closed gate runs the existing
+// reconcile path unchanged, and an open gate must leave conditions,
+// observedGeneration, and events exactly as the previous converged pass left
+// them (00-architecture.md D3).
+//
+// Any failure to compute the hash closes the gate. Falling back to "no hash, so
+// nothing changed" would skip remote reads on exactly the objects whose desired
+// state could not be determined.
+func evaluateGate(
+	policy freshness.Policy,
+	latch *freshness.Latch,
+	grade freshness.Grade,
+	input gateInput,
+	appliedHash string,
+	appliedAt *metav1.Time,
+	now time.Time,
+) gateDecision {
+	desired, err := freshness.DesiredHash(struct {
+		Kind      string
+		Namespace string
+		Name      string
+		UID       string
+		RemoteID  string
+		AccountID string
+		ClusterID string
+		Spec      any
+	}{
+		Kind:      input.Kind,
+		Namespace: input.Namespace,
+		Name:      input.Name,
+		UID:       string(input.UID),
+		RemoteID:  input.RemoteID,
+		AccountID: input.AccountID,
+		ClusterID: input.ClusterID,
+		Spec:      input.Spec,
+	})
+	if err != nil || desired == "" {
+		observability.ObserveGate(input.Kind, gateHashFailureDecision)
+		return gateDecision{}
+	}
+
+	return evaluateGateWithHash(
+		policy, latch, grade, input.Kind,
+		types.NamespacedName{Namespace: input.Namespace, Name: input.Name},
+		appliedHash, desired, appliedAt, now,
+	)
+}
+
+// evaluateGateWithHash is evaluateGate for callers that already hold an
+// authoritative desired hash and must not recompute one.
+//
+// The Gateway-mode tunnel configuration is the motivating case: its desired
+// state is the compiled cloudflared configuration, and the hash that
+// status.configVersion.desiredHash is compared against is the one
+// cloudflaredconfig.Compile returns. Hashing the spec again here would produce
+// a different value than the one the write path persists, so the gate would
+// never open.
+func evaluateGateWithHash(
+	policy freshness.Policy,
+	latch *freshness.Latch,
+	grade freshness.Grade,
+	kind string,
+	key types.NamespacedName,
+	appliedHash, desiredHash string,
+	appliedAt *metav1.Time,
+	now time.Time,
+) gateDecision {
+	invalidated := latch.IsInvalidated(kind, key)
+
+	var applied time.Time
+	if appliedAt != nil {
+		applied = appliedAt.Time
+	}
+
+	gate := policy.Evaluate(grade, appliedHash, desiredHash, applied, now, invalidated)
+	// freshness.Policy.Evaluate already names the first condition that closed
+	// the gate, so the label is never recomputed here and cannot drift from the
+	// judgement it describes. DecisionNotGated means a T0 caller reached this
+	// helper, which is a programming error rather than a gate outcome; leaving
+	// it unobserved keeps the metric to real evaluations.
+	if gate.Decision != freshness.DecisionNotGated {
+		observability.ObserveGate(kind, string(gate.Decision))
+	}
+	return gateDecision{Gate: gate, DesiredHash: desiredHash}
+}
+
+// clearGate drops the invalidation latch for an object whose reconcile has
+// converged, so the next pass is judged on hash and age alone.
+func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
+	latch.Clear(kind, key)
+}
+
+// gateClusterID resolves the cluster identity used in the gate hash.
+//
+// Failure is deliberately not fatal. The gate is an optimization, and a
+// reconcile that previously converged without reading kube-system must keep
+// converging. An unresolved cluster ID yields an empty string, which produces
+// a different hash than the stored one and closes the gate, so the object
+// simply takes the normal remote path.
+func gateClusterID(ctx context.Context, reader kubeclient.Client) string {
+	clusterID, err := flarecloudflare.ClusterID(ctx, reader)
+	if err != nil {
+		return ""
+	}
+	return clusterID
+}
+
+// convergedRequeue is the requeue interval for a reconciler that just
+// converged.
+//
+// A configured policy returns the grade TTL, so the next pass lands exactly
+// when the gate expires. An unset or zeroed policy returns the caller's
+// pre-gate interval instead: disabling freshness is the documented rollback,
+// and a rollback that silently removed periodic reconciliation would leave
+// remote-only changes undetected forever rather than restoring the old
+// behaviour.
+//
+// Callers whose converged path had no periodic requeue before the gate must
+// not use this helper; for them a zero policy correctly means no requeue.
+func convergedRequeue(policy freshness.Policy, grade freshness.Grade, fallback time.Duration) time.Duration {
+	if ttl := policy.TTL(grade); ttl > 0 {
+		return ttl
+	}
+	return fallback
+}

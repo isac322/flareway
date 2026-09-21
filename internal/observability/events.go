@@ -31,12 +31,14 @@ const (
 	EventReasonConflict        = "Conflict"
 	EventReasonCleanupBlocked  = "CleanupBlocked"
 	EventReasonSecurityBlocked = "SecurityBlocked"
+	EventReasonOutOfBandChange = "OutOfBandChange"
 )
 
 var eventMessages = map[string]string{
 	EventReasonConflict:        "Ownership or desired-state conflict detected",
 	EventReasonCleanupBlocked:  "Cleanup is blocked by outstanding dependencies",
 	EventReasonSecurityBlocked: "The requested operation was denied by authorization policy",
+	EventReasonOutOfBandChange: "Out-of-band drift detected on remote Cloudflare resource",
 }
 
 // EmitConditionTransitions emits warning Events only when an object enters one

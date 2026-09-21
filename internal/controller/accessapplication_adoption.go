@@ -43,6 +43,12 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	input flarecloudflare.AccessApplicationInput,
 	ownerTag string,
 ) (flarecloudflare.AccessApplication, error) {
+	// T0: every remote read in this function is a fresh read by contract.
+	// The desired-hash gate in reconcileActive decides whether this function
+	// runs at all; once it runs, ObserveOnly observation, AdoptByID
+	// verification, ownership checks, and create-conflict recovery must see
+	// the live remote — a stale snapshot would let an adoption claim or a
+	// destructive update proceed on outdated ownership evidence.
 	if input.Type == flarecloudflare.AccessApplicationTypeProxyEndpoint && len(application.Spec.Application.Tags) > 0 {
 		return flarecloudflare.AccessApplication{}, errors.New("ProxyEndpoint Access applications do not support application tags")
 	}
@@ -63,6 +69,16 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	if input.Type == flarecloudflare.AccessApplicationTypeProxyEndpoint {
 		return r.reconcileProxyEndpointApplication(ctx, remote, scope, application, input)
 	}
+	// D13: writes carry exactly one owner marker — the HMAC tag when the
+	// cluster ownership key is available, the legacy plaintext tag otherwise.
+	// Reads still accept either form, so legacy-marked remotes are recognized
+	// and upgraded to the signed marker on the next write.
+	_, ownerTags, writeTag := r.accessOwnerTags(ctx, application, ownerTag)
+	if writeTag != ownerTag {
+		input.Tags = append(removeAccessTags(input.Tags, ownerTag), writeTag)
+		slices.Sort(input.Tags)
+		input.Tags = slices.Compact(input.Tags)
+	}
 	if application.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
 		if application.Spec.ExternalRef == nil {
 			return flarecloudflare.AccessApplication{}, errors.New("adoption mode AdoptById for AccessApplication requires externalRef")
@@ -73,7 +89,7 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 		}
 		managedRecovery := observed.Name == input.Name &&
 			hasAccessTag(observed.Tags, accessManagedTag) &&
-			hasAccessTag(observed.Tags, ownerTag)
+			hasAnyAccessTag(observed.Tags, ownerTags)
 		if !managedRecovery {
 			if err := verifyAccessApplicationExpectation(observed, application.Spec.Adoption.Expect); err != nil {
 				return flarecloudflare.AccessApplication{}, err
@@ -90,7 +106,7 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	if application.Status.ApplicationID != "" {
 		current, err := remote.GetAccessApplication(ctx, scope, application.Status.ApplicationID)
 		if err == nil {
-			if !hasAccessTag(current.Tags, ownerTag) || !hasAccessTag(current.Tags, accessManagedTag) {
+			if !hasAnyAccessTag(current.Tags, ownerTags) || !hasAccessTag(current.Tags, accessManagedTag) {
 				return flarecloudflare.AccessApplication{}, fmt.Errorf("ownership conflict: Access application %q is not owned by this resource", application.Status.ApplicationID)
 			}
 			if accessApplicationMatchesInput(current, input) {
@@ -108,7 +124,7 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	if application.Spec.ExternalRef != nil {
 		return flarecloudflare.AccessApplication{}, errors.New("managed AccessApplication externalRef requires adoption.mode AdoptById")
 	}
-	recovered, found, err := findOwnedParentApplication(ctx, remote, scope, ownerTag, input.Name)
+	recovered, found, err := findOwnedParentApplication(ctx, remote, scope, ownerTags, input.Name)
 	if err != nil {
 		return flarecloudflare.AccessApplication{}, err
 	}
@@ -128,7 +144,7 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	if createErr == nil {
 		return created.Application, nil
 	}
-	recovered, found, recoveryErr := findOwnedParentApplication(ctx, remote, scope, ownerTag, input.Name)
+	recovered, found, recoveryErr := findOwnedParentApplication(ctx, remote, scope, ownerTags, input.Name)
 	if recoveryErr != nil {
 		return flarecloudflare.AccessApplication{}, errors.Join(createErr, recoveryErr)
 	}
@@ -148,20 +164,29 @@ func verifyAccessApplicationExpectation(observed flarecloudflare.AccessApplicati
 	return nil
 }
 
-func findOwnedParentApplication(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTag, name string) (flarecloudflare.AccessApplication, bool, error) {
+// findOwnedParentApplication recovers a managed parent by name and ownership
+// marker. During the HMAC transition ownerTags carries the legacy plaintext
+// tag and, when the cluster key is available, the signed tag; either proves
+// ownership. A candidate that also carries a foreign owner marker is a
+// contradiction (D8): it is never adopted.
+func findOwnedParentApplication(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTags []string, name string) (flarecloudflare.AccessApplication, bool, error) {
 	applications, err := remote.ListAccessApplications(ctx, scope)
 	if err != nil {
 		return flarecloudflare.AccessApplication{}, false, fmt.Errorf("list Access applications for ownership recovery: %w", err)
 	}
 	var found flarecloudflare.AccessApplication
 	for _, application := range applications {
-		if !hasAccessTag(application.Tags, ownerTag) ||
+		if application.Name != name ||
 			!hasAccessTag(application.Tags, accessManagedTag) ||
-			application.Name != name {
+			!hasAnyAccessTag(application.Tags, ownerTags) {
 			continue
 		}
+		if foreign := foreignAccessOwnerTags(application.Tags, ownerTags); len(foreign) > 0 {
+			return flarecloudflare.AccessApplication{}, false, fmt.Errorf(
+				"access application %q (%s) carries conflicting owner markers %v", name, application.ID, foreign)
+		}
 		if found.ID != "" && found.ID != application.ID {
-			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry owner tag %q and name %q", ownerTag, name)
+			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry owner tags %v and name %q", ownerTags, name)
 		}
 		found = application
 	}

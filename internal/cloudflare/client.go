@@ -15,6 +15,11 @@ limitations under the License.
 */
 
 // Package cloudflare provides rate-limited, typed adapters around cloudflare-go.
+//
+// HMAC ownership markers (ownership.go) take the signing key as a parameter.
+// Provisioning and storing that key — a controller-owned Secret — is deferred
+// to a later wave; until then callers pass nil and markers fall back to the
+// legacy plaintext form.
 package cloudflare
 
 import (

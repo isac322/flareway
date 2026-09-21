@@ -161,6 +161,15 @@ spec:
           status:
             description: AccessCustomPageStatus defines the observed state of AccessCustomPage.
             properties:
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

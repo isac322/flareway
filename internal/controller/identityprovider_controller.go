@@ -33,14 +33,18 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -61,6 +65,9 @@ type IdentityProviderReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=identityproviders;cloudflareaccounts,verbs=get;list;watch
@@ -88,7 +95,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		return ctrl.Result{}, nil
 	}
 
-	api, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
+	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
 		_ = r.patchStatus(ctx, object, flarecloudflare.IdentityProvider{ID: object.Status.IDPID}, nil, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
@@ -121,6 +128,19 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		return ctrl.Result{}, err
 	}
 	input := flarecloudflare.IdentityProviderInput{Name: name, Type: object.Spec.Type, Config: object.Spec.Config, SCIMConfig: object.Spec.SCIMConfig, ClientSecret: secretValue}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "IdentityProvider", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.IDPID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	id := object.Status.IDPID
 	var remote flarecloudflare.IdentityProvider
 	created := false
@@ -312,7 +332,11 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		_ = r.patchStatus(ctx, object, remote, nil, metav1.ConditionFalse, "Pending", err.Error())
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "IdentityProvider", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized")
 }
 
 func (r *IdentityProviderReconciler) clientSecret(ctx context.Context, object *v1alpha1.IdentityProvider) (string, error) {
@@ -917,6 +941,7 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 	}
 	return r.Status().Patch(ctx, object, base)
 }
+
 // finishRemoteError reports a failed remote call on the object's conditions.
 // A typed 404 revokes acceptance because the remote object is gone; any other
 // failure is transient, so the existing Accepted condition and the recorded
@@ -1012,7 +1037,15 @@ func (r *IdentityProviderReconciler) SetupWithManager(manager ctrl.Manager) erro
 	}); err != nil {
 		return fmt.Errorf("index IdentityProvider Secrets: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.IdentityProvider{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.providersForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.providersForSecret)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.providersForNamespace)).Complete(observedReconciler("identity-provider", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.IdentityProvider{}, builder.WithPredicates(desiredStateChangedPredicate)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.providersForAccount)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.providersForSecret)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.providersForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("identity-provider", r))
 }
 
 func (r *IdentityProviderReconciler) providersForAccount(ctx context.Context, object client.Object) []reconcile.Request {

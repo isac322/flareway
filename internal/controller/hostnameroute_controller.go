@@ -27,17 +27,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // HostnameRouteReconciler manages Cloudflare private hostname routes.
@@ -47,6 +51,9 @@ type HostnameRouteReconciler struct {
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	OperatorNamespace   string
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=hostnameroutes;cloudflaretunnels;warpconnectors;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -116,6 +123,19 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, object, remote, hostname, false, true, metav1.ConditionTrue, "Observed", "Hostname route is observed without mutation")
 	}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeTraffic, gateInput{
+		Kind: "HostnameRoute", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.RouteID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -127,7 +147,11 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		}
 		return r.finishRemoteError(ctx, object, err)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, hostname, true, true, metav1.ConditionTrue, "Ready", "Hostname route is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "HostnameRoute", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, r.patchStatus(ctx, object, remote, hostname, true, true, metav1.ConditionTrue, "Ready", "Hostname route is synchronized")
 }
 
 func (r *HostnameRouteReconciler) authorizeManagement(ctx context.Context, object *v1alpha1.HostnameRoute, account *v1alpha1.CloudflareAccount, hostname string) error {
@@ -599,16 +623,19 @@ func (r *HostnameRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index HostnameRoute source namespace: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.HostnameRoute{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.HostnameRoute{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForAccount)).
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
 		Watches(&v1alpha1.WARPConnector{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForGateway)).
-		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutePeers)).
+		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutePeers), builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allHostnameRoutes)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("hostname-route", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("hostname-route", r))
 }
 
 func (r *HostnameRouteReconciler) hostnameRoutesForAccount(ctx context.Context, object client.Object) []reconcile.Request {

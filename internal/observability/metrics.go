@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,6 +38,29 @@ const (
 	ReconcileResultError   = "error"
 )
 
+// Drift cases for the flareway_drift_detected_total "case" label.
+const (
+	DriftCaseOrphan   = "orphan"
+	DriftCaseMissing  = "missing"
+	DriftCaseMismatch = "mismatch"
+	DriftCaseVersion  = "version"
+)
+
+// Sweep results for the flareway_sweep_total "result" label.
+const (
+	SweepResultOK      = "ok"
+	SweepResultPartial = "partial"
+	SweepResultError   = "error"
+)
+
+// Gate decisions for the flareway_gate_total "decision" label.
+const (
+	GateDecisionOpen              = "open"
+	GateDecisionClosedHash        = "closed_hash"
+	GateDecisionClosedTTL         = "closed_ttl"
+	GateDecisionClosedInvalidated = "closed_invalidated"
+)
+
 // Metrics contains Flareway's collectors. A separate value can be registered
 // with an isolated registry in tests; production uses Default.
 type Metrics struct {
@@ -45,6 +69,10 @@ type Metrics struct {
 	cloudflareRateLimit prometheus.Counter
 	gatewayProgrammed   *prometheus.GaugeVec
 	configVersion       *prometheus.GaugeVec
+	driftDetected       *prometheus.CounterVec
+	sweeps              *prometheus.CounterVec
+	gates               *prometheus.CounterVec
+	sweepLastSuccess    *prometheus.GaugeVec
 }
 
 // Default is registered with controller-runtime's registry, which is served by
@@ -74,6 +102,22 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 			Name: "flareway_config_version",
 			Help: "Cloudflared configuration version desired or applied for a Gateway.",
 		}, []string{"gateway", "kind"}),
+		driftDetected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flareway_drift_detected_total",
+			Help: "Total out-of-band drifts detected by resource kind and drift case.",
+		}, []string{"kind", "case"}),
+		sweeps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flareway_sweep_total",
+			Help: "Total periodic sweep passes by resource kind and result.",
+		}, []string{"kind", "result"}),
+		gates: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "flareway_gate_total",
+			Help: "Total desired-hash gate evaluations by resource kind and decision.",
+		}, []string{"kind", "decision"}),
+		sweepLastSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "flareway_sweep_last_success_timestamp",
+			Help: "Unix timestamp of the last fully successful sweep pass by resource kind.",
+		}, []string{"kind"}),
 	}
 	registerer.MustRegister(
 		metrics.reconciles,
@@ -81,6 +125,10 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 		metrics.cloudflareRateLimit,
 		metrics.gatewayProgrammed,
 		metrics.configVersion,
+		metrics.driftDetected,
+		metrics.sweeps,
+		metrics.gates,
+		metrics.sweepLastSuccess,
 	)
 	return metrics
 }
@@ -141,6 +189,65 @@ func (metrics *Metrics) DeleteGateway(gateway string) {
 	metrics.configVersion.DeleteLabelValues(gateway, "applied")
 }
 
+// ObserveDrift records one detected out-of-band drift. The kind label is a
+// bounded resource kind such as "CloudflareTunnel" or "AccessPolicy"; account
+// IDs, object IDs, and namespaces are never valid labels. Unknown drift cases
+// are dropped rather than becoming an unbounded label source.
+func (metrics *Metrics) ObserveDrift(kind, driftCase string) {
+	if !validKindLabel(kind) || !validDriftCase(driftCase) {
+		return
+	}
+	metrics.driftDetected.WithLabelValues(kind, driftCase).Inc()
+}
+
+// ObserveDrift records one detected out-of-band drift on the Default registry.
+func ObserveDrift(kind, driftCase string) {
+	Default.ObserveDrift(kind, driftCase)
+}
+
+// ObserveSweep records one completed sweep pass for a resource kind. Unknown
+// results are dropped rather than becoming an unbounded label source.
+func (metrics *Metrics) ObserveSweep(kind, result string) {
+	if !validKindLabel(kind) || !validSweepResult(result) {
+		return
+	}
+	metrics.sweeps.WithLabelValues(kind, result).Inc()
+}
+
+// ObserveSweep records one completed sweep pass on the Default registry.
+func ObserveSweep(kind, result string) {
+	Default.ObserveSweep(kind, result)
+}
+
+// SetSweepLastSuccess publishes the wall-clock time of a sweep pass that
+// observed a complete remote listing. Partial passes must not call this, so a
+// stale timestamp remains visible when sweeps degrade.
+func (metrics *Metrics) SetSweepLastSuccess(kind string, at time.Time) {
+	if !validKindLabel(kind) {
+		return
+	}
+	metrics.sweepLastSuccess.WithLabelValues(kind).Set(float64(at.Unix()))
+}
+
+// SetSweepLastSuccess publishes a successful sweep timestamp on the Default registry.
+func SetSweepLastSuccess(kind string, at time.Time) {
+	Default.SetSweepLastSuccess(kind, at)
+}
+
+// ObserveGate records one desired-hash gate evaluation. Unknown decisions are
+// dropped rather than becoming an unbounded label source.
+func (metrics *Metrics) ObserveGate(kind, decision string) {
+	if !validKindLabel(kind) || !validGateDecision(decision) {
+		return
+	}
+	metrics.gates.WithLabelValues(kind, decision).Inc()
+}
+
+// ObserveGate records one desired-hash gate evaluation on the Default registry.
+func ObserveGate(kind, decision string) {
+	Default.ObserveGate(kind, decision)
+}
+
 // ObserveReconciler wraps a controller without changing its behavior.
 func ObserveReconciler(controller string, next reconcile.Reconciler) reconcile.Reconciler {
 	return Default.observeReconciler(controller, next)
@@ -157,6 +264,44 @@ func (metrics *Metrics) observeReconciler(controller string, next reconcile.Reco
 func validGatewayLabel(value string) bool {
 	parts := strings.Split(value, "/")
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+// validKindLabel bounds the "kind" label to short PascalCase-ish identifiers so
+// account IDs, object IDs, and namespaces cannot become label values.
+func validKindLabel(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validDriftCase(value string) bool {
+	switch value {
+	case DriftCaseOrphan, DriftCaseMissing, DriftCaseMismatch, DriftCaseVersion:
+		return true
+	}
+	return false
+}
+
+func validSweepResult(value string) bool {
+	switch value {
+	case SweepResultOK, SweepResultPartial, SweepResultError:
+		return true
+	}
+	return false
+}
+
+func validGateDecision(value string) bool {
+	switch value {
+	case GateDecisionOpen, GateDecisionClosedHash, GateDecisionClosedTTL, GateDecisionClosedInvalidated:
+		return true
+	}
+	return false
 }
 
 func cloudflareService(path string) string {

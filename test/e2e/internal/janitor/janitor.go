@@ -57,17 +57,17 @@ type API interface {
 
 // Report describes what Sweep removed and deliberately skipped.
 type Report struct {
-	AccessApplicationsDeleted int
-	AccessPoliciesDeleted     int
-	ServiceTokensDeleted      int
-	HostnameRoutesDeleted     int
-	NetworkRoutesDeleted      int
-	VirtualNetworksDeleted    int
-	DNSRecordsDeleted         int
-	TunnelsDeleted            int
-	DeviceProfilesDeleted     int
+	AccessApplicationsDeleted  int
+	AccessPoliciesDeleted      int
+	ServiceTokensDeleted       int
+	HostnameRoutesDeleted      int
+	NetworkRoutesDeleted       int
+	VirtualNetworksDeleted     int
+	DNSRecordsDeleted          int
+	TunnelsDeleted             int
+	DeviceProfilesDeleted      int
 	DeviceRegistrationsDeleted int
-	ConnectedSkipped          int
+	ConnectedSkipped           int
 }
 
 // Sweep removes disconnected e2e resources older than olderThan.

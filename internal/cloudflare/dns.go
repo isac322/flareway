@@ -30,6 +30,7 @@ import (
 // DNSAPI is the public DNS record surface used by the tunnel controller.
 type DNSAPI interface {
 	ListDNSRecords(ctx context.Context, zoneID, name string) ([]DNSRecord, error)
+	ListDNSRecordsByComment(ctx context.Context, zoneID, commentContains string) ([]DNSRecord, error)
 	CreateCNAME(ctx context.Context, zoneID string, input DNSRecordInput) (DNSRecord, error)
 	UpdateCNAME(ctx context.Context, zoneID, recordID string, input DNSRecordInput) (DNSRecord, error)
 	DeleteDNSRecord(ctx context.Context, zoneID, recordID string) error
@@ -81,7 +82,7 @@ func (client *Client) ListDNSRecords(ctx context.Context, zoneID, name string) (
 		Name: cloudflaresdk.F(dns.RecordListParamsName{
 			Exact: cloudflaresdk.F(normalizedName),
 		}),
-		PerPage: cloudflaresdk.F(100.0),
+		PerPage: cloudflaresdk.F(float64(dnsListPerPage)),
 	})
 
 	result := make([]DNSRecord, 0)
@@ -91,6 +92,34 @@ func (client *Client) ListDNSRecords(ctx context.Context, zoneID, name string) (
 	}
 	if err := pager.Err(); err != nil {
 		return nil, fmt.Errorf("list Cloudflare DNS records: %w", err)
+	}
+	return result, nil
+}
+
+// ListDNSRecordsByComment returns records of any type whose comment contains
+// commentContains (case-insensitive substring match). It lets a sweep worker
+// observe every Flareway-owned record in a zone with a single remote list call
+// instead of one GET per hostname (D6). An empty filter is rejected so callers
+// can never accidentally list the whole zone.
+func (client *Client) ListDNSRecordsByComment(ctx context.Context, zoneID, commentContains string) ([]DNSRecord, error) {
+	if strings.TrimSpace(commentContains) == "" {
+		return nil, fmt.Errorf("comment filter substring cannot be empty")
+	}
+	pager := client.sdk.DNS.Records.ListAutoPaging(ctx, dns.RecordListParams{
+		ZoneID: cloudflaresdk.F(zoneID),
+		Comment: cloudflaresdk.F(dns.RecordListParamsComment{
+			Contains: cloudflaresdk.F(commentContains),
+		}),
+		PerPage: cloudflaresdk.F(float64(dnsListPerPage)),
+	})
+
+	result := make([]DNSRecord, 0)
+	for pager.Next() {
+		record := pager.Current()
+		result = append(result, dnsRecordFromSDK(record))
+	}
+	if err := pager.Err(); err != nil {
+		return nil, fmt.Errorf("list Cloudflare DNS records by comment: %w", err)
 	}
 	return result, nil
 }

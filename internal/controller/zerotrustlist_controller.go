@@ -28,11 +28,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // ZeroTrustListReconciler owns a Cloudflare Gateway list and all its items.
@@ -42,6 +45,9 @@ type ZeroTrustListReconciler struct {
 	APIReader           client.Reader
 	NewCloudflareClient NewGatewayCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=zerotrustlists;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -92,14 +98,28 @@ func (r *ZeroTrustListReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		owned := object.Status.OwnershipVerified && object.Status.ListID != "" && object.Status.ListID == remote.ID
 		return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, zeroTrustListDiff(desiredItems, remote.Items), metav1.ConditionTrue, "Observed", "Zero Trust list is observed without mutation")
 	}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeTraffic, gateInput{
+		Kind: "ZeroTrustList", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.ListID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: object.Spec,
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	remote, err := r.ensureManaged(ctx, api, object, desiredItems)
 	if err != nil {
 		return r.finishRemoteOrValidationError(ctx, object, err)
 	}
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "ZeroTrustList", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, "Ready", "Zero Trust list is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: globalRequeue}, nil
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeTraffic, globalRequeue)}, nil
 }
 
 func observeGatewayList(ctx context.Context, api flarecloudflare.GatewayListAPI, object *v1alpha1.ZeroTrustList) (flarecloudflare.GatewayList, error) {
@@ -406,7 +426,15 @@ func (r *ZeroTrustListReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index ZeroTrustList accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustList{}).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Complete(observedReconciler("zero-trust-list", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.ZeroTrustList{}).
+		Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("zero-trust-list", r))
 }
 
 func (r *ZeroTrustListReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

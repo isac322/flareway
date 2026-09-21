@@ -30,14 +30,18 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const accessGroupAccountIndex = accessAccountIndex + ".accessGroup"
@@ -49,6 +53,9 @@ type AccessGroupReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessgroups;identityproviders;deviceposturerules;servicetokens;cloudflareaccounts,verbs=get;list;watch
@@ -128,6 +135,25 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, false, metav1.ConditionTrue, "Observed", "Access group is observed without mutation")
 	}
 
+	// T1 gate: the managed path below reads the remote group before any write.
+	// ObserveOnly above stays ungated (safety condition 9 — observation is the
+	// feature). Adoption scans inside ensureManaged are T0 by construction:
+	// the gate only opens once status.groupId is bound and the applied hash
+	// matches, so a first-time adoption always reads fresh.
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "AccessGroup", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.GroupID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+
 	remote, owned, conflict, ensureErr := r.ensureManaged(ctx, api, scope, object, input)
 	if ensureErr != nil {
 		reason := accessGroupErrorReason(ensureErr)
@@ -142,7 +168,11 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if conflict != "" {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, false, metav1.ConditionFalse, "Conflict", conflict)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "AccessGroup", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized")
 }
 func (r *AccessGroupReconciler) ensureManaged(ctx context.Context, api flarecloudflare.AccessGroupAPI, scope flarecloudflare.AccessScope, object *v1alpha1.AccessGroup, input flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, bool, string, error) {
 	id := object.Status.GroupID
@@ -359,6 +389,8 @@ func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha
 			current.Status.ZoneID = scope.ZoneID
 			current.Status.OwnershipVerified = owned
 		}
+		current.Status.AppliedHash = object.Status.AppliedHash
+		current.Status.AppliedAt = object.Status.AppliedAt
 		current.Status.ObservedGeneration = generation
 		current.Status.Conditions = mergeAccessConditions(current.Status.Conditions, r.now(), accessCondition(generation, "Accepted", status, reason, message), accessCondition(generation, "Ready", status, reason, message))
 		if err := r.Status().Patch(ctx, current, base); err != nil {
@@ -414,7 +446,11 @@ func (r *AccessGroupReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessGroup accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessGroup{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.groupsForAccount)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.groupsForNamespace)).Complete(observedReconciler("access-group", r))
+	b := ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessGroup{}, builder.WithPredicates(desiredStateChangedPredicate)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.groupsForAccount)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.DevicePostureRule{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.groupsForDependency)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.groupsForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("access-group", r))
 }
 func (r *AccessGroupReconciler) groupsForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.AccessGroupList

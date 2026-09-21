@@ -234,6 +234,12 @@ type WARPConnectorStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// AppliedHash is the desired-state hash recorded after the last successful remote convergence.
+	// +optional
+	AppliedHash string `json:"appliedHash,omitempty"`
+	// AppliedAt is when AppliedHash was last recorded; nil means never applied.
+	// +optional
+	AppliedAt *metav1.Time `json:"appliedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

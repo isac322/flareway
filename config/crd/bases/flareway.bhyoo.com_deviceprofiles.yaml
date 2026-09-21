@@ -557,6 +557,11 @@ spec:
             description: DeviceProfileStatus records the resolved remote profile and
               aggregate ownership.
             properties:
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
               appliedExclude:
                 items:
                   description: DeviceProfileAppliedSplitTunnelEntry records an applied
@@ -619,6 +624,10 @@ spec:
                 maxItems: 1000
                 type: array
                 x-kubernetes-list-type: atomic
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               appliedInclude:
                 items:
                   description: DeviceProfileAppliedSplitTunnelEntry records an applied

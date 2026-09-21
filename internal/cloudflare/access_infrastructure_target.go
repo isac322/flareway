@@ -107,7 +107,7 @@ func (client *Client) GetAccessInfrastructureTarget(ctx context.Context, id stri
 func (client *Client) ListAccessInfrastructureTargets(ctx context.Context) ([]AccessInfrastructureTarget, error) {
 	pager := client.sdk.ZeroTrust.Access.Infrastructure.Targets.ListAutoPaging(ctx, zero_trust.AccessInfrastructureTargetListParams{
 		AccountID: cloudflaresdk.F(client.accountID),
-		PerPage:   cloudflaresdk.F(int64(1000)),
+		PerPage:   cloudflaresdk.F(int64(accessListPerPage)),
 	})
 	result := make([]AccessInfrastructureTarget, 0)
 	for pager.Next() {

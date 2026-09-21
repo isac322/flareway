@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -57,6 +58,9 @@ type CloudflareAccountReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile verifies the token, lists account zones, and observes the Zero Trust organization.
+// No desiredHash gate: token verification, zone discovery, and organization reads are the
+// account's liveness/authorization evidence (T0 verification reads) and already run on the
+// 10-minute cloudflareAccountRefresh cycle, so a freshness gate would add no savings.
 func (r *CloudflareAccountReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	account := new(v1alpha1.CloudflareAccount)
 	if err := r.Get(ctx, request.NamespacedName, account); err != nil {
@@ -211,7 +215,7 @@ func (r *CloudflareAccountReconciler) SetupWithManager(manager ctrl.Manager) err
 	}
 
 	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.CloudflareAccount{}).
+		For(&v1alpha1.CloudflareAccount{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.accountsForSecret)).
 		Complete(observedReconciler("cloudflare-account", r))
 }

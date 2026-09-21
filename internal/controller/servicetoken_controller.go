@@ -29,14 +29,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -50,6 +54,9 @@ type ServiceTokenReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=servicetokens;cloudflareaccounts,verbs=get;list;watch
@@ -113,6 +120,25 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	input := flarecloudflare.ServiceTokenInput{Name: name, Duration: object.Spec.Duration, Enabled: object.Spec.Enabled}
 	if rejected, rejectErr := r.rejectServiceTokenSecretCollision(ctx, object, scope, flarecloudflare.ServiceToken{}); rejected || rejectErr != nil {
 		return ctrl.Result{}, rejectErr
+	}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.TokenID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		requeue := decision.Requeue
+		if object.Status.ExpiresAt != nil {
+			if untilExpiry := r.requeueAfter(object.Status.ExpiresAt.Time, object.Spec.Duration, nil); untilExpiry < requeue {
+				requeue = untilExpiry
+			}
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 	if id == "" {
 		recoveredID, recoverErr := r.recoverTokenID(ctx, object)
@@ -259,7 +285,15 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			}
 		}
 	}
-	return ctrl.Result{RequeueAfter: r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is synchronized", update)
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "ServiceToken", request.NamespacedName)
+	requeue := r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)
+	if ttl := r.Freshness.TTL(freshness.GradeAuthz); ttl > 0 && ttl < requeue {
+		requeue = ttl
+	}
+	return ctrl.Result{RequeueAfter: requeue}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is synchronized", update)
 }
 
 type serviceTokenStatusUpdate struct {
@@ -619,7 +653,15 @@ func (r *ServiceTokenReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index ServiceToken accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ServiceToken{}).Owns(&corev1.Secret{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.tokensForAccount)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.tokensForNamespace)).Complete(observedReconciler("service-token", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.ServiceToken{}, builder.WithPredicates(desiredStateChangedPredicate)).
+		Owns(&corev1.Secret{}).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.tokensForAccount)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.tokensForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("service-token", r))
 }
 func (r *ServiceTokenReconciler) tokensForAccount(ctx context.Context, object client.Object) []reconcile.Request {
 	var list v1alpha1.ServiceTokenList

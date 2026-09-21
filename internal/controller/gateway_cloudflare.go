@@ -43,17 +43,32 @@ import (
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/ir"
+	"github.com/isac322/flareway/internal/observability"
 )
 
 const cloudflareConvergenceTimeout = 30 * time.Second
 
 type cloudflareConfigResult struct {
-	version int64
-	hash    string
-	pending string
+	hash            string
+	version         int64
+	remoteVersion   int64
+	remoteCreatedAt *metav1.Time
+	// appliedAt is set only when this pass freshly confirmed or wrote the
+	// remote configuration. The caller stamps it into
+	// status.configVersion.appliedAt; an open gate leaves it nil so the
+	// recorded freshness timestamp is preserved.
+	appliedAt *metav1.Time
+	// requeue is the self-expiry delay until the desired-hash gate needs
+	// re-evaluation (D10). Zero means no freshness-driven requeue.
+	requeue time.Duration
 	drift   bool
 	message string
+	pending string
+	// held reports that drift was detected but the configured DriftPolicy
+	// suppressed the overwrite.
+	held bool
 }
 
 func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) (*ir.Gateway, bool, error) {
@@ -551,7 +566,11 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		return cloudflareConfigResult{}, errors.New("the Gateway reconciler cannot write a Direct-mode CloudflareTunnel")
 	}
 	if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
-		return cloudflareConfigResult{pending: "tunnel is ObserveOnly; no ingress will be written"}, nil
+		return cloudflareConfigResult{
+			remoteVersion:   tunnel.Status.ConfigVersion.Remote,
+			remoteCreatedAt: tunnel.Status.ConfigVersion.CreatedAt,
+			pending:         "tunnel is ObserveOnly; no ingress will be written",
+		}, nil
 	}
 	currentTunnel, err := r.validateGatewayTunnelWriter(ctx, gateway, tunnel)
 	if err != nil {
@@ -561,6 +580,34 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	params, hash, err := cloudflaredconfig.Compile(gateway)
 	if err != nil {
 		return cloudflareConfigResult{}, err
+	}
+	// Desired-hash gate (D11): evaluated outside the tunnel lock and before
+	// the Cloudflare client is built. An open gate skips client creation,
+	// GetTunnel, and the lock entirely; the result is reconstructed from the
+	// status recorded by the last converged pass so configVersion.remote and
+	// createdAt keep their values (C14 #9). A closed gate runs the unchanged
+	// remote path below — the lock closure never serves cached state.
+	now := r.gatewayNow()
+	gateKey := client.ObjectKeyFromObject(tunnel)
+	gate := evaluateGateWithHash(
+		r.Freshness,
+		r.Invalidator,
+		freshness.GradeTraffic,
+		"CloudflareTunnel",
+		gateKey,
+		tunnel.Status.ConfigVersion.DesiredHash,
+		hash,
+		tunnel.Status.ConfigVersion.AppliedAt,
+		now,
+	).Gate
+	if gate.Open {
+		return cloudflareConfigResult{
+			hash:            hash,
+			version:         tunnel.Status.ConfigVersion.Desired,
+			remoteVersion:   tunnel.Status.ConfigVersion.Remote,
+			remoteCreatedAt: tunnel.Status.ConfigVersion.CreatedAt,
+			requeue:         gate.Requeue,
+		}, nil
 	}
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
@@ -573,6 +620,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	if err := validateRemoteTunnel(remoteTunnel, account.Spec.AccountID); err != nil {
 		return cloudflareConfigResult{}, err
 	}
+	freshAppliedAt := metav1.NewTime(now)
 	result := cloudflareConfigResult{hash: hash}
 	err = api.WithTunnelLock(ctx, tunnel.Status.TunnelID, func() error {
 		remote, err := api.GetTunnelConfiguration(ctx, tunnel.Status.TunnelID)
@@ -586,15 +634,29 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			tunnel.Status.ConfigVersion.DesiredHash == hash &&
 			remote.Version == tunnel.Status.ConfigVersion.Desired {
 			result.version = tunnel.Status.ConfigVersion.Desired
+			result.remoteVersion = remote.Version
+			result.remoteCreatedAt = timeStatus(remote.CreatedAt)
+			result.appliedAt = &freshAppliedAt
 			return nil
 		}
 		baseline := tunnel.Status.ConfigVersion.Applied
 		if baseline == 0 {
 			baseline = tunnel.Status.ConfigVersion.Desired
 		}
-		if baseline != 0 && remote.Version != baseline {
+		if remote.Version != baseline {
 			result.drift = true
-			result.message = fmt.Sprintf("Cloudflare Tunnel configuration changed out of band: remote version %d, expected %d; overwriting with desired configuration", remote.Version, baseline)
+			action := "overwriting with desired configuration"
+			if r.DriftPolicy == DriftPolicyHold {
+				result.held = true
+				action = "automatic overwrite held by policy"
+			}
+			result.message = fmt.Sprintf("Cloudflare Tunnel configuration changed out of band: remote version %d, expected %d; %s", remote.Version, baseline, action)
+			observability.ObserveDrift("CloudflareTunnel", "version")
+		}
+		if result.held {
+			result.remoteVersion = remote.Version
+			result.remoteCreatedAt = timeStatus(remote.CreatedAt)
+			return nil
 		}
 		updated, err := api.UpdateTunnelConfiguration(ctx, tunnel.Status.TunnelID, params)
 		if err != nil {
@@ -604,10 +666,20 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			return err
 		}
 		result.version = updated.Version
+		result.remoteVersion = updated.Version
+		result.remoteCreatedAt = timeStatus(updated.CreatedAt)
+		result.appliedAt = &freshAppliedAt
 		return nil
 	})
 	if err != nil {
 		return cloudflareConfigResult{}, fmt.Errorf("update Cloudflare Tunnel configuration: %w", err)
+	}
+	if result.appliedAt != nil {
+		// The remote state was freshly confirmed or written: release any
+		// sweep invalidation and requeue at the freshness horizon so the
+		// next pass re-evaluates the gate exactly when it expires (D10).
+		clearGate(r.Invalidator, "CloudflareTunnel", gateKey)
+		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
 	}
 	return result, nil
 }
@@ -730,7 +802,7 @@ func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool
 		if record.State != dnsRecordStateConflict {
 			delete(wanted, strings.ToLower(record.Hostname))
 		}
-}
+	}
 	return len(wanted) == 0
 }
 
@@ -843,11 +915,6 @@ func (r *GatewayReconciler) patchTunnelGatewayStatus(
 	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&statusValue)
 	if err != nil {
 		return fmt.Errorf("convert Gateway-owned CloudflareTunnel status: %w", err)
-	}
-	if configMap, ok := statusMap["configVersion"].(map[string]any); ok {
-		delete(configMap, "remote")
-		delete(configMap, "createdAt")
-		statusMap["configVersion"] = configMap
 	}
 	// Force empty lists into the apply document so removing the last hostname or
 	// listener releases stale status instead of omitting the field.

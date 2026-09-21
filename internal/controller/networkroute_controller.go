@@ -28,15 +28,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // NetworkRouteReconciler manages Cloudflare private CIDR routes.
@@ -45,6 +49,9 @@ type NetworkRouteReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=networkroutes;virtualnetworks;cloudflaretunnels;warpconnectors;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -126,6 +133,19 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, false, true, metav1.ConditionTrue, "Observed", "Network route is observed without mutation")
 	}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeTraffic, gateInput{
+		Kind: "NetworkRoute", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.RouteID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -141,7 +161,11 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if lookupErr != nil {
 		return r.finishIPLookupError(ctx, object, remote, true, true, lookupErr)
 	}
-	return ctrl.Result{}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, true, true, metav1.ConditionTrue, "Ready", "Network route is synchronized")
+	object.Status.AppliedHash = decision.DesiredHash
+	appliedAt := metav1.NewTime(r.now())
+	object.Status.AppliedAt = &appliedAt
+	clearGate(r.Invalidator, "NetworkRoute", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, r.patchStatusWithIPLookup(ctx, object, remote, lookup, true, true, metav1.ConditionTrue, "Ready", "Network route is synchronized")
 }
 
 func (r *NetworkRouteReconciler) ensureManaged(ctx context.Context, api flarecloudflare.NetworkRouteAPI, object *v1alpha1.NetworkRoute, input flarecloudflare.NetworkRouteInput) (flarecloudflare.NetworkRoute, error) {
@@ -573,16 +597,19 @@ func (r *NetworkRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index NetworkRoute virtual network references: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.NetworkRoute{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.NetworkRoute{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForAccount)).
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForTunnel)).
 		Watches(&v1alpha1.WARPConnector{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForTunnel)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForVirtualNetwork)).
-		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutePeers)).
+		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutePeers), builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allNetworkRoutes)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("network-route", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("network-route", r))
 }
 
 func (r *NetworkRouteReconciler) networkRoutesForAccount(ctx context.Context, object client.Object) []reconcile.Request {

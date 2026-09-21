@@ -189,7 +189,7 @@ func TestEventingClientStatusApplyEmitsTransitionEvent(t *testing.T) {
 	apply := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "flareway.bhyoo.com/v1alpha1",
 		"kind":       "AccessApplication",
-		"metadata": map[string]any{"namespace": "apps", "name": "apply-status"},
+		"metadata":   map[string]any{"namespace": "apps", "name": "apply-status"},
 		"status": map[string]any{"conditions": []any{map[string]any{
 			"type": "CleanupBlocked", "status": "True", "reason": "DependenciesRemain",
 		}}},
@@ -201,7 +201,6 @@ func TestEventingClientStatusApplyEmitsTransitionEvent(t *testing.T) {
 		t.Fatalf("status apply event = %q", event)
 	}
 }
-
 
 func receiveEvent(t *testing.T, recorder *record.FakeRecorder) string {
 	t.Helper()
