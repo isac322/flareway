@@ -28,6 +28,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -57,6 +58,7 @@ const (
 	accessApplicationAccountIndex         = "flareway.accessApplication.account"
 	accessApplicationAUDNamespace         = "flareway-system"
 	accessApplicationRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
+	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
 	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
 	accessApplicationPrivateTunnelsKey    = "tunnels"
 	accessApplicationAUDReadyKey          = "ready"
@@ -173,13 +175,16 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	}
 
 	if _, latched := application.Annotations[accessApplicationRevocationAnnotation]; latched {
-		acknowledged, message, err := r.revocationAcknowledged(ctx, application)
+		acknowledged, message, reason, err := r.revocationAcknowledged(ctx, application)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if !acknowledged {
 			status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
-			setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "RevocationPending", message, r.now())
+			if reason == "" {
+				reason = "RevocationPending"
+			}
+			setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, reason, message, r.now())
 			return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 		}
 		if err := r.revokeApplicationTokensWithClient(ctx, remote, resolved.scope, application); err != nil {
@@ -275,14 +280,20 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 	if err := r.deleteAUDSecrets(ctx, application); err != nil {
 		return ctrl.Result{}, err
 	}
-	acknowledged, message, err := r.revocationAcknowledged(ctx, application)
+	acknowledged, message, reason, err := r.revocationAcknowledged(ctx, application)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	status := r.desiredStatus(application, retained, application.Status.ApplicationID, application.Status.BypassApplications, false)
 	setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, invalid.Reason, invalid.Message, r.now())
 	if !acknowledged {
-		setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, metav1.ConditionFalse, "RevocationPending", message, r.now())
+		cleanupStatus := metav1.ConditionFalse
+		if reason != accessRevocationPublisherUnavailable {
+			reason = "RevocationPending"
+		} else {
+			cleanupStatus = metav1.ConditionTrue
+		}
+		setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, cleanupStatus, reason, message, r.now())
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 	}
 	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
@@ -299,6 +310,11 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 		}
 		status.ApplicationID = ""
 		status.BypassApplications = nil
+		status.Type = ""
+		status.OwnershipVerified = false
+		status.Domain = ""
+		status.ZoneID = ""
+		status.Tags = nil
 		if err := r.clearRevocationLatch(ctx, application); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1158,23 +1174,23 @@ func revocationBaseline(status v1alpha1.CloudflareTunnelHostnameStatus, tunnel *
 	return status.AppliedVersion
 }
 
-func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context, application *v1alpha1.AccessApplication) (bool, string, error) {
+func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context, application *v1alpha1.AccessApplication) (bool, string, string, error) {
 	raw := application.Annotations[accessApplicationRevocationAnnotation]
 	if raw == "" {
-		return false, "Access revocation is not latched", nil
+		return false, "Access revocation is not latched", "", nil
 	}
 	var latch accessRevocationLatch
 	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
-		return false, "", fmt.Errorf("decode Access revocation latch: %w", err)
+		return false, "", "", fmt.Errorf("decode Access revocation latch: %w", err)
 	}
 	handoffs, err := r.listApplicationAUDSecrets(ctx, application)
 	if err != nil {
-		return false, "", fmt.Errorf("list Access handoffs while waiting for revocation: %w", err)
+		return false, "", "", fmt.Errorf("list Access handoffs while waiting for revocation: %w", err)
 	}
 	for index := range handoffs {
 		if audSecretOwnedByApplication(&handoffs[index], application) &&
 			string(handoffs[index].Data[accessApplicationAUDReadyKey]) == "true" {
-			return false, "Waiting for the Access AUD handoff to remain absent", nil
+			return false, "Waiting for the Access AUD handoff to remain absent", "", nil
 		}
 	}
 	applicationKey := application.Namespace + "/" + application.Name
@@ -1189,7 +1205,7 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 				continue
 			}
 			if err != nil {
-				return false, "", fmt.Errorf("get CloudflareTunnel while waiting for Access revocation: %w", err)
+				return false, "", "", fmt.Errorf("get CloudflareTunnel while waiting for Access revocation: %w", err)
 			}
 			tunnel = current
 			tunnels[claim.Tunnel] = tunnel
@@ -1203,7 +1219,7 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 				status.ProtectionDomain == claim.ProtectionDomain &&
 				status.AccessApplication == applicationKey &&
 				status.Guard == v1alpha1.HostnameGuardBlocked &&
-				status.AppliedVersion > claim.BaselineVersion &&
+				versionAcknowledged(status, tunnel, claim) &&
 				status.AppliedVersion == tunnel.Status.ConfigVersion.Applied &&
 				tunnel.Status.ConfigVersion.Desired == tunnel.Status.ConfigVersion.Applied {
 				acknowledged = true
@@ -1211,10 +1227,73 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 			}
 		}
 		if !acknowledged {
-			return false, fmt.Sprintf("Waiting for %s/%s on CloudflareTunnel %s to acknowledge Blocked after version %d", claim.Hostname, claim.ProtectionDomain, claim.Tunnel, claim.BaselineVersion), nil
+			publisherAvailable, err := accessRevocationPublisherAvailable(ctx, r.Client, tunnel)
+			if err != nil {
+				return false, "", "", err
+			}
+			if !publisherAvailable {
+				return false, fmt.Sprintf("Recorded Gateway for CloudflareTunnel %s is unavailable to publish revocation; preserving Access resources and finalizer", claim.Tunnel), accessRevocationPublisherUnavailable, nil
+			}
+			return false, fmt.Sprintf("Waiting for %s/%s on CloudflareTunnel %s to acknowledge Blocked after version %d", claim.Hostname, claim.ProtectionDomain, claim.Tunnel, claim.BaselineVersion), "", nil
 		}
 	}
-	return true, "Every Access protection domain acknowledged a fresh Blocked version", nil
+	return true, "Every Access protection domain acknowledged a fresh Blocked version", "", nil
+}
+
+// versionAcknowledged reports whether the tunnel has published the Blocked
+// transition. A public protection domain appears in the remote tunnel
+// configuration, so revocation requires a version newer than the latched
+// baseline. A private protection domain is deliberately absent from that
+// configuration: the block is enforced by the data plane on loopback, and the
+// remote version can never advance for it, so a settled version at or above
+// the baseline is the strongest evidence that exists.
+func versionAcknowledged(
+	status v1alpha1.CloudflareTunnelHostnameStatus,
+	tunnel *v1alpha1.CloudflareTunnel,
+	claim accessRevocationClaim,
+) bool {
+	if status.AppliedVersion > claim.BaselineVersion {
+		return true
+	}
+	return status.AppliedVersion == claim.BaselineVersion &&
+		protectionDomainExposure(tunnel, claim.ProtectionDomain) == v1alpha1.ExposurePrivate
+}
+
+// protectionDomainExposure reports the listener exposure that owns the
+// protection domain, or the empty exposure when the tunnel no longer records
+// it.
+func protectionDomainExposure(tunnel *v1alpha1.CloudflareTunnel, domain string) v1alpha1.Exposure {
+	if tunnel == nil {
+		return ""
+	}
+	for _, listener := range tunnel.Status.Listeners {
+		for _, protectionDomain := range listener.ProtectionDomains {
+			if protectionDomain.Name == domain {
+				return listener.Exposure
+			}
+		}
+	}
+	return ""
+}
+
+func accessRevocationPublisherAvailable(ctx context.Context, reader client.Reader, tunnel *v1alpha1.CloudflareTunnel) (bool, error) {
+	if tunnel == nil || tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "" || tunnel.Status.GatewayUID == "" {
+		return false, nil
+	}
+	var gateway gatewayv1.Gateway
+	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: tunnel.Status.GatewayRef.Name}
+	if err := reader.Get(ctx, key, &gateway); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get recorded Gateway %s while waiting for Access revocation: %w", key, err)
+	}
+	if gateway.UID != tunnel.Status.GatewayUID || !gatewayClaimsTunnel(&gateway, tunnel) {
+		return false, nil
+	}
+	// A deleting Gateway is still the recorded publisher; keep polling so its
+	// normal drain/recovery path can acknowledge the claim.
+	return true, nil
 }
 
 func revokeAccessApplicationTokens(
@@ -1335,29 +1414,42 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 	if !controllerutil.ContainsFinalizer(application, v1alpha1.AccessApplicationFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
-		if err := r.latchRevocation(ctx, application); err != nil {
+	programmed := meta.FindStatusCondition(application.Status.Conditions, accessApplicationConditionProgrammed)
+	if programmed == nil || programmed.Status != metav1.ConditionFalse || programmed.ObservedGeneration != application.Generation {
+		status := *application.Status.DeepCopy()
+		setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "Pending", "Access application deletion is pending", r.now())
+		if err := r.patchStatus(ctx, application, status); err != nil {
 			return ctrl.Result{}, err
 		}
+		application.Status = status
+	}
+	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
+		if err := r.latchRevocation(ctx, application); err != nil {
+			return r.finishDeleteError(ctx, application, err)
+		}
 		if err := r.deleteAUDSecrets(ctx, application); err != nil {
-			return ctrl.Result{}, err
+			return r.finishDeleteError(ctx, application, err)
 		}
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
 	if err := r.deleteAUDSecrets(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
-	blocked, message, err := r.revocationAcknowledged(ctx, application)
+	blocked, message, reason, err := r.revocationAcknowledged(ctx, application)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	if !blocked {
 		status := *application.Status.DeepCopy()
 		conditionStatus := metav1.ConditionFalse
-		reason := "Pending"
-		if r.now().Sub(application.DeletionTimestamp.Time) >= accessApplicationCleanupLimit {
+		if reason == accessRevocationPublisherUnavailable {
 			conditionStatus = metav1.ConditionTrue
-			reason = "CleanupTimedOut"
+		} else {
+			reason = "Pending"
+			if r.now().Sub(application.DeletionTimestamp.Time) >= accessApplicationCleanupLimit {
+				conditionStatus = metav1.ConditionTrue
+				reason = "CleanupTimedOut"
+			}
 		}
 		setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, conditionStatus, reason, message, r.now())
 		if err := r.patchStatus(ctx, application, status); err != nil {
@@ -1366,16 +1458,16 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
 	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
 		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
 		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
-			return ctrl.Result{}, err
+			return r.finishDeleteError(ctx, application, err)
 		}
 	}
 	if err := r.deletePrivateTunnelLedger(ctx, application); err != nil {
-		return ctrl.Result{}, err
+		return r.finishDeleteError(ctx, application, err)
 	}
 	before := application.DeepCopy()
 	controllerutil.RemoveFinalizer(application, v1alpha1.AccessApplicationFinalizer)
@@ -1383,6 +1475,14 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		return ctrl.Result{}, fmt.Errorf("remove AccessApplication finalizer: %w", err)
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *AccessApplicationReconciler) finishDeleteError(ctx context.Context, application *v1alpha1.AccessApplication, cause error) (ctrl.Result, error) {
+	status := *application.Status.DeepCopy()
+	now := r.now()
+	setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, metav1.ConditionTrue, "RemoteError", cause.Error(), now)
+	setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "CleanupBlocked", "Access application deletion is blocked", now)
+	return ctrl.Result{}, errors.Join(cause, r.patchStatus(ctx, application, status))
 }
 
 func accessStatusHostnames(destinations []v1alpha1.AccessApplicationDestinationStatus) []string {
@@ -1546,6 +1646,13 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 	now := metav1.NewTime(r.now())
 	status := *application.Status.DeepCopy()
 	status.ApplicationID = applicationID
+	if applicationID == "" {
+		status.Type = ""
+		status.OwnershipVerified = false
+		status.Domain = ""
+		status.ZoneID = ""
+		status.Tags = nil
+	}
 	status.ObservedGeneration = application.Generation
 	status.Destinations = accessDestinationStatuses(compilation.Destinations)
 	status.DataPlanes = make([]v1alpha1.AccessApplicationDataPlaneStatus, 0, len(compilation.DataPlanes))
@@ -1572,12 +1679,17 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 		if applicationID != "" && programmed {
 			programmedStatus = metav1.ConditionTrue
 			programmedReason = "Programmed"
+		} else {
+			programmedReason = "Pending"
 		}
-		if compilation.OriginJWTEnforced && programmed {
+		switch {
+		case compilation.OriginJWTEnforced && programmed:
 			originStatus = metav1.ConditionTrue
 			originReason = "Enforced"
-		} else if !compilation.OriginJWTEnforced {
+		case !compilation.OriginJWTEnforced:
 			originReason = "NotApplicable"
+		default:
+			originReason = "Pending"
 		}
 	}
 	conditions := []metav1.Condition{
