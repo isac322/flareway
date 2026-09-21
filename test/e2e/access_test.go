@@ -239,11 +239,19 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	}, NodeTimeout(2*time.Minute))
 
 	It("keeps child bypass paths public while protecting the enclosing dashboard", func(ctx SpecContext) {
+
+		current := mixedApplication.DeepCopy()
+		Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(mixedApplication), current)).To(Succeed())
+		children, found, err := unstructured.NestedSlice(current.Object, "status", "bypassApplications")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(children).To(HaveLen(2), "each public carve-out requires an operator-owned child application")
 		readyCtx, cancel := context.WithTimeout(ctx, time.Minute)
 		defer cancel()
 		consecutive := 0
 		duration, readyErr := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 			status, _, _, err := edgeRequestTo(checkCtx, mixedHostname, "/dashboard", nil)
+			GinkgoWriter.Printf("bypass convergence /dashboard: HTTP %d, request error=%v\n", status, err)
 			if err != nil {
 				consecutive = 0
 				return false, nil
@@ -264,6 +272,10 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 			consecutive++
 			return consecutive >= 3, nil
 		})
+		if readyErr != nil {
+			GinkgoWriter.Printf("bypass readiness failure; AccessApplication: %s; Gateway: %s\n",
+				statusSummary(mixedApplication), statusSummary(mixedGateway))
+		}
 		Expect(readyErr).NotTo(HaveOccurred(), "child bypass paths did not converge while the dashboard remained protected")
 		recordLatency("access-bypass-edge-ready", duration)
 
@@ -280,13 +292,6 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		status, _, body, err = edgeRequestTo(ctx, mixedHostname, "/dashboard", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusOK), "service token must reach protected dashboard; body: %s", body)
-
-		current := mixedApplication.DeepCopy()
-		Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(mixedApplication), current)).To(Succeed())
-		children, found, err := unstructured.NestedSlice(current.Object, "status", "bypassApplications")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(found).To(BeTrue())
-		Expect(children).To(HaveLen(2), "each public carve-out requires an operator-owned child application")
 	}, NodeTimeout(2*time.Minute))
 
 	It("blocks immediately when the AUD Secret disappears and never becomes public", func(ctx SpecContext) {
