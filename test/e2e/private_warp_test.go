@@ -220,7 +220,9 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			return len(addresses) > 0 && allSyntheticPrivateAddresses(addresses), nil
 		})
 		if err != nil {
-			GinkgoWriter.Printf("runner DNS diagnostics for %s:\n%s", privateHostname, runnerDNSDiagnostics(ctx, privateHostname))
+			// A blocked classification is not a spec failure, so Ginkgo would
+			// discard buffered writer output; print the evidence directly.
+			fmt.Printf("runner DNS diagnostics for %s:\n%s", privateHostname, runnerDNSDiagnostics(ctx, privateHostname))
 			writePrivateWARPResult(e2ereport.PrivateWARPResult{
 				Result: e2ereport.PrivateWARPBlockedRunner,
 				Reason: "runner DNS did not return Cloudflare private-hostname synthetic addresses",
