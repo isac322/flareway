@@ -84,7 +84,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 
 	accessAPI, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, nil, object.Status.IntegrationID, metav1.ConditionFalse, "Pending", err.Error())
+		_ = r.patchStatus(ctx, object, nil, object.Status.IntegrationID, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
 	}
 	api, ok := accessAPI.(flarecloudflare.DevicePostureIntegrationAPI)

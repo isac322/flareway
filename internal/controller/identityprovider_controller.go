@@ -90,7 +90,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 
 	api, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, flarecloudflare.IdentityProvider{ID: object.Status.IDPID}, nil, metav1.ConditionFalse, "Pending", err.Error())
+		_ = r.patchStatus(ctx, object, flarecloudflare.IdentityProvider{ID: object.Status.IDPID}, nil, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
 	}
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {

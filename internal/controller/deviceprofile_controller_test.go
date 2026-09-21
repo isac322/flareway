@@ -33,8 +33,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
@@ -91,6 +93,166 @@ func TestAggregateRejectsMoreThanOneThousandEntries(t *testing.T) {
 	_, err := (&DeviceProfileReconciler{}).aggregate(context.Background(), profile, &v1alpha1.CloudflareAccount{}, &corev1.Namespace{})
 	if err == nil || err.Error() != "split-tunnel aggregate has 1001 entries; maximum is 1000" {
 		t.Fatalf("expected aggregate limit error, got %v", err)
+	}
+}
+
+func deviceProfileAggregateScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add flareway v1alpha1 to scheme: %v", err)
+	}
+	return scheme
+}
+
+func deviceProfileAggregateAccount() *v1alpha1.CloudflareAccount {
+	return &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: "0123456789abcdef0123456789abcdef",
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				Hostnames:         []string{"*.example.com"},
+				PrivateRoutes: &v1alpha1.CloudflarePrivateRouteGrant{
+					NetworkRouteSelector:  &metav1.LabelSelector{},
+					HostnameRouteSelector: &metav1.LabelSelector{},
+				},
+			}},
+		},
+	}
+}
+
+func deviceProfileAggregateProfile(account *v1alpha1.CloudflareAccount, sources v1alpha1.DeviceProfileRouteSources) *v1alpha1.DeviceProfile {
+	return &v1alpha1.DeviceProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile", Namespace: "tenant"},
+		Spec: v1alpha1.DeviceProfileSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Profile:          v1alpha1.DeviceProfileTarget{Kind: v1alpha1.DeviceProfileKindDefault},
+			SplitTunnel:      v1alpha1.DeviceProfileSplitTunnel{Mode: v1alpha1.DeviceProfileSplitTunnelModeInclude, RouteSources: sources},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+	}
+}
+
+// A NetworkRoute whose spec was edited but not yet reconciled must keep
+// contributing its last applied CIDR so existing WARP traffic is preserved
+// while the new generation is pending.
+func TestAggregatePreservesAppliedNetworkRouteDuringPendingGeneration(t *testing.T) {
+	ctx := context.Background()
+	scheme := deviceProfileAggregateScheme(t)
+	account := deviceProfileAggregateAccount()
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}}
+
+	pending := &v1alpha1.NetworkRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: "tenant", Generation: 2},
+		Spec: v1alpha1.NetworkRouteSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Network:    "10.20.0.0/16",
+		},
+		Status: v1alpha1.NetworkRouteStatus{
+			RouteID: "route-pending",
+			Applied: v1alpha1.NetworkRouteAppliedStatus{Network: "10.10.0.0/16", ObservedGeneration: 1},
+			Conditions: []metav1.Condition{{
+				Type:               v1alpha1.PrivateNetworkConditionAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				ObservedGeneration: 1,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	unapplied := &v1alpha1.NetworkRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "unapplied", Namespace: "tenant", Generation: 1},
+		Spec: v1alpha1.NetworkRouteSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Network:    "10.30.0.0/16",
+		},
+		Status: v1alpha1.NetworkRouteStatus{
+			Conditions: []metav1.Condition{{
+				Type:               v1alpha1.PrivateNetworkConditionAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				ObservedGeneration: 1,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(namespace, account, pending, unapplied).Build()
+	profile := deviceProfileAggregateProfile(account, v1alpha1.DeviceProfileRouteSources{NetworkRoutes: &v1alpha1.DeviceProfileRouteSelector{}})
+
+	desired, err := (&DeviceProfileReconciler{Client: kube}).aggregate(ctx, profile, account, namespace)
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+	addresses := make([]string, 0, len(desired.include))
+	for _, entry := range desired.include {
+		addresses = append(addresses, entry.Address)
+	}
+	if !slices.Contains(addresses, "10.10.0.0/16") {
+		t.Fatalf("applied CIDR was dropped while the new generation is pending: %#v", addresses)
+	}
+	if slices.Contains(addresses, "10.20.0.0/16") {
+		t.Fatalf("un-applied generation 2 CIDR leaked into the include list: %#v", addresses)
+	}
+	if slices.Contains(addresses, "10.30.0.0/16") {
+		t.Fatalf("route without an applied network contributed its spec CIDR: %#v", addresses)
+	}
+}
+
+// A HostnameRoute whose spec was edited must keep contributing its last
+// applied hostname, preserving the wildcard form that the observed remote
+// hostname loses.
+func TestAggregatePreservesAppliedHostnameRouteWildcard(t *testing.T) {
+	ctx := context.Background()
+	scheme := deviceProfileAggregateScheme(t)
+	account := deviceProfileAggregateAccount()
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}}
+
+	route := &v1alpha1.HostnameRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "tenant", Generation: 2},
+		Spec: v1alpha1.HostnameRouteSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Hostname:   "*.new.example.com",
+		},
+		Status: v1alpha1.HostnameRouteStatus{
+			RouteID:  "route-1",
+			Hostname: "example.com",
+			Applied:  v1alpha1.HostnameRouteAppliedStatus{Hostname: "*.example.com", ObservedGeneration: 1},
+			Conditions: []metav1.Condition{{
+				Type:               v1alpha1.PrivateNetworkConditionAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				ObservedGeneration: 1,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(namespace, account, route).Build()
+	profile := deviceProfileAggregateProfile(account, v1alpha1.DeviceProfileRouteSources{HostnameRoutes: &v1alpha1.DeviceProfileRouteSelector{}})
+
+	desired, err := (&DeviceProfileReconciler{Client: kube}).aggregate(ctx, profile, account, namespace)
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+	hosts := make([]string, 0, len(desired.include))
+	for _, entry := range desired.include {
+		hosts = append(hosts, entry.Host)
+	}
+	if !slices.Contains(hosts, "*.example.com") {
+		t.Fatalf("applied wildcard hostname was dropped while the new generation is pending: %#v", hosts)
+	}
+	if slices.Contains(hosts, "*.new.example.com") {
+		t.Fatalf("un-applied generation 2 hostname leaked into the include list: %#v", hosts)
+	}
+	if slices.Contains(hosts, "example.com") {
+		t.Fatalf("normalized observed hostname replaced the applied wildcard: %#v", hosts)
 	}
 }
 

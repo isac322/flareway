@@ -83,7 +83,7 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	}
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, operation, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, nil, object.Status.RuleID, metav1.ConditionFalse, "Pending", err.Error())
+		_ = r.patchStatus(ctx, object, nil, object.Status.RuleID, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
 	}
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {

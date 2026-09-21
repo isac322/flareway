@@ -682,3 +682,213 @@ func TestAccessCustomPageOrphanDeletionRetainsRemotePage(t *testing.T) {
 		t.Fatalf("orphaned AccessCustomPage still exists: %v", err)
 	}
 }
+
+func TestAccessCustomPageStandaloneApplicationReferenceBlocksDeletion(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeCustomPageCloudflare()
+	kube, reconciler, page := newCustomPageTestReconciler(t, remote, nil, clock)
+	if err := kube.Create(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(page)}
+	reconcileCustomPage(ctx, t, reconciler, request, "add finalizer")
+	reconcileCustomPage(ctx, t, reconciler, request, "create custom page")
+
+	var current v1alpha1.AccessCustomPage
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	pageID := current.Status.CustomPageID
+	if pageID == "" {
+		t.Fatal("custom page was not programmed")
+	}
+
+	standalone := &v1alpha1.AccessStandaloneApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "portal", Namespace: page.Namespace},
+		Spec: v1alpha1.AccessStandaloneApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: page.Spec.AccountRef.Name},
+			Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+			Bookmark:   &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://portal.example.test/"},
+			Application: v1alpha1.AccessApplicationSettings{CustomPageRefs: []v1alpha1.AccessCustomPageReference{{
+				ObjectRef: &v1alpha1.NamespacedLocalObjectReference{Name: page.Name},
+			}}},
+		},
+	}
+	if err := kube.Create(ctx, standalone); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileCustomPage(ctx, t, reconciler, request, "block referenced deletion")
+	if _, found := remote.pages[pageID]; !found {
+		t.Fatal("remote custom page was deleted while a standalone application references it")
+	}
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if condition := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionCleanupBlocked); condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("CleanupBlocked condition = %#v, want True", condition)
+	}
+
+	if err := kube.Delete(ctx, standalone); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCustomPage(ctx, t, reconciler, request, "delete unreferenced custom page")
+	if _, found := remote.pages[pageID]; found {
+		t.Fatal("unreferenced remote custom page was retained under Delete policy")
+	}
+	if err := kube.Get(ctx, request.NamespacedName, &v1alpha1.AccessCustomPage{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("deleted AccessCustomPage still exists: %v", err)
+	}
+}
+
+func TestAccessCustomPageObserveOnlyDegradedClearsAfterDriftRepairs(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeCustomPageCloudflare()
+	kube, reconciler, page := newCustomPageTestReconciler(t, remote, nil, clock)
+	page.Name = "observed"
+	page.Spec.Name = "observed"
+	page.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+	page.Spec.ExternalRef = &v1alpha1.AccessCustomPageExternalReference{CustomPageID: "external-page"}
+	remote.pages["external-page"] = flarecloudflare.AccessCustomPage{
+		AccessCustomPageSummary: flarecloudflare.AccessCustomPageSummary{
+			ID:              "external-page",
+			Name:            "flareway/cluster-id/" + page.Namespace + "/observed",
+			Type:            page.Spec.Type,
+			ContractVersion: page.Spec.ContractVersion,
+		},
+		HTML: "<main>drifted</main>",
+	}
+	if err := kube.Create(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(page)}
+	reconcileCustomPage(ctx, t, reconciler, request, "add finalizer")
+	reconcileCustomPage(ctx, t, reconciler, request, "observe drift")
+
+	var current v1alpha1.AccessCustomPage
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if condition := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "DriftDetected" {
+		t.Fatalf("Degraded after drift = %#v, want True/DriftDetected", condition)
+	}
+
+	repaired := remote.pages["external-page"]
+	repaired.HTML = page.Spec.HTML
+	remote.pages["external-page"] = repaired
+	reconcileCustomPage(ctx, t, reconciler, request, "observe the repaired page")
+
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready after repair = %#v, want True", ready)
+	}
+	if degraded := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != "Healthy" {
+		t.Fatalf("Degraded after repair = %#v, want False/Healthy", degraded)
+	}
+}
+
+// customPageErrorGate forwards every call to the wrapped client and only
+// injects a transient error on GetAccessCustomPage, so remote state is never
+// corrupted by the injected failure.
+type customPageErrorGate struct {
+	flarecloudflare.AccessAPI
+	failGet bool
+}
+
+func (g *customPageErrorGate) GetAccessCustomPage(ctx context.Context, id string) (flarecloudflare.AccessCustomPage, error) {
+	if g.failGet {
+		return flarecloudflare.AccessCustomPage{}, fmt.Errorf("get Access custom page %q: temporary network outage", id)
+	}
+	return g.AccessAPI.GetAccessCustomPage(ctx, id)
+}
+
+func TestAccessCustomPageManagedDegradedClearsAfterRemoteErrorRecovers(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeCustomPageCloudflare()
+	kube, reconciler, page := newCustomPageTestReconciler(t, remote, nil, clock)
+	gate := &customPageErrorGate{AccessAPI: remote}
+	reconciler.NewCloudflareClient = func(string, string) (flarecloudflare.AccessAPI, error) { return gate, nil }
+	if err := kube.Create(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(page)}
+	reconcileCustomPage(ctx, t, reconciler, request, "add finalizer")
+	reconcileCustomPage(ctx, t, reconciler, request, "create custom page")
+
+	var current v1alpha1.AccessCustomPage
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.CustomPageID == "" {
+		t.Fatal("custom page was not programmed")
+	}
+
+	gate.failGet = true
+	if _, err := reconciler.Reconcile(ctx, request); err == nil {
+		t.Fatal("expected the remote read failure to surface as an error")
+	}
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if failed := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); failed == nil || failed.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded during the failure = %#v, want True", failed)
+	}
+
+	gate.failGet = false
+	reconcileCustomPage(ctx, t, reconciler, request, "recover after the remote error")
+
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready after recovery = %#v, want True", ready)
+	}
+	if degraded := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != "Healthy" {
+		t.Fatalf("Degraded after recovery = %#v, want False/Healthy", degraded)
+	}
+}
+
+func TestAccessCustomPageTemplateWarningsPersistAcrossSteadyStateReconciles(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	remote := newFakeCustomPageCloudflare()
+	remote.warnings = []flarecloudflare.AccessCustomPageWarning{{Tier: "liquid", Ref: "line:1", Message: "unknown variable"}}
+	kube, reconciler, page := newCustomPageTestReconciler(t, remote, events.NewFakeRecorder(10), clock)
+	if err := kube.Create(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(page)}
+	reconcileCustomPage(ctx, t, reconciler, request, "add finalizer")
+	reconcileCustomPage(ctx, t, reconciler, request, "create custom page")
+
+	var current v1alpha1.AccessCustomPage
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	warning := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded)
+	if warning == nil || warning.Status != metav1.ConditionTrue || warning.Reason != "TemplateWarnings" {
+		t.Fatalf("Degraded after create = %#v, want True/TemplateWarnings", warning)
+	}
+
+	// A steady-state reconcile reads the page through GET, which cannot
+	// re-observe template warnings; the last observed warning must persist.
+	reconcileCustomPage(ctx, t, reconciler, request, "steady-state reconcile")
+	if err := kube.Get(ctx, request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionReady); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready after steady-state reconcile = %#v, want True", ready)
+	}
+	degraded := meta.FindStatusCondition(current.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != "TemplateWarnings" || degraded.Message != warning.Message {
+		t.Fatalf("Degraded after steady-state reconcile = %#v, want preserved True/TemplateWarnings", degraded)
+	}
+}

@@ -104,23 +104,31 @@ func (r *ZeroTrustListReconciler) Reconcile(ctx context.Context, request ctrl.Re
 
 func observeGatewayList(ctx context.Context, api flarecloudflare.GatewayListAPI, object *v1alpha1.ZeroTrustList) (flarecloudflare.GatewayList, error) {
 	id := object.Status.ListID
-	if object.Spec.ExternalRef != nil {
+	authoritative := object.Spec.ExternalRef != nil
+	if authoritative {
 		id = object.Spec.ExternalRef.ListID
 	}
 	if id != "" {
 		remote, err := api.GetGatewayList(ctx, id)
 		if err != nil {
-			return flarecloudflare.GatewayList{}, err
-		}
-		if !object.Status.OwnershipVerified {
-			if expected := object.Spec.Adoption.Expect.Name; expected != "" && remote.Name != expected {
-				return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "remote list name %q does not match expectation %q", remote.Name, expected)
+			if authoritative || ignoreRemoteNotFound(err) != nil {
+				return flarecloudflare.GatewayList{}, err
 			}
+			// The cached remote ID no longer resolves; fall through to
+			// rediscovery by spec.name.
+		} else if authoritative || remote.Name == object.Spec.Name {
+			if !object.Status.OwnershipVerified {
+				if expected := object.Spec.Adoption.Expect.Name; expected != "" && remote.Name != expected {
+					return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "remote list name %q does not match expectation %q", remote.Name, expected)
+				}
+			}
+			if remote.Type != flarecloudflare.GatewayListType(object.Spec.Type) {
+				return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "remote list type %q does not match spec.type %q", remote.Type, object.Spec.Type)
+			}
+			return remote, nil
 		}
-		if remote.Type != flarecloudflare.GatewayListType(object.Spec.Type) {
-			return flarecloudflare.GatewayList{}, privateInvalid("Conflict", "remote list type %q does not match spec.type %q", remote.Type, object.Spec.Type)
-		}
-		return remote, nil
+		// A name-based observation may only reuse the cached ID while the
+		// remote name still matches spec.name; otherwise rediscover below.
 	}
 	lists, err := api.ListGatewayLists(ctx)
 	if err != nil {
@@ -306,22 +314,39 @@ func (r *ZeroTrustListReconciler) reconcileDelete(ctx context.Context, object *v
 	if effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged && effectiveGlobalDeletionPolicy(object.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete && object.Status.ListID != "" && object.Status.OwnershipVerified {
 		account, token, err := globalAccountToken(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name)
 		if err != nil {
-			return err
+			return r.cleanupFailure(ctx, object, "CredentialsUnavailable", err)
 		}
 		if r.NewCloudflareClient == nil {
-			return fmt.Errorf("cloudflare Gateway client factory is required")
+			return r.cleanupFailure(ctx, object, "CredentialsUnavailable", fmt.Errorf("cloudflare Gateway client factory is required"))
 		}
 		api, err := r.NewCloudflareClient(token, account.Spec.AccountID)
 		if err != nil {
-			return err
+			return r.cleanupFailure(ctx, object, "CredentialsUnavailable", err)
 		}
 		if err = ignoreRemoteNotFound(api.DeleteGatewayList(ctx, object.Status.ListID)); err != nil {
-			return err
+			return r.cleanupFailure(ctx, object, "ListDeleteFailed", err)
 		}
 	}
 	base := client.MergeFrom(object.DeepCopy())
 	controllerutil.RemoveFinalizer(object, v1alpha1.ZeroTrustListFinalizer)
 	return r.Patch(ctx, object, base)
+}
+
+func (r *ZeroTrustListReconciler) cleanupFailure(ctx context.Context, object *v1alpha1.ZeroTrustList, reason string, err error) error {
+	if patchErr := r.patchCleanupBlocked(ctx, object, reason, err.Error()); patchErr != nil {
+		return patchErr
+	}
+	return err
+}
+
+func (r *ZeroTrustListReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.ZeroTrustList, reason, message string) error {
+	base := client.MergeFrom(object.DeepCopy())
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
+		accessCondition(object.Generation, "CleanupBlocked", metav1.ConditionTrue, reason, message),
+		accessCondition(object.Generation, v1alpha1.ZeroTrustListConditionReady, metav1.ConditionFalse, "CleanupBlocked", message),
+	)
+	return r.Status().Patch(ctx, object, base)
 }
 
 func (r *ZeroTrustListReconciler) finishError(ctx context.Context, object *v1alpha1.ZeroTrustList, err error) (ctrl.Result, error) {

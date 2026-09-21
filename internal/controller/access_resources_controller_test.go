@@ -96,7 +96,7 @@ var _ = ginkgo.Describe("Access resource controllers", ginkgo.Ordered, func() {
 
 		deniedCrossNamespace := readyAccount.DeepCopy()
 		deniedCrossNamespace.Spec.Grants[0].AccessPolicyRefs = v1alpha1.GrantPermissionDenied
-		gomega.Expect(authorizeAccessReference(testContext, testClient, namespace, "platform-access", deniedCrossNamespace)).To(gomega.MatchError(gomega.ContainSubstring("RefNotPermitted")))
+		gomega.Expect(authorizeAccessReference(testContext, testClient, namespace, "platform-access", deniedCrossNamespace, "AccessGroup")).To(gomega.MatchError(gomega.ContainSubstring("RefNotPermitted")))
 		acceptedConditions := []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue}}
 		gomega.Expect(validateAccessReference(namespace, namespace, "AccessGroup", accountName, nil, acceptedConditions, "other-account")).To(gomega.MatchError(gomega.ContainSubstring("want")))
 		deleting := metav1.NewTime(time.Now())
@@ -545,12 +545,12 @@ var _ = ginkgo.Describe("Access resource controllers", ginkgo.Ordered, func() {
 			accepted := statusutil.FindCondition(token.Status.Conditions, "Accepted")
 			g.Expect(accepted).NotTo(gomega.BeNil())
 			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
-			g.Expect(accepted.Reason).To(gomega.Equal("Pending"))
+			g.Expect(accepted.Reason).To(gomega.Equal(authz.ReasonRefNotPermitted))
 			g.Expect(accepted.Message).To(gomega.ContainSubstring("RefNotPermitted"))
 			ready := statusutil.FindCondition(token.Status.Conditions, "Ready")
 			g.Expect(ready).NotTo(gomega.BeNil())
 			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
-			g.Expect(ready.Reason).To(gomega.Equal("Pending"))
+			g.Expect(ready.Reason).To(gomega.Equal(authz.ReasonRefNotPermitted))
 		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
 		gomega.Consistently(func() int {
 			testResourceAccessCloudflare.mu.Lock()

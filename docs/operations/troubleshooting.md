@@ -169,8 +169,8 @@ The e2e suite requires a dedicated test account and zone:
 - `FLAREWAY_E2E_CF_ACCOUNT_ID`
 - `FLAREWAY_E2E_ZONE`
 - optional `FLAREWAY_E2E_KUBECONFIG`
-- `FLAREWAY_E2E_LABELS` (default `public,access`)
-- `FLAREWAY_E2E_WARP_DEVICE=1` only on a registered WARP runner
+- `FLAREWAY_E2E_LABELS` (default `public,access`; add `warp` for the private WARP spec)
+- `FLAREWAY_E2E_WARP_DEVICE=1` only on a registered WARP runner; the e2e workflow registers the runner itself via `hack/e2e-warp-runner.sh` (per-run service token, app-scoped enrollment policy, and custom device profile, all deleted after the run)
 - optional `FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER`
 - `FLAREWAY_E2E_DEVICE_PROFILE_KIND` and explicit `FLAREWAY_E2E_ALLOW_DEFAULT_PROFILE=1` before mutating the default profile
 
