@@ -25,6 +25,7 @@ type dependabotConfig struct {
 type dependabotUpdate struct {
 	PackageEcosystem      string             `json:"package-ecosystem"`
 	Directory             string             `json:"directory"`
+	Directories           []string           `json:"directories"`
 	Schedule              dependabotSchedule `json:"schedule"`
 	OpenPullRequestsLimit int                `json:"open-pull-requests-limit"`
 }
@@ -50,27 +51,37 @@ func TestDependabotCoversEveryDependencySurface(t *testing.T) {
 	}
 
 	expected := map[string]bool{
-		"gomod:/":                false,
-		"github-actions:/":       false,
+		"gomod:/":          false,
+		"github-actions:/": false,
+		"github-actions:/.github/actions/go-cache": false,
 		"docker:/":               false,
 		"docker:/config/samples": false,
 		"helm:/charts/flareway":  false,
 		"devcontainers:/":        false,
 	}
 	for _, update := range config.Updates {
-		key := update.PackageEcosystem + ":" + update.Directory
-		if _, found := expected[key]; !found {
-			t.Fatalf("unexpected Dependabot update surface %q", key)
-		}
-		if expected[key] {
-			t.Fatalf("duplicate Dependabot update surface %q", key)
-		}
-		expected[key] = true
 		if update.Schedule.Interval != "cron" || update.Schedule.Cronjob != dependabotCron || update.Schedule.Timezone != dependabotTimezone {
-			t.Fatalf("Dependabot schedule for %s = %#v, want cron %q in %s", key, update.Schedule, dependabotCron, dependabotTimezone)
+			t.Fatalf("Dependabot schedule for %s = %#v, want cron %q in %s", update.PackageEcosystem, update.Schedule, dependabotCron, dependabotTimezone)
 		}
 		if update.OpenPullRequestsLimit != 10 {
-			t.Fatalf("Dependabot open PR limit for %s = %d, want 10", key, update.OpenPullRequestsLimit)
+			t.Fatalf("Dependabot open PR limit for %s = %d, want 10", update.PackageEcosystem, update.OpenPullRequestsLimit)
+		}
+		directories := update.Directories
+		if update.Directory != "" {
+			directories = append(directories, update.Directory)
+		}
+		if len(directories) == 0 {
+			t.Fatalf("Dependabot update for %s declares no directory", update.PackageEcosystem)
+		}
+		for _, directory := range directories {
+			key := update.PackageEcosystem + ":" + directory
+			if _, found := expected[key]; !found {
+				t.Fatalf("unexpected Dependabot update surface %q", key)
+			}
+			if expected[key] {
+				t.Fatalf("duplicate Dependabot update surface %q", key)
+			}
+			expected[key] = true
 		}
 	}
 	for key, found := range expected {

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -75,7 +76,7 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if _, err = authorizePrivateNamespace(ctx, r.Client, account, object.Namespace, authz.Request{PlatformObject: true}); err != nil {
 		return r.finishError(ctx, object, err)
 	}
-	if err = r.checkSingleWriter(ctx, object); err != nil {
+	if err = r.checkSingleWriter(ctx, account, object); err != nil {
 		return r.finishError(ctx, object, err)
 	}
 	ownerComment, err := privateOwnerComment(ctx, r.Client, object, object.Spec.Comment)
@@ -225,7 +226,7 @@ func virtualNetworkNeedsUpdate(input flarecloudflare.VirtualNetworkInput, remote
 	return remote.Name != input.Name || remote.IsDefault != input.IsDefault || remote.Comment != input.Comment
 }
 
-func (r *VirtualNetworkReconciler) checkSingleWriter(ctx context.Context, object *v1alpha1.VirtualNetwork) error {
+func (r *VirtualNetworkReconciler) checkSingleWriter(ctx context.Context, account *v1alpha1.CloudflareAccount, object *v1alpha1.VirtualNetwork) error {
 	var list v1alpha1.VirtualNetworkList
 	if err := r.List(ctx, &list); err != nil {
 		return err
@@ -241,9 +242,18 @@ func (r *VirtualNetworkReconciler) checkSingleWriter(ctx context.Context, object
 			continue
 		}
 		otherKey := client.ObjectKeyFromObject(other)
-		if privateObjectPrecedes(other.CreationTimestamp, otherKey, object.CreationTimestamp, thisKey) {
-			return privateInvalid("Conflict", "the VirtualNetwork %s is the earlier writer for this account name or default network", otherKey)
+		if !privateObjectPrecedes(other.CreationTimestamp, otherKey, object.CreationTimestamp, thisKey) {
+			continue
 		}
+		// A contender is eligible only while the account grants its namespace;
+		// an unauthorized peer cannot squat the name or default claim.
+		if _, err := authorizePrivateNamespace(ctx, r.Client, account, other.Namespace, authz.Request{PlatformObject: true}); err != nil {
+			if privateIsValidationError(err) {
+				continue
+			}
+			return err
+		}
+		return privateInvalid("Conflict", "the VirtualNetwork %s is the earlier writer for this account name or default network", otherKey)
 	}
 	return nil
 }
@@ -255,7 +265,11 @@ func (r *VirtualNetworkReconciler) reconcileDelete(ctx context.Context, object *
 	if blockedBy, err := r.networkRouteReferences(ctx, object); err != nil {
 		return err
 	} else if blockedBy != "" {
-		return fmt.Errorf("the VirtualNetwork deletion is blocked by NetworkRoute %s", blockedBy)
+		message := fmt.Sprintf("the VirtualNetwork deletion is blocked by NetworkRoute %s", blockedBy)
+		if err := r.patchCleanupBlocked(ctx, object, message); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", message)
 	}
 	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly &&
 		effectivePrivateDeletionPolicy(object.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete &&
@@ -298,6 +312,16 @@ func (r *VirtualNetworkReconciler) reconcileDelete(ctx context.Context, object *
 	base := client.MergeFrom(object.DeepCopy())
 	controllerutil.RemoveFinalizer(object, v1alpha1.VirtualNetworkFinalizer)
 	return r.Patch(ctx, object, base)
+}
+
+func (r *VirtualNetworkReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.VirtualNetwork, message string) error {
+	base := client.MergeFrom(object.DeepCopy())
+	object.Status.ObservedGeneration = object.Generation
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
+		privateCondition(object.Generation, "CleanupBlocked", metav1.ConditionTrue, "Referenced", message),
+		privateCondition(object.Generation, v1alpha1.PrivateNetworkConditionReady, metav1.ConditionFalse, "CleanupBlocked", message),
+	)
+	return r.Status().Patch(ctx, object, base)
 }
 
 func (r *VirtualNetworkReconciler) finishError(ctx context.Context, object *v1alpha1.VirtualNetwork, err error) (ctrl.Result, error) {
@@ -426,13 +450,23 @@ func (r *VirtualNetworkReconciler) networkRouteReferences(ctx context.Context, o
 	if err := r.List(ctx, &routes, client.InNamespace(object.Namespace)); err != nil {
 		return "", err
 	}
+	var blockers []string
 	for i := range routes.Items {
 		route := &routes.Items[i]
-		if route.DeletionTimestamp.IsZero() && route.Spec.VirtualNetworkRef != nil && route.Spec.VirtualNetworkRef.Name == object.Name {
-			return client.ObjectKeyFromObject(route).String(), nil
+		if route.DeletionTimestamp.IsZero() && (referencesVirtualNetwork(route.Spec.VirtualNetworkRef, object.Name) ||
+			(route.Spec.IPLookup != nil && referencesVirtualNetwork(route.Spec.IPLookup.VirtualNetworkRef, object.Name))) {
+			blockers = append(blockers, client.ObjectKeyFromObject(route).String())
 		}
 	}
-	return "", nil
+	if len(blockers) == 0 {
+		return "", nil
+	}
+	slices.Sort(blockers)
+	return blockers[0], nil
+}
+
+func referencesVirtualNetwork(reference *corev1.LocalObjectReference, name string) bool {
+	return reference != nil && reference.Name == name
 }
 
 func virtualNetworkRequests(items []v1alpha1.VirtualNetwork) []reconcile.Request {
