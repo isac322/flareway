@@ -206,6 +206,10 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	It("denies unauthenticated and forged assertions while accepting a service token", func(ctx SpecContext) {
 		status, responseHeaders, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)
 		Expect(err).NotTo(HaveOccurred())
+		if status != http.StatusFound {
+			GinkgoWriter.Printf("Unauthenticated Access response: status=%d server=%q ray=%q content-type=%q body-bytes=%d\n",
+				status, responseHeaders.Get("Server"), responseHeaders.Get("Cf-Ray"), responseHeaders.Get("Content-Type"), len(body))
+		}
 		Expect(status).To(Equal(http.StatusFound), "unauthenticated Access request must redirect to authentication; body: %s", body)
 		expectAccessChallenge(responseHeaders, "unauthenticated Access request")
 

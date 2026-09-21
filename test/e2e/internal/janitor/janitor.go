@@ -47,6 +47,12 @@ type API interface {
 	DeleteNetworkRoute(context.Context, string) error
 	ListHostnameRoutes(context.Context) ([]cfapi.HostnameRoute, error)
 	DeleteHostnameRoute(context.Context, string) error
+	ListDeviceProfiles(context.Context) ([]cfapi.DeviceProfile, error)
+	DeleteDeviceProfile(context.Context, string) error
+	ListDeviceRegistrations(context.Context) ([]cfapi.DeviceRegistration, error)
+	DeleteDeviceRegistration(context.Context, string) error
+	ListAccessApplicationPolicies(context.Context, string) ([]cfapi.AccessPolicy, error)
+	DeleteAccessApplicationPolicy(context.Context, string, string) error
 }
 
 // Report describes what Sweep removed and deliberately skipped.
@@ -59,6 +65,8 @@ type Report struct {
 	VirtualNetworksDeleted    int
 	DNSRecordsDeleted         int
 	TunnelsDeleted            int
+	DeviceProfilesDeleted     int
+	DeviceRegistrationsDeleted int
 	ConnectedSkipped          int
 }
 
@@ -74,7 +82,7 @@ func SweepPrefix(ctx context.Context, api API, prefix string, olderThan time.Dur
 	if api == nil {
 		return report, fmt.Errorf("janitor API is required")
 	}
-	if !strings.HasPrefix(strings.ToLower(prefix), names.OwnerPrefix) {
+	if !validSweepPrefix(prefix) {
 		return report, fmt.Errorf("refusing unsafe janitor prefix %q", prefix)
 	}
 	if olderThan < 0 {
@@ -107,11 +115,82 @@ func SweepPrefix(ctx context.Context, api API, prefix string, olderThan time.Dur
 		failures = append(failures, fmt.Errorf("list Access policies: %w", err))
 	} else {
 		for _, policy := range policies {
-			if !containsPrefix(policy.Name, prefix) || !eligibleForCleanup(policy.CreatedAt, cutoff, olderThan) {
+			if !names.HasOwnerMarker(policy.Name, prefix) || !eligibleForCleanup(policy.CreatedAt, cutoff, olderThan) {
 				continue
 			}
 			if err := api.DeleteAccessPolicy(ctx, policy.ID); err != nil {
 				failures = append(failures, fmt.Errorf("delete Access policy %s: %w", policy.ID, err))
+				continue
+			}
+			report.AccessPoliciesDeleted++
+		}
+	}
+
+	// Device registrations carry no name marker, so ownership is proven only
+	// through a profile this sweep owns and will delete. Registrations are
+	// removed before their profiles.
+	ownedProfiles := make(map[string]struct{})
+	profiles, err := api.ListDeviceProfiles(ctx)
+	if err != nil {
+		failures = append(failures, fmt.Errorf("list device profiles: %w", err))
+	} else {
+		for _, profile := range profiles {
+			if ownedDeviceProfile(profile, prefix) && eligibleForCleanup(profileTime(profile), cutoff, olderThan) {
+				ownedProfiles[profile.PolicyID] = struct{}{}
+			}
+		}
+	}
+
+	registrations, err := api.ListDeviceRegistrations(ctx)
+	if err != nil {
+		failures = append(failures, fmt.Errorf("list device registrations: %w", err))
+	} else {
+		for _, registration := range registrations {
+			policyID := registrationProfileID(registration)
+			_, owned := ownedProfiles[policyID]
+			if !owned || registration.DeletedAt != nil {
+				continue
+			}
+			if err := api.DeleteDeviceRegistration(ctx, registration.ID); err != nil {
+				// Retain the owning profile: deleting it would orphan the
+				// registration and erase the only ownership link.
+				delete(ownedProfiles, policyID)
+				failures = append(failures, fmt.Errorf("delete device registration %s: %w", registration.ID, err))
+				continue
+			}
+			report.DeviceRegistrationsDeleted++
+		}
+	}
+
+	for _, profile := range profiles {
+		if _, owned := ownedProfiles[profile.PolicyID]; !owned {
+			continue
+		}
+		if err := api.DeleteDeviceProfile(ctx, profile.PolicyID); err != nil {
+			failures = append(failures, fmt.Errorf("delete device profile %s: %w", profile.PolicyID, err))
+			continue
+		}
+		report.DeviceProfilesDeleted++
+	}
+
+	// Runner enrollment policies live on the shared WARP enrollment
+	// application, which is never owned or deleted; only policies carrying the
+	// run marker are removed.
+	for _, application := range applications {
+		if application.Type != "warp" {
+			continue
+		}
+		appPolicies, err := api.ListAccessApplicationPolicies(ctx, application.ID)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("list policies for Access application %s: %w", application.ID, err))
+			continue
+		}
+		for _, policy := range appPolicies {
+			if !names.HasOwnerMarker(policy.Name, prefix) || !eligibleForCleanup(policy.CreatedAt, cutoff, olderThan) {
+				continue
+			}
+			if err := api.DeleteAccessApplicationPolicy(ctx, application.ID, policy.ID); err != nil {
+				failures = append(failures, fmt.Errorf("delete Access application %s policy %s: %w", application.ID, policy.ID, err))
 				continue
 			}
 			report.AccessPoliciesDeleted++
@@ -123,7 +202,7 @@ func SweepPrefix(ctx context.Context, api API, prefix string, olderThan time.Dur
 		failures = append(failures, fmt.Errorf("list Access service tokens: %w", err))
 	} else {
 		for _, token := range tokens {
-			if !containsPrefix(token.Name, prefix) || !eligibleForCleanup(token.CreatedAt, cutoff, olderThan) {
+			if !names.HasOwnerMarker(token.Name, prefix) || !eligibleForCleanup(token.CreatedAt, cutoff, olderThan) {
 				continue
 			}
 			if err := api.DeleteServiceToken(ctx, token.ID); err != nil {
@@ -203,7 +282,7 @@ func SweepPrefix(ctx context.Context, api API, prefix string, olderThan time.Dur
 		failures = append(failures, fmt.Errorf("list tunnels: %w", err))
 	} else {
 		for _, tunnel := range tunnels {
-			if !containsPrefix(tunnel.Name, prefix) || !beforeCutoff(tunnel.CreatedAt, cutoff) {
+			if !names.HasOwnerMarker(tunnel.Name, prefix) || !beforeCutoff(tunnel.CreatedAt, cutoff) {
 				continue
 			}
 			if len(tunnel.Connections) != 0 || tunnel.Status == "healthy" || tunnel.Status == "degraded" {
@@ -222,11 +301,11 @@ func SweepPrefix(ctx context.Context, api API, prefix string, olderThan time.Dur
 }
 
 func ownedDNSRecord(record cfapi.DNSRecord, prefix string) bool {
-	if containsPrefix(record.Name, prefix) || containsPrefix(record.Comment, prefix) {
+	if names.HasOwnerMarker(record.Name, prefix) || names.HasOwnerMarker(record.Comment, prefix) {
 		return true
 	}
 	for _, tag := range record.Tags {
-		if containsPrefix(tag, prefix) {
+		if names.HasOwnerMarker(tag, prefix) {
 			return true
 		}
 	}
@@ -234,15 +313,34 @@ func ownedDNSRecord(record cfapi.DNSRecord, prefix string) bool {
 }
 
 func ownedPrivateResource(primary, comment, prefix string) bool {
-	return containsPrefix(primary, prefix) || containsPrefix(comment, prefix)
+	return names.HasOwnerMarker(primary, prefix) || names.HasOwnerMarker(comment, prefix)
+}
+
+// ownedDeviceProfile matches only custom profiles: the default profile is
+// never deleted or modified by the janitor. The match expression is a second
+// marker surface because the suite embeds the run ID in the identity email.
+func ownedDeviceProfile(profile cfapi.DeviceProfile, prefix string) bool {
+	if profile.Default || profile.PolicyID == "" {
+		return false
+	}
+	return names.HasOwnerMarker(profile.Name, prefix) || names.HasOwnerMarker(profile.Match, prefix)
+}
+
+// registrationProfileID resolves the profile binding of a registration from
+// the nested policy object populated by include=policy.
+func registrationProfileID(registration cfapi.DeviceRegistration) string {
+	if registration.Policy == nil {
+		return ""
+	}
+	return registration.Policy.ID
 }
 
 func ownedAccessApplication(application cfapi.AccessApplication, prefix string) bool {
-	if containsPrefix(application.Name, prefix) || containsPrefix(application.Domain, prefix) {
+	if names.HasOwnerMarker(application.Name, prefix) || names.HasOwnerMarker(application.Domain, prefix) {
 		return true
 	}
 	for _, tag := range application.Tags {
-		if containsPrefix(tag, prefix) {
+		if names.HasOwnerMarker(tag, prefix) {
 			return true
 		}
 	}
@@ -254,7 +352,7 @@ func isBypassApplication(application cfapi.AccessApplication) bool {
 		return true
 	}
 	for _, tag := range application.Tags {
-		if strings.HasPrefix(strings.ToLower(tag), "flareway-bypass-of=") {
+		if strings.HasPrefix(strings.ToLower(tag), "flareway-bypass-") {
 			return true
 		}
 	}
@@ -268,8 +366,16 @@ func eligibleForCleanup(createdAt, cutoff time.Time, olderThan time.Duration) bo
 	return beforeCutoff(createdAt, cutoff)
 }
 
-func containsPrefix(value, prefix string) bool {
-	return strings.Contains(strings.ToLower(value), strings.ToLower(prefix))
+// validSweepPrefix accepts only the bare owner prefix (global stale sweep) or
+// the owner prefix plus one complete run ID (per-run cleanup). Anything else,
+// including truncated or extended run IDs, is rejected before any listing.
+func validSweepPrefix(prefix string) bool {
+	prefix = strings.ToLower(prefix)
+	if prefix == names.OwnerPrefix {
+		return true
+	}
+	runID, found := strings.CutPrefix(prefix, names.OwnerPrefix)
+	return found && names.IsRunID(runID)
 }
 
 func beforeCutoff(createdAt, cutoff time.Time) bool {
@@ -281,4 +387,36 @@ func recordTime(record cfapi.DNSRecord) time.Time {
 		return record.CreatedOn
 	}
 	return record.ModifiedOn
+}
+
+// profileTime dates a device profile for stale eligibility. The profiles API
+// omits created_at, so the RFC3339 marker embedded in the description by the
+// suite and runner bootstrap is the fallback; profiles without either stay
+// eligible only for run-scoped (olderThan=0) cleanup.
+func profileTime(profile cfapi.DeviceProfile) time.Time {
+	if !profile.CreatedAt.IsZero() {
+		return profile.CreatedAt
+	}
+	if !profile.UpdatedAt.IsZero() {
+		return profile.UpdatedAt
+	}
+	return createdMarkerTime(profile.Description)
+}
+
+// createdMarkerTime extracts the names.CreatedMarkerPrefix timestamp from a
+// resource description, returning the zero time when it is absent or invalid.
+func createdMarkerTime(description string) time.Time {
+	index := strings.Index(description, names.CreatedMarkerPrefix)
+	if index < 0 {
+		return time.Time{}
+	}
+	value := description[index+len(names.CreatedMarkerPrefix):]
+	if end := strings.IndexAny(value, " \t|"); end >= 0 {
+		value = value[:end]
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
