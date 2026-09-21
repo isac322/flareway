@@ -181,7 +181,12 @@ func TestEnsureDNSKeepsRepurposedStaleRecords(t *testing.T) {
 			status, conflict, err := new(CloudflareTunnelReconciler).ensureDNS(
 				context.Background(), cloudflareClient, tunnel, gatewayName, clusterID, "tunnel", nil,
 			)
-			if err != nil || conflict == "" || !slices.Equal(status, []v1alpha1.CloudflareTunnelDNSRecordStatus{previous}) {
+			expected := previous
+			if test.name == "record ID changed" {
+				if err != nil || conflict != "" || len(status) != 0 {
+					t.Fatalf("missing checkpoint should be pruned: status=%#v conflict=%q error=%v", status, conflict, err)
+				}
+			} else if err != nil || conflict == "" || !slices.Equal(status, []v1alpha1.CloudflareTunnelDNSRecordStatus{expected}) {
 				t.Fatalf("ensureDNS() status=%#v conflict=%q error=%v", status, conflict, err)
 			}
 			if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords"}) {
