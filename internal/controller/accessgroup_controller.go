@@ -423,9 +423,9 @@ func (r *AccessGroupReconciler) groupsForAccount(ctx context.Context, object cli
 	}
 	return accessGroupRequests(list.Items)
 }
-func (r *AccessGroupReconciler) groupsForDependency(ctx context.Context, object client.Object) []reconcile.Request {
+func (r *AccessGroupReconciler) groupsForDependency(ctx context.Context, _ client.Object) []reconcile.Request {
 	var list v1alpha1.AccessGroupList
-	if err := r.List(ctx, &list, client.InNamespace(object.GetNamespace())); err != nil {
+	if err := r.List(ctx, &list); err != nil {
 		return nil
 	}
 	return accessGroupRequests(list.Items)
