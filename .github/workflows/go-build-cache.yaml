@@ -1,0 +1,55 @@
+name: Go build cache
+
+# The shared Go build cache is written here and only here. A cache written on a
+# pull request branch is visible to that pull request alone, so every other
+# workflow restores the entry this job saves on main.
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 18 * * 6" # 03:00 KST Sunday, inside the 7-day eviction window
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-build-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: Warm the shared Go build cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Go and restore the shared build cache
+        id: go
+        uses: ./.github/actions/go-cache
+      - name: Compile every Go artifact CI builds
+        run: make warm-build-cache
+      - name: Report the cache about to be saved
+        env:
+          GOCACHE_DIR: ${{ steps.go.outputs.gocache }}
+          CACHE_KEY: ${{ steps.go.outputs.cache-key }}
+        run: |
+          entries="$(find "${GOCACHE_DIR}" -type f -name '*-a' | wc -l | tr -d '[:space:]')"
+          size="$(du -sh "${GOCACHE_DIR}" | cut -f1)"
+          cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+          | Saved Go build cache | Value |
+          | --- | --- |
+          | key | \`${CACHE_KEY}\` |
+          | cached action entries | ${entries} |
+          | size | ${size} |
+          EOF
+      - name: Save the shared Go build cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.gocache }}
+          key: ${{ steps.go.outputs.cache-key }}
