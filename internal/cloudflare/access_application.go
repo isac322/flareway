@@ -1018,9 +1018,15 @@ func accessApplicationRequestOptions(values map[string]any) []option.RequestOpti
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	options := make([]option.RequestOption, 0, len(keys))
+	options := make([]option.RequestOption, 0, len(keys)+1)
 	for _, key := range keys {
 		options = append(options, option.WithJSONSet(key, values[key]))
+	}
+	// The typed SDK bodies mark domain as required and would serialize an empty
+	// string; the API rejects a domain that is not a public destination, so the
+	// key must be absent from the wire payload when no domain was requested.
+	if _, found := values["domain"]; !found {
+		options = append(options, option.WithJSONDel("domain"))
 	}
 	return options
 }
