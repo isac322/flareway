@@ -142,7 +142,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	wouldApply := mergeOrganizationDiff(organizationWouldApply, dohWouldApply)
 	if effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
 		if absent {
-			observed = flarecloudflare.Organization{}
+			return r.finishError(ctx, object, privateInvalid("TargetNotFound", "the Cloudflare Zero Trust organization was not found"))
 		}
 		return ctrl.Result{}, r.patchStatus(ctx, object, observed, observedDOH, wouldApply, object.Status.ObservedUserRevocationRequest, metav1.ConditionTrue, "Observed", "Zero Trust organization is observed without mutation")
 	}
@@ -234,7 +234,7 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx co
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(object.Namespace, ref)
-	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account, "AccessCustomPage"); err != nil {
 		return "", err
 	}
 	var page v1alpha1.AccessCustomPage
@@ -258,7 +258,7 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationServiceTokenID(ctx 
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(object.Namespace, ref)
-	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account, "ServiceToken"); err != nil {
 		return "", err
 	}
 	var token v1alpha1.ServiceToken

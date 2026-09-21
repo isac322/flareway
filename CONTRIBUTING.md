@@ -30,6 +30,24 @@ Never hand-edit generated output (`config/crd/bases/`,
 source markers or types and regenerate with `make manifests` or
 `make generate`.
 
+## CI caches
+
+Every workflow job that runs Go restores one shared Go build cache entry
+through the local `./.github/actions/go-cache` action, which also installs
+the toolchain pinned by `go.mod`. Do not use `actions/setup-go` directly:
+its built-in cache mixes the module cache into a single `go.sum`-keyed
+entry that is written only on a miss, so every job races for one write and
+the build cache then stays frozen until `go.sum` changes.
+
+Only the `Go build cache` workflow writes the shared entry, and only on
+`main`. GitHub scopes a cache to the branch that wrote it, so a pull
+request can read `main`'s entry but never another pull request's. That job
+runs `make warm-build-cache`, which compiles everything CI builds — every
+package, the race and tagged test binaries, the conformance and end-to-end
+binaries, and the `go install` tools — so the single entry covers every
+consumer. When you add a job that runs Go, use the composite action, and
+add whatever it compiles to `make warm-build-cache`.
+
 ## Commit style
 
 History uses Conventional-Commit-style subjects:

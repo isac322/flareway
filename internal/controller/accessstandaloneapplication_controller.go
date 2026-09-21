@@ -88,7 +88,7 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	operation := authz.Request{Zone: object.Spec.Zone, PlatformObject: true}
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, operation, r.NewCloudflareClient)
 	if err != nil {
-		return r.finishError(ctx, object, "Pending", err)
+		return r.finishError(ctx, object, privateErrorReason(err), err)
 	}
 	scope, err := accessStandaloneScope(account, object.Spec.Zone)
 	if err != nil {
@@ -473,7 +473,7 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicy(ctx cont
 	if targetNamespace == "" {
 		targetNamespace = namespace
 	}
-	if err := authorizeAccessReference(ctx, r.Client, namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, r.Client, namespace, targetNamespace, account, "AccessPolicy"); err != nil {
 		return "", err
 	}
 	var policy v1alpha1.AccessPolicy
@@ -539,7 +539,7 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneCustomPages(ctx
 		if targetNamespace == "" {
 			targetNamespace = namespace
 		}
-		if err := authorizeAccessReference(ctx, r.Client, namespace, targetNamespace, account); err != nil {
+		if err := authorizeAccessReference(ctx, r.Client, namespace, targetNamespace, account, "AccessCustomPage"); err != nil {
 			return nil, err
 		}
 		var page v1alpha1.AccessCustomPage

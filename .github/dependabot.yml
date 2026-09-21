@@ -19,7 +19,11 @@ updates:
           - "patch"
 
   - package-ecosystem: "github-actions"
-    directory: "/"
+    # Paths outside .github/workflows must be listed explicitly so the
+    # actions pinned inside the local composite action stay updated too.
+    directories:
+      - "/"
+      - "/.github/actions/go-cache"
     schedule:
       interval: "cron"
       cronjob: "0 9 * * *"

@@ -1,0 +1,76 @@
+name: Go build cache
+description: >-
+  Install the Go toolchain pinned by go.mod and restore the single Go build
+  cache entry that every Flareway workflow shares.
+
+outputs:
+  gocache:
+    description: GOCACHE directory holding the shared Go build cache.
+    value: ${{ steps.identity.outputs.gocache }}
+  cache-key:
+    description: >-
+      Key the warm job saves the shared build cache under. Unique per run and
+      attempt, so a save never collides with an existing immutable entry.
+    value: ${{ steps.identity.outputs.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+  restored-key:
+    description: Key of the restored shared entry, empty when nothing matched.
+    value: ${{ steps.restore.outputs.cache-matched-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+      with:
+        go-version-file: go.mod
+        # setup-go's built-in cache bundles GOMODCACHE and GOCACHE into a
+        # single go.sum-keyed entry that it only writes on a miss. Every job of
+        # every workflow computes the same key, one of them wins the race, and
+        # the build cache then stays frozen at whatever that job happened to
+        # compile until go.sum changes. The shared entry restored below
+        # replaces it and carries the build cache alone.
+        cache: false
+
+    - name: Resolve the shared build cache key
+      id: identity
+      shell: bash
+      run: |
+        {
+          printf 'gocache=%s\n' "$(go env GOCACHE)"
+          printf 'prefix=go-build-v1-%s-%s-%s-\n' \
+            "$(go env GOHOSTOS)" "$(go env GOHOSTARCH)" "$(go env GOVERSION)"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Restore the shared Go build cache
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.identity.outputs.gocache }}
+        # The primary key is never present: only the warm job on main writes,
+        # and it appends its own run id. Every job therefore resolves the
+        # prefix, which returns the most recent shared entry visible to the
+        # ref -- for pull requests and tags, the one written on main.
+        key: ${{ steps.identity.outputs.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.identity.outputs.prefix }}
+
+    - name: Report the shared Go build cache state
+      shell: bash
+      env:
+        GOCACHE_DIR: ${{ steps.identity.outputs.gocache }}
+        RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+      run: |
+        entries=0
+        size=0
+        if [[ -d "${GOCACHE_DIR}" ]]; then
+          entries="$(find "${GOCACHE_DIR}" -type f -name '*-a' | wc -l | tr -d '[:space:]')"
+          size="$(du -sh "${GOCACHE_DIR}" | cut -f1)"
+        fi
+        printf 'shared Go build cache: key=%s entries=%s size=%s\n' \
+          "${RESTORED_KEY:-miss}" "${entries}" "${size}"
+        cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+        | Shared Go build cache | Value |
+        | --- | --- |
+        | restored key | \`${RESTORED_KEY:-miss}\` |
+        | cached action entries | ${entries} |
+        | restored size | ${size} |
+        EOF

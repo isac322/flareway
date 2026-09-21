@@ -727,8 +727,10 @@ func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool
 		return true
 	}
 	for _, record := range tunnel.Status.DNSRecords {
-		delete(wanted, strings.ToLower(record.Hostname))
-	}
+		if record.State != dnsRecordStateConflict {
+			delete(wanted, strings.ToLower(record.Hostname))
+		}
+}
 	return len(wanted) == 0
 }
 
