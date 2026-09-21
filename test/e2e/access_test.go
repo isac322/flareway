@@ -239,6 +239,34 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	}, NodeTimeout(2*time.Minute))
 
 	It("keeps child bypass paths public while protecting the enclosing dashboard", func(ctx SpecContext) {
+		readyCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		consecutive := 0
+		duration, readyErr := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+			status, _, _, err := edgeRequestTo(checkCtx, mixedHostname, "/dashboard", nil)
+			if err != nil {
+				consecutive = 0
+				return false, nil
+			}
+			if status >= http.StatusOK && status < http.StatusMultipleChoices {
+				return false, fmt.Errorf("protected dashboard became public while waiting for bypass convergence: HTTP %d", status)
+			}
+			ready := status == http.StatusFound
+			for _, path := range []string{"/v1", "/backend-api/tools"} {
+				status, _, _, err = edgeRequestTo(checkCtx, mixedHostname, path, nil)
+				GinkgoWriter.Printf("bypass convergence %s: HTTP %d, request error=%v\n", path, status, err)
+				ready = ready && err == nil && status == http.StatusOK
+			}
+			if !ready {
+				consecutive = 0
+				return false, nil
+			}
+			consecutive++
+			return consecutive >= 3, nil
+		})
+		Expect(readyErr).NotTo(HaveOccurred(), "child bypass paths did not converge while the dashboard remained protected")
+		recordLatency("access-bypass-edge-ready", duration)
+
 		for _, path := range []string{"/v1", "/backend-api/tools"} {
 			status, _, body, err := edgeRequestTo(ctx, mixedHostname, path, nil)
 			Expect(err).NotTo(HaveOccurred())
