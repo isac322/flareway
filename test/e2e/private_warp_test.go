@@ -210,7 +210,14 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "private Gateway did not become Programmed and no account-plan blocker was reported")
 		recordLatency("private-warp-programmed", duration)
 
-		bindRunnerVirtualNetwork(ctx, virtualNetwork)
+		if !bindRunnerVirtualNetwork(ctx, virtualNetwork) {
+			writePrivateWARPResult(e2ereport.PrivateWARPResult{
+				Result: e2ereport.PrivateWARPBlockedPlan,
+				Reason: "Cloudflare requires a closed-beta entitlement to select the run's virtual network on a device profile",
+			})
+			GinkgoWriter.Println("private WARP result: blocked: plan (device profile virtual network selection unavailable)")
+			return
+		}
 
 		dnsCtx, dnsCancel := context.WithTimeout(ctx, 90*time.Second)
 		defer dnsCancel()
@@ -490,10 +497,11 @@ func privateHTTPSRequest(ctx context.Context, hostname, path string) (int, strin
 }
 
 // bindRunnerVirtualNetwork scopes the registered WARP device to the virtual
-// network this run created. Cloudflare matches a private destination by
-// virtual network, so a device that stays in the account default network never
-// resolves this run's private hostname.
-func bindRunnerVirtualNetwork(ctx context.Context, network *unstructured.Unstructured) {
+// network this run created and reports whether the account may do so.
+// Cloudflare matches a private destination by virtual network, so a device
+// that stays in the account default network never resolves this run's private
+// hostname.
+func bindRunnerVirtualNetwork(ctx context.Context, network *unstructured.Unstructured) bool {
 	current := network.DeepCopy()
 	Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(network), current)).To(Succeed())
 	identifier, found, err := unstructured.NestedString(current.Object, "status", "virtualNetworkId")
@@ -501,8 +509,13 @@ func bindRunnerVirtualNetwork(ctx context.Context, network *unstructured.Unstruc
 	Expect(found).To(BeTrue(), "VirtualNetwork status carries no remote identifier")
 	command := exec.CommandContext(ctx, "bash", filepath.Join("..", "..", "hack", "e2e-warp-runner.sh"), "bind-vnet", identifier)
 	output, err := command.CombinedOutput()
-	Expect(err).NotTo(HaveOccurred(), "bind the WARP runner to virtual network %s: %s", identifier, output)
 	GinkgoWriter.Printf("%s", output)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 3 {
+		return false
+	}
+	Expect(err).NotTo(HaveOccurred(), "bind the WARP runner to virtual network %s: %s", identifier, output)
+	return true
 }
 
 func writePrivateWARPResult(result e2ereport.PrivateWARPResult) {
