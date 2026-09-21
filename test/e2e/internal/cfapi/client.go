@@ -65,6 +65,7 @@ type DNSRecord struct {
 type AccessApplication struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
+	Type      string    `json:"type"`
 	Domain    string    `json:"domain"`
 	Tags      []string  `json:"tags"`
 	CreatedAt time.Time `json:"created_at"`
@@ -82,6 +83,21 @@ type ServiceToken struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// DeviceRegistration is the cleanup view of one WARP device registration.
+// Registrations carry no name; ownership is proven through the profile ID,
+// which is only populated when the list request passes include=policy.
+type DeviceRegistration struct {
+	ID        string                    `json:"id"`
+	Policy    *DeviceRegistrationPolicy `json:"policy"`
+	CreatedAt time.Time                 `json:"created_at"`
+	DeletedAt *time.Time                `json:"deleted_at"`
+}
+
+// DeviceRegistrationPolicy is the nested profile reference on a registration.
+type DeviceRegistrationPolicy struct {
+	ID string `json:"id"`
 }
 
 // VirtualNetwork is a cleanup view of a Cloudflare virtual network.
@@ -134,6 +150,8 @@ type DeviceProfile struct {
 	TunnelProtocol             string                       `json:"tunnel_protocol"`
 	VirtualNetworks            DeviceProfileVirtualNetworks `json:"virtual_networks"`
 	DNSSearchSuffixes          []DNSSearchSuffix            `json:"dns_search_suffixes"`
+	CreatedAt                  time.Time                    `json:"created_at"`
+	UpdatedAt                  time.Time                    `json:"updated_at"`
 }
 
 // DeviceProfileServiceModeV2 records the WARP client mode and optional proxy port.
@@ -188,7 +206,10 @@ type responseEnvelope[T any] struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"errors"`
-	Result T `json:"result"`
+	Result     T `json:"result"`
+	ResultInfo struct {
+		Cursor string `json:"cursor"`
+	} `json:"result_info"`
 }
 
 // New returns a client. Empty baseURL selects Cloudflare API v4.
@@ -329,6 +350,51 @@ func (c *Client) ListServiceTokens(ctx context.Context) ([]ServiceToken, error) 
 	return tokens, nil
 }
 
+// ListAccessApplicationPolicies returns the policies attached to one Access
+// application, used to find app-scoped enrollment policies on the WARP app.
+func (c *Client) ListAccessApplicationPolicies(ctx context.Context, applicationID string) ([]AccessPolicy, error) {
+	var policies []AccessPolicy
+	path := "/accounts/" + url.PathEscape(c.accountID) + "/access/apps/" + url.PathEscape(applicationID) + "/policies"
+	if err := c.getAll(ctx, path, url.Values{"per_page": {"100"}}, &policies); err != nil {
+		return nil, err
+	}
+	return policies, nil
+}
+
+// DeleteAccessApplicationPolicy removes one app-scoped Access policy.
+func (c *Client) DeleteAccessApplicationPolicy(ctx context.Context, applicationID, policyID string) error {
+	path := "/accounts/" + url.PathEscape(c.accountID) + "/access/apps/" + url.PathEscape(applicationID) + "/policies/" + url.PathEscape(policyID)
+	return c.do(ctx, http.MethodDelete, path, nil)
+}
+
+// ListDeviceRegistrations returns every WARP device registration in the
+// account, including soft-deleted ones because status=all is required to see
+// registrations whose profile was already removed. include=policy populates
+// the profile binding used for ownership. The endpoint paginates with a
+// cursor instead of page numbers.
+func (c *Client) ListDeviceRegistrations(ctx context.Context) ([]DeviceRegistration, error) {
+	path := "/accounts/" + url.PathEscape(c.accountID) + "/devices/registrations"
+	query := url.Values{"status": {"all"}, "include": {"policy"}, "per_page": {"100"}}
+	var registrations []DeviceRegistration
+	for {
+		var page []DeviceRegistration
+		cursor, err := c.getPage(ctx, path, query, &page)
+		if err != nil {
+			return nil, err
+		}
+		registrations = append(registrations, page...)
+		if cursor == "" || len(page) == 0 {
+			return registrations, nil
+		}
+		query.Set("cursor", cursor)
+	}
+}
+
+// DeleteDeviceRegistration removes one WARP device registration.
+func (c *Client) DeleteDeviceRegistration(ctx context.Context, registrationID string) error {
+	return c.do(ctx, http.MethodDelete, "/accounts/"+url.PathEscape(c.accountID)+"/devices/registrations/"+url.PathEscape(registrationID), nil)
+}
+
 // DeleteServiceToken removes an Access service token.
 func (c *Client) DeleteServiceToken(ctx context.Context, tokenID string) error {
 	return c.do(ctx, http.MethodDelete, "/accounts/"+url.PathEscape(c.accountID)+"/access/service_tokens/"+url.PathEscape(tokenID), nil)
@@ -374,6 +440,17 @@ func (c *Client) ListHostnameRoutes(ctx context.Context) ([]HostnameRoute, error
 // DeleteHostnameRoute removes one private hostname route.
 func (c *Client) DeleteHostnameRoute(ctx context.Context, routeID string) error {
 	return c.do(ctx, http.MethodDelete, "/accounts/"+url.PathEscape(c.accountID)+"/zerotrust/routes/hostname/"+url.PathEscape(routeID), nil)
+}
+
+// ListDeviceProfiles returns every device profile in the account, including
+// the default profile; callers must check DeviceProfile.Default. The endpoint
+// is a single unpaginated response, not a page-numbered list.
+func (c *Client) ListDeviceProfiles(ctx context.Context) ([]DeviceProfile, error) {
+	var profiles []DeviceProfile
+	if err := c.get(ctx, "/accounts/"+url.PathEscape(c.accountID)+"/devices/policies", &profiles); err != nil {
+		return nil, err
+	}
+	return profiles, nil
 }
 
 // GetDeviceProfile reads the exact custom or default device profile.
@@ -551,32 +628,42 @@ func (c *Client) getAll(ctx context.Context, path string, query url.Values, targ
 }
 
 func (c *Client) get(ctx context.Context, path string, target any) error {
+	_, err := c.getPage(ctx, path, nil, target)
+	return err
+}
+
+// getPage fetches one page and returns the result_info cursor, which is empty
+// for endpoints that do not cursor-paginate.
+func (c *Client) getPage(ctx context.Context, path string, query url.Values, target any) (string, error) {
+	if query != nil {
+		path += "?" + query.Encode()
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return fmt.Errorf("create Cloudflare request: %w", err)
+		return "", fmt.Errorf("create Cloudflare request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.token)
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("send Cloudflare request: %w", err)
+		return "", fmt.Errorf("send Cloudflare request: %w", err)
 	}
 	defer func() { _ = response.Body.Close() }() // response result is authoritative
 	content, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	if err != nil {
-		return fmt.Errorf("read Cloudflare response: %w", err)
+		return "", fmt.Errorf("read Cloudflare response: %w", err)
 	}
 	var envelope responseEnvelope[json.RawMessage]
 	if err := json.Unmarshal(content, &envelope); err != nil {
-		return fmt.Errorf("decode Cloudflare response: %w", err)
+		return "", fmt.Errorf("decode Cloudflare response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
-		return cloudflareError(response.StatusCode, envelope.Errors)
+		return "", cloudflareError(response.StatusCode, envelope.Errors)
 	}
 	if err := json.Unmarshal(envelope.Result, target); err != nil {
-		return fmt.Errorf("decode Cloudflare result: %w", err)
+		return "", fmt.Errorf("decode Cloudflare result: %w", err)
 	}
-	return nil
+	return envelope.ResultInfo.Cursor, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, target any) error {
