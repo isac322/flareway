@@ -46,6 +46,8 @@ import (
 
 	"github.com/isac322/flareway/test/e2e/internal/poll"
 	e2ereport "github.com/isac322/flareway/test/e2e/internal/report"
+
+	"github.com/isac322/flareway/api/v1alpha1"
 )
 
 var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
@@ -149,6 +151,14 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 	AfterAll(func(ctx SpecContext) {
 		if !configuration.WARPDevice {
 			return
+		}
+		// The AccessApplication publishes its revocation through the Gateway
+		// data plane, so it must be fully gone before the Gateway and tunnel
+		// disappear; otherwise its finalizer blocks and the remote Access
+		// policy stays in use.
+		for _, value := range []*unstructured.Unstructured{accessApplication, allowPolicy} {
+			deleteObject(ctx, value)
+			waitForObjectDeletion(ctx, value)
 		}
 		for index := len(created) - 1; index >= 0; index-- {
 			deleteObject(ctx, created[index])
@@ -388,8 +398,9 @@ func privateAccessTargetReady(ctx context.Context, application *unstructured.Uns
 		if !ok {
 			continue
 		}
-		if destination["type"] == "private" && destination["hostname"] == hostname &&
-			destination["portRange"] == "443" && destination["l4Protocol"] == "tcp" {
+		if destination["type"] == string(v1alpha1.AccessApplicationDestinationPrivate) &&
+			destination["hostname"] == hostname && destination["portRange"] == "443" &&
+			destination["l4Protocol"] == string(v1alpha1.AccessL4ProtocolTCP) {
 			return true, nil
 		}
 	}
