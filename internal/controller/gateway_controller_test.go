@@ -169,6 +169,8 @@ var _ = ginkgo.Describe("Gateway reconciler", ginkgo.Ordered, func() {
 			g.Expect(condition.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonPending)))
 			g.Expect(condition.Message).To(gomega.ContainSubstring("Envoy rejected xDS snapshot"), "observed condition: %#v", condition)
 			g.Expect(condition.Message).To(gomega.ContainSubstring("rejected test snapshot"))
+			g.Expect(gateway.Status.Addresses).To(gomega.HaveLen(1))
+			g.Expect(gateway.Status.Addresses[0].Value).To(gomega.Equal("gateway.example.test"))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 		gomega.Expect(testSnapshots.ACK(snapshotKey)).To(gomega.Succeed())
 

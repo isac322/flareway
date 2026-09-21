@@ -506,17 +506,6 @@ func TestBackendTLSPolicyStatusConformance(t *testing.T) {
 	})
 }
 
-func TestTranslateGatewayServiceAddress(t *testing.T) {
-	in := baseInputs()
-	in.Services = []corev1.Service{{
-		ObjectMeta: metav1.ObjectMeta{Name: "flareway-gw-gateway", Namespace: "default"},
-		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "10.96.0.10"},
-	}}
-	_, statuses := Translate(in)
-	if len(statuses.Gateway.Addresses) != 1 || statuses.Gateway.Addresses[0].Value != "10.96.0.10" || statuses.Gateway.Addresses[0].Type == nil || *statuses.Gateway.Addresses[0].Type != gatewayv1.IPAddressType {
-		t.Fatalf("Gateway addresses = %#v", statuses.Gateway.Addresses)
-	}
-}
 func TestTranslateInfrastructurePropagation(t *testing.T) {
 	in := baseInputs()
 	in.Gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{

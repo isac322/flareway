@@ -378,6 +378,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if !compiled.ConformanceMode && (tunnel == nil || account == nil || compiled.Cloudflare == nil) {
 		r.clearSnapshot(req.NamespacedName)
+		statuses.Gateway.Addresses = nil
 		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, "CloudflareTunnel and CloudflareAccount are required")
 		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
 			return ctrl.Result{}, err
@@ -466,6 +467,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		); err != nil {
 			return ctrl.Result{}, err
 		}
+		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
 		if cloudflareResult.pending != "" || cloudflareResult.drift {
 			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message)
@@ -1190,6 +1192,7 @@ func (r *GatewayReconciler) handleSnapshotBuildFailure(
 	statuses *gatewayapi.Statuses,
 	buildErr error,
 ) error {
+	statuses.Gateway.Addresses = nil
 	now := metav1.Now()
 	if r.Now != nil {
 		now = metav1.NewTime(r.Now())

@@ -25,11 +25,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Go and restore the shared build cache
+        uses: ./.github/actions/go-cache
       - name: Verify generated files
         run: make verify-generated
 
@@ -42,11 +39,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Go and restore the shared build cache
+        uses: ./.github/actions/go-cache
       - name: Lint
         run: make lint
 
@@ -59,11 +53,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Go and restore the shared build cache
+        uses: ./.github/actions/go-cache
       - name: Test
         run: make test
       - name: Compile exploratory harness
@@ -78,11 +69,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Go and restore the shared build cache
+        uses: ./.github/actions/go-cache
       - name: Test Envoy integration
         run: make test-envoy
 
@@ -95,11 +83,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Go and restore the shared build cache
+        uses: ./.github/actions/go-cache
       - name: Verify artifacts
         run: make verify-artifacts
 

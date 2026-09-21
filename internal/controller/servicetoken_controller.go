@@ -79,7 +79,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Pending", err.Error(), serviceTokenStatusUpdate{})
+		_ = r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, privateErrorReason(err), err.Error(), serviceTokenStatusUpdate{})
 		return ctrl.Result{}, err
 	}
 	scope, err := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
