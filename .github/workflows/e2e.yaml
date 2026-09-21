@@ -171,9 +171,14 @@ jobs:
           mkdir -p artifacts/cluster
           kubectl -n flareway-system logs deployment/flareway-controller-manager \
             --all-containers --ignore-errors > artifacts/cluster/controller.log 2>&1 || true
-          kubectl logs -A -l flareway.bhyoo.com/gateway \
-            --all-containers --prefix --ignore-errors \
-            > artifacts/cluster/dataplane.log 2>&1 || true
+          {
+            kubectl get pods -A -l flareway.bhyoo.com/gateway \
+              -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' |
+              while read -r namespace pod; do
+                kubectl -n "$namespace" logs "$pod" \
+                  --all-containers --prefix --ignore-errors
+              done
+          } > artifacts/cluster/dataplane.log 2>&1 || true
           kubectl get \
             cloudflareaccounts,cloudflaretunnels,accessapplications,accesspolicies,accessgroups,identityproviders,deviceposturerules,servicetokens,virtualnetworks,networkroutes,hostnameroutes,deviceprofiles,devicesettings,zerotrustorganizations,zerotrustgatewaypolicies,zerotrustlists,gateways,httproutes \
             -A -o yaml > artifacts/cluster/resources.yaml 2>&1 || true
