@@ -234,7 +234,7 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx co
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(object.Namespace, ref)
-	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account, "AccessCustomPage"); err != nil {
 		return "", err
 	}
 	var page v1alpha1.AccessCustomPage
@@ -258,7 +258,7 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationServiceTokenID(ctx 
 		return ref.ExternalID, nil
 	}
 	targetNamespace := referenceNamespace(object.Namespace, ref)
-	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account); err != nil {
+	if err := authorizeAccessReference(ctx, r.Client, object.Namespace, targetNamespace, account, "ServiceToken"); err != nil {
 		return "", err
 	}
 	var token v1alpha1.ServiceToken

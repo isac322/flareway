@@ -72,7 +72,7 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	}
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{}, r.NewCloudflareClient)
 	if err != nil {
-		return r.finishAccessPolicyError(ctx, object, "Pending", err)
+		return r.finishAccessPolicyError(ctx, object, privateErrorReason(err), err)
 	}
 	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
 	if err != nil {
