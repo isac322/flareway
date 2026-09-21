@@ -78,7 +78,7 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 
 	api, account, err := accessClientForAccount(ctx, r.readClient(), object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		return r.finishError(ctx, object, "Pending", err)
+		return r.finishError(ctx, object, privateErrorReason(err), err)
 	}
 	input, err := r.resolveInput(ctx, object, account)
 	if err != nil {
