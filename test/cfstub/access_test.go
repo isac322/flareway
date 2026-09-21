@@ -173,6 +173,26 @@ func TestAccessTagsGateApplicationWrites(t *testing.T) {
 	}
 }
 
+func TestAccessTagsListIsAccountScopedAndPaginated(t *testing.T) {
+	server := New(t)
+	for _, name := range []string{"beta-tag", "alpha-tag", "gamma-tag"} {
+		requestResult[AccessTag](t, server, http.MethodPost, "/accounts/account-1/access/tags", AccessTag{Name: name}, nil)
+	}
+	requestResult[AccessTag](t, server, http.MethodPost, "/accounts/account-2/access/tags", AccessTag{Name: "other-account"}, nil)
+
+	var all []AccessTag
+	requestResult(t, server, http.MethodGet, "/accounts/account-1/access/tags", nil, &all)
+	if len(all) != 3 || all[0].Name != "alpha-tag" || all[1].Name != "beta-tag" || all[2].Name != "gamma-tag" {
+		t.Fatalf("listed Access tags = %#v", all)
+	}
+
+	var page []AccessTag
+	requestResult(t, server, http.MethodGet, "/accounts/account-1/access/tags?page=2&per_page=2", nil, &page)
+	if len(page) != 1 || page[0].Name != "gamma-tag" {
+		t.Fatalf("second Access tag page = %#v", page)
+	}
+}
+
 func TestAccessResourcesCRUDAndFaults(t *testing.T) {
 	server := New(t)
 
