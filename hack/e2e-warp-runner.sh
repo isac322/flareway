@@ -286,7 +286,7 @@ bootstrap() {
     '</dict>' | sudo tee "${MDM_FILE}" >/dev/null
   sudo chmod 600 "${MDM_FILE}"
   sudo systemctl restart warp-svc
-  warp_cli --accept-tos status >/dev/null 2>&1 || true
+  warp_cli status >/dev/null 2>&1 || true
 
   # Select only the registration bound to this run's device profile. A
   # registration carries the applied profile under .policy.id (include=policy)
