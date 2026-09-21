@@ -17,7 +17,12 @@ permissions:
 
 concurrency:
   group: go-build-cache-${{ github.ref }}
-  cancel-in-progress: true
+  # A full warm pass takes longer than the interval between merges during a
+  # busy stretch on main. Cancelling in progress would let a burst of merges
+  # starve the only writer and leave the shared entry stale or missing, so a
+  # new push queues behind the running pass instead; GitHub keeps only the
+  # newest pending run, which then saves an entry for the newest commit.
+  cancel-in-progress: false
 
 jobs:
   warm:
