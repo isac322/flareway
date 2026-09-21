@@ -191,6 +191,10 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			GinkgoWriter.Println("private WARP result: blocked: plan")
 			return
 		}
+		if err != nil {
+			GinkgoWriter.Printf("private readiness failure; Gateway: %s; Tunnel: %s; AccessApplication: %s; VirtualNetwork: %s; HostnameRoute: %s\n",
+				statusSummary(gateway), statusSummary(tunnel), statusSummary(accessApplication), statusSummary(virtualNetwork), statusSummary(hostnameRoute))
+		}
 		Expect(err).NotTo(HaveOccurred(), "private Gateway did not become Programmed and no account-plan blocker was reported")
 		recordLatency("private-warp-programmed", duration)
 
