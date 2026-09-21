@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -407,6 +408,61 @@ func TestAccessApplicationClientRoutesScopesCapturesSaaSSecretAndRevokes(t *test
 	}
 	if err := client.DeleteAccessApplication(ctx, AccessScope{ZoneID: "zone-1"}, observed.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAccessApplicationPrivateOnlyOmitsDomainOnTheWire(t *testing.T) {
+	server := cfstub.New(t)
+	client := New("top-secret", "account-1", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+	ctx := context.Background()
+
+	privateDestinations := []AccessApplicationDestination{{
+		Type: AccessApplicationDestinationTypePrivate, Hostname: "db.internal.example",
+		PortRange: "5432", L4Protocol: AccessApplicationL4ProtocolTCP, VNetID: "vnet-1",
+	}}
+	created, err := client.CreateAccessApplication(ctx, AccessScope{}, AccessApplicationInput{
+		Type: AccessApplicationTypeSelfHosted, Name: "private-app", Destinations: privateDestinations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := server.State.AccessApplications("accounts/account-1")
+	if len(stored) != 1 {
+		t.Fatalf("stored applications = %#v", stored)
+	}
+	if domain, found := stored[0]["domain"]; found {
+		t.Fatalf("private-only create sent domain %#v", domain)
+	}
+	destinations, _ := stored[0]["destinations"].([]any)
+	if len(destinations) != 1 {
+		t.Fatalf("private-only create stored destinations = %#v", stored[0]["destinations"])
+	}
+
+	if _, err := client.UpdateAccessApplication(ctx, AccessScope{}, created.Application.ID, AccessApplicationInput{
+		Type: AccessApplicationTypeSelfHosted, Name: "private-app", Destinations: privateDestinations,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored = server.State.AccessApplications("accounts/account-1")
+	if domain, found := stored[0]["domain"]; found {
+		t.Fatalf("private-only update sent domain %#v", domain)
+	}
+
+	mixed, err := client.CreateAccessApplication(ctx, AccessScope{}, AccessApplicationInput{
+		Type: AccessApplicationTypeSelfHosted, Name: "mixed-app", Domain: "app.example.test",
+		Destinations: append(slices.Clone(privateDestinations), AccessApplicationDestination{
+			Type: AccessApplicationDestinationTypePublic, URI: "app.example.test",
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored = server.State.AccessApplications("accounts/account-1")
+	if len(stored) != 2 || stored[1]["id"] != mixed.Application.ID {
+		t.Fatalf("stored applications = %#v", stored)
+	}
+	if stored[1]["domain"] != "app.example.test" {
+		t.Fatalf("mixed create lost domain: %#v", stored[1])
 	}
 }
 
