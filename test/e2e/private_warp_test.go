@@ -220,6 +220,7 @@ var _ = Describe("Private WARP hostname", Label("warp"), Ordered, func() {
 			return len(addresses) > 0 && allSyntheticPrivateAddresses(addresses), nil
 		})
 		if err != nil {
+			GinkgoWriter.Printf("runner DNS diagnostics for %s:\n%s", privateHostname, runnerDNSDiagnostics(ctx, privateHostname))
 			writePrivateWARPResult(e2ereport.PrivateWARPResult{
 				Result: e2ereport.PrivateWARPBlockedRunner,
 				Reason: "runner DNS did not return Cloudflare private-hostname synthetic addresses",
@@ -333,6 +334,28 @@ func messagesFromConditions(conditions []any) []string {
 		}
 	}
 	return messages
+}
+
+// runnerDNSDiagnostics records why the runner's resolver did not return a
+// Cloudflare synthetic address: which resolver answered, what the WARP client
+// reports, and whether the hostname is still handled locally.
+func runnerDNSDiagnostics(ctx context.Context, hostname string) string {
+	diagnosticCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var summary strings.Builder
+	for _, diagnostic := range [][]string{
+		{"warp-cli", "--accept-tos", "status"},
+		{"warp-cli", "--accept-tos", "settings"},
+		{"resolvectl", "status"},
+		{"resolvectl", "query", hostname},
+	} {
+		output, err := exec.CommandContext(diagnosticCtx, diagnostic[0], diagnostic[1:]...).CombinedOutput()
+		fmt.Fprintf(&summary, "$ %s\n%s\n", strings.Join(diagnostic, " "), output)
+		if err != nil {
+			fmt.Fprintf(&summary, "(exit: %v)\n", err)
+		}
+	}
+	return summary.String()
 }
 
 func resolvePrivateHostname(ctx context.Context, resolver *net.Resolver, hostname string) ([]netip.Addr, error) {
