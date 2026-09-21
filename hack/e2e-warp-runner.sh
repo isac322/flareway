@@ -120,10 +120,10 @@ state_get() {
 }
 
 warp_cli() {
-  if command -v warp-cli >/dev/null 2>&1 && warp-cli "$@"; then
+  if command -v warp-cli >/dev/null 2>&1 && warp-cli --accept-tos "$@"; then
     return 0
   fi
-  sudo warp-cli "$@"
+  sudo warp-cli --accept-tos "$@"
 }
 
 install_warp() {
