@@ -71,6 +71,7 @@ func (s *Server) registerAccessRoutes() {
 	s.Handle(http.MethodPost, `^/accounts/[^/]+/access/service_tokens/[^/]+/rotate$`, s.rotateAccessServiceToken)
 	s.Handle(http.MethodPost, `^/accounts/[^/]+/access/service_tokens/[^/]+/refresh$`, s.refreshAccessServiceToken)
 	s.Handle(http.MethodPost, `^/accounts/[^/]+/access/tags$`, s.createAccessTag)
+	s.Handle(http.MethodGet, `^/accounts/[^/]+/access/tags$`, s.listAccessTags)
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/access/tags/[^/]+$`, s.getAccessTag)
 	s.Handle(http.MethodDelete, `^/accounts/[^/]+/access/tags/[^/]+$`, s.deleteAccessTag)
 }
@@ -245,6 +246,12 @@ func (s *Server) createAccessTag(w http.ResponseWriter, r *http.Request) {
 	}
 	s.State.accessTags[accountID][tag.Name] = tag
 	writeResult(w, http.StatusOK, tag)
+}
+
+func (s *Server) listAccessTags(w http.ResponseWriter, r *http.Request) {
+	items := s.State.AccessTags(pathPart(r.URL.Path, 1))
+	page, info := paginate(items, r)
+	writePage(w, page, info)
 }
 
 func (s *Server) getAccessTag(w http.ResponseWriter, r *http.Request) {
