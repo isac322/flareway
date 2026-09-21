@@ -102,12 +102,17 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(directClient.Get(testContext, key, &observed)).To(gomega.Succeed())
 		var currentGateway gatewayv1.Gateway
 		gomega.Expect(directClient.Get(testContext, key, &currentGateway)).To(gomega.Succeed())
-		observed.Status.TunnelID = "11111111-1111-1111-1111-111111111111"
-		observed.Status.OwnershipVerified = true
-		observed.Status.ConnectorTokenSecretRef = &corev1.LocalObjectReference{Name: "tunnel-token"}
-		observed.Status.GatewayRef = &corev1.LocalObjectReference{Name: currentGateway.Name}
-		observed.Status.GatewayUID = currentGateway.UID
-		gomega.Expect(directClient.Status().Update(testContext, &observed)).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			if err := directClient.Get(testContext, key, &observed); err != nil {
+				return err
+			}
+			observed.Status.TunnelID = "11111111-1111-1111-1111-111111111111"
+			observed.Status.OwnershipVerified = true
+			observed.Status.ConnectorTokenSecretRef = &corev1.LocalObjectReference{Name: "tunnel-token"}
+			observed.Status.GatewayRef = &corev1.LocalObjectReference{Name: currentGateway.Name}
+			observed.Status.GatewayUID = currentGateway.UID
+			return directClient.Status().Update(testContext, &observed)
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 		writerGateway := &ir.Gateway{Key: key, UID: currentGateway.UID}
 		statusWriter := &GatewayReconciler{Client: directClient}
 		condition := gatewayTunnelCondition(&observed, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, "Pending", "waiting for probes", metav1.Now())
