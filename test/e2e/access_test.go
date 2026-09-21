@@ -206,6 +206,10 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	It("denies unauthenticated and forged assertions while accepting a service token", func(ctx SpecContext) {
 		status, responseHeaders, body, err := edgeRequestTo(ctx, accessHostname, "/get", nil)
 		Expect(err).NotTo(HaveOccurred())
+		if status != http.StatusFound {
+			GinkgoWriter.Printf("Unauthenticated Access response: status=%d server=%q ray=%q content-type=%q body-bytes=%d\n",
+				status, responseHeaders.Get("Server"), responseHeaders.Get("Cf-Ray"), responseHeaders.Get("Content-Type"), len(body))
+		}
 		Expect(status).To(Equal(http.StatusFound), "unauthenticated Access request must redirect to authentication; body: %s", body)
 		expectAccessChallenge(responseHeaders, "unauthenticated Access request")
 
@@ -235,6 +239,46 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 	}, NodeTimeout(2*time.Minute))
 
 	It("keeps child bypass paths public while protecting the enclosing dashboard", func(ctx SpecContext) {
+
+		current := mixedApplication.DeepCopy()
+		Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(mixedApplication), current)).To(Succeed())
+		children, found, err := unstructured.NestedSlice(current.Object, "status", "bypassApplications")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(children).To(HaveLen(2), "each public carve-out requires an operator-owned child application")
+		readyCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		consecutive := 0
+		duration, readyErr := poll.Until(readyCtx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+			status, _, _, err := edgeRequestTo(checkCtx, mixedHostname, "/dashboard", nil)
+			GinkgoWriter.Printf("bypass convergence /dashboard: HTTP %d, request error=%v\n", status, err)
+			if err != nil {
+				consecutive = 0
+				return false, nil
+			}
+			if status >= http.StatusOK && status < http.StatusMultipleChoices {
+				return false, fmt.Errorf("protected dashboard became public while waiting for bypass convergence: HTTP %d", status)
+			}
+			ready := status == http.StatusFound
+			for _, path := range []string{"/v1", "/backend-api/tools"} {
+				status, _, _, err = edgeRequestTo(checkCtx, mixedHostname, path, nil)
+				GinkgoWriter.Printf("bypass convergence %s: HTTP %d, request error=%v\n", path, status, err)
+				ready = ready && err == nil && status == http.StatusOK
+			}
+			if !ready {
+				consecutive = 0
+				return false, nil
+			}
+			consecutive++
+			return consecutive >= 3, nil
+		})
+		if readyErr != nil {
+			GinkgoWriter.Printf("bypass readiness failure; AccessApplication: %s; Gateway: %s\n",
+				statusSummary(mixedApplication), statusSummary(mixedGateway))
+		}
+		Expect(readyErr).NotTo(HaveOccurred(), "child bypass paths did not converge while the dashboard remained protected")
+		recordLatency("access-bypass-edge-ready", duration)
+
 		for _, path := range []string{"/v1", "/backend-api/tools"} {
 			status, _, body, err := edgeRequestTo(ctx, mixedHostname, path, nil)
 			Expect(err).NotTo(HaveOccurred())
@@ -248,13 +292,6 @@ var _ = Describe("Cloudflare Access", Label("access"), Ordered, func() {
 		status, _, body, err = edgeRequestTo(ctx, mixedHostname, "/dashboard", serviceTokenHeader)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(http.StatusOK), "service token must reach protected dashboard; body: %s", body)
-
-		current := mixedApplication.DeepCopy()
-		Expect(kubeClient.Get(ctx, client.ObjectKeyFromObject(mixedApplication), current)).To(Succeed())
-		children, found, err := unstructured.NestedSlice(current.Object, "status", "bypassApplications")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(found).To(BeTrue())
-		Expect(children).To(HaveLen(2), "each public carve-out requires an operator-owned child application")
 	}, NodeTimeout(2*time.Minute))
 
 	It("blocks immediately when the AUD Secret disappears and never becomes public", func(ctx SpecContext) {

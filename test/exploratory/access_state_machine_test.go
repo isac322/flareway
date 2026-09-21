@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -292,7 +293,10 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 				return "", err
 			}
 			if m.appDeleting {
-				return "", fmt.Errorf("AccessApplication %s is still deleting", m.app)
+				if err := retainedDeletion(&application, application.Status.Conditions, v1alpha1.AccessApplicationFinalizer, "Programmed"); err != nil {
+					return "", err
+				}
+				return application.ResourceVersion, nil
 			}
 			accepted := meta.FindStatusCondition(application.Status.Conditions, "Accepted")
 			if accepted == nil || accepted.Status != metav1.ConditionFalse {
@@ -312,7 +316,10 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 				return "", err
 			}
 			if m.tokenDeleting {
-				return "", fmt.Errorf("ServiceToken %s is still deleting", m.token)
+				if err := retainedDeletion(&token, token.Status.Conditions, v1alpha1.ServiceTokenFinalizer, "Ready"); err != nil {
+					return "", err
+				}
+				return token.ResourceVersion, nil
 			}
 			accepted := meta.FindStatusCondition(token.Status.Conditions, "Accepted")
 			if accepted == nil || accepted.Status != metav1.ConditionFalse {
@@ -327,6 +334,30 @@ func (m *accessMachine) settleDenyEdge(rt *rapid.T, wasAccessDenied, wasTokenDen
 		}
 	}
 	m.refreshDenyMarks()
+}
+
+// retainedDeletion reports whether a deleting object is retained by a blocked
+// cleanup: the deletionTimestamp and the family finalizer must still be set,
+// and the controller must have reported a fresh CleanupBlocked=True plus a
+// non-ready condition (Programmed for AccessApplication, Ready for
+// ServiceToken) at the current generation. Absence is a successful outcome
+// handled by the caller; anything short of this state keeps polling.
+func retainedDeletion(object client.Object, conditions []metav1.Condition, finalizer, readyType string) error {
+	if object.GetDeletionTimestamp().IsZero() {
+		return fmt.Errorf("%T %s has no deletionTimestamp", object, object.GetName())
+	}
+	if !slices.Contains(object.GetFinalizers(), finalizer) {
+		return fmt.Errorf("%T %s lost finalizer %s", object, object.GetName(), finalizer)
+	}
+	blocked := meta.FindStatusCondition(conditions, "CleanupBlocked")
+	if blocked == nil || blocked.Status != metav1.ConditionTrue || blocked.ObservedGeneration != object.GetGeneration() {
+		return fmt.Errorf("%T %s has not reported blocked cleanup", object, object.GetName())
+	}
+	ready := meta.FindStatusCondition(conditions, readyType)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.ObservedGeneration != object.GetGeneration() {
+		return fmt.Errorf("%T %s still reports %s while cleanup is blocked", object, object.GetName(), readyType)
+	}
+	return nil
 }
 
 // drain settles the system before a mutation that can revoke authorization,

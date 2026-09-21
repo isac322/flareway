@@ -271,18 +271,21 @@ func (r *NetworkRouteReconciler) checkOverlap(ctx context.Context, object *v1alp
 			if claimNetwork == "" {
 				return privateInvalid("Invalid", "NetworkRoute %s has no recorded remote network identity", otherKey)
 			}
-			if other.Spec.VirtualNetworkRef != nil && claimVirtualNetworkID == "" {
-				return privateInvalid("Invalid", "NetworkRoute %s has an incomplete %s claim", otherKey, claimSource)
-			}
 			otherPrefix, err := parseMaskedPrefix(claimNetwork)
 			if err != nil {
 				return privateInvalid("Invalid", "NetworkRoute %s has invalid %s network %q: %v", otherKey, claimSource, claimNetwork, err)
+			}
+			if !prefixesOverlap(prefix, otherPrefix) {
+				continue
+			}
+			if other.Spec.VirtualNetworkRef != nil && claimVirtualNetworkID == "" {
+				return privateInvalid("Invalid", "NetworkRoute %s has an incomplete %s claim", otherKey, claimSource)
 			}
 			sameVirtualNetwork := claimVirtualNetworkID == virtualNetworkID
 			if virtualNetworkID == "" && object.Spec.VirtualNetworkRef == nil && other.Spec.VirtualNetworkRef == nil {
 				sameVirtualNetwork = claimSource == "observed" || applied.ObservedGeneration == other.Generation
 			}
-			if sameVirtualNetwork && prefixesOverlap(prefix, otherPrefix) {
+			if sameVirtualNetwork {
 				return privateInvalid("Invalid", "network %s overlaps %s NetworkRoute %s network %s in the same virtual network", prefix, claimSource, otherKey, otherPrefix)
 			}
 			continue
@@ -290,7 +293,10 @@ func (r *NetworkRouteReconciler) checkOverlap(ctx context.Context, object *v1alp
 		if !other.DeletionTimestamp.IsZero() || object.Status.RouteID != "" {
 			continue
 		}
-		if other.Namespace != object.Namespace || privateVirtualNetworkReferenceName(other.Spec.VirtualNetworkRef) != privateVirtualNetworkReferenceName(object.Spec.VirtualNetworkRef) {
+		if privateVirtualNetworkReferenceName(other.Spec.VirtualNetworkRef) != privateVirtualNetworkReferenceName(object.Spec.VirtualNetworkRef) {
+			continue
+		}
+		if other.Spec.VirtualNetworkRef != nil && other.Namespace != object.Namespace {
 			continue
 		}
 		otherPrefix, err := parseMaskedPrefix(other.Spec.Network)
