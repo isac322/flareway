@@ -367,6 +367,71 @@ func TestAccessPathProofTreatsV1AndV10AsDisjoint(t *testing.T) {
 	}
 }
 
+// A wildcard listener carries a virtual host whose hostname is the pattern
+// itself, because Translate gives every listener somewhere to serve its
+// fail-closed response. An Access application attached to that listener must
+// claim the concrete hosts bound to it and never the pattern: Cloudflare
+// Access matches an application by domain, so an application for
+// "*.example.com" guards every host in the zone, including hosts other
+// listeners deliberately leave public.
+func TestAccessOnWildcardListenerClaimsConcreteHostsOnly(t *testing.T) {
+	in := accessInputs(false)
+	wildcard := gatewayv1.Hostname("*.example.com")
+	in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
+		Name: "preview", Hostname: &wildcard, Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	})
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"api.example.com", "*.example.com"}
+
+	preview := routeWithBackend("preview", "backend", 8080)
+	preview.Spec.Hostnames = []gatewayv1.Hostname{"ws-abcd1234.example.com"}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{routeWithBackend("dashboard", "backend", 8080), preview}
+
+	app := accessApplication("preview-access", "Gateway", "gateway", "preview")
+	in.AccessApplications = []v1alpha1.AccessApplication{app}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{
+		{Namespace: "default", Name: "preview-access"}: {AUD: "aud-preview", ApplicationID: "app-preview", Ready: true},
+	}
+
+	_, statuses := Translate(in)
+	compiled := statuses.AccessApplications[types.NamespacedName{Namespace: "default", Name: "preview-access"}]
+	if !compiled.Accepted {
+		t.Fatalf("wildcard listener target was rejected: %#v", compiled)
+	}
+	for _, destination := range compiled.Destinations {
+		if strings.HasPrefix(destination.URI, "*") {
+			t.Fatalf("Access application claimed the wildcard pattern %q; it would guard the whole zone", destination.URI)
+		}
+	}
+	if len(compiled.Destinations) != 1 || compiled.Destinations[0].URI != "ws-abcd1234.example.com" {
+		t.Fatalf("wildcard listener destinations = %#v", compiled.Destinations)
+	}
+}
+
+// With nothing bound to it, a wildcard listener has only its pattern virtual
+// host. The application must find no target rather than fall back to the
+// pattern, which is the shape that took a whole zone on 2026-09-22.
+func TestAccessOnEmptyWildcardListenerFindsNoTarget(t *testing.T) {
+	in := accessInputs(false)
+	wildcard := gatewayv1.Hostname("*.example.com")
+	in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
+		Name: "preview", Hostname: &wildcard, Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	})
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"api.example.com", "*.example.com"}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{routeWithBackend("dashboard", "backend", 8080)}
+
+	app := accessApplication("preview-access", "Gateway", "gateway", "preview")
+	in.AccessApplications = []v1alpha1.AccessApplication{app}
+
+	_, statuses := Translate(in)
+	compiled := statuses.AccessApplications[types.NamespacedName{Namespace: "default", Name: "preview-access"}]
+	if compiled.Accepted {
+		t.Fatalf("empty wildcard listener produced destinations %#v", compiled.Destinations)
+	}
+	if compiled.Reason != "TargetNotFound" {
+		t.Fatalf("empty wildcard listener reason = %q, message = %q", compiled.Reason, compiled.Message)
+	}
+}
+
 func accessInputs(unprotected bool) Inputs {
 	in := baseInputs()
 	in.GatewayClassConfig.Spec.ConformanceMode = false
