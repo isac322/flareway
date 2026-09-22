@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -170,7 +171,11 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		tunnel.Status.OwnershipVerified = false
 		clearIntent.Ownership = true
 	}
-	ownedConditions := tunnelOwnedConditions(tunnel)
+	// ownedConditions accumulates only the condition deltas this pass authors.
+	// Non-authored Flareway conditions are carried verbatim from the live
+	// object by the shared conditions transaction, so seeding from the cached
+	// status here would re-author stale entries.
+	var ownedConditions []metav1.Condition
 	set := func(condition metav1.Condition) {
 		ownedConditions = gatewaystatus.SetCondition(ownedConditions, now, condition)
 	}
@@ -188,7 +193,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, ownedConditions)
-			r.setReadyForMode(&status, tunnel, mode, now)
+			setTunnelReadyPolicy(&status, tunnel, now)
 			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 		// The recorded Gateway dataplane has drained; the binding is now
@@ -222,7 +227,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "WaitingForOwnerDrain", message, tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForOwnerDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, ownedConditions)
-			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 		if gateway == nil {
@@ -240,7 +244,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 				status.ManagementTokenSecretRef = nil
 				clearIntent.Credentials = true
 			}
-			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 			return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 		gatewayRef = &corev1.LocalObjectReference{Name: gateway.Name}
@@ -255,7 +258,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "OwnershipCheckpoint", "Waiting for the exact Gateway UID ownership checkpoint", tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "OwnershipCheckpoint", "Waiting for the exact Gateway UID ownership checkpoint", tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-			r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 	}
@@ -272,7 +274,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "WaitingForDrain", message, tunnel.Generation, now))
 			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-			r.setReadyForMode(&status, tunnel, mode, now)
+			setTunnelReadyPolicy(&status, tunnel, now)
 			return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 		}
 	}
@@ -289,7 +291,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 				set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, "ObserveOnly", "ObserveOnly does not manage DNS records", tunnel.Generation, now))
 				status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 				status.OwnershipVerified = false
-				r.setReadyForMode(&status, tunnel, mode, now)
+				setTunnelReadyPolicy(&status, tunnel, now)
 				return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 			}
 		}
@@ -310,7 +312,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	if !gatewaystatus.ConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
@@ -320,7 +321,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 
@@ -341,7 +341,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", bindingErr.Error(), tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Invalid", bindingErr.Error(), tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	if decision := authorizeBindings(&account, namespace, allBindings, mode == v1alpha1.CloudflareTunnelConfigurationModeDirect); !decision.Allowed {
@@ -349,7 +348,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", decision.Message, tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", decision.Message, tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 	}
 	acceptedMessage := fmt.Sprintf("Direct configuration is authorized for CloudflareAccount %s", account.Name)
@@ -363,7 +361,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "CredentialsInvalid", err.Error(), tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", "Waiting for valid Cloudflare credentials", tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
@@ -414,9 +411,12 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			status.ManagementTokenSecretRef = managementSecretRef
 			status.Clients = tunnelClientStatuses(clients)
 			status.Addresses = tunnelAddresses(tunnel.Status.TunnelID, len(publicHosts) > 0)
-			r.setReadyForMode(&status, tunnel, mode, now)
+			setTunnelReadyPolicy(&status, tunnel, now)
 			if tunnelGateStatusUnchanged(tunnel.Status, status) {
-				return ctrl.Result{RequeueAfter: gate.Requeue}, nil
+				// The data fields are unchanged, but the conditions
+				// transaction still runs: it owns migration, the Ready
+				// clamp, and any authored deltas from this pass.
+				return ctrl.Result{RequeueAfter: gate.Requeue}, r.commitTunnelConditions(ctx, tunnel, status.Conditions, false)
 			}
 			openClear := clearIntent
 			openClear.Clients = true
@@ -424,12 +424,18 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			return ctrl.Result{RequeueAfter: gate.Requeue}, r.patchOwnedStatus(ctx, tunnel, status, openClear)
 		}
 	}
+	// The conditions commit runs before any remote mutation: it guarantees the
+	// status subresource exists for the identity checkpoint below, migrates
+	// legacy condition ownership ahead of every data write this pass, and may
+	// veto a stale observation before a non-idempotent CreateTunnel executes.
+	if err := r.commitTunnelConditions(ctx, tunnel, ownedConditions, true); err != nil {
+		return ctrl.Result{}, err
+	}
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
 	if err != nil {
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "CloudflareError", err.Error(), tunnel.Generation, now))
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", "Waiting for the remote Tunnel", tunnel.Generation, now))
 		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
@@ -471,7 +477,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			status.ManagementTokenSecretRef = nil
 			conflictClear.Credentials = true
 		}
-		r.setReady(&status, tunnel.Status.Conditions, tunnel.Generation, now)
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, conflictClear)
 	}
 
@@ -487,7 +492,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			observeClear.DNSRecords = true
 			observeClear.DeletedAt = true
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "ConnectionsUnavailable", err.Error(), tunnel.Generation, now), now)
-			r.setReadyForMode(&status, tunnel, mode, now)
+			setTunnelReadyPolicy(&status, tunnel, now)
 			if patchErr := r.patchOwnedStatus(ctx, tunnel, status, observeClear); patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
@@ -510,16 +515,14 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		observeClear.DeletedAt = true
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed Cloudflare Tunnel %s without adopting it", remote.ID), tunnel.Generation, now), now)
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, "ObserveOnly", "ObserveOnly does not manage DNS records", tunnel.Generation, now), now)
-		r.setReadyForMode(&status, tunnel, mode, now)
+		setTunnelReadyPolicy(&status, tunnel, now)
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, observeClear)
 	}
 
 	checkpoint := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 	projectRemoteTunnelStatus(&checkpoint, remote, tunnel.Generation)
 	if !remoteProjectionEqual(tunnel.Status, checkpoint) {
-		checkpointClear := clearIntent
-		checkpointClear.DeletedAt = true
-		if err := r.patchOwnedStatus(ctx, tunnel, checkpoint, checkpointClear); err != nil {
+		if err := r.persistRemoteIdentity(ctx, tunnel, checkpoint); err != nil {
 			return ctrl.Result{}, fmt.Errorf("checkpoint remote Tunnel identity: %w", err)
 		}
 		tunnel.Status = mergeTunnelOwnedStatus(tunnel.Status, checkpoint)
@@ -553,7 +556,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, "ConfigurationError", err.Error(), tunnel.Generation, now), now)
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "ConfigurationError", err.Error(), tunnel.Generation, now), now)
-		r.setReadyForMode(&status, tunnel, mode, now)
+		setTunnelReadyPolicy(&status, tunnel, now)
 		if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
@@ -594,7 +597,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		dnsRecords, dnsConflict, dnsErr := r.ensureDNS(ctx, cf, tunnel, dnsOwnerName, clusterID, remote.ID, publicHosts)
 		if dnsErr != nil {
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "CloudflareError", dnsErr.Error(), tunnel.Generation, now), now)
-			r.setReadyForMode(&status, tunnel, mode, now)
+			setTunnelReadyPolicy(&status, tunnel, now)
 			if patchErr := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
@@ -609,7 +612,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 	}
 
-	r.setReadyForMode(&status, tunnel, mode, now)
+	setTunnelReadyPolicy(&status, tunnel, now)
 	clearIntent.DNSRecords = true
 	clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
 	// A disabled gate (zero TTL) preserves the pre-gate polling cadence:
@@ -647,7 +650,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	// Delete-path applies get the same stale-cache protection; only the
 	// authoritative DNS removal and connection listing below may empty fields.
 	clearIntent := tunnelStatusClear{}
-	status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, tunnelOwnedConditions(tunnel))
+	status := tunnelOwnedStatus(tunnel, tunnel.Status.GatewayRef, tunnel.Status.GatewayUID, nil)
 	if owner != nil && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly &&
 		tunnel.Status.OwnershipVerified && !allHostnamesBlocked(tunnel.Status.Hostnames) {
 		message := "Waiting for the exact recorded Gateway UID to block every hostname"
@@ -2461,29 +2464,11 @@ func tunnelOwnedStatus(tunnel *v1alpha1.CloudflareTunnel, gatewayRef *corev1.Loc
 		Addresses:                append([]gatewayv1.GatewayStatusAddress(nil), tunnel.Status.Addresses...),
 		DNSRecords:               append([]v1alpha1.CloudflareTunnelDNSRecordStatus(nil), tunnel.Status.DNSRecords...),
 		GatewayRef:               gatewayRef, GatewayUID: gatewayUID,
-		ConfigVersion: tunnel.Status.ConfigVersion, Conditions: conditions,
+		ConfigVersion: tunnel.Status.ConfigVersion,
+		// Conditions carries only the deltas this pass authored; the shared
+		// conditions transaction merges them onto the live Flareway set.
+		Conditions: conditions,
 	}
-}
-
-func tunnelOwnedConditions(tunnel *v1alpha1.CloudflareTunnel) []metav1.Condition {
-	owned := map[string]bool{
-		v1alpha1.CloudflareTunnelConditionAccepted:       true,
-		v1alpha1.CloudflareTunnelConditionTunnelReady:    true,
-		v1alpha1.CloudflareTunnelConditionDNSReady:       true,
-		v1alpha1.CloudflareTunnelConditionReady:          true,
-		v1alpha1.CloudflareTunnelConditionCleanupBlocked: true,
-		v1alpha1.CloudflareTunnelConditionConflict:       true,
-	}
-	if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect {
-		owned[v1alpha1.CloudflareTunnelConditionConfigApplied] = true
-	}
-	result := make([]metav1.Condition, 0, len(owned))
-	for _, condition := range tunnel.Status.Conditions {
-		if owned[condition.Type] {
-			result = append(result, condition)
-		}
-	}
-	return result
 }
 
 func tunnelCondition(conditionType string, status metav1.ConditionStatus, reason, message string, generation int64, now metav1.Time) metav1.Condition {
@@ -2494,38 +2479,23 @@ func setStatusCondition(status *v1alpha1.CloudflareTunnelStatus, condition metav
 	status.Conditions = gatewaystatus.SetCondition(status.Conditions, now, condition)
 }
 
-func (r *CloudflareTunnelReconciler) setReady(status *v1alpha1.CloudflareTunnelStatus, gatewayConditions []metav1.Condition, generation int64, now metav1.Time) {
-	ready := gatewaystatus.ConditionTrue(status.Conditions, v1alpha1.CloudflareTunnelConditionTunnelReady) &&
-		gatewaystatus.ConditionTrue(gatewayConditions, v1alpha1.CloudflareTunnelConditionConfigApplied) &&
-		gatewaystatus.ConditionTrue(status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady)
-	conditionStatus := metav1.ConditionFalse
-	reason := "Pending"
-	message := "TunnelReady, ConfigApplied, and DNSReady must all be True"
-	if ready {
-		conditionStatus = metav1.ConditionTrue
-		reason = "Ready"
-		message = "Tunnel, data-plane configuration, and DNS are ready"
-	}
-	setStatusCondition(status, tunnelCondition(v1alpha1.CloudflareTunnelConditionReady, conditionStatus, reason, message, generation, now), now)
-}
-
-func (r *CloudflareTunnelReconciler) setReadyForMode(status *v1alpha1.CloudflareTunnelStatus, tunnel *v1alpha1.CloudflareTunnel, mode v1alpha1.CloudflareTunnelConfigurationMode, now metav1.Time) {
-	configurationConditions := tunnel.Status.Conditions
-	if tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
-		setStatusCondition(status, tunnelCondition(
-			v1alpha1.CloudflareTunnelConditionReady,
-			metav1.ConditionFalse,
-			"ObserveOnly",
-			"ObserveOnly reports remote state but does not authorize a managed connector dataplane",
-			tunnel.Generation,
-			now,
-		), now)
+// setTunnelReadyPolicy authors the explicit lifecycle Ready override. Under
+// ObserveOnly the Tunnel reports remote state without authorizing a managed
+// connector dataplane, so Ready is forced False with its own reason even when
+// every input happens to be True. Managed tunnels leave Ready to the shared
+// conditions transaction, which derives it from the live merged inputs.
+func setTunnelReadyPolicy(status *v1alpha1.CloudflareTunnelStatus, tunnel *v1alpha1.CloudflareTunnel, now metav1.Time) {
+	if tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
 		return
 	}
-	if mode == v1alpha1.CloudflareTunnelConfigurationModeDirect {
-		configurationConditions = status.Conditions
-	}
-	r.setReady(status, configurationConditions, tunnel.Generation, now)
+	setStatusCondition(status, tunnelCondition(
+		v1alpha1.CloudflareTunnelConditionReady,
+		metav1.ConditionFalse,
+		"ObserveOnly",
+		"ObserveOnly reports remote state but does not authorize a managed connector dataplane",
+		tunnel.Generation,
+		now,
+	), now)
 }
 
 func (r *CloudflareTunnelReconciler) activeFailure(
@@ -2540,7 +2510,7 @@ func (r *CloudflareTunnelReconciler) activeFailure(
 	now := r.now()
 	status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, conditions)
 	setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, reason, err.Error(), tunnel.Generation, now), now)
-	r.setReadyForMode(&status, tunnel, tunnelConfigurationMode(tunnel), now)
+	setTunnelReadyPolicy(&status, tunnel, now)
 	// Direct mode never has a valid Gateway binding; Gateway mode keeps the
 	// selected owner identity authoritative.
 	clearIntent := tunnelStatusClear{GatewayBinding: tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect}
@@ -2615,22 +2585,43 @@ type tunnelStatusClear struct {
 	Addresses bool
 }
 
-// patchOwnedStatus applies the tunnel-owned status under the flareway-tunnel
-// field manager. Because SSA deletes owned fields omitted from the document,
-// an apply built from a stale cached object must not empty protected fields
-// that exist live unless the caller declared clear intent. When the document
-// would empty a protected field without intent, the live object is read once
-// through APIReader and the live values are restored into the document. The
-// live read only happens on a potential regression — a converged apply that
-// carries its protected fields never reads — so the steady-state loop does
-// not pay a quorum read. The controller is the sole writer of these fields
-// and runs with MaxConcurrentReconciles=1, so the read-to-apply window cannot
-// observe a newer tunnel write; only an external actor could interpose, which
-// is the bounded TOCTOU tradeoff accepted here.
+// patchOwnedStatus commits one tunnel status update in two phases so the
+// ordering invariants hold on every call:
+//
+//  1. The conditions transaction runs first under the shared
+//     flareway-tunnel-status manager. It migrates legacy condition ownership
+//     before any data-only apply can delete orphaned entries, and it carries
+//     every authored demotion plus the unconditional Ready clamp.
+//  2. The data apply runs under flareway-tunnel. Because SSA deletes owned
+//     fields omitted from the document, an apply built from a stale cached
+//     object must not empty protected fields that exist live unless the
+//     caller declared clear intent; preserveTunnelStatusFields restores them.
+//  3. Promotions — authored True values for the Ready inputs TunnelReady,
+//     ConfigApplied, and DNSReady — commit only after the data they justify
+//     is durable. Callers that author no promotion skip this phase.
+//
+// status.Conditions must contain only this pass's authored deltas; the
+// conditions transaction carries non-authored Flareway entries verbatim from
+// the live object and derives Ready inside the same document.
 func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus, clearIntent tunnelStatusClear) error {
+	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeDirect {
+		for _, condition := range status.Conditions {
+			if condition.Type == v1alpha1.CloudflareTunnelConditionConfigApplied {
+				return fmt.Errorf("the tunnel reconciler cannot author ConfigApplied outside Direct mode for %s/%s", tunnel.Namespace, tunnel.Name)
+			}
+		}
+	}
+	if err := r.commitTunnelConditions(ctx, tunnel, status.Conditions, true); err != nil {
+		return err
+	}
 	statusMap, err := tunnelOwnedStatusMap(tunnel, status)
 	if err != nil {
 		return err
+	}
+	if clearIntent.Ownership {
+		// The identity checkpoint can also own this field through an Update.
+		// Omitting false from an apply would leave that claim's true value.
+		statusMap["ownershipVerified"] = status.OwnershipVerified
 	}
 	if err := r.preserveTunnelStatusFields(ctx, tunnel, statusMap, clearIntent); err != nil {
 		return err
@@ -2646,6 +2637,140 @@ func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunne
 	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(tunnelFieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("apply tunnel-owned status for %s/%s: %w", tunnel.Namespace, tunnel.Name, err)
 	}
+	if !tunnelAuthoredPromotion(status.Conditions) {
+		return nil
+	}
+	return r.commitTunnelConditions(ctx, tunnel, status.Conditions, false)
+}
+
+// tunnelAuthoredPromotion reports whether the authored set asserts a True
+// value for Ready or one of its inputs — the only deltas that must wait for
+// the data apply they justify.
+func tunnelAuthoredPromotion(authored []metav1.Condition) bool {
+	for _, condition := range authored {
+		if condition.Status != metav1.ConditionTrue {
+			continue
+		}
+		if _, isInput := tunnelReadyInputConditions[condition.Type]; isInput ||
+			condition.Type == v1alpha1.CloudflareTunnelConditionReady {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelReadyInputConditions are the condition types whose True value asserts
+// convergence evidence that must be durable before the condition becomes
+// visible. Demotions and non-input conditions are never withheld.
+var tunnelReadyInputConditions = map[string]struct{}{
+	v1alpha1.CloudflareTunnelConditionTunnelReady:  {},
+	v1alpha1.CloudflareTunnelConditionConfigApplied: {},
+	v1alpha1.CloudflareTunnelConditionDNSReady:      {},
+}
+
+// commitTunnelConditions runs the shared conditions transaction for the
+// tunnel writer. When withholdPromotions is set, authored True values for the
+// Ready inputs are deferred to the post-data phase so a promotion never
+// becomes visible before the status data justifying it is durable; an
+// explicit Ready=False override still commits early because it is a demotion.
+// The tunnel writer needs no ownership gate: it is the authority that sets
+// ownershipVerified, gatewayRef, and deletedAt, so gating on them would
+// deadlock provisioning, ObserveOnly, conflict, and teardown writes.
+func (r *CloudflareTunnelReconciler) commitTunnelConditions(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, authored []metav1.Condition, withholdPromotions bool) error {
+	conditions := authored
+	var override *metav1.Condition
+	if withholdPromotions {
+		conditions = make([]metav1.Condition, 0, len(authored))
+		for _, condition := range authored {
+			_, isInput := tunnelReadyInputConditions[condition.Type]
+			switch {
+			case condition.Type == v1alpha1.CloudflareTunnelConditionReady && condition.Status == metav1.ConditionTrue:
+				// A True override is a promotion; it waits for the data phase.
+			case condition.Type == v1alpha1.CloudflareTunnelConditionReady:
+				candidate := condition
+				override = &candidate
+			case isInput && condition.Status == metav1.ConditionTrue:
+				// Promotion: committed by the post-data phase.
+			default:
+				conditions = append(conditions, condition)
+			}
+		}
+	}
+	return patchTunnelConditions(ctx, r.Client, r.APIReader, tunnelConditionUpdate{
+		Observed:      tunnel,
+		Conditions:    conditions,
+		Now:           r.now(),
+		ReadyOverride: override,
+	})
+}
+
+// tunnelRemoteIdentityFields are the status fields the remote-identity
+// checkpoint may write. They are exactly the fields projectRemoteTunnelStatus
+// fills from a fresh remote read minus observedGeneration and the volatile
+// connection timestamps: observedGeneration records which spec generation the
+// controller observed, not remote truth, so the checkpoint leaves it to the
+// full data apply rather than restamping a stale observation onto a newer
+// generation; connectionsActiveAt and connectionsInactiveAt legitimately
+// transition non-nil to nil (a reconnect clears conns_inactive_at) and
+// ToUnstructured omits a nil pointer, so this patch could only ever set them,
+// never clear them. A JSON Patch records ownership under the flareway-tunnel
+// Update entry, and SSA never deletes an owned-but-omitted field while
+// another entry still owns it, so a timestamp captured here could never be
+// cleared by the data apply again. They are not identity; the same-pass data
+// apply owns them exclusively. ownershipVerified can only ever be captured as
+// true: the field is `json:",omitempty"`, so a false value is omitted by
+// ToUnstructured and skipped by the loop below. That is correct only because
+// projectRemoteTunnelStatus sets it true unconditionally; a caller needing to
+// persist false must use the data apply.
+var tunnelRemoteIdentityFields = []string{
+	"tunnelId", "accountId", "name", "tunnelType", "configSource",
+	"connectorState", "createdAt", "deletedAt", "ownershipVerified",
+}
+
+// persistRemoteIdentity durably captures the remote Tunnel identity returned
+// by ensureRemoteTunnel. CreateTunnel is not idempotent and status.tunnelId
+// is the only record of the created remote object, so this checkpoint must
+// not be vetoed by the conditions transaction's generation or CAS checks.
+// It is an RFC 6902 JSON Patch — not an SSA apply — so it cannot delete or
+// claim condition entries regardless of which manager owns them, and it
+// carries no generation or resourceVersion precondition: a test op on
+// /metadata/uid is the only guard, binding the capture to the exact object
+// this pass observed while tolerating spec churn and concurrent status
+// writes. The status subresource is guaranteed to exist because the
+// conditions commit runs before ensureRemoteTunnel. ownershipVerified is
+// load-bearing: capturing tunnelId without it would wedge the tunnel into
+// the adoption-conflict path on the next pass.
+func (r *CloudflareTunnelReconciler) persistRemoteIdentity(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, projected v1alpha1.CloudflareTunnelStatus) error {
+	if r.Client == nil {
+		return errors.New("CloudflareTunnelReconciler Client is required for the remote identity checkpoint")
+	}
+	fields, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&projected)
+	if err != nil {
+		return fmt.Errorf("convert remote Tunnel identity: %w", err)
+	}
+	ops := make([]map[string]any, 0, len(tunnelRemoteIdentityFields)+1)
+	ops = append(ops, map[string]any{"op": "test", "path": "/metadata/uid", "value": string(tunnel.UID)})
+	for _, field := range tunnelRemoteIdentityFields {
+		// Absent keys are skipped rather than sent as an add op carrying JSON
+		// null. The apiserver prunes non-nullable nulls that have no default,
+		// so such an op is a silent no-op today — but it deliberately leaves
+		// defaultable nulls for the defaulting pass, so if any of these fields
+		// ever gains a default the op would start writing that default into
+		// status. A non-nil deletedAt cannot reach this checkpoint: remote
+		// validation rejects deleted tunnels before identity capture.
+		value, present := fields[field]
+		if !present {
+			continue
+		}
+		ops = append(ops, map[string]any{"op": "add", "path": "/status/" + field, "value": value})
+	}
+	patch, err := json.Marshal(ops)
+	if err != nil {
+		return fmt.Errorf("marshal remote Tunnel identity patch: %w", err)
+	}
+	if err := r.Status().Patch(ctx, tunnel, client.RawPatch(types.JSONPatchType, patch), client.FieldOwner(tunnelFieldManager)); err != nil {
+		return fmt.Errorf("persist remote Tunnel identity for %s/%s: %w", tunnel.Namespace, tunnel.Name, err)
+	}
 	return nil
 }
 
@@ -2659,6 +2784,9 @@ func tunnelOwnedStatusMap(tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.Clo
 	}
 	delete(statusMap, "hostnames")
 	delete(statusMap, "listeners")
+	// Conditions are owned exclusively by the shared flareway-tunnel-status
+	// manager; carrying them here would fight it for ownership.
+	delete(statusMap, "conditions")
 	if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway {
 		delete(statusMap, "configVersion")
 	}

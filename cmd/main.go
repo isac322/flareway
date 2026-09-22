@@ -321,6 +321,7 @@ func main() {
 		}
 		if err := (&controller.GatewayReconciler{
 			Client:            observedClient,
+			APIReader:         mgr.GetAPIReader(),
 			Scheme:            mgr.GetScheme(),
 			Snapshots:         xdsServer,
 			OperatorNamespace: dataplane.DefaultOperatorNamespace,

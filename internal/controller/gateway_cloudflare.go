@@ -50,6 +50,17 @@ import (
 
 const cloudflareConvergenceTimeout = 30 * time.Second
 
+// errTunnelConvergenceLost marks promotion-guard failures caused by lost
+// convergence evidence that is ordinary pending, not a fault: the compiled
+// snapshot lost its ACK or the programming gate reopened. Callers demote
+// ConfigApplied and requeue rather than surfacing a Go error.
+var errTunnelConvergenceLost = errors.New("tunnel convergence evidence lost")
+
+// errTunnelGateObservation marks promotion-guard failures caused by a real
+// observation error (Pod list, probe transport, writer revalidation). Callers
+// demote ConfigApplied and still surface the error.
+var errTunnelGateObservation = errors.New("tunnel gate observation failed")
+
 type cloudflareConfigResult struct {
 	hash            string
 	version         int64
@@ -69,6 +80,10 @@ type cloudflareConfigResult struct {
 	// held reports that drift was detected but the configured DriftPolicy
 	// suppressed the overwrite.
 	held bool
+	// remoteChanged reports that this pass issued a remote
+	// UpdateTunnelConfiguration and carries the provider-assigned version.
+	// The caller checkpoints desired=remote before the convergence gate.
+	remoteChanged bool
 }
 
 func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) (*ir.Gateway, bool, error) {
@@ -400,25 +415,54 @@ func sameGatewayIdentity(expected, actual *gatewayv1.Gateway) bool {
 		expected.Name == actual.Name &&
 		expected.UID == actual.UID
 }
+
+// directReader returns the uncached reader used for writer revalidation and
+// condition-commit bases. APIReader is preferred; tests that never wire it
+// fall back to Client, which is still a direct read for envtest/fake clients.
+func (r *GatewayReconciler) directReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *GatewayReconciler) validateGatewayTunnelWriter(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) (*v1alpha1.CloudflareTunnel, error) {
 	if gateway == nil || gateway.UID == "" || tunnel == nil {
 		return nil, errors.New("gateway Tunnel writer requires non-empty Gateway UID and Tunnel")
 	}
+	reader := r.directReader()
 	var currentGateway gatewayv1.Gateway
-	if err := r.Get(ctx, gateway.Key, &currentGateway); err != nil {
+	if err := reader.Get(ctx, gateway.Key, &currentGateway); err != nil {
 		return nil, fmt.Errorf("revalidate Gateway %s before Tunnel write: %w", gateway.Key, err)
 	}
 	if currentGateway.UID != gateway.UID || !currentGateway.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("gateway %s UID %s is no longer the live writer", gateway.Key, gateway.UID)
 	}
 	var currentTunnel v1alpha1.CloudflareTunnel
-	if err := r.Get(ctx, client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
 		return nil, fmt.Errorf("revalidate CloudflareTunnel %s/%s before Gateway write: %w", tunnel.Namespace, tunnel.Name, err)
 	}
 	if tunnel.UID != "" && currentTunnel.UID != tunnel.UID {
 		return nil, fmt.Errorf("CloudflareTunnel %s/%s was recreated before Gateway write", tunnel.Namespace, tunnel.Name)
 	}
-	selected, _, waitingForDrain, err := selectLiveTunnelGateway(ctx, r.Client, &currentTunnel)
+	// The fresh read may only replace the observed snapshot when it is the
+	// same spec revision and the same remote/owner identity: adopting a
+	// newer generation would rebase this pass's stale observations onto the
+	// new spec, and adopting a changed tunnelId/accountId/gateway binding
+	// would let promotion compare fresh provenance against itself. Other
+	// status fields (dnsRecords, conditions) legitimately move mid-pass and
+	// are not identity.
+	if currentTunnel.Generation != tunnel.Generation ||
+		tunnelConfigurationMode(&currentTunnel) != tunnelConfigurationMode(tunnel) {
+		return nil, fmt.Errorf("CloudflareTunnel %s/%s spec changed since this pass observed it (generation %d -> %d)", tunnel.Namespace, tunnel.Name, tunnel.Generation, currentTunnel.Generation)
+	}
+	if currentTunnel.Status.TunnelID != tunnel.Status.TunnelID ||
+		currentTunnel.Status.AccountID != tunnel.Status.AccountID ||
+		currentTunnel.Status.GatewayUID != tunnel.Status.GatewayUID ||
+		localRefName(currentTunnel.Status.GatewayRef) != localRefName(tunnel.Status.GatewayRef) {
+		return nil, fmt.Errorf("CloudflareTunnel %s/%s remote or owner identity changed since this pass observed it", tunnel.Namespace, tunnel.Name)
+	}
+	selected, _, waitingForDrain, err := selectLiveTunnelGateway(ctx, reader, &currentTunnel)
 	if err != nil {
 		return nil, err
 	}
@@ -433,6 +477,13 @@ func (r *GatewayReconciler) validateGatewayTunnelWriter(ctx context.Context, gat
 		return nil, fmt.Errorf("CloudflareTunnel %s/%s is not verified for managed Gateway writes", currentTunnel.Namespace, currentTunnel.Name)
 	}
 	return &currentTunnel, nil
+}
+
+func localRefName(ref *corev1.LocalObjectReference) string {
+	if ref == nil {
+		return ""
+	}
+	return ref.Name
 }
 
 func effectiveGatewayConfig(base *v1alpha1.GatewayClassConfig, tunnel *v1alpha1.CloudflareTunnel) *v1alpha1.GatewayClassConfig {
@@ -611,14 +662,14 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	}
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
-		return cloudflareConfigResult{}, err
+		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, err)
 	}
 	remoteTunnel, err := api.GetTunnel(ctx, tunnel.Status.TunnelID)
 	if err != nil {
-		return cloudflareConfigResult{}, fmt.Errorf("get Cloudflare Tunnel before configuration update: %w", err)
+		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, fmt.Errorf("get Cloudflare Tunnel before configuration update: %w", err))
 	}
 	if err := validateRemoteTunnel(remoteTunnel, account.Spec.AccountID); err != nil {
-		return cloudflareConfigResult{}, err
+		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, err)
 	}
 	freshAppliedAt := metav1.NewTime(now)
 	result := cloudflareConfigResult{hash: hash}
@@ -658,6 +709,16 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			result.remoteCreatedAt = timeStatus(remote.CreatedAt)
 			return nil
 		}
+		// Durable invalidation before the remote mutation: ConfigApplied and
+		// the derived Ready drop to False so a crash anywhere below leaves a
+		// fail-closed record instead of a stale True describing a superseded
+		// desired state. The intended hash rides in the message only —
+		// status.configVersion.desiredHash stays the hash of the last
+		// successful remote write until the checkpoint below records the
+		// provider-assigned version.
+		if err := r.demoteTunnelConfigApplied(ctx, gateway, tunnel, now, "Applying", fmt.Sprintf("Applying Cloudflare Tunnel configuration with desired hash %s", hash)); err != nil {
+			return err
+		}
 		updated, err := api.UpdateTunnelConfiguration(ctx, tunnel.Status.TunnelID, params)
 		if err != nil {
 			return err
@@ -669,10 +730,26 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		result.remoteVersion = updated.Version
 		result.remoteCreatedAt = timeStatus(updated.CreatedAt)
 		result.appliedAt = &freshAppliedAt
+		result.remoteChanged = true
 		return nil
 	})
 	if err != nil {
-		return cloudflareConfigResult{}, fmt.Errorf("update Cloudflare Tunnel configuration: %w", err)
+		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, fmt.Errorf("update Cloudflare Tunnel configuration: %w", err))
+	}
+	if result.remoteChanged {
+		// The provider-assigned version checkpoints before the convergence
+		// gate: desired=remote records what was actually written so a crash
+		// before promotion still describes remote truth. Conditions are
+		// untouched — ConfigApplied=False from the demotion persists.
+		checkpoint := tunnel.Status.ConfigVersion
+		checkpoint.Desired = result.version
+		checkpoint.DesiredHash = result.hash
+		checkpoint.Remote = result.remoteVersion
+		checkpoint.CreatedAt = result.remoteCreatedAt
+		checkpoint.AppliedAt = result.appliedAt
+		if err := r.patchTunnelGatewayData(ctx, gateway, tunnel, checkpoint, tunnel.Status.Hostnames, desiredTunnelListeners(gateway)); err != nil {
+			return cloudflareConfigResult{}, fmt.Errorf("checkpoint Cloudflare Tunnel configuration version: %w", err)
+		}
 	}
 	if result.appliedAt != nil {
 		// The remote state was freshly confirmed or written: release any
@@ -682,6 +759,25 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
 	}
 	return result, nil
+}
+
+// remoteConfigFailure records ConfigApplied=False before returning a remote
+// path error so a quiet True never masks a real failure. The demotion is
+// best-effort: a commit failure is reported alongside the original error, and
+// a writer-guard rejection (ownership lost mid-pass) leaves the original
+// error authoritative.
+func (r *GatewayReconciler) remoteConfigFailure(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, now time.Time, cause error) error {
+	if demoteErr := r.demoteTunnelConfigApplied(ctx, gateway, tunnel, now, "RemoteError", "Cloudflare Tunnel remote operation failed; see controller logs"); demoteErr != nil {
+		return fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", cause, demoteErr)
+	}
+	return cause
+}
+
+// demoteTunnelConfigApplied commits ConfigApplied=False through the shared
+// conditions transaction. Ready is derived False in the same document.
+func (r *GatewayReconciler) demoteTunnelConfigApplied(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, now time.Time, reason, message string) error {
+	return r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
+		gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, metav1.NewTime(now)))
 }
 
 func (r *GatewayReconciler) cloudflareClient(ctx context.Context, account *v1alpha1.CloudflareAccount) (flarecloudflare.API, error) {
@@ -889,6 +985,12 @@ func tunnelGatewayAddresses(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunn
 	return nil
 }
 
+// patchTunnelGatewayStatus is the demotion-shaped write: the conditions
+// transaction commits before the data apply so a persisted ConfigApplied=False
+// (or a no-change re-authoring) never trails the fields it describes. Callers
+// promoting ConfigApplied to True must use patchTunnelGatewayData followed by
+// patchTunnelGatewayConditions instead — promotion commits after the
+// justifying configVersion is durable.
 func (r *GatewayReconciler) patchTunnelGatewayStatus(
 	ctx context.Context,
 	gateway *ir.Gateway,
@@ -898,19 +1000,163 @@ func (r *GatewayReconciler) patchTunnelGatewayStatus(
 	listeners []v1alpha1.CloudflareTunnelListenerStatus,
 	conditions ...metav1.Condition,
 ) error {
+	if err := r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(r.gatewayNow()), conditions...); err != nil {
+		return err
+	}
+	return r.patchTunnelGatewayData(ctx, gateway, tunnel, config, hostnames, listeners)
+}
+
+// patchTunnelGatewayConditions commits the authored Gateway-owned condition
+// deltas through the shared flareway-tunnel-status transaction: a fresh read
+// supplies the resourceVersion basis, the writer guard re-runs per attempt,
+// and Ready is derived in the same document. With no authored deltas the call
+// performs only legacy-ownership migration and the Ready clamp — the required
+// pre-data stage on promotion passes.
+func (r *GatewayReconciler) patchTunnelGatewayConditions(
+	ctx context.Context,
+	gateway *ir.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	now metav1.Time,
+	conditions ...metav1.Condition,
+) error {
+	return r.patchTunnelGatewayConditionsValidated(ctx, gateway, tunnel, now, nil, conditions...)
+}
+
+// patchTunnelGatewayConditionsValidated is patchTunnelGatewayConditions with
+// an additional caller guard (Tier-2 promotion evidence) evaluated against the
+// fresh live object on every commit attempt.
+func (r *GatewayReconciler) patchTunnelGatewayConditionsValidated(
+	ctx context.Context,
+	gateway *ir.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	now metav1.Time,
+	extraValidate func(*v1alpha1.CloudflareTunnel) error,
+	conditions ...metav1.Condition,
+) error {
 	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeGateway {
 		return errors.New("the Gateway reconciler cannot own Direct-mode CloudflareTunnel status")
 	}
-	currentTunnel, err := r.validateGatewayTunnelWriter(ctx, gateway, tunnel)
-	if err != nil {
-		return err
+	guard := r.gatewayTunnelConditionGuard(ctx, gateway, tunnel)
+	validate := func(live *v1alpha1.CloudflareTunnel) error {
+		if err := guard(live); err != nil {
+			return err
+		}
+		if extraValidate != nil {
+			return extraValidate(live)
+		}
+		return nil
 	}
-	tunnel = currentTunnel
+	return patchTunnelConditions(ctx, r.Client, r.directReader(), tunnelConditionUpdate{
+		Observed:   tunnel,
+		Conditions: conditions,
+		Now:        now,
+		Validate:   validate,
+	})
+}
+
+// gatewayTunnelConditionGuard revalidates the Gateway-writer preconditions
+// against the fresh live Tunnel on every conditions-commit attempt: the live
+// Gateway still exists with the observed UID and no deletionTimestamp, the
+// Tunnel still names it as its verified UID-bound owner, no drain is pending,
+// and the Tunnel is managed and verified. The Tunnel object CAS covers the
+// Tunnel revision; the Gateway is a separate object, so a bounded cross-object
+// race remains — the Gateway watch requeues a correcting pass.
+func (r *GatewayReconciler) gatewayTunnelConditionGuard(ctx context.Context, gateway *ir.Gateway, observed *v1alpha1.CloudflareTunnel) func(*v1alpha1.CloudflareTunnel) error {
+	return func(live *v1alpha1.CloudflareTunnel) error {
+		if gateway == nil || gateway.UID == "" || live == nil {
+			return errors.New("gateway Tunnel writer requires non-empty Gateway UID and Tunnel")
+		}
+		reader := r.directReader()
+		var currentGateway gatewayv1.Gateway
+		if err := reader.Get(ctx, gateway.Key, &currentGateway); err != nil {
+			return fmt.Errorf("revalidate Gateway %s before Tunnel conditions write: %w", gateway.Key, err)
+		}
+		if currentGateway.UID != gateway.UID || !currentGateway.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("gateway %s UID %s is no longer the live writer", gateway.Key, gateway.UID)
+		}
+		if observed != nil &&
+			(live.Status.TunnelID != observed.Status.TunnelID ||
+				live.Status.AccountID != observed.Status.AccountID ||
+				live.Status.GatewayUID != observed.Status.GatewayUID ||
+				localRefName(live.Status.GatewayRef) != localRefName(observed.Status.GatewayRef)) {
+			return fmt.Errorf("CloudflareTunnel %s/%s remote or owner identity changed since this pass observed it", live.Namespace, live.Name)
+		}
+		selected, _, waitingForDrain, err := selectLiveTunnelGateway(ctx, reader, live)
+		if err != nil {
+			return err
+		}
+		if waitingForDrain || !sameGatewayIdentity(&currentGateway, selected) || !tunnelGatewayStatusIdentityMatches(live, &currentGateway) {
+			return fmt.Errorf("gateway %s UID %s does not hold the current UID-bound Tunnel ownership", gateway.Key, gateway.UID)
+		}
+		if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+			live.Status.DeletedAt != nil ||
+			!live.Status.OwnershipVerified ||
+			live.Status.TunnelID == "" ||
+			live.Status.ConnectorTokenSecretRef == nil {
+			return fmt.Errorf("CloudflareTunnel %s/%s is not verified for managed Gateway writes", live.Namespace, live.Name)
+		}
+		return nil
+	}
+}
+
+// gatewayPromotionGuard returns the Tier-2 evidence check for a
+// ConfigApplied=True commit, evaluated against the fresh live Tunnel on every
+// commit attempt. The three domains are judged in their own units: the exact
+// compiled xDS snapshot identity must be ACKed, the live configVersion must
+// still record this pass's desired version/hash and observed remote version,
+// and — when requireGate is set — the full Cloudflare programming gate
+// (cloudflared Pod versions and managed DNS) must still hold. The xDS string
+// identity and the Cloudflare int64 version are never equated.
+func (r *GatewayReconciler) gatewayPromotionGuard(
+	ctx context.Context,
+	gateway *ir.Gateway,
+	result cloudflareConfigResult,
+	snapshotVersion string,
+	requireGate bool,
+) func(*v1alpha1.CloudflareTunnel) error {
+	return func(live *v1alpha1.CloudflareTunnel) error {
+		if live.Status.ConfigVersion.Desired != result.version ||
+			live.Status.ConfigVersion.DesiredHash != result.hash ||
+			live.Status.ConfigVersion.Remote != result.remoteVersion {
+			return fmt.Errorf("live CloudflareTunnel %s/%s configVersion no longer records this pass's desired state", live.Namespace, live.Name)
+		}
+		if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) {
+			return fmt.Errorf("%w: compiled xDS snapshot %s is not ACKed", errTunnelConvergenceLost, snapshotVersion)
+		}
+		if requireGate {
+			ready, lagging, _, err := r.cloudflareGate(ctx, gateway, live, fmt.Sprint(result.version), snapshotVersion)
+			if err != nil {
+				return fmt.Errorf("%w: %v", errTunnelGateObservation, err)
+			}
+			if !ready {
+				return fmt.Errorf("%w: Cloudflare programming gate no longer holds: %s", errTunnelConvergenceLost, strings.Join(lagging, ", "))
+			}
+		}
+		return nil
+	}
+}
+
+// patchTunnelGatewayData applies the Gateway-owned data fields
+// (configVersion, hostnames, listeners) under the flareway-gateway manager.
+// The document deliberately omits status.conditions: they are owned by the
+// shared flareway-tunnel-status manager, and every call site must run the
+// conditions stage first so legacy ownership has migrated before this apply —
+// otherwise the apply would delete old-manager condition entries.
+func (r *GatewayReconciler) patchTunnelGatewayData(
+	ctx context.Context,
+	gateway *ir.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+) error {
+	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeGateway {
+		return errors.New("the Gateway reconciler cannot own Direct-mode CloudflareTunnel status")
+	}
 	statusValue := v1alpha1.CloudflareTunnelStatus{
 		ConfigVersion: config,
 		Hostnames:     hostnames,
 		Listeners:     listeners,
-		Conditions:    conditions,
 	}
 	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&statusValue)
 	if err != nil {
@@ -924,26 +1170,50 @@ func (r *GatewayReconciler) patchTunnelGatewayStatus(
 	if len(listeners) == 0 {
 		statusMap["listeners"] = []any{}
 	}
-	if len(conditions) == 0 {
-		statusMap["conditions"] = []any{}
+	key := client.ObjectKeyFromObject(tunnel)
+	validate := r.gatewayTunnelConditionGuard(ctx, gateway, tunnel)
+	var lastErr error
+	for range tunnelConditionMaxAttempts {
+		// Every attempt re-reads the live object through the direct reader and
+		// re-runs the shared identity check plus the writer provenance guard
+		// before pinning the apply to that revision — a UID replacement or a
+		// generation/mode transition between the caller's snapshot and this
+		// write must never receive this pass's data.
+		var live v1alpha1.CloudflareTunnel
+		if err := r.directReader().Get(ctx, key, &live); err != nil {
+			return fmt.Errorf("read live CloudflareTunnel %s for Gateway data: %w", key, err)
+		}
+		if err := tunnelConditionIdentityCheck(tunnel, &live); err != nil {
+			return err
+		}
+		if err := validate(&live); err != nil {
+			return err
+		}
+		apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
+		apply.SetAPIVersion(v1alpha1.GroupVersion.String())
+		apply.SetKind("CloudflareTunnel")
+		apply.SetName(live.Name)
+		apply.SetNamespace(live.Namespace)
+		apply.SetResourceVersion(live.ResourceVersion)
+		err = r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(gatewayFieldManager), client.ForceOwnership)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			return fmt.Errorf("apply Gateway-owned CloudflareTunnel status: %w", err)
+		}
+		lastErr = err
 	}
-	apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
-	apply.SetAPIVersion(v1alpha1.GroupVersion.String())
-	apply.SetKind("CloudflareTunnel")
-	apply.SetName(tunnel.Name)
-	apply.SetNamespace(tunnel.Namespace)
-	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(gatewayFieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("apply Gateway-owned CloudflareTunnel status: %w", err)
-	}
-	return nil
+	return fmt.Errorf("apply Gateway-owned CloudflareTunnel %s status: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
 }
 
+// gatewayTunnelCondition stamps an authored condition with the caller's clock.
+// The shared conditions transaction compares against the live entry and keeps
+// its lastTransitionTime when the status is unchanged, so this function must
+// not inherit timestamps from the caller's pre-pass snapshot — that is what
+// made recovered True values regress in time.
 func gatewayTunnelCondition(tunnel *v1alpha1.CloudflareTunnel, conditionType string, status metav1.ConditionStatus, reason, message string, now metav1.Time) metav1.Condition {
-	transition := now
-	if existing := meta.FindStatusCondition(tunnel.Status.Conditions, conditionType); existing != nil && existing.Status == status {
-		transition = existing.LastTransitionTime
-	}
-	return metav1.Condition{Type: conditionType, Status: status, Reason: reason, Message: message, ObservedGeneration: tunnel.Generation, LastTransitionTime: transition}
+	return metav1.Condition{Type: conditionType, Status: status, Reason: reason, Message: message, ObservedGeneration: tunnel.Generation, LastTransitionTime: now}
 }
 
 func (r *GatewayReconciler) gatewayNow() time.Time {

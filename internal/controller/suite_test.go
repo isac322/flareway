@@ -99,6 +99,7 @@ var _ = ginkgo.BeforeSuite(func() {
 	}).SetupWithManager(manager)).To(gomega.Succeed())
 	gomega.Expect((&GatewayReconciler{
 		Client:            manager.GetClient(),
+		APIReader:         manager.GetAPIReader(),
 		Scheme:            manager.GetScheme(),
 		Snapshots:         testSnapshots,
 		BuildSnapshot:     controlledSnapshotBuild,
