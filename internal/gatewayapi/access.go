@@ -160,6 +160,30 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 	return compileAccessApplicationAgainstIR(in, gateway, application)
 }
 
+// isWildcardHostname reports whether a virtual host stands for a pattern
+// rather than one concrete host.
+//
+// Translate gives every listener a virtual host carrying the listener's own
+// hostname, so that a listener with no matching route still has somewhere to
+// serve its fail-closed response. On a wildcard listener that host is the
+// pattern itself, for example "*.example.com", and it is a catch-all, not a
+// site anyone reaches.
+//
+// An Access application must never turn one into a destination. Cloudflare
+// Access matches an application by domain, so an application created for
+// "*.example.com" guards every host in the zone, including hosts served by
+// other listeners that were deliberately left public. A webhook endpoint that
+// answered its caller then starts answering a login redirect instead, and the
+// application that caused it names only the one listener it was attached to.
+//
+// The bare "*" catch-all, which ComputeHosts returns when neither the route
+// nor the listener sets a hostname, has always been skipped here. A wildcard
+// listener hostname is the same kind of object and is skipped for the same
+// reason.
+func isWildcardHostname(hostname string) bool {
+	return hostname == "*" || strings.HasPrefix(hostname, "*.")
+}
+
 func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
 	result := AccessApplicationCompilation{
 		Accepted: true,
@@ -217,7 +241,7 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 					continue
 				}
 				for _, virtualHost := range domain.VirtualHosts {
-					if virtualHost.Hostname == "" || virtualHost.Hostname == "*" {
+					if virtualHost.Hostname == "" || isWildcardHostname(virtualHost.Hostname) {
 						continue
 					}
 					matched = true
