@@ -181,6 +181,102 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		gomega.Expect(testPrivateNetworkCloudflare.count("CreateNetworkRoute")).To(gomega.Equal(1))
 	})
 
+	ginkgo.It("re-evaluates a rejected NetworkRoute when a peer's status-only claim changes", func() {
+		fixture := newPrivateNetworkFixture("peer-status")
+		fixture.create()
+		vnet := fixture.createVirtualNetwork("prod")
+		fixture.waitVirtualNetworkReady(vnet)
+
+		// The peer never programs: the account's route selector rejects its
+		// labels, so it stays an earlier unprogrammed contender.
+		peer := fixture.networkRoute("peer", "10.96.0.0/12", vnet.Name)
+		peer.Labels = nil
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("RefNotPermitted"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		rejected := fixture.networkRoute("rejected", "10.96.0.0/16", vnet.Name)
+		gomega.Expect(testClient.Create(testContext, rejected)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(rejected), rejected)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(rejected.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("overlaps earlier unprogrammed NetworkRoute"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		// A status-only update records the peer's disjoint remote claim. The
+		// peer watch must deliver it, or the rejected route stays Invalid.
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			peer.Status.RouteID = "peer-route"
+			peer.Status.Network = "10.200.0.0/16"
+			peer.Status.VirtualNetworkID = vnet.Status.VirtualNetworkID
+			peer.Status.Applied = v1alpha1.NetworkRouteAppliedStatus{
+				Network:          "10.200.0.0/16",
+				VirtualNetworkID: vnet.Status.VirtualNetworkID,
+			}
+			g.Expect(testClient.Status().Update(testContext, peer)).To(gomega.Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(rejected), rejected)).To(gomega.Succeed())
+			g.Expect(rejected.Status.RouteID).NotTo(gomega.BeEmpty())
+			g.Expect(statusutil.ConditionTrue(rejected.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("re-evaluates a rejected HostnameRoute when a peer's status-only claim changes", func() {
+		fixture := newPrivateNetworkFixture("peer-status")
+		fixture.create()
+
+		// The peer never programs: the account's route selector rejects its
+		// labels, so it stays an earlier unprogrammed contender.
+		peer := fixture.hostnameRoute("peer", "app.private.internal")
+		peer.Labels = nil
+		gomega.Expect(testClient.Create(testContext, peer)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(peer.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("RefNotPermitted"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		rejected := fixture.hostnameRoute("rejected", "app.private.internal")
+		gomega.Expect(testClient.Create(testContext, rejected)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(rejected), rejected)).To(gomega.Succeed())
+			condition := statusutil.FindCondition(rejected.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
+			g.Expect(condition).NotTo(gomega.BeNil())
+			g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(condition.Message).To(gomega.ContainSubstring("overlaps earlier unprogrammed HostnameRoute"))
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		// A status-only update records the peer's disjoint remote claim. The
+		// peer watch must deliver it, or the rejected route stays Invalid.
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(peer), peer)).To(gomega.Succeed())
+			peer.Status.RouteID = "peer-route"
+			peer.Status.Hostname = "other.private.internal"
+			peer.Status.Applied = v1alpha1.HostnameRouteAppliedStatus{Hostname: "other.private.internal"}
+			g.Expect(testClient.Status().Update(testContext, peer)).To(gomega.Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(rejected), rejected)).To(gomega.Succeed())
+			g.Expect(rejected.Status.RouteID).NotTo(gomega.BeEmpty())
+			g.Expect(statusutil.ConditionTrue(rejected.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("keeps applied network and hostname claims when an older route update would overlap a live route", func() {
 		fixture := newPrivateNetworkFixture("update-overlap")
 		fixture.create()
