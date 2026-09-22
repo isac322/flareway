@@ -632,7 +632,8 @@ func (r *HostnameRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
 		Watches(&v1alpha1.WARPConnector{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForTunnel)).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutesForGateway)).
-		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutePeers), builder.WithPredicates(desiredStateChangedPredicate)).
+		// Peer status is an overlap-check input; filtering status-only updates would strand routes rejected as Invalid.
+		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.hostnameRoutePeers)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allHostnameRoutes)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
 	if r.SweepEvents != nil {

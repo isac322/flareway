@@ -632,6 +632,98 @@ func TestDeleteDNSRecordIfOwnedFailsClosed(t *testing.T) {
 	g.Expect(cf.Calls()).NotTo(gomega.ContainElement("DeleteDNSRecord"))
 }
 
+func TestDeleteDNSRecordIfOwnedAcceptsMarkerWithOperatorText(t *testing.T) {
+	g := gomega.NewWithT(t)
+	cf := newFakeTunnelCloudflareFactory()
+	marker := "flareway cluster/tenant/gateway"
+	expected := v1alpha1.CloudflareTunnelDNSRecordStatus{
+		Hostname: "app.example.test", RecordID: "record", ZoneID: "zone",
+	}
+	// spec.dns.recordComment appends operator text to the stored comment;
+	// callers pass only the bare marker from dnsOwnershipMarkers.
+	cf.PutDNS(expected.ZoneID, RemoteDNSRecord{
+		ID: expected.RecordID, Name: expected.Hostname, Type: "CNAME",
+		Content: "tunnel.cfargotunnel.com", Comment: marker + " owned by platform team",
+	})
+
+	deleted, conflict, err := deleteDNSRecordIfOwned(
+		context.Background(), cf, []string{marker}, []string{"tunnel.cfargotunnel.com"}, expected,
+	)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(conflict).To(gomega.BeEmpty())
+	g.Expect(deleted).To(gomega.BeTrue())
+	g.Expect(cf.HasDNSRecord(expected.ZoneID, expected.RecordID)).To(gomega.BeFalse())
+	g.Expect(cf.Calls()).To(gomega.ContainElement("DeleteDNSRecord"))
+}
+
+func TestDeleteDNSRecordIfOwnedRejectsLookalikeCommentsAndForeignTargets(t *testing.T) {
+	marker := "flareway cluster/tenant/gateway"
+	for _, test := range []struct {
+		name    string
+		comment string
+		content string
+	}{
+		// A prefix that is not the marker followed by the separator must not
+		// authorize deletion.
+		{name: "marker prefix without separator", comment: marker + "-other", content: "tunnel.cfargotunnel.com"},
+		// Marker plus operator text still requires the managed tunnel target.
+		{name: "foreign target", comment: marker + " owned by platform team", content: "foreign.example.test"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			cf := newFakeTunnelCloudflareFactory()
+			expected := v1alpha1.CloudflareTunnelDNSRecordStatus{
+				Hostname: "app.example.test", RecordID: "record", ZoneID: "zone",
+			}
+			cf.PutDNS(expected.ZoneID, RemoteDNSRecord{
+				ID: expected.RecordID, Name: expected.Hostname, Type: "CNAME",
+				Content: test.content, Comment: test.comment,
+			})
+
+			deleted, conflict, err := deleteDNSRecordIfOwned(
+				context.Background(), cf, []string{marker}, []string{"tunnel.cfargotunnel.com"}, expected,
+			)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(deleted).To(gomega.BeFalse())
+			g.Expect(conflict).NotTo(gomega.BeEmpty())
+			g.Expect(cf.HasDNSRecord(expected.ZoneID, expected.RecordID)).To(gomega.BeTrue())
+			g.Expect(cf.Calls()).NotTo(gomega.ContainElement("DeleteDNSRecord"))
+		})
+	}
+}
+
+func TestRemoveDNSRecordsDeletesRecordWithOperatorComment(t *testing.T) {
+	g := gomega.NewWithT(t)
+	cf := newFakeTunnelCloudflareFactory()
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "owned by platform team"},
+		},
+	}
+	markers := dnsOwnershipMarkers(tunnel, "cluster", "gateway")
+	stored := dnsOwnershipComment(tunnel, "cluster", "gateway")
+	g.Expect(stored).NotTo(gomega.Equal(markers[0]))
+
+	expected := v1alpha1.CloudflareTunnelDNSRecordStatus{
+		Hostname: "app.example.test", RecordID: "record", ZoneID: "zone",
+	}
+	cf.PutDNS(expected.ZoneID, RemoteDNSRecord{
+		ID: expected.RecordID, Name: expected.Hostname, Type: "CNAME",
+		Content: "tunnel.cfargotunnel.com", Comment: stored,
+	})
+
+	remaining, conflict, err := removeDNSRecords(
+		context.Background(), cf, markers, []string{"tunnel.cfargotunnel.com"},
+		[]v1alpha1.CloudflareTunnelDNSRecordStatus{expected},
+	)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(conflict).To(gomega.BeEmpty())
+	g.Expect(remaining).To(gomega.BeEmpty())
+	g.Expect(cf.HasDNSRecord(expected.ZoneID, expected.RecordID)).To(gomega.BeFalse())
+	g.Expect(cf.Calls()).To(gomega.ContainElement("DeleteDNSRecord"))
+}
+
 func TestTunnelGatewayBindingsRequireHostnameAndZone(t *testing.T) {
 	g := gomega.NewWithT(t)
 	tunnel := &v1alpha1.CloudflareTunnel{}

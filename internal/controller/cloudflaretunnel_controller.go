@@ -1925,7 +1925,7 @@ func deleteDNSRecordIfOwned(
 		}
 		matched := ""
 		for _, comment := range comments {
-			if comment != "" && current.Comment == comment {
+			if flarecloudflare.IsOwnedDNSRecord(current, comment) {
 				matched = comment
 				break
 			}

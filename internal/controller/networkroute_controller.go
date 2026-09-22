@@ -606,7 +606,8 @@ func (r *NetworkRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForTunnel)).
 		Watches(&v1alpha1.WARPConnector{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForTunnel)).
 		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutesForVirtualNetwork)).
-		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutePeers), builder.WithPredicates(desiredStateChangedPredicate)).
+		// Peer status is an overlap-check input; filtering status-only updates would strand routes rejected as Invalid.
+		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.networkRoutePeers)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allNetworkRoutes)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
 	if r.SweepEvents != nil {
