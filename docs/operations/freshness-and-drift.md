@@ -102,16 +102,15 @@ never treated as empty, so its records cannot be misreported as deleted.
 Authentication failures, rate limiting, and cancellation still abort the whole
 pass, as does any listing failure on the other kinds.
 
-Only the DNS zone-local failures above produce a partial pass: it is reported
-as `result="partial"` — never `ok`, even when every zone was denied — an
-aggregate diagnostic naming the failed zones and their causes is logged, and
-`flareway_sweep_last_success_timestamp` deliberately does **not** advance, so
-a degraded sweep is visible rather than silently reassuring. Terminal
-failures keep their own semantics instead: authentication failures, account
-rate limiting, client-side pacing failures, and a deadline exceeded surface
-as `result="error"`, context cancellation aborts the pass silently, and a
-listing failure on any other kind keeps its existing generic partial or error
-outcome.
+A DNS pass with isolated zone failures is reported as `result="partial"`,
+never `ok`, even when every zone was denied. It preserves findings from
+completed zones and logs an aggregate diagnostic naming the failed zones
+and their causes. `flareway_sweep_last_success_timestamp` does not advance.
+Per-zone authentication, rate-limiting, pacing, and deadline failures abort
+the pass with `result="error"`; context cancellation aborts silently.
+Account-wide zone discovery and other resource kinds retain their existing
+generic partial or error outcomes, without partial findings or a DNS zone
+aggregate.
 
 ## Rolling back
 
