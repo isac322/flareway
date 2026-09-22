@@ -1,7 +1,7 @@
 # Issue #92 상태 일관성 QA 체크리스트
 
 대상: [isac322/flareway#92](https://github.com/isac322/flareway/issues/92) — 수렴된 Gateway가 reconcile마다 `ConfigApplied=False`를 중간 게시하고 상태를 교란하는 결함.
-상태: **구현 진행 중 — 부분 실행 증거 기록됨**. 일부 항목은 envtest에서 실행되어 PASS/FAIL이 기록되었고 나머지는 `pending`이다. 이 문서는 제안된 QA와 실행된 증거를 구분해 기록하며, 전체 검증 완료를 의미하지 않는다.
+상태: **전체 항목 실행 완료 — 51/51 PASS**. 모든 항목이 envtest/매니저/리뷰/CI에서 검증되었다. 단, 실제 Cloudflare 계정에 대한 라이브 검증은 주장하지 않는다 — 모든 증거는 fake Cloudflare 클라이언트와 envtest 기반이며, 라이브 e2e는 별도 게이트다.
 
 ## 1. 실행된 증거 (결함 측)
 
@@ -25,7 +25,7 @@
 - **단정 교정**: QA-92-30b — 동일값 SSA 적용은 소유 이전이 아니라 공유 소유(co-ownership)를 생성함이 실행으로 확인되어 2단계 단정으로 교정; 교정된 claim-before-release 단정은 양 phase 모두 PASS.
 - **공유 conditions 트랜잭션 그룹 PASS** (envtest, 15/15, 95.722s): QA-92-16(지속+일시 CAS), 23, 24(helper + 실 차단 캐시, 매니저 경유), 26, 27, 29, 30a/b/c, 31, 32(Direct 실제 Reconcile + Gateway 거부), 33(ObserveOnly 실제 Reconcile + mutation 없음), 34(실제 drain/finalizer).
 - **전체 controller 스위트 PASS** (Ginkgo 269/269, 539.372s): `ownershipVerified` revocation 수정 후 실행. 이전에 별도 블로커였던 기존 stale credential identity 회귀도 함께 통과. `make test-unit`도 통과.
-- **미해결**: QA-92-44(기존 게이트 전체 CI + 커밋 후 verify-generated)만 `pending` — 전체 검증 완료가 아님.
+- **전체 CI PASS** (8/8 체크): SDK parity, Gateway HTTP conformance, Generation diff, Envoy, Container, Unit/envtest, Schema/build/Helm/Kustomize, Lint. 초기 CI는 Go 10분 집계 타임아웃으로 실패했으나 `test-envtest`에 `-timeout 30m` 적용 후 전부 통과. 커밋 후 `verify-generated`도 PASS.
 - **최종 리뷰 회귀 수정 PASS** (envtest): QA-92-26/29 확장 케이스 — Gateway 신규 UID/spec generation 체크포인트 재현이 수정 전 FAIL, fresh UID/generation/mode/provenance 가드 + RV-CAS 데이터 헬퍼 적용 후 2/2 PASS. volatile timestamp — 실제 T1 데이터 apply 후 nil 관측이 구 T1을 영속화해 FAIL, identity UID 패치에서 Active/Inactive 타임스탬프 제외 후 PASS.
 - **마이그레이션 확장 PASS** (envtest): QA-92-30b API 요청 수 양성 단정 통과. ownership=false 클리어는 revocation 수정으로 이미 PASS(269 전체 스위트에 포함).
 - **독립 최종 리뷰 완료**: 최종 atomicity 리뷰와 최종 Gateway 리뷰 모두 현재 수정을 승인, 발견 사항 없음.
@@ -163,7 +163,7 @@ QA 항목이 검증할 대상 계약:
 | ID | 전제 | 자극 | 관측 기대 | 티어 | 증거 |
 |---|---|---|---|---|---|
 | QA-92-43 | 동일 하네스·동일 정상 상태, 실제 매니저+실 타이머 | pre/post 수정 각각 기록된 창 형태(40.7521초)로 계측 | post-fix reconcile 수와 `workqueue_work_duration_seconds_sum`이 동일 조건 pre-fix 실측 대비 명확히 감소; 자기 유발 status `MODIFIED` 루프 0건. 라이브 수치는 참조값일 뿐 기대값으로 복사하지 않음 | envtest-manager + live-audit | PASS (쌍측정 완료: §1 수정 측 증거) |
-| QA-92-44 | 수정 적용 | 기존 unit/envtest 스위트 전체 + 결함 단정 진단 스펙 | 기존 게이트 전부 통과; 결함을 단정하던 진단 스펙은 실패로 전환되어 제거/반전 대상임을 확인 | envtest-component | pending |
+| QA-92-44 | 수정 적용 | 기존 unit/envtest 스위트 전체 + 결함 단정 진단 스펙 | 기존 게이트 전부 통과; 결함을 단정하던 진단 스펙은 실패로 전환되어 제거/반전 대상임을 확인 | envtest-component | PASS (CI 8/8 + verify-generated) |
 | QA-92-45 | QA 전 항목 확정 후 | 독립 리뷰어가 최종 diff를 재검토 | 관측 계약 단정 품질뿐 아니라 런타임 동작·라이프사이클·보안 불변조건·동시성·diff 범위 적절성을 포괄; 내부 구현 고정(소스 텍스트/배선/필드 복사 단정) 없음을 확인 | review | PASS (독립 최종 리뷰 2건 승인, 발견 사항 없음) |
 
 ## 5. 수용 기준 매핑
