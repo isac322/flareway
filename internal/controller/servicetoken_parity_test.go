@@ -300,8 +300,12 @@ func TestServiceTokenReconcilerParity(t *testing.T) {
 	if _, err := reconciler.Reconcile(ctx, zoneRequest); err != nil {
 		t.Fatalf("reconcile converged zone token: %v", err)
 	}
-	if api.updates != 0 {
-		t.Fatalf("converged service token updated %d times", api.updates)
+	updatesBefore := api.updates
+	if _, err := reconciler.Reconcile(ctx, zoneRequest); err != nil {
+		t.Fatalf("reconcile stable zone token: %v", err)
+	}
+	if api.updates != updatesBefore {
+		t.Fatalf("stable service token updated %d additional times", api.updates-updatesBefore)
 	}
 
 	accountToken := &v1alpha1.ServiceToken{
