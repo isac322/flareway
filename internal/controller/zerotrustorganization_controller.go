@@ -219,11 +219,11 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		}
 	}
 
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
 	clearGate(r.Invalidator, "ZeroTrustOrganization", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, observedDOH, nil, observedRevocation, metav1.ConditionTrue, "Ready", "Zero Trust organization is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil

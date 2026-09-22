@@ -186,17 +186,18 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishError(ctx, object, err)
 	}
 	clients = boundedWARPConnectorClients(clients)
-	if decision.DesiredHash != "" {
-		object.Status.AppliedHash = decision.DesiredHash
-		appliedAt := metav1.NewTime(r.now())
-		object.Status.AppliedAt = &appliedAt
-	}
 	clearGate(r.Invalidator, "WARPConnector", request.NamespacedName)
 	requeue := warpConnectorRequeue
 	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
 		requeue = convergedRequeue(r.Freshness, freshness.GradeIndirect, warpConnectorRequeue)
 	}
-	return ctrl.Result{RequeueAfter: requeue}, r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != "")
+	if err := r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != ""); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 func (r *WARPConnectorReconciler) clientForObject(ctx context.Context, object *flarewayv1alpha1.WARPConnector) (flarecloudflare.WARPConnectorAPI, *flarewayv1alpha1.CloudflareAccount, error) {

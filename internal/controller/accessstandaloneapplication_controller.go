@@ -155,11 +155,14 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if !flarecloudflare.AccessApplicationMatchesInput(remote, input) {
 		return ctrl.Result{RequeueAfter: accessStandaloneApplicationRequeue}, r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionFalse, "Updating", "Waiting for the updated standalone Access application to be observed", object.Status.AppliedHash, object.Status.AppliedAt)
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessStandaloneApplicationRequeue)}, r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized", decision.DesiredHash, &appliedAt)
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessStandaloneApplicationRequeue)}, nil
 }
 
 func accessStandaloneScope(account *v1alpha1.CloudflareAccount, zoneName string) (flarecloudflare.AccessScope, error) {

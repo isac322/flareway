@@ -168,11 +168,14 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if conflict != "" {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, false, metav1.ConditionFalse, "Conflict", conflict)
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "AccessGroup", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized")
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 func (r *AccessGroupReconciler) ensureManaged(ctx context.Context, api flarecloudflare.AccessGroupAPI, scope flarecloudflare.AccessScope, object *v1alpha1.AccessGroup, input flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, bool, string, error) {
 	id := object.Status.GroupID

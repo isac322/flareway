@@ -332,11 +332,14 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		_ = r.patchStatus(ctx, object, remote, nil, metav1.ConditionFalse, "Pending", err.Error())
 		return ctrl.Result{}, err
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "IdentityProvider", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized")
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
 func (r *IdentityProviderReconciler) clientSecret(ctx context.Context, object *v1alpha1.IdentityProvider) (string, error) {

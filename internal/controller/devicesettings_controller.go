@@ -115,13 +115,11 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return r.finishRemoteError(ctx, object, err)
 		}
 	}
-	if decision.DesiredHash != "" {
-		object.Status.AppliedHash = decision.DesiredHash
-		appliedAt := metav1.NewTime(r.now())
-		object.Status.AppliedAt = &appliedAt
-	}
 	clearGate(r.Invalidator, "DeviceSettings", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, nil, metav1.ConditionTrue, "Ready", "Device settings are synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil

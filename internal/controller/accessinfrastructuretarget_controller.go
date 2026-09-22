@@ -138,11 +138,14 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 		}
 		return r.finishRemoteError(ctx, object, err)
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized", decision.DesiredHash, &appliedAt)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
 func (r *AccessInfrastructureTargetReconciler) ensureManaged(ctx context.Context, api flarecloudflare.AccessInfrastructureTargetAPI, object *v1alpha1.AccessInfrastructureTarget, input flarecloudflare.AccessInfrastructureTargetInput) (flarecloudflare.AccessInfrastructureTarget, error) {

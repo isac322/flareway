@@ -285,15 +285,18 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			}
 		}
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
 	clearGate(r.Invalidator, "ServiceToken", request.NamespacedName)
 	requeue := r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)
 	if ttl := r.Freshness.TTL(freshness.GradeAuthz); ttl > 0 && ttl < requeue {
 		requeue = ttl
 	}
-	return ctrl.Result{RequeueAfter: requeue}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is synchronized", update)
+	if err := r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is synchronized", update); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 type serviceTokenStatusUpdate struct {

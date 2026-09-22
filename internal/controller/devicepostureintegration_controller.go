@@ -180,11 +180,14 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		}
 	}
 	r.rememberCredentialsRevision(object, revision)
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "DevicePostureIntegration", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized")
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
 type devicePostureIntegrationCredentials struct {

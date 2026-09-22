@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/observability"
@@ -198,4 +200,114 @@ func convergedRequeue(policy freshness.Policy, grade freshness.Grade, fallback t
 		return ttl
 	}
 	return fallback
+}
+
+// gateStamp is the converged gate record a reconciler persists so the next
+// pass can skip its remote reads.
+type gateStamp struct {
+	Hash string
+	At   metav1.Time
+}
+
+// newGateStamp builds the stamp for a pass that just converged.
+func newGateStamp(hash string, at time.Time) gateStamp {
+	return gateStamp{Hash: hash, At: metav1.NewTime(at)}
+}
+
+// persistGateStamp writes the converged gate stamp as its own status patch.
+//
+// It exists because most status patch helpers capture their merge base from
+// the live object (client.MergeFrom(object.DeepCopy())). A caller that assigns
+// the stamp before calling one of those helpers puts the new values into both
+// the base and the target, so the merge patch carries no change and the stamp
+// is silently dropped. The gate then never opens, the object reads the remote
+// on every pass, and nothing anywhere reports a problem — the build, the
+// linter, and the whole test suite stay green while the saving is zero.
+//
+// Re-reading the stored object and diffing against it makes the write
+// independent of how each controller's own helper builds its base, so the
+// mechanism is identical for every kind instead of correct for some.
+//
+// The extra patch lands only on a pass that actually converged, which is
+// exactly the pass that stops happening once the gate starts opening.
+func persistGateStamp(
+	ctx context.Context,
+	writer kubeclient.Client,
+	object kubeclient.Object,
+	stamp gateStamp,
+) error {
+	if writer == nil || object == nil || stamp.Hash == "" {
+		return nil
+	}
+	current, ok := object.DeepCopyObject().(kubeclient.Object)
+	if !ok {
+		return nil
+	}
+	if err := writer.Get(ctx, kubeclient.ObjectKeyFromObject(object), current); err != nil {
+		// A deleted object has nothing to stamp; anything else is reported so
+		// the caller does not treat an unstamped pass as converged.
+		return kubeclient.IgnoreNotFound(err)
+	}
+	before, ok := current.DeepCopyObject().(kubeclient.Object)
+	if !ok {
+		return nil
+	}
+	if !applyGateStamp(current, stamp) {
+		return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", current)
+	}
+	if err := writer.Status().Patch(ctx, current, kubeclient.MergeFrom(before)); err != nil {
+		return fmt.Errorf("persist freshness gate stamp: %w", err)
+	}
+	return nil
+}
+
+// applyGateStamp writes the stamp onto a gated object and reports whether the
+// kind is one this operator gates. A gated controller whose kind is missing
+// here would otherwise persist nothing and lose its saving silently, so the
+// false result is turned into an error by the caller rather than ignored.
+func applyGateStamp(object kubeclient.Object, stamp gateStamp) bool {
+	at := stamp.At
+	switch typed := object.(type) {
+	case *v1alpha1.VirtualNetwork:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.NetworkRoute:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.HostnameRoute:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.IdentityProvider:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessGroup:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessPolicy:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessCustomPage:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessInfrastructureTarget:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessStandaloneApplication:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.AccessApplication:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.DeviceSettings:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.DeviceProfile:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.DevicePostureRule:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.DevicePostureIntegration:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.ServiceToken:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.WARPConnector:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.ZeroTrustList:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.ZeroTrustGatewayPolicy:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	case *v1alpha1.ZeroTrustOrganization:
+		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+	default:
+		return false
+	}
+	return true
 }

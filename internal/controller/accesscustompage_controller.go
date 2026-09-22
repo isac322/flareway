@@ -139,11 +139,14 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 		warnings = remote.Warnings
 		r.recordWarnings(object, warnings)
 	}
-	object.Status.AppliedHash = decision.DesiredHash
-	appliedAt := metav1.NewTime(r.now())
-	object.Status.AppliedAt = &appliedAt
+	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved, object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
 	clearGate(r.Invalidator, "AccessCustomPage", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved, decision.DesiredHash, &appliedAt)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
 func (r *AccessCustomPageReconciler) reconcileManaged(ctx context.Context, api flarecloudflare.AccessCustomPageAPI, object *v1alpha1.AccessCustomPage, input flarecloudflare.AccessCustomPageInput) (flarecloudflare.AccessCustomPage, bool, error) {
