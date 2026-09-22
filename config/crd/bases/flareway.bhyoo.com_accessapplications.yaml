@@ -1476,6 +1476,15 @@ spec:
                 x-kubernetes-list-type: atomic
               applicationId:
                 type: string
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               bypassApplications:
                 items:
                   description: AccessBypassApplicationStatus records an operator-owned

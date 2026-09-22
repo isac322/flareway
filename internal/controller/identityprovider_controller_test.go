@@ -44,6 +44,7 @@ type identityProviderFakeAPI struct {
 	getErr    error
 	deleteErr error
 	deletes   int
+	gets      int
 	providers map[string]flarecloudflare.IdentityProvider
 }
 
@@ -68,6 +69,7 @@ func (f *identityProviderFakeAPI) UpdateIdentityProvider(_ context.Context, id s
 }
 
 func (f *identityProviderFakeAPI) GetIdentityProvider(_ context.Context, id string) (flarecloudflare.IdentityProvider, error) {
+	f.gets++
 	if f.getErr != nil {
 		return flarecloudflare.IdentityProvider{}, f.getErr
 	}

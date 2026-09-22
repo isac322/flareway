@@ -29,13 +29,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // ZeroTrustGatewayPolicyReconciler owns one l4 or dns Gateway rule.
@@ -45,6 +49,9 @@ type ZeroTrustGatewayPolicyReconciler struct {
 	APIReader           client.Reader
 	NewCloudflareClient NewGatewayCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=zerotrustgatewaypolicies;zerotrustlists;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -106,14 +113,31 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 		return r.finishError(ctx, object, err)
 	}
 	input := gatewayRuleInput(resolved, ownerDescription)
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeTraffic, gateInput{
+		Kind: "ZeroTrustGatewayPolicy", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.RuleID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	remote, err := r.ensureManaged(ctx, api, object, input, ownerDescription)
 	if err != nil {
 		return r.finishRemoteOrValidationError(ctx, object, err)
 	}
+	clearGate(r.Invalidator, "ZeroTrustGatewayPolicy", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, "Ready", "Zero Trust Gateway policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: globalRequeue}, nil
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeTraffic, globalRequeue)}, nil
 }
 
 func resolveGatewayPolicyDesired(ctx context.Context, kube client.Client, object *v1alpha1.ZeroTrustGatewayPolicy) (v1alpha1.ZeroTrustGatewayPolicyDesiredState, error) {
@@ -598,7 +622,16 @@ func (r *ZeroTrustGatewayPolicyReconciler) SetupWithManager(manager ctrl.Manager
 	}); err != nil {
 		return fmt.Errorf("index ZeroTrustGatewayPolicy listRefs: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.ZeroTrustGatewayPolicy{}).Watches(&v1alpha1.ZeroTrustGatewayPolicy{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forList)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).Complete(observedReconciler("zero-trust-gateway-policy", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.ZeroTrustGatewayPolicy{}, builder.WithPredicates(desiredStateChangedPredicate)).
+		Watches(&v1alpha1.ZeroTrustGatewayPolicy{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).
+		Watches(&v1alpha1.ZeroTrustList{}, handler.EnqueueRequestsFromMapFunc(r.forList)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("zero-trust-gateway-policy", r))
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

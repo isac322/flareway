@@ -288,6 +288,15 @@ spec:
             description: ZeroTrustOrganizationStatus records bounded, non-secret observed
               state.
             properties:
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               authDomain:
                 type: string
               conditions:

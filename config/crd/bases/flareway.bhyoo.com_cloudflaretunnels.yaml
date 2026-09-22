@@ -1008,6 +1008,53 @@ spec:
                 maxItems: 16
                 type: array
                 x-kubernetes-list-type: atomic
+              audRevocationSequence:
+                description: |-
+                  AUDRevocationSequence is the monotonic sequence counter used to allocate
+                  revocation latch tokens.
+                format: int64
+                minimum: 0
+                type: integer
+              audRevocations:
+                description: |-
+                  AUDRevocations persists in-flight Access AUD revocation latches. Entries
+                  are removed only by the Gateway reconciler's release/prune pass; there is
+                  deliberately no item cap because dropping a latch would re-admit a
+                  revoked AUD (G3).
+                items:
+                  description: |-
+                    CloudflareAUDRevocationLatch records an in-flight Access AUD revocation for
+                    one AccessApplication bound to this Tunnel's Gateway.
+                  properties:
+                    application:
+                      description: Application names the AccessApplication as "namespace/name".
+                      minLength: 1
+                      type: string
+                    applicationUid:
+                      description: ApplicationUID binds the latch to the exact AccessApplication
+                        instance.
+                      type: string
+                    latchedAt:
+                      description: LatchedAt records when this revocation was latched.
+                      format: date-time
+                      type: string
+                    token:
+                      description: |-
+                        Token is the monotonically increasing generation token at which the
+                        revocation was latched.
+                      format: int64
+                      minimum: 1
+                      type: integer
+                  required:
+                  - application
+                  - applicationUid
+                  - latchedAt
+                  - token
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - application
+                x-kubernetes-list-type: map
               clients:
                 items:
                   description: CloudflareTunnelClientStatus records one bounded cloudflared
@@ -1143,6 +1190,11 @@ spec:
                   applied:
                     format: int64
                     type: integer
+                  appliedAt:
+                    description: AppliedAt is when the desired configuration was last
+                      applied remotely; nil means never applied.
+                    format: date-time
+                    type: string
                   createdAt:
                     format: date-time
                     type: string

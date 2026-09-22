@@ -30,14 +30,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	flarewayv1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -73,6 +77,9 @@ type WARPConnectorReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewWARPConnectorCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=warpconnectors;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -116,6 +123,19 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 	}
 	if prepared {
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+	}
+	var decision gateDecision
+	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
+		clusterID := gateClusterID(ctx, r.Client)
+		decision = evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+			Kind: "WARPConnector", Namespace: object.Namespace, Name: object.Name,
+			UID: object.UID, RemoteID: object.Status.TunnelID,
+			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Spec: object.Spec,
+		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+		if decision.Open {
+			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+		}
 	}
 	remote, owned, err := r.ensureRemote(ctx, api, account, object)
 	if err != nil {
@@ -166,7 +186,18 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishError(ctx, object, err)
 	}
 	clients = boundedWARPConnectorClients(clients)
-	return ctrl.Result{RequeueAfter: warpConnectorRequeue}, r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != "")
+	clearGate(r.Invalidator, "WARPConnector", request.NamespacedName)
+	requeue := warpConnectorRequeue
+	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
+		requeue = convergedRequeue(r.Freshness, freshness.GradeIndirect, warpConnectorRequeue)
+	}
+	if err := r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != ""); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 func (r *WARPConnectorReconciler) clientForObject(ctx context.Context, object *flarewayv1alpha1.WARPConnector) (flarecloudflare.WARPConnectorAPI, *flarewayv1alpha1.CloudflareAccount, error) {
@@ -919,15 +950,18 @@ func (r *WARPConnectorReconciler) SetupWithManager(manager ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index WARPConnector accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&flarewayv1alpha1.WARPConnector{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&flarewayv1alpha1.WARPConnector{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Owns(&corev1.Secret{}).
 		Watches(&flarewayv1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorsForAccount)).
 		Watches(&flarewayv1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorForNetworkRoute)).
 		Watches(&flarewayv1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorForHostnameRoute)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.warpConnectorsForNamespace)).
-		Named("warpconnector").
-		Complete(observedReconciler("warp-connector", r))
+		Named("warpconnector")
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("warp-connector", r))
 }
 
 func warpConnectorForTunnelReference(sourceNamespace string, reference flarewayv1alpha1.TunnelReference) []reconcile.Request {

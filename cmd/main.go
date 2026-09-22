@@ -33,6 +33,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -45,7 +46,9 @@ import (
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/controller"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/observability"
+	"github.com/isac322/flareway/internal/sweep"
 	"github.com/isac322/flareway/internal/xds/pki"
 	xdsserver "github.com/isac322/flareway/internal/xds/server"
 	// +kubebuilder:scaffold:imports
@@ -96,6 +99,9 @@ func main() {
 	var enablePrivateNetworkControllers bool
 	var enableDeviceControllers bool
 	var enableOrganizationControllers bool
+	var driftPolicyFlag string
+	var freshnessAuthz, freshnessTraffic, freshnessIndirect, freshnessDisplay time.Duration
+	var disableSweep bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -113,6 +119,18 @@ func main() {
 		"Enable DeviceProfile and DeviceSettings controllers.")
 	flag.BoolVar(&enableOrganizationControllers, "enable-organization-controllers", true,
 		"Enable ZeroTrustOrganization, ZeroTrustGatewayPolicy, and ZeroTrustList controllers.")
+	flag.StringVar(&driftPolicyFlag, "drift-policy", string(controller.DriftPolicyOverwrite),
+		"How reconcilers react to out-of-band drift on remote Cloudflare resources: Overwrite restores the desired state, Hold skips remote writes until manual intervention.")
+	flag.DurationVar(&freshnessAuthz, "freshness-authz", 60*time.Second,
+		"Freshness TTL for T1 (Authz) resources: IdentityProvider, ServiceToken, AccessGroup. A converged object skips remote reads until this TTL expires or drift invalidates it.")
+	flag.DurationVar(&freshnessTraffic, "freshness-traffic", 300*time.Second,
+		"Freshness TTL for T2 (Traffic) resources: VirtualNetwork, NetworkRoute, HostnameRoute, ZeroTrustGatewayPolicy, ZeroTrustList.")
+	flag.DurationVar(&freshnessIndirect, "freshness-indirect", 1800*time.Second,
+		"Freshness TTL for T3 (Indirect) resources: DeviceProfile, DeviceSettings, DevicePostureRule, DevicePostureIntegration, ZeroTrustOrganization, WARPConnector.")
+	flag.DurationVar(&freshnessDisplay, "freshness-display", 0,
+		"Freshness TTL for T4 (Display) resources. 0 disables periodic display reads.")
+	flag.BoolVar(&disableSweep, "disable-sweep", false,
+		"Disable the periodic drift sweep worker. Out-of-band drift is then detected only by freshness TTL expiry; use this to roll back the sweep if it misbehaves.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -133,6 +151,25 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	driftPolicy, err := controller.ParseDriftPolicy(driftPolicyFlag)
+	if err != nil {
+		setupLog.Error(err, "Invalid --drift-policy")
+		os.Exit(1)
+	}
+	freshnessPolicy := freshness.Policy{
+		Authz:    freshnessAuthz,
+		Traffic:  freshnessTraffic,
+		Indirect: freshnessIndirect,
+		Display:  freshnessDisplay,
+	}
+	if err := freshnessPolicy.Validate(); err != nil {
+		setupLog.Error(err, "Invalid --freshness-* flags")
+		os.Exit(1)
+	}
+
+	gateLatch := freshness.NewLatch()
+	var sweepEvents <-chan event.GenericEvent
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -218,6 +255,23 @@ func main() {
 	cloudflareFactory := flarecloudflare.NewFactory(ctrl.Log.WithName("cloudflare"))
 	observedClient := observability.NewEventingClient(mgr.GetClient(), mgr.GetAPIReader(), eventRecorderAdapter{recorder: mgr.GetEventRecorder("flareway")})
 	if enableGatewayControllers || enableAccessControllers || enablePrivateNetworkControllers || enableDeviceControllers || enableOrganizationControllers {
+		if !disableSweep {
+			sweeper := sweep.NewSweeper(sweep.SweeperOptions{
+				Client:            mgr.GetClient(),
+				APIReader:         mgr.GetAPIReader(),
+				Scheme:            mgr.GetScheme(),
+				CloudflareFactory: cloudflareFactory,
+				Invalidator:       gateLatch,
+				Policy:            freshnessPolicy,
+				Logger:            ctrl.Log.WithName("sweep"),
+				OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			})
+			if err := mgr.Add(sweeper); err != nil {
+				setupLog.Error(err, "Failed to register drift sweeper")
+				os.Exit(1)
+			}
+			sweepEvents = sweeper.Events()
+		}
 		if err := (&controller.CloudflareAccountReconciler{
 			Client:     observedClient,
 			Scheme:     mgr.GetScheme(),
@@ -272,6 +326,10 @@ func main() {
 			OperatorNamespace: dataplane.DefaultOperatorNamespace,
 			CloudflareFactory: cloudflareFactory,
 			Prober:            dataplane.NewHTTPProber(5 * time.Second),
+			DriftPolicy:       driftPolicy,
+			Freshness:         freshnessPolicy,
+			Invalidator:       gateLatch,
+			SweepEvents:       sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up Gateway controller")
 			os.Exit(1)
@@ -281,6 +339,9 @@ func main() {
 			APIReader:           mgr.GetAPIReader(),
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.TunnelClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up CloudflareTunnel controller")
 			os.Exit(1)
@@ -291,6 +352,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up VirtualNetwork controller")
 			os.Exit(1)
@@ -299,6 +363,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up NetworkRoute controller")
 			os.Exit(1)
@@ -308,6 +375,9 @@ func main() {
 			Scheme:              mgr.GetScheme(),
 			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
 			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up HostnameRoute controller")
 			os.Exit(1)
@@ -316,6 +386,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.WARPConnectorClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up WARPConnector controller")
 			os.Exit(1)
@@ -325,7 +398,12 @@ func main() {
 		if err := (&controller.AccessPolicyReconciler{
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
+			Recorder:            mgr.GetEventRecorder("access-policy"),
+			DriftPolicy:         driftPolicy,
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessPolicy controller")
 			os.Exit(1)
@@ -334,6 +412,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessGroup controller")
 			os.Exit(1)
@@ -342,6 +423,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up IdentityProvider controller")
 			os.Exit(1)
@@ -350,6 +434,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up DevicePostureRule controller")
 			os.Exit(1)
@@ -358,6 +445,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up ServiceToken controller")
 			os.Exit(1)
@@ -368,6 +458,9 @@ func main() {
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessApplicationClientFromFactory(cloudflareFactory),
 			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessApplication controller")
 			os.Exit(1)
@@ -376,6 +469,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessStandaloneApplication controller")
 			os.Exit(1)
@@ -384,6 +480,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessInfrastructureTarget controller")
 			os.Exit(1)
@@ -393,6 +492,9 @@ func main() {
 			Scheme:              mgr.GetScheme(),
 			Recorder:            mgr.GetEventRecorder("access-custom-page"),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up AccessCustomPage controller")
 			os.Exit(1)
@@ -401,6 +503,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up DevicePostureIntegration controller")
 			os.Exit(1)
@@ -411,6 +516,9 @@ func main() {
 			Client:              observedClient,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.DeviceProfileClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up DeviceProfile controller")
 			os.Exit(1)
@@ -420,6 +528,9 @@ func main() {
 			APIReader:           mgr.GetAPIReader(),
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.DeviceClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up DeviceSettings controller")
 			os.Exit(1)
@@ -431,6 +542,9 @@ func main() {
 			APIReader:           mgr.GetAPIReader(),
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.OrganizationClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up ZeroTrustOrganization controller")
 			os.Exit(1)
@@ -440,6 +554,9 @@ func main() {
 			APIReader:           mgr.GetAPIReader(),
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.GatewayClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up ZeroTrustList controller")
 			os.Exit(1)
@@ -449,6 +566,9 @@ func main() {
 			APIReader:           mgr.GetAPIReader(),
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: controller.GatewayClientFromFactory(cloudflareFactory),
+			Freshness:           freshnessPolicy,
+			Invalidator:         gateLatch,
+			SweepEvents:         sweepEvents,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up ZeroTrustGatewayPolicy controller")
 			os.Exit(1)

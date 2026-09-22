@@ -567,6 +567,16 @@ func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testi
 		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "apps", UID: "application-uid"},
 		Status:     v1alpha1.AccessApplicationStatus{ApplicationID: "application-id"},
 	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps"},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 1},
+			Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+				Hostname: "app.example.com", ProtectionDomain: "access-domain", AccessApplication: "apps/access",
+				Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
+			}},
+		},
+	}
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -577,9 +587,20 @@ func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testi
 	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add Flareway scheme: %v", err)
 	}
-	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(gateway, &application).Build()
+	kube := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.CloudflareTunnel{}).
+		WithObjects(gateway, &application, tunnel).
+		Build()
 	reconciler := &GatewayReconciler{
-		Client: kube, OperatorNamespace: dataplane.DefaultOperatorNamespace, audRevocations: &audRevocationState{},
+		Client: kube, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+	}
+	currentTunnel := func() *v1alpha1.CloudflareTunnel {
+		var current v1alpha1.CloudflareTunnel
+		if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &current); err != nil {
+			t.Fatalf("get CloudflareTunnel: %v", err)
+		}
+		return &current
 	}
 	secret := boundAUDSecret(
 		accessAUDSecretName(&application, client.ObjectKeyFromObject(gateway)),
@@ -593,37 +614,44 @@ func TestAUDRevocationLatchBlocksRestoredSecretUntilFreshBlockedVersion(t *testi
 			Namespace: "apps", Name: "access",
 		}: {AUD: "restored-aud", ApplicationID: "application-id", Ready: true}},
 	}
-	tunnel := &v1alpha1.CloudflareTunnel{Status: v1alpha1.CloudflareTunnelStatus{
-		ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 1},
-		Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
-			Hostname: "app.example.com", ProtectionDomain: "access-domain", AccessApplication: "apps/access",
-			Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
-		}},
-	}}
 
 	forged := secret.DeepCopy()
 	forged.Namespace = gateway.Namespace
-	reconciler.latchAUDRevocation(context.Background(), forged)
-	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
+	if err := reconciler.latchAUDRevocation(context.Background(), forged); err != nil {
+		t.Fatalf("latch forged AUD revocation: %v", err)
+	}
+	if err := reconciler.applyAUDRevocationLatches(context.Background(), gateway, currentTunnel(), &inputs); err != nil {
+		t.Fatalf("apply AUD revocation latches: %v", err)
+	}
 	if !inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
 		t.Fatal("tenant-forged AUD handoff altered Gateway readiness")
 	}
 
-	reconciler.latchAUDRevocation(context.Background(), &secret)
-	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
+	if err := reconciler.latchAUDRevocation(context.Background(), &secret); err != nil {
+		t.Fatalf("latch AUD revocation: %v", err)
+	}
+	if err := reconciler.applyAUDRevocationLatches(context.Background(), gateway, currentTunnel(), &inputs); err != nil {
+		t.Fatalf("apply AUD revocation latches: %v", err)
+	}
 	if inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
 		t.Fatal("restored AUD escaped the revocation latch before Blocked was applied")
 	}
 
-	tunnel.Status.ConfigVersion.Applied = 2
-	tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
-	tunnel.Status.Hostnames[0].AppliedVersion = 2
+	converged := currentTunnel()
+	converged.Status.ConfigVersion.Applied = 2
+	converged.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+	converged.Status.Hostnames[0].AppliedVersion = 2
 	inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}] = gatewayapi.AUDSecret{
 		AUD: "restored-aud", ApplicationID: "application-id", Ready: true,
 	}
-	reconciler.applyAUDRevocationLatches(gateway, tunnel, &inputs, reconciler.revocationState().ceiling())
+	if err := reconciler.applyAUDRevocationLatches(context.Background(), gateway, converged, &inputs); err != nil {
+		t.Fatalf("apply AUD revocation latches: %v", err)
+	}
 	if !inputs.AUDSecrets[types.NamespacedName{Namespace: "apps", Name: "access"}].Ready {
 		t.Fatal("fresh Blocked handshake did not release restored AUD")
+	}
+	if latched := currentTunnel().Status.AUDRevocations; len(latched) != 0 {
+		t.Fatalf("released AUD revocation latch persisted: %#v", latched)
 	}
 }
 

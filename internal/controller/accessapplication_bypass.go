@@ -89,7 +89,11 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	}
 
 	parentName := accessApplicationRemoteName(application)
-	ownedRemote, err := listOwnedBypassApplications(ctx, remote, scope, ownerTag, parentName)
+	// D13: writes carry exactly one owner marker and one bypass marker — the
+	// signed owner tag when the cluster ownership key is available, the legacy
+	// plaintext tag otherwise. Reads still accept every generation of marker.
+	signingKey, ownerTags, writeOwnerTag := r.accessOwnerTags(ctx, application, ownerTag)
+	ownedRemote, err := listOwnedBypassApplications(ctx, remote, scope, ownerTags, signingKey)
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +127,13 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			}
 			deletionPolicy = effectiveBypassDeletionPolicy(declared.DeletionPolicy)
 		}
-		tagName := accessBypassTag(ownerTag, childName)
-		desiredTags[tagName] = struct{}{}
+		// Reads accept every marker generation; the write carries only the
+		// digest derived from the owner tag this reconcile writes.
+		bypassMarkers := accessBypassMarkersForOwners(signingKey, ownerTags, childName)
+		tagName := accessBypassTag(writeOwnerTag, childName)
+		for _, marker := range bypassMarkers {
+			desiredTags[marker] = struct{}{}
+		}
 		policyID := defaultPolicyID
 		if declaredFound && declared.PolicyRef != nil {
 			policyID, err = r.resolveBypassPolicyReference(ctx, application, application.Spec.AccountRef.Name, remote, *declared.PolicyRef)
@@ -133,7 +142,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			}
 		}
 		uri := strings.TrimSuffix(strings.ToLower(bypass.Hostname), "/") + bypass.Path
-		tags := []string{accessManagedTag, ownerTag, tagName}
+		tags := []string{accessManagedTag, tagName, writeOwnerTag}
 		slices.Sort(tags)
 		input := flarecloudflare.AccessApplicationInput{
 			Type:                   flarecloudflare.AccessApplicationTypeSelfHosted,
@@ -164,12 +173,12 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			if previous.ApplicationID == declared.ExternalRef.ApplicationID &&
 				previous.Origin == v1alpha1.AccessBypassApplicationOriginAdopted &&
 				previous.Name != "" {
-				ownedTag := accessBypassTag(ownerTag, previous.Name)
-				if !ownedBypassApplication(child, ownerTag, ownedTag, previous.Name) {
+				previousMarkers := accessBypassMarkersForOwners(signingKey, ownerTags, previous.Name)
+				if !ownedBypassApplication(child, ownerTags, previousMarkers, previous.Name) {
 					return nil, fmt.Errorf("ownership conflict: adopted bypass Access application %q is not owned by this resource", previous.ApplicationID)
 				}
 				managedRecovery = true
-			} else if previous.ApplicationID == "" && ownedBypassApplication(child, ownerTag, tagName, childName) {
+			} else if previous.ApplicationID == "" && ownedBypassApplication(child, ownerTags, bypassMarkers, childName) {
 				managedRecovery = true
 			}
 			if !managedRecovery {
@@ -184,7 +193,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			if previous.ApplicationID != "" {
 				child, err = remote.GetAccessApplication(ctx, scope, previous.ApplicationID)
 				if err == nil {
-					if !ownedBypassApplication(child, ownerTag, tagName, childName) {
+					if !ownedBypassApplication(child, ownerTags, bypassMarkers, childName) {
 						return nil, fmt.Errorf("ownership conflict: bypass Access application %q is not owned by this resource", previous.ApplicationID)
 					}
 					origin = previous.Origin
@@ -198,13 +207,18 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			}
 		}
 		if !selected {
-			if recovered, found := ownedRemote[tagName]; found {
+			for _, marker := range bypassMarkers {
+				recovered, found := ownedRemote[marker]
+				if !found {
+					continue
+				}
 				if recovered.Name != childName {
-					return nil, fmt.Errorf("ownership conflict: bypass tag %q belongs to Access application name %q, want %q", tagName, recovered.Name, childName)
+					return nil, fmt.Errorf("ownership conflict: bypass tag %q belongs to Access application name %q, want %q", marker, recovered.Name, childName)
 				}
 				child = recovered
 				origin = v1alpha1.AccessBypassApplicationOriginRecovered
 				selected = true
+				break
 			}
 		}
 		if selected {
@@ -225,7 +239,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 				origin = v1alpha1.AccessBypassApplicationOriginCreated
 			} else {
 				createErr := err
-				recovered, found, recoveryErr := findOwnedBypassApplication(ctx, remote, scope, ownerTag, tagName, childName)
+				recovered, found, recoveryErr := findOwnedBypassApplication(ctx, remote, scope, ownerTags, bypassMarkers, childName)
 				switch {
 				case recoveryErr != nil:
 					err = errors.Join(createErr, recoveryErr)
@@ -287,13 +301,13 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		if childName == "" && status.Hostname != "" {
 			childName = bypassChildApplicationName(parentName, status.Hostname, status.Path)
 		}
-		tagName := accessBypassTag(ownerTag, childName)
-		if !ownedBypassApplication(child, ownerTag, tagName, childName) {
+		pruneMarkers := accessBypassMarkersForOwners(signingKey, ownerTags, childName)
+		if !ownedBypassApplication(child, ownerTags, pruneMarkers, childName) {
 			continue
 		}
 		if effectiveBypassDeletionPolicy(status.DeletionPolicy) == v1alpha1.DeletionPolicyOrphan {
 			input := accessApplicationInputFromObserved(child)
-			input.Tags = removeAccessTags(input.Tags, accessManagedTag, ownerTag, tagName)
+			input.Tags = removeAccessTags(input.Tags, append(append([]string{accessManagedTag}, ownerTags...), pruneMarkers...)...)
 			if !accessApplicationMatchesInput(child, input) {
 				if _, err := remote.UpdateAccessApplication(ctx, scope, child.ID, input); err != nil {
 					return nil, fmt.Errorf("orphan bypass Access application %s: %w", id, err)
@@ -302,7 +316,9 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		} else if err := remote.DeleteAccessApplication(ctx, scope, id); err != nil && !isRemoteNotFound(err) {
 			return nil, fmt.Errorf("delete obsolete bypass Access application %s: %w", id, err)
 		}
-		deleteTags[tagName] = struct{}{}
+		for _, marker := range pruneMarkers {
+			deleteTags[marker] = struct{}{}
+		}
 	}
 	for _, tagName := range sortedStringKeys(deleteTags) {
 		if err := remote.DeleteAccessTag(ctx, tagName); err != nil && !isRemoteNotFound(err) {
@@ -313,14 +329,14 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	return result, nil
 }
 
-func listOwnedBypassApplications(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTag, parentName string) (map[string]flarecloudflare.AccessApplication, error) {
+func listOwnedBypassApplications(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTags []string, key []byte) (map[string]flarecloudflare.AccessApplication, error) {
 	applications, err := remote.ListAccessApplications(ctx, scope)
 	if err != nil {
 		return nil, fmt.Errorf("list bypass Access applications for ownership recovery: %w", err)
 	}
 	result := make(map[string]flarecloudflare.AccessApplication)
 	for _, application := range applications {
-		tagName, owned := ownedBypassApplicationTag(application, ownerTag, parentName)
+		tagName, owned := ownedBypassApplicationTag(application, ownerTags, key)
 		if !owned {
 			continue
 		}
@@ -332,18 +348,18 @@ func listOwnedBypassApplications(ctx context.Context, remote AccessApplicationCl
 	return result, nil
 }
 
-func findOwnedBypassApplication(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTag, bypassTag, expectedName string) (flarecloudflare.AccessApplication, bool, error) {
+func findOwnedBypassApplication(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTags, bypassTags []string, expectedName string) (flarecloudflare.AccessApplication, bool, error) {
 	applications, err := remote.ListAccessApplications(ctx, scope)
 	if err != nil {
 		return flarecloudflare.AccessApplication{}, false, fmt.Errorf("list bypass Access applications for ownership recovery: %w", err)
 	}
 	var found flarecloudflare.AccessApplication
 	for _, application := range applications {
-		if !ownedBypassApplication(application, ownerTag, bypassTag, expectedName) {
+		if !ownedBypassApplication(application, ownerTags, bypassTags, expectedName) {
 			continue
 		}
 		if found.ID != "" && found.ID != application.ID {
-			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry bypass tag %q and name %q", bypassTag, expectedName)
+			return flarecloudflare.AccessApplication{}, false, fmt.Errorf("multiple Access applications carry bypass tags %v and name %q", bypassTags, expectedName)
 		}
 		found = application
 	}
@@ -484,16 +500,15 @@ func (r *AccessApplicationReconciler) resolveBypassPolicyReference(
 		if observed.Decision != string(v1alpha1.AccessPolicyDecisionBypass) {
 			return "", accessValidationError{reason: "Invalid", message: fmt.Sprintf("the AccessPolicy %s/%s remote decision is %q, want Bypass", namespace, policy.Name, observed.Decision)}
 		}
-		policyID = observed.ID
 	}
 	return policyID, nil
 }
 
-func ownedBypassApplication(application flarecloudflare.AccessApplication, ownerTag, bypassTag, expectedName string) bool {
+func ownedBypassApplication(application flarecloudflare.AccessApplication, ownerTags, bypassTags []string, expectedName string) bool {
 	return application.Name == expectedName &&
 		hasAccessTag(application.Tags, accessManagedTag) &&
-		hasAccessTag(application.Tags, ownerTag) &&
-		hasAccessTag(application.Tags, bypassTag)
+		hasAnyAccessTag(application.Tags, ownerTags) &&
+		hasAnyAccessTag(application.Tags, bypassTags)
 }
 
 func sortBypassStatuses(values []v1alpha1.AccessBypassApplicationStatus) {
@@ -533,12 +548,20 @@ func effectiveBypassDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.Dele
 	return policy
 }
 
-func ownedBypassApplicationTag(application flarecloudflare.AccessApplication, ownerTag, _ string) (string, bool) {
-	if !hasAccessTag(application.Tags, accessManagedTag) || !hasAccessTag(application.Tags, ownerTag) {
+// ownedBypassApplicationTag returns the bypass marker the application carries,
+// accepting both the legacy plaintext and the HMAC marker forms.
+func ownedBypassApplicationTag(application flarecloudflare.AccessApplication, ownerTags []string, key []byte) (string, bool) {
+	if !hasAccessTag(application.Tags, accessManagedTag) || !hasAnyAccessTag(application.Tags, ownerTags) {
 		return "", false
 	}
-	tagName := accessBypassTag(ownerTag, application.Name)
-	return tagName, hasAccessTag(application.Tags, tagName)
+	for _, owner := range ownerTags {
+		for _, marker := range accessBypassMarkers(key, owner, application.Name) {
+			if hasAccessTag(application.Tags, marker) {
+				return marker, true
+			}
+		}
+	}
+	return "", false
 }
 
 func upsertLocalBypassStatus(application *v1alpha1.AccessApplication, child v1alpha1.AccessBypassApplicationStatus) {
@@ -589,9 +612,14 @@ func (r *AccessApplicationReconciler) persistChildID(ctx context.Context, applic
 	})
 }
 
+// accessApplicationDeletionTargets classifies remote applications into the
+// parent and bypass children owned by this AccessApplication. ownerTags
+// carries every accepted owner marker (legacy plaintext plus the HMAC marker
+// when the cluster key is available) and key signs the bypass markers.
 func accessApplicationDeletionTargets(
 	application *v1alpha1.AccessApplication,
-	ownerTag string,
+	ownerTags []string,
+	key []byte,
 	applications []flarecloudflare.AccessApplication,
 ) (map[string]struct{}, map[string]struct{}, map[string]struct{}, error) {
 	parentIDs := make(map[string]struct{})
@@ -608,7 +636,7 @@ func accessApplicationDeletionTargets(
 	}
 	parentName := accessApplicationRemoteName(application)
 	for _, candidate := range applications {
-		if !hasAccessTag(candidate.Tags, accessManagedTag) || !hasAccessTag(candidate.Tags, ownerTag) {
+		if !hasAccessTag(candidate.Tags, accessManagedTag) || !hasAnyAccessTag(candidate.Tags, ownerTags) {
 			continue
 		}
 		if candidate.ID == application.Status.ApplicationID || candidate.Name == parentName {
@@ -620,14 +648,16 @@ func accessApplicationDeletionTargets(
 			if childName == "" {
 				childName = bypassChildApplicationName(parentName, status.Hostname, status.Path)
 			}
-			tagName := accessBypassTag(ownerTag, childName)
-			if ownedBypassApplication(candidate, ownerTag, tagName, childName) {
+			markers := accessBypassMarkersForOwners(key, ownerTags, childName)
+			if ownedBypassApplication(candidate, ownerTags, markers, childName) {
 				childIDs[candidate.ID] = struct{}{}
-				bypassTags[tagName] = struct{}{}
+				for _, marker := range markers {
+					bypassTags[marker] = struct{}{}
+				}
 			}
 			continue
 		}
-		tagName, owned := ownedBypassApplicationTag(candidate, ownerTag, parentName)
+		tagName, owned := ownedBypassApplicationTag(candidate, ownerTags, key)
 		if owned {
 			childIDs[candidate.ID] = struct{}{}
 			bypassTags[tagName] = struct{}{}

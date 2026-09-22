@@ -1332,16 +1332,19 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 				TLS: &gatewayv1.ListenerTLSConfig{CertificateRefs: []gatewayv1.SecretObjectReference{{Name: "listener-cert"}}},
 			}}},
 		}
+		tunnel := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{
+			Namespace: gateway.Namespace, Name: gateway.Name,
+		}}
 		kube := fakeclient.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(gateway, application, listenerGateway).
+			WithStatusSubresource(&v1alpha1.CloudflareTunnel{}).
+			WithObjects(gateway, application, listenerGateway, tunnel).
 			WithIndex(&gatewayv1.Gateway{}, gatewayListenerSecretIndex, func(object client.Object) []string {
 				return gatewayListenerSecretKeys(object.(*gatewayv1.Gateway))
 			}).
 			Build()
-		state := &audRevocationState{}
 		reconciler := &GatewayReconciler{
-			Client: kube, OperatorNamespace: "trusted-operator", audRevocations: state,
+			Client: kube, OperatorNamespace: "trusted-operator",
 		}
 		applicationReconciler := &AccessApplicationReconciler{
 			Client: kube, OperatorNamespace: reconciler.OperatorNamespace,
@@ -1386,16 +1389,19 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 				secret.Data[v1alpha1.AccessApplicationIDSecretKey] = []byte("other-application-id")
 			}},
 		}
-		identityKey := audRevocationIdentityKey(gateway, application)
+		persistedLatches := func() []v1alpha1.CloudflareAUDRevocationLatch {
+			var current v1alpha1.CloudflareTunnel
+			gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &current)).To(gomega.Succeed())
+			return current.Status.AUDRevocations
+		}
 		for _, test := range invalid {
 			ginkgo.By("rejecting a handoff with the wrong " + test.name)
 			secret := genuine.DeepCopy()
 			test.mutate(secret)
 			gomega.Expect(reconciler.mapSecretToGateways(context.Background(), secret)).To(gomega.BeEmpty())
 			gomega.Expect(applicationReconciler.mapAUDSecretToApplication(context.Background(), secret)).To(gomega.BeEmpty())
-			reconciler.latchAUDRevocation(context.Background(), secret)
-			_, latched := state.token(identityKey)
-			gomega.Expect(latched).To(gomega.BeFalse())
+			gomega.Expect(reconciler.latchAUDRevocation(context.Background(), secret)).To(gomega.Succeed())
+			gomega.Expect(persistedLatches()).To(gomega.BeEmpty())
 		}
 
 		gomega.Expect(reconciler.mapSecretToGateways(context.Background(), &genuine)).To(gomega.ConsistOf(
@@ -1404,10 +1410,11 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 		gomega.Expect(applicationReconciler.mapAUDSecretToApplication(context.Background(), &genuine)).To(gomega.ConsistOf(
 			ctrl.Request{NamespacedName: client.ObjectKeyFromObject(application)},
 		))
-		reconciler.latchAUDRevocation(context.Background(), &genuine)
-		_, latched := state.token(identityKey)
-		gomega.Expect(latched).To(gomega.BeTrue())
-
+		gomega.Expect(reconciler.latchAUDRevocation(context.Background(), &genuine)).To(gomega.Succeed())
+		latches := persistedLatches()
+		gomega.Expect(latches).To(gomega.HaveLen(1))
+		gomega.Expect(latches[0].Application).To(gomega.Equal(client.ObjectKeyFromObject(application).String()))
+		gomega.Expect(latches[0].ApplicationUID).To(gomega.Equal(application.UID))
 		listenerSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Namespace: listenerGateway.Namespace, Name: "listener-cert",
 		}}
@@ -1474,73 +1481,96 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 			Status:     v1alpha1.AccessApplicationStatus{ApplicationID: "shared-application-id"},
 		}
 		secret := boundAUDSecret(accessAUDSecretName(&application, client.ObjectKeyFromObject(gateway)), &application, gateway, "audience")
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "shared-gateway"},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 1},
+				Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+					AccessApplication: client.ObjectKeyFromObject(&application).String(),
+					Guard:             v1alpha1.HostnameGuardForwarding,
+					AppliedVersion:    1,
+				}},
+			},
+		}
 		scheme := runtime.NewScheme()
 		gomega.Expect(gatewayv1.Install(scheme)).To(gomega.Succeed())
 		gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
-		kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(gateway, &application).Build()
-		state := &audRevocationState{}
-		first := &GatewayReconciler{Client: kube, audRevocations: state}
-		second := &GatewayReconciler{Client: kube, audRevocations: state}
-		first.latchAUDRevocation(context.Background(), &secret)
+		kube := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&v1alpha1.CloudflareTunnel{}).
+			WithObjects(gateway, &application, tunnel).
+			Build()
+		first := &GatewayReconciler{Client: kube}
+		second := &GatewayReconciler{Client: kube}
+		currentTunnel := func() *v1alpha1.CloudflareTunnel {
+			var current v1alpha1.CloudflareTunnel
+			gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &current)).To(gomega.Succeed())
+			return &current
+		}
+		gomega.Expect(first.latchAUDRevocation(context.Background(), &secret)).To(gomega.Succeed())
 		inputs := gatewayapi.Inputs{
 			AccessApplications: []v1alpha1.AccessApplication{application},
 			AUDSecrets: map[types.NamespacedName]gatewayapi.AUDSecret{
 				client.ObjectKeyFromObject(&application): {AUD: "audience", ApplicationID: application.Status.ApplicationID, Ready: true},
 			},
 		}
-		tunnel := &v1alpha1.CloudflareTunnel{Status: v1alpha1.CloudflareTunnelStatus{
-			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Applied: 1},
-			Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
-				AccessApplication: client.ObjectKeyFromObject(&application).String(),
-				Guard:             v1alpha1.HostnameGuardForwarding,
-				AppliedVersion:    1,
-			}},
-		}}
-		second.applyAUDRevocationLatches(gateway, tunnel, &inputs, second.revocationState().ceiling())
+		gomega.Expect(second.applyAUDRevocationLatches(context.Background(), gateway, currentTunnel(), &inputs)).To(gomega.Succeed())
 		gomega.Expect(inputs.AUDSecrets[client.ObjectKeyFromObject(&application)].Ready).To(gomega.BeFalse())
 
-		tokenState := &audRevocationState{}
-		key := audRevocationIdentityKey(gateway, &application)
-		tokenState.latch(key)
-		staleToken, found := tokenState.token(key)
-		gomega.Expect(found).To(gomega.BeTrue())
-		tokenState.latch(key)
-		tokenState.release(key, staleToken)
-		freshToken, found := tokenState.token(key)
-		gomega.Expect(found).To(gomega.BeTrue())
-		gomega.Expect(freshToken).NotTo(gomega.Equal(staleToken))
+		// A relatch after the snapshot was read allocates a fresh token, so a
+		// release computed from the stale snapshot must not remove it.
+		stale := currentTunnel()
+		gomega.Expect(first.latchAUDRevocation(context.Background(), &secret)).To(gomega.Succeed())
+		stale.Status.ConfigVersion.Applied = 2
+		stale.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+		stale.Status.Hostnames[0].AppliedVersion = 2
+		gomega.Expect(second.applyAUDRevocationLatches(context.Background(), gateway, stale, &inputs)).To(gomega.Succeed())
+		latches := currentTunnel().Status.AUDRevocations
+		gomega.Expect(latches).To(gomega.HaveLen(1))
+		gomega.Expect(latches[0].Token).To(gomega.Equal(int64(2)))
 
-		tunnel.Status.ConfigVersion.Applied = 2
-		tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
-		tunnel.Status.Hostnames[0].AppliedVersion = 2
-		second.applyAUDRevocationLatches(gateway, tunnel, &inputs, second.revocationState().ceiling())
-		_, sharedLatched := second.revocationState().token(key)
-		gomega.Expect(sharedLatched).To(gomega.BeFalse())
+		fresh := currentTunnel()
+		fresh.Status.ConfigVersion.Applied = 2
+		fresh.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+		fresh.Status.Hostnames[0].AppliedVersion = 2
+		gomega.Expect(second.applyAUDRevocationLatches(context.Background(), gateway, fresh, &inputs)).To(gomega.Succeed())
+		gomega.Expect(currentTunnel().Status.AUDRevocations).To(gomega.BeEmpty())
 	})
 
 	ginkgo.It("prunes revocations for applications no longer attached to a Gateway", func() {
-		state := &audRevocationState{}
-		reconciler := &GatewayReconciler{audRevocations: state}
 		gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{
 			Namespace: "tenant", Name: "gateway", UID: "gateway-uid",
 		}}
-		application := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{
-			Namespace: "tenant", Name: "removed", UID: "removed-uid",
-		}}
-		key := audRevocationIdentityKey(gateway, application)
-		state.latch(key)
-		ceiling := state.ceiling()
-		freshApplication := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{
-			Namespace: "tenant", Name: "newly-attached", UID: "newly-attached-uid",
-		}}
-		freshKey := audRevocationIdentityKey(gateway, freshApplication)
-		state.latch(freshKey)
-		reconciler.applyAUDRevocationLatches(gateway, nil, &gatewayapi.Inputs{}, ceiling)
-		_, found := state.token(key)
-		gomega.Expect(found).To(gomega.BeFalse())
-		freshToken, found := state.token(freshKey)
-		gomega.Expect(found).To(gomega.BeTrue())
-		state.release(freshKey, freshToken)
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "gateway"},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				AUDRevocationSequence: 2,
+				AUDRevocations: []v1alpha1.CloudflareAUDRevocationLatch{
+					{Application: "tenant/removed", ApplicationUID: "removed-uid", Token: 1, LatchedAt: metav1.Now()},
+					{Application: "tenant/newly-attached", ApplicationUID: "newly-attached-uid", Token: 2, LatchedAt: metav1.Now()},
+				},
+			},
+		}
+		scheme := runtime.NewScheme()
+		gomega.Expect(v1alpha1.AddToScheme(scheme)).To(gomega.Succeed())
+		kube := fakeclient.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&v1alpha1.CloudflareTunnel{}).
+			WithObjects(tunnel).
+			Build()
+		reconciler := &GatewayReconciler{Client: kube}
+		inputs := gatewayapi.Inputs{
+			AccessApplications: []v1alpha1.AccessApplication{{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "newly-attached", UID: "newly-attached-uid"},
+			}},
+			AUDSecrets: map[types.NamespacedName]gatewayapi.AUDSecret{},
+		}
+		gomega.Expect(reconciler.applyAUDRevocationLatches(context.Background(), gateway, tunnel, &inputs)).To(gomega.Succeed())
+		var current v1alpha1.CloudflareTunnel
+		gomega.Expect(kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &current)).To(gomega.Succeed())
+		gomega.Expect(current.Status.AUDRevocations).To(gomega.HaveLen(1))
+		gomega.Expect(current.Status.AUDRevocations[0].Application).To(gomega.Equal("tenant/newly-attached"))
+		gomega.Expect(current.Status.AUDRevocations[0].Token).To(gomega.Equal(int64(2)))
 	})
 })
 
@@ -1813,115 +1843,115 @@ type dataplaneObjectFactory func(namespace, name string) (client.Object, client.
 
 func configMapDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      map[string]string{"foreign": "keep"},
-			Annotations: map[string]string{"foreign": "keep"},
-		},
-		Data: map[string]string{"foreign": "keep"},
-	}, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Data:       map[string]string{"desired": "value"},
-	}
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      map[string]string{"foreign": "keep"},
+				Annotations: map[string]string{"foreign": "keep"},
+			},
+			Data: map[string]string{"foreign": "keep"},
+		}, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Data:       map[string]string{"desired": "value"},
+		}
 }
 
 func deploymentDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	currentReplicas := int32(3)
 	desiredReplicas := int32(2)
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      map[string]string{"foreign": "keep"},
-			Annotations: map[string]string{"foreign": "keep"},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &currentReplicas,
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "foreign"}},
-				Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name: "foreign", Image: "example.invalid/foreign",
-				}}},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      map[string]string{"foreign": "keep"},
+				Annotations: map[string]string{"foreign": "keep"},
 			},
-		},
-	}, &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &desiredReplicas,
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "desired"}},
-				Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name: "desired", Image: "example.invalid/desired",
-				}}},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &currentReplicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "foreign"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name: "foreign", Image: "example.invalid/foreign",
+					}}},
+				},
 			},
-		},
-	}
+		}, &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &desiredReplicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "desired"}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name: "desired", Image: "example.invalid/desired",
+					}}},
+				},
+			},
+		}
 }
 
 func serviceDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      map[string]string{"foreign": "keep"},
-			Annotations: map[string]string{"foreign": "keep"},
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": "foreign"},
-			Ports:    []corev1.ServicePort{{Name: "foreign", Port: 81}},
-		},
-	}, &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": "desired"},
-			Ports:    []corev1.ServicePort{{Name: "desired", Port: 80}},
-		},
-	}
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      map[string]string{"foreign": "keep"},
+				Annotations: map[string]string{"foreign": "keep"},
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "foreign"},
+				Ports:    []corev1.ServicePort{{Name: "foreign", Port: 81}},
+			},
+		}, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "desired"},
+				Ports:    []corev1.ServicePort{{Name: "desired", Port: 80}},
+			},
+		}
 }
 
 func pdbDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      map[string]string{"foreign": "keep"},
-			Annotations: map[string]string{"foreign": "keep"},
-		},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
-			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-		},
-	}, &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
-			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-		},
-	}
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      map[string]string{"foreign": "keep"},
+				Annotations: map[string]string{"foreign": "keep"},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+			},
+		}, &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
+				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+			},
+		}
 }
 
 func networkPolicyDataplaneObjects(namespace, name string) (client.Object, client.Object) {
 	return &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   namespace,
-			Name:        name,
-			Labels:      map[string]string{"foreign": "keep"},
-			Annotations: map[string]string{"foreign": "keep"},
-		},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
-		},
-	}, &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-		},
-	}
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   namespace,
+				Name:        name,
+				Labels:      map[string]string{"foreign": "keep"},
+				Annotations: map[string]string{"foreign": "keep"},
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foreign"}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			},
+		}, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "desired"}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			},
+		}
 }
 
 type dataplaneCreateRaceClient struct {

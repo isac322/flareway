@@ -186,6 +186,15 @@ spec:
           status:
             description: ServiceTokenStatus is part of the servicetokenstatus configuration.
             properties:
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               clientId:
                 type: string
               conditions:

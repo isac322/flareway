@@ -32,14 +32,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -56,6 +60,9 @@ type DevicePostureIntegrationReconciler struct {
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
 	credentialRevisions sync.Map
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=devicepostureintegrations;cloudflareaccounts,verbs=get;list;watch
@@ -82,7 +89,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		return ctrl.Result{}, nil
 	}
 
-	accessAPI, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
+	accessAPI, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
 		_ = r.patchStatus(ctx, object, nil, object.Status.IntegrationID, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
@@ -117,6 +124,20 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		return ctrl.Result{}, err
 	}
 	input := flarecloudflare.DevicePostureIntegrationInput{Name: name, Type: object.Spec.Type, Interval: object.Spec.Interval, Config: object.Spec.Config, ClientSecret: credentials.clientSecret, ClientKey: credentials.clientKey, AccessClientID: credentials.accessClientID, AccessClientSecret: credentials.accessClientSecret}
+
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+		Kind: "DevicePostureIntegration", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.IntegrationID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 
 	id := object.Status.IntegrationID
 	var remote flarecloudflare.DevicePostureIntegration
@@ -159,7 +180,14 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		}
 	}
 	r.rememberCredentialsRevision(object, revision)
-	return ctrl.Result{}, r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized")
+	if err := r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	clearGate(r.Invalidator, "DevicePostureIntegration", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
 type devicePostureIntegrationCredentials struct {
@@ -394,7 +422,15 @@ func (r *DevicePostureIntegrationReconciler) SetupWithManager(manager ctrl.Manag
 	}); err != nil {
 		return fmt.Errorf("index DevicePostureIntegration Secrets: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).For(&v1alpha1.DevicePostureIntegration{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForAccount)).Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForSecret)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForNamespace)).Complete(observedReconciler("device-posture-integration", r))
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.DevicePostureIntegration{}, builder.WithPredicates(desiredStateChangedPredicate)).
+		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForAccount)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForSecret)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.integrationsForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("device-posture-integration", r))
 }
 
 func (r *DevicePostureIntegrationReconciler) integrationsForAccount(ctx context.Context, object client.Object) []reconcile.Request {

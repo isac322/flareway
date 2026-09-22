@@ -185,7 +185,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}
 		remote.Put(wrongChild)
 
-		recovered, found, err := findOwnedBypassApplication(testContext, remote, flarecloudflare.AccessScope{}, ownerTag, bypassTag, expectedName)
+		recovered, found, err := findOwnedBypassApplication(testContext, remote, flarecloudflare.AccessScope{}, []string{ownerTag}, []string{bypassTag}, expectedName)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(found).To(gomega.BeFalse())
 		gomega.Expect(recovered.ID).To(gomega.BeEmpty())
@@ -203,7 +203,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			ID: "wrong-parent", Name: "other/parent",
 			Tags: []string{accessManagedTag, ownerTag},
 		}
-		parentIDs, childIDs, tagNames, err := accessApplicationDeletionTargets(application, ownerTag, []flarecloudflare.AccessApplication{wrongParent, wrongChild})
+		parentIDs, childIDs, tagNames, err := accessApplicationDeletionTargets(application, []string{ownerTag}, nil, []flarecloudflare.AccessApplication{wrongParent, wrongChild})
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(parentIDs).To(gomega.BeEmpty())
 		gomega.Expect(childIDs).To(gomega.BeEmpty())
@@ -458,21 +458,39 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(string(statusJSON)).NotTo(gomega.ContainSubstring("aud-"))
 		parentInput := testAccessCloudflare.Input(application.Status.ApplicationID)
-		gomega.Expect(parentInput.Tags).To(gomega.HaveLen(3))
 		gomega.Expect(parentInput.Tags).To(gomega.ContainElements("customer-existing", accessManagedTag))
-		var ownerTag string
+		var ownerTags []string
 		for _, tag := range parentInput.Tags {
 			if validInternalDigestTag(tag, accessOwnerTagPrefix) {
-				ownerTag = tag
+				ownerTags = append(ownerTags, tag)
 			}
 			gomega.Expect(tag).NotTo(gomega.ContainSubstring("="))
 		}
-		gomega.Expect(ownerTag).NotTo(gomega.BeEmpty())
+		gomega.Expect(ownerTags).NotTo(gomega.BeEmpty())
 		calls := testAccessCloudflare.Calls()
 		gomega.Expect(calls).NotTo(gomega.ContainElements("GetTag:customer-existing", "CreateTag:customer-existing"))
 		gomega.Expect(indexOfAccessCall(calls, "CreateTag:"+accessManagedTag)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "Create:"+fixture.remoteName())))
-		gomega.Expect(indexOfAccessCall(calls, "CreateTag:"+ownerTag)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "Create:"+fixture.remoteName())))
+		for _, ownerTag := range ownerTags {
+			gomega.Expect(indexOfAccessCall(calls, "CreateTag:"+ownerTag)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "Create:"+fixture.remoteName())))
+		}
 		gomega.Expect(testAccessCloudflare.Calls()).To(gomega.ContainElement("Create:" + fixture.remoteName()))
+	})
+
+	ginkgo.It("reports OwnershipVerified for a managed application carrying the signed owner marker", func() {
+		fixture := newAccessFixture("verified-signed-owner", false, false)
+		fixture.create()
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var application v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
+			g.Expect(application.Status.OwnershipVerified).To(gomega.BeTrue())
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		var application v1alpha1.AccessApplication
+		gomega.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+		ownerTags := tagsWithPrefix(testAccessCloudflare.Input(application.Status.ApplicationID).Tags, accessOwnerTagPrefix)
+		gomega.Expect(ownerTags).To(gomega.HaveLen(1))
 	})
 
 	ginkgo.It("rejects a missing policy reference before any remote write", func() {
@@ -643,12 +661,16 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(application.Status.BypassApplications).To(gomega.HaveLen(1))
 			g.Expect(testAccessCloudflare.ApplicationCount()).To(gomega.Equal(2))
 			childInput := testAccessCloudflare.Input(application.Status.BypassApplications[0].ApplicationID)
-			tagName := firstTagWithPrefix(childInput.Tags, accessBypassTagPrefix)
-			g.Expect(validInternalDigestTag(tagName, accessBypassTagPrefix)).To(gomega.BeTrue())
-			g.Expect(tagName).To(gomega.Equal(accessBypassTag(
-				firstTagWithPrefix(testAccessCloudflare.Input(application.Status.ApplicationID).Tags, accessOwnerTagPrefix),
-				childInput.Name,
-			)))
+			bypassTags := tagsWithPrefix(childInput.Tags, accessBypassTagPrefix)
+			g.Expect(bypassTags).To(gomega.HaveLen(1))
+			g.Expect(validInternalDigestTag(bypassTags[0], accessBypassTagPrefix)).To(gomega.BeTrue())
+			ownerTags := tagsWithPrefix(testAccessCloudflare.Input(application.Status.ApplicationID).Tags, accessOwnerTagPrefix)
+			g.Expect(ownerTags).NotTo(gomega.BeEmpty())
+			derived := make([]string, 0, len(ownerTags))
+			for _, ownerTag := range ownerTags {
+				derived = append(derived, accessBypassTag(ownerTag, childInput.Name))
+			}
+			g.Expect(derived).To(gomega.ContainElement(bypassTags[0]))
 		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
@@ -973,13 +995,23 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		parentID := application.Status.ApplicationID
 		childID := application.Status.BypassApplications[0].ApplicationID
 		parentInput := testAccessCloudflare.Input(parentID)
-		ownerTag := firstTagWithPrefix(parentInput.Tags, accessOwnerTagPrefix)
-		gomega.Expect(validInternalDigestTag(ownerTag, accessOwnerTagPrefix)).To(gomega.BeTrue())
+		ownerTags := tagsWithPrefix(parentInput.Tags, accessOwnerTagPrefix)
+		gomega.Expect(ownerTags).NotTo(gomega.BeEmpty())
+		for _, ownerTag := range ownerTags {
+			gomega.Expect(validInternalDigestTag(ownerTag, accessOwnerTagPrefix)).To(gomega.BeTrue())
+		}
 		childInput := testAccessCloudflare.Input(childID)
-		bypassTag := firstTagWithPrefix(childInput.Tags, accessBypassTagPrefix)
+		bypassTags := tagsWithPrefix(childInput.Tags, accessBypassTagPrefix)
+		gomega.Expect(bypassTags).To(gomega.HaveLen(1))
+		bypassTag := bypassTags[0]
 		gomega.Expect(validInternalDigestTag(bypassTag, accessBypassTagPrefix)).To(gomega.BeTrue())
-		gomega.Expect(bypassTag).To(gomega.Equal(accessBypassTag(ownerTag, childInput.Name)))
-		gomega.Expect(childInput.Tags).To(gomega.ConsistOf(accessManagedTag, ownerTag, bypassTag))
+		derived := make([]string, 0, len(ownerTags))
+		for _, ownerTag := range ownerTags {
+			derived = append(derived, accessBypassTag(ownerTag, childInput.Name))
+		}
+		gomega.Expect(derived).To(gomega.ContainElement(bypassTag))
+		gomega.Expect(childInput.Tags).To(gomega.ContainElements(accessManagedTag, bypassTag))
+		gomega.Expect(tagsWithPrefix(childInput.Tags, accessOwnerTagPrefix)).NotTo(gomega.BeEmpty())
 		var tunnel v1alpha1.CloudflareTunnel
 		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
 		gomega.Expect(applyAccessTunnelHandshake(&tunnel, v1alpha1.CloudflareTunnelHostnameStatus{
@@ -1011,7 +1043,9 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		calls := testAccessCloudflare.Calls()
 		gomega.Expect(indexOfAccessCall(calls, "Delete:"+childID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "Delete:"+parentID)))
 		gomega.Expect(indexOfAccessCall(calls, "Delete:"+parentID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+bypassTag)))
-		gomega.Expect(indexOfAccessCall(calls, "DeleteTag:"+bypassTag)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+ownerTag)))
+		for _, ownerTag := range ownerTags {
+			gomega.Expect(indexOfAccessCall(calls, "Delete:"+parentID)).To(gomega.BeNumerically("<", indexOfAccessCall(calls, "DeleteTag:"+ownerTag)))
+		}
 		gomega.Expect(testAccessCloudflare.Tags()).To(gomega.ConsistOf(accessManagedTag, "customer-retained"))
 	})
 
@@ -1173,8 +1207,9 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		programAccessFixture(fixture, &application, 1)
 		parentID := application.Status.ApplicationID
 		childID := application.Status.BypassApplications[0].ApplicationID
-		bypassTag := firstTagWithPrefix(testAccessCloudflare.Input(childID).Tags, accessBypassTagPrefix)
-		gomega.Expect(bypassTag).NotTo(gomega.BeEmpty())
+		bypassTags := tagsWithPrefix(testAccessCloudflare.Input(childID).Tags, accessBypassTagPrefix)
+		gomega.Expect(bypassTags).To(gomega.HaveLen(1))
+		bypassTag := bypassTags[0]
 
 		var route gatewayv1.HTTPRoute
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Namespace: fixture.namespace, Name: "routes"}, &route)).To(gomega.Succeed())
@@ -1582,13 +1617,17 @@ func accessCallsWithPrefix(calls []string, prefix string) []string {
 	return matches
 }
 
-func firstTagWithPrefix(tags []string, prefix string) string {
+// tagsWithPrefix returns every tag carrying prefix. Owner and bypass markers
+// may coexist in legacy and HMAC form during the ownership-marker migration,
+// so callers must assert on the whole set instead of picking the first match.
+func tagsWithPrefix(tags []string, prefix string) []string {
+	matches := make([]string, 0, len(tags))
 	for _, tag := range tags {
 		if strings.HasPrefix(tag, prefix) {
-			return tag
+			matches = append(matches, tag)
 		}
 	}
-	return ""
+	return matches
 }
 
 type fakeAccessApplicationCloudflare struct {

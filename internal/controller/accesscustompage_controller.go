@@ -30,15 +30,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -54,6 +58,9 @@ type AccessCustomPageReconciler struct {
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
 	Recorder            recorder.EventRecorder
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accesscustompages;accessapplications;accessstandaloneapplications;cloudflareaccounts,verbs=get;list;watch
@@ -80,7 +87,7 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 		return ctrl.Result{}, nil
 	}
 
-	api, _, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
+	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
 		return ctrl.Result{}, r.finishError(ctx, object, privateErrorReason(err), err)
 	}
@@ -101,7 +108,26 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 		if len(drift) > 0 {
 			message += "; drift detected in " + strings.Join(drift, ", ")
 		}
-		return ctrl.Result{}, r.patchStatus(ctx, object, remote, false, metav1.ConditionTrue, "Observed", message, drift, nil, false)
+		return ctrl.Result{}, r.patchStatus(ctx, object, remote, false, metav1.ConditionTrue, "Observed", message, drift, nil, false, object.Status.AppliedHash, object.Status.AppliedAt)
+	}
+
+	// T1 gate: the managed path below reads the remote custom page before
+	// any write. ObserveOnly above stays ungated (safety condition 9).
+	// Adoption reads inside reconcileManaged are T0 by construction: the
+	// gate only opens once status.customPageId is bound and the applied
+	// hash matches.
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "AccessCustomPage", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.CustomPageID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
 
 	remote, warningsObserved, err := r.reconcileManaged(ctx, api, object, input)
@@ -113,7 +139,14 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 		warnings = remote.Warnings
 		r.recordWarnings(object, warnings)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved)
+	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved, object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	clearGate(r.Invalidator, "AccessCustomPage", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
 func (r *AccessCustomPageReconciler) reconcileManaged(ctx context.Context, api flarecloudflare.AccessCustomPageAPI, object *v1alpha1.AccessCustomPage, input flarecloudflare.AccessCustomPageInput) (flarecloudflare.AccessCustomPage, bool, error) {
@@ -284,8 +317,10 @@ func customPageDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionP
 	return policy
 }
 
-func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool) error {
+func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool, appliedHash string, appliedAt *metav1.Time) error {
 	base := client.MergeFrom(object.DeepCopy())
+	object.Status.AppliedHash = appliedHash
+	object.Status.AppliedAt = appliedAt
 	if remote.ID != "" {
 		object.Status.CustomPageID = remote.ID
 		object.Status.OwnershipVerified = owned
@@ -332,7 +367,7 @@ func (r *AccessCustomPageReconciler) patchCleanupBlocked(ctx context.Context, ob
 }
 
 func (r *AccessCustomPageReconciler) finishError(ctx context.Context, object *v1alpha1.AccessCustomPage, reason string, err error) error {
-	if patchErr := r.patchStatus(ctx, object, flarecloudflare.AccessCustomPage{}, object.Status.OwnershipVerified, metav1.ConditionFalse, reason, err.Error(), nil, nil, false); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, flarecloudflare.AccessCustomPage{}, object.Status.OwnershipVerified, metav1.ConditionFalse, reason, err.Error(), nil, nil, false, object.Status.AppliedHash, object.Status.AppliedAt); patchErr != nil {
 		return errors.Join(err, patchErr)
 	}
 	return err
@@ -385,13 +420,16 @@ func (r *AccessCustomPageReconciler) SetupWithManager(manager ctrl.Manager) erro
 	}); err != nil {
 		return fmt.Errorf("index AccessCustomPage accounts: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.AccessCustomPage{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.AccessCustomPage{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.pagesForAccount)).
 		Watches(&v1alpha1.AccessApplication{}, handler.EnqueueRequestsFromMapFunc(r.pagesForApplication)).
 		Watches(&v1alpha1.AccessStandaloneApplication{}, handler.EnqueueRequestsFromMapFunc(r.pagesForStandaloneApplication)).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.pagesForNamespace)).
-		Complete(observedReconciler("access-custom-page", r))
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.pagesForNamespace))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("access-custom-page", r))
 }
 
 func (r *AccessCustomPageReconciler) pagesForAccount(ctx context.Context, object client.Object) []reconcile.Request {

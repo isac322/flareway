@@ -271,6 +271,15 @@ spec:
             properties:
               accountId:
                 type: string
+              appliedAt:
+                description: AppliedAt is when AppliedHash was last recorded; nil
+                  means never applied.
+                format: date-time
+                type: string
+              appliedHash:
+                description: AppliedHash is the desired-state hash recorded after
+                  the last successful remote convergence.
+                type: string
               clients:
                 items:
                   description: WARPConnectorClientStatus records one bounded connected

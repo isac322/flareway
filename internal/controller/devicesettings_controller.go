@@ -27,11 +27,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // DeviceSettingsReconciler owns the account-wide device settings singleton.
@@ -41,6 +44,9 @@ type DeviceSettingsReconciler struct {
 	APIReader           client.Reader
 	NewCloudflareClient NewDeviceCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=devicesettings;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -81,6 +87,18 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
+	var decision gateDecision
+	if effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged {
+		clusterID := gateClusterID(ctx, r.Client)
+		decision = evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+			Kind: "DeviceSettings", Namespace: object.Namespace, Name: object.Name,
+			UID: object.UID, AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Spec: object.Spec,
+		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+		if decision.Open {
+			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+		}
+	}
 	observed, err := api.GetDeviceSettings(ctx)
 	if err != nil {
 		return r.finishRemoteError(ctx, object, err)
@@ -97,10 +115,14 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return r.finishRemoteError(ctx, object, err)
 		}
 	}
+	clearGate(r.Invalidator, "DeviceSettings", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, nil, metav1.ConditionTrue, "Ready", "Device settings are synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: globalRequeue}, nil
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil
 }
 func (r *DeviceSettingsReconciler) checkSingleWriter(ctx context.Context, object *v1alpha1.DeviceSettings, accountID string) error {
 	reader := r.APIReader
@@ -236,12 +258,15 @@ func (r *DeviceSettingsReconciler) SetupWithManager(manager ctrl.Manager) error 
 	}); err != nil {
 		return fmt.Errorf("index DeviceSettings accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
+	b := ctrl.NewControllerManagedBy(manager).
 		For(&v1alpha1.DeviceSettings{}).
 		Watches(&v1alpha1.DeviceSettings{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
-		Complete(observedReconciler("device-settings", r))
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("device-settings", r))
 }
 
 func (r *DeviceSettingsReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

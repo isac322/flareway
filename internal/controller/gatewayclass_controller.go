@@ -141,7 +141,7 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&gatewayv1.GatewayClass{}, builder.WithPredicates(ownedGatewayClass)).
+		For(&gatewayv1.GatewayClass{}, builder.WithPredicates(ownedGatewayClass, desiredStateChangedPredicate)).
 		Watches(
 			&flarewayv1alpha1.GatewayClassConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.gatewayClassesForConfig),

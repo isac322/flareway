@@ -27,7 +27,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -47,6 +46,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -55,12 +55,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/observability"
@@ -109,22 +111,20 @@ type GatewayReconciler struct {
 	CloudflareFactory flarecloudflare.ClientFactory
 	Prober            dataplane.Prober
 	Recorder          recorder.EventRecorder
-	audRevocations    *audRevocationState
-}
-
-type audRevocationState struct {
-	mu      sync.Mutex
-	next    uint64
-	entries map[string]uint64
-}
-
-var sharedAUDRevocations audRevocationState
-
-func (r *GatewayReconciler) revocationState() *audRevocationState {
-	if r.audRevocations != nil {
-		return r.audRevocations
-	}
-	return &sharedAUDRevocations
+	// DriftPolicy controls how out-of-band Cloudflare configuration drift is
+	// handled. Empty or DriftPolicyOverwrite keeps the default overwrite
+	// behavior; DriftPolicyHold exposes the drift without writing.
+	DriftPolicy DriftPolicy
+	// Freshness is the desired-hash gate policy (D1). A zero Policy keeps
+	// every gate closed, which preserves the pre-gate behavior of reading
+	// the remote on every pass.
+	Freshness freshness.Policy
+	// Invalidator is the sweep drift latch consulted by the desired-hash
+	// gate. Nil means no invalidation source.
+	Invalidator *freshness.Latch
+	// SweepEvents carries drift wakeups from the sweep worker. When nil no
+	// raw source is registered in SetupWithManager.
+	SweepEvents <-chan event.GenericEvent
 }
 
 func (r *GatewayReconciler) operatorNamespace() string {
@@ -132,50 +132,6 @@ func (r *GatewayReconciler) operatorNamespace() string {
 		return r.OperatorNamespace
 	}
 	return dataplane.DefaultOperatorNamespace
-}
-
-func (s *audRevocationState) latch(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.next++
-	if s.entries == nil {
-		s.entries = make(map[string]uint64)
-	}
-	s.entries[key] = s.next
-}
-
-func (s *audRevocationState) token(key string) (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	token, found := s.entries[key]
-	return token, found
-}
-
-func (s *audRevocationState) release(key string, token uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.entries[key] == token {
-		delete(s.entries, key)
-	}
-}
-
-func (s *audRevocationState) ceiling() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.next
-}
-
-func (s *audRevocationState) prune(prefix string, active map[string]struct{}, ceiling uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, token := range s.entries {
-		if token > ceiling || !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		if _, found := active[key]; !found {
-			delete(s.entries, key)
-		}
-	}
 }
 
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;gatewayclasses;httproutes;referencegrants;backendtlspolicies,verbs=get;list;watch
@@ -197,12 +153,13 @@ func (s *audRevocationState) prune(prefix string, active map[string]struct{}, ce
 
 // Reconcile builds and publishes the complete desired state for one Gateway.
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	revocationCeiling := r.revocationState().ceiling()
 	var gateway gatewayv1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gateway); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.clearSnapshot(req.NamespacedName)
-			r.clearAUDRevocationsForGateway(req.NamespacedName, revocationCeiling)
+			if err := r.clearAUDRevocationsForGateway(ctx, req.NamespacedName); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -293,7 +250,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	inputs.CloudflareTunnel = tunnel
 	inputs.CloudflareAccount = account
-	r.applyAUDRevocationLatches(&gateway, tunnel, &inputs, revocationCeiling)
+	if err := r.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	compiled, statuses := gatewayapi.Translate(inputs)
 	if compiled == nil {
@@ -436,7 +395,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		if cloudflareResult.drift && r.Recorder != nil {
-			r.Recorder.Eventf(&gateway, nil, corev1.EventTypeWarning, "OutOfBandChange", "ReconcileGateway", "%s", cloudflareResult.message)
+			r.Recorder.Eventf(&gateway, nil, corev1.EventTypeWarning, observability.EventReasonOutOfBandChange, "ReconcileGateway", "%s", cloudflareResult.message)
+			if tunnel != nil {
+				r.Recorder.Eventf(tunnel, nil, corev1.EventTypeWarning, observability.EventReasonOutOfBandChange, "ReconcileTunnel", "%s", cloudflareResult.message)
+			}
 		}
 		now := metav1.Now()
 		if r.Now != nil {
@@ -447,13 +409,26 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			config.Desired = cloudflareResult.version
 			config.DesiredHash = cloudflareResult.hash
 		}
+		if cloudflareResult.appliedAt != nil {
+			config.AppliedAt = cloudflareResult.appliedAt
+		}
+		config.Remote = cloudflareResult.remoteVersion
+		config.CreatedAt = cloudflareResult.remoteCreatedAt
 		reason := "Pending"
 		message := cloudflareResult.pending
-		if cloudflareResult.drift {
+		switch {
+		case cloudflareResult.held:
+			reason = "DriftHold"
+			message = cloudflareResult.message
+		case cloudflareResult.drift:
 			reason = "OutOfBandChange"
 			message = cloudflareResult.message
-		} else if message == "" {
+		case message == "":
 			message = fmt.Sprintf("Waiting for cloudflared configuration version %d", config.Desired)
+		}
+		driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
+		if cloudflareResult.drift {
+			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
 		}
 		if err := r.patchTunnelGatewayStatus(
 			ctx,
@@ -464,12 +439,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			desiredTunnelListeners(compiled),
 			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, now),
 			privateListenerCondition(compiled, privateState, now),
+			driftCondition,
 		); err != nil {
 			return ctrl.Result{}, err
 		}
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
-		if cloudflareResult.pending != "" || cloudflareResult.drift {
+		if cloudflareResult.pending != "" || cloudflareResult.drift || cloudflareResult.held {
 			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message)
 			if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 				return ctrl.Result{}, err
@@ -517,8 +493,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready, message)
 		config := tunnel.Status.ConfigVersion
-		config.Desired = cloudflareResult.version
-		config.DesiredHash = cloudflareResult.hash
+		if cloudflareResult.version > 0 {
+			config.Desired = cloudflareResult.version
+			config.DesiredHash = cloudflareResult.hash
+		}
+		if cloudflareResult.appliedAt != nil {
+			config.AppliedAt = cloudflareResult.appliedAt
+		}
+		config.Remote = cloudflareResult.remoteVersion
+		config.CreatedAt = cloudflareResult.remoteCreatedAt
 		hostnames := tunnel.Status.Hostnames
 		conditionStatus := metav1.ConditionFalse
 		reason := "Pending"
@@ -533,10 +516,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 		now := metav1.NewTime(r.gatewayNow())
+		driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
+		if cloudflareResult.drift {
+			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
+		}
 		if err := r.patchTunnelGatewayStatus(
 			ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled),
 			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, message, now),
 			privateListenerCondition(compiled, privateState, now),
+			driftCondition,
 		); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -559,7 +547,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if pending {
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: cloudflareResult.requeue}, nil
 }
 
 func (r *GatewayReconciler) rejectDirectTunnelAttachment(
@@ -1709,8 +1697,8 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index AccessApplication target HTTPRoutes: %w", err)
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&gatewayv1.Gateway{}).
+	blder := ctrl.NewControllerManagedBy(mgr).
+		For(&gatewayv1.Gateway{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
@@ -1741,8 +1729,15 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](500*time.Millisecond, 1000*time.Second),
 				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 			),
-		}).
-		Complete(observedReconciler("gateway", r))
+		})
+	if r.SweepEvents != nil {
+		// The sweep latch is the source of truth; this channel is only a fast
+		// wakeup so a drifted object reconciles before its TTL expires (C10).
+		// Events carry the drifted CloudflareTunnel, so they map through the
+		// same tunnel→Gateway lookup as the regular Tunnel watch.
+		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToGateways)))
+	}
+	return blder.Complete(observedReconciler("gateway", r))
 }
 
 func (r *GatewayReconciler) mapHTTPRouteToGateways(_ context.Context, object client.Object) []reconcile.Request {
@@ -1835,14 +1830,18 @@ func (r *GatewayReconciler) secretEventHandler() handler.EventHandler {
 			oldSecret, oldOK := event.ObjectOld.(*corev1.Secret)
 			newSecret, newOK := event.ObjectNew.(*corev1.Secret)
 			if oldOK && newOK && audSecretRevoked(oldSecret, newSecret) {
-				r.latchAUDRevocation(ctx, oldSecret)
+				if err := r.latchAUDRevocation(ctx, oldSecret); err != nil {
+					ctrl.LoggerFrom(ctx).Error(err, "Unable to persist AUD revocation latch", "secret", client.ObjectKeyFromObject(oldSecret))
+				}
 			}
 			enqueue(ctx, event.ObjectOld, queue)
 			enqueue(ctx, event.ObjectNew, queue)
 		},
 		DeleteFunc: func(ctx context.Context, event event.DeleteEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 			if secret, ok := event.Object.(*corev1.Secret); ok {
-				r.latchAUDRevocation(ctx, secret)
+				if err := r.latchAUDRevocation(ctx, secret); err != nil {
+					ctrl.LoggerFrom(ctx).Error(err, "Unable to persist AUD revocation latch", "secret", client.ObjectKeyFromObject(secret))
+				}
 			}
 			enqueue(ctx, event.Object, queue)
 		},
@@ -1880,20 +1879,78 @@ func audRevocationKey(secret *corev1.Secret) string {
 	return gateway + "\x00" + gatewayUID + "\x00" + application + "\x00" + applicationUID
 }
 
-func audRevocationIdentityKey(gateway *gatewayv1.Gateway, application *v1alpha1.AccessApplication) string {
-	if gateway == nil || application == nil || gateway.UID == "" || application.UID == "" {
-		return ""
-	}
-	return client.ObjectKeyFromObject(gateway).String() + "\x00" + string(gateway.UID) + "\x00" +
-		client.ObjectKeyFromObject(application).String() + "\x00" + string(application.UID)
-}
-
-func (r *GatewayReconciler) latchAUDRevocation(ctx context.Context, secret *corev1.Secret) {
+// latchAUDRevocation persists a revocation latch on the CloudflareTunnel bound
+// to the Secret's Gateway. The latch survives process restarts so a revoked
+// AUD can never be re-admitted after a controller bounce (G3).
+func (r *GatewayReconciler) latchAUDRevocation(ctx context.Context, secret *corev1.Secret) error {
 	gateway, application, trusted := liveAUDSecretBinding(ctx, r.Client, r.operatorNamespace(), secret)
 	if !trusted {
-		return
+		return nil
 	}
-	r.revocationState().latch(audRevocationIdentityKey(gateway, application))
+	tunnel, err := r.gatewayTunnel(ctx, gateway)
+	if err != nil {
+		return err
+	}
+	if tunnel == nil {
+		// Without a Tunnel no dataplane can admit the revoked AUD; there is
+		// nothing to latch.
+		return nil
+	}
+	applicationKey := client.ObjectKeyFromObject(application).String()
+	return r.updateAUDRevocations(ctx, client.ObjectKeyFromObject(tunnel), func(current *v1alpha1.CloudflareTunnel) {
+		current.Status.AUDRevocationSequence++
+		token := current.Status.AUDRevocationSequence
+		for index := range current.Status.AUDRevocations {
+			entry := &current.Status.AUDRevocations[index]
+			if entry.Application != applicationKey {
+				continue
+			}
+			entry.ApplicationUID = application.UID
+			entry.Token = token
+			entry.LatchedAt = metav1.NewTime(r.gatewayNow())
+			return
+		}
+		current.Status.AUDRevocations = append(current.Status.AUDRevocations, v1alpha1.CloudflareAUDRevocationLatch{
+			Application:    applicationKey,
+			ApplicationUID: application.UID,
+			Token:          token,
+			LatchedAt:      metav1.NewTime(r.gatewayNow()),
+		})
+	})
+}
+
+// gatewayTunnel resolves the CloudflareTunnel bound to gateway, returning nil
+// when the referenced Tunnel does not exist.
+func (r *GatewayReconciler) gatewayTunnel(ctx context.Context, gateway *gatewayv1.Gateway) (*v1alpha1.CloudflareTunnel, error) {
+	name, _, supported := referencedTunnelName(gateway)
+	if !supported {
+		return nil, nil
+	}
+	if name == "" {
+		name = gateway.Name
+	}
+	var tunnel v1alpha1.CloudflareTunnel
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: name}, &tunnel); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get CloudflareTunnel for Gateway %s: %w", client.ObjectKeyFromObject(gateway), err)
+	}
+	return &tunnel, nil
+}
+
+// updateAUDRevocations applies mutate to the persisted AUD revocation latches
+// of one CloudflareTunnel, retrying the whole read-modify-write on
+// resourceVersion conflicts so a latch is never silently lost (G3).
+func (r *GatewayReconciler) updateAUDRevocations(ctx context.Context, key types.NamespacedName, mutate func(*v1alpha1.CloudflareTunnel)) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var current v1alpha1.CloudflareTunnel
+		if err := r.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		mutate(&current)
+		return r.Status().Update(ctx, &current)
+	})
 }
 
 func liveAUDSecretBinding(
@@ -1934,26 +1991,41 @@ func liveAUDSecretBinding(
 	return &gateway, &application, true
 }
 
-func (r *GatewayReconciler) applyAUDRevocationLatches(gateway *gatewayv1.Gateway, tunnel *v1alpha1.CloudflareTunnel, inputs *gatewayapi.Inputs, ceiling uint64) {
-	if gateway == nil || inputs == nil {
-		return
+// applyAUDRevocationLatches enforces persisted AUD revocation latches on the
+// translated inputs, then releases latches whose blocked state converged and
+// prunes latches for applications no longer bound to this Gateway.
+func (r *GatewayReconciler) applyAUDRevocationLatches(
+	ctx context.Context,
+	gateway *gatewayv1.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	inputs *gatewayapi.Inputs,
+) error {
+	if gateway == nil || tunnel == nil || inputs == nil {
+		return nil
 	}
-	state := r.revocationState()
+	// Latches recorded after this snapshot was read carry a token above the
+	// ceiling and are never released or pruned by this pass.
+	ceiling := tunnel.Status.AUDRevocationSequence
+
+	latchesByApp := make(map[string]v1alpha1.CloudflareAUDRevocationLatch, len(tunnel.Status.AUDRevocations))
+	for _, latch := range tunnel.Status.AUDRevocations {
+		latchesByApp[latch.Application] = latch
+	}
+
 	active := make(map[string]struct{}, len(inputs.AccessApplications))
+	activeUIDs := make(map[string]types.UID, len(inputs.AccessApplications))
+	toRelease := make(map[string]int64)
 	for index := range inputs.AccessApplications {
 		application := &inputs.AccessApplications[index]
-		key := audRevocationIdentityKey(gateway, application)
-		if key == "" {
+		appKey := client.ObjectKeyFromObject(application).String()
+		active[appKey] = struct{}{}
+		activeUIDs[appKey] = application.UID
+		latch, latched := latchesByApp[appKey]
+		if !latched || latch.ApplicationUID != application.UID {
 			continue
 		}
-		active[key] = struct{}{}
-		token, latched := state.token(key)
-		if !latched {
-			continue
-		}
-		applicationKey := application.Namespace + "/" + application.Name
-		if audRevocationApplied(tunnel, applicationKey) {
-			state.release(key, token)
+		if audRevocationApplied(tunnel, appKey) {
+			toRelease[appKey] = latch.Token
 			continue
 		}
 		namespacedName := types.NamespacedName{Namespace: application.Namespace, Name: application.Name}
@@ -1961,12 +2033,69 @@ func (r *GatewayReconciler) applyAUDRevocationLatches(gateway *gatewayv1.Gateway
 		handoff.Ready = false
 		inputs.AUDSecrets[namespacedName] = handoff
 	}
-	prefix := client.ObjectKeyFromObject(gateway).String() + "\x00"
-	state.prune(prefix, active, ceiling)
+
+	toPrune := make(map[string]int64)
+	for _, latch := range tunnel.Status.AUDRevocations {
+		if latch.Token > ceiling {
+			continue
+		}
+		if _, isActive := active[latch.Application]; !isActive {
+			toPrune[latch.Application] = latch.Token
+			continue
+		}
+		// A latch bound to a previous incarnation of an active application can
+		// never converge or release; prune it so latches cannot accumulate.
+		if activeUIDs[latch.Application] != latch.ApplicationUID {
+			toPrune[latch.Application] = latch.Token
+		}
+	}
+
+	if len(toRelease) == 0 && len(toPrune) == 0 {
+		return nil
+	}
+
+	// CAS on the persisted token: a latch re-created after this snapshot was
+	// read carries a different token and is kept, so a concurrent revocation
+	// can never be released or pruned by a stale pass.
+	return r.updateAUDRevocations(ctx, client.ObjectKeyFromObject(tunnel), func(current *v1alpha1.CloudflareTunnel) {
+		filtered := current.Status.AUDRevocations[:0]
+		for _, entry := range current.Status.AUDRevocations {
+			if token, release := toRelease[entry.Application]; release && entry.Token == token {
+				continue
+			}
+			if token, prune := toPrune[entry.Application]; prune && entry.Token == token {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		current.Status.AUDRevocations = filtered
+	})
 }
 
-func (r *GatewayReconciler) clearAUDRevocationsForGateway(key types.NamespacedName, ceiling uint64) {
-	r.revocationState().prune(key.String()+"\x00", nil, ceiling)
+// clearAUDRevocationsForGateway removes the persisted AUD revocation latches
+// of every CloudflareTunnel bound to a deleted Gateway. Tunnels bound to a
+// different Gateway keep their latches.
+func (r *GatewayReconciler) clearAUDRevocationsForGateway(ctx context.Context, key types.NamespacedName) error {
+	var tunnels v1alpha1.CloudflareTunnelList
+	if err := r.List(ctx, &tunnels, client.InNamespace(key.Namespace)); err != nil {
+		return fmt.Errorf("list CloudflareTunnels for AUD revocation cleanup: %w", err)
+	}
+	for index := range tunnels.Items {
+		tunnel := &tunnels.Items[index]
+		bound := tunnel.Name == key.Name
+		if tunnel.Status.GatewayRef != nil {
+			bound = tunnel.Status.GatewayRef.Name == key.Name
+		}
+		if !bound || len(tunnel.Status.AUDRevocations) == 0 {
+			continue
+		}
+		if err := r.updateAUDRevocations(ctx, client.ObjectKeyFromObject(tunnel), func(current *v1alpha1.CloudflareTunnel) {
+			current.Status.AUDRevocations = nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func audRevocationApplied(tunnel *v1alpha1.CloudflareTunnel, application string) bool {

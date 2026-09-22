@@ -281,7 +281,7 @@ func TestRemoveDNSRecordsPrefersCurrentOwnershipComment(t *testing.T) {
 	})
 
 	remaining, conflict, err := removeDNSRecords(
-		context.Background(), cf, "current-owner", []v1alpha1.CloudflareTunnelDNSRecordStatus{expected},
+		context.Background(), cf, []string{"current-owner"}, []string{"tunnel.cfargotunnel.com"}, []v1alpha1.CloudflareTunnelDNSRecordStatus{expected},
 	)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(conflict).NotTo(gomega.BeEmpty())
@@ -613,7 +613,7 @@ func TestDeleteDNSRecordIfOwnedFailsClosed(t *testing.T) {
 	missingCheckpoint := v1alpha1.CloudflareTunnelDNSRecordStatus{
 		Hostname: "app.example.test", RecordID: "record", ZoneID: "zone",
 	}
-	deleted, conflict, err := deleteDNSRecordIfOwned(context.Background(), cf, "", missingCheckpoint)
+	deleted, conflict, err := deleteDNSRecordIfOwned(context.Background(), cf, nil, []string{"tunnel.cfargotunnel.com"}, missingCheckpoint)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(deleted).To(gomega.BeFalse())
 	g.Expect(conflict).To(gomega.ContainSubstring("no checkpointed ownership comment"))
@@ -624,7 +624,7 @@ func TestDeleteDNSRecordIfOwnedFailsClosed(t *testing.T) {
 	// a foreign replacement and must survive teardown.
 	replaced := missingCheckpoint
 	replaced.RecordID = "other-id"
-	deleted, conflict, err = deleteDNSRecordIfOwned(context.Background(), cf, "checkpointed-owner", replaced)
+	deleted, conflict, err = deleteDNSRecordIfOwned(context.Background(), cf, []string{"checkpointed-owner"}, []string{"tunnel.cfargotunnel.com"}, replaced)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(deleted).To(gomega.BeTrue())
 	g.Expect(conflict).To(gomega.BeEmpty())
@@ -720,7 +720,10 @@ func TestPreserveTunnelStatusFieldsReadsLiveOnlyOnOmission(t *testing.T) {
 	g.Expect(stale["clients"]).To(gomega.HaveLen(1))
 	g.Expect(stale["addresses"]).To(gomega.HaveLen(1))
 	g.Expect(stale["dnsRecords"]).To(gomega.HaveLen(1))
-	g.Expect(stale["configVersion"]).To(gomega.Equal(map[string]any{"remote": int64(4), "createdAt": created.Time.UTC().Format(time.RFC3339)}))
+	// Gateway mode: configVersion is owned entirely by the Gateway writer
+	// (S0/G4), so the tunnel apply document must never carry it — not even
+	// the remote/createdAt subfields the tunnel used to own.
+	g.Expect(stale).NotTo(gomega.HaveKey("configVersion"))
 	g.Expect(stale["gatewayRef"]).To(gomega.Equal(map[string]any{"name": "gateway"}))
 	g.Expect(stale["gatewayUid"]).To(gomega.Equal("uid-1"))
 	g.Expect(stale["deletedAt"]).To(gomega.Equal(created.Time.UTC().Format(time.RFC3339)))
@@ -1433,7 +1436,15 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
-	ginkgo.It("reports an out-of-band configuration version conflict", func() {
+	ginkgo.It("leaves out-of-band configuration drift to the Gateway writer in Gateway mode", func() {
+		// S0/G4 contract: in Gateway mode the Tunnel reconciler performs no
+		// remote configuration calls at all — configVersion observation and
+		// out-of-band drift detection moved to the GatewayReconciler, which
+		// reads the remote inside its own reconcile (and on the per-object
+		// TTL-expiry path; tunnel ingress config is deliberately excluded
+		// from the sweep, internal/sweep/doc.go "Non-sweepable kinds"). The
+		// pre-S0 expectation of a Tunnel-side Conflict/ConfigurationChanged
+		// condition pinned the removed duplicate read.
 		fixture := newTunnelFixture("version-conflict", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
 		fixture.create()
 
@@ -1445,14 +1456,28 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 		testTunnelCloudflare.SetConfigVersion(tunnel.Status.TunnelID, 8)
 		gomega.Expect(applyGatewayTunnelVersion(&tunnel, 7, 7)).To(gomega.Succeed())
 
+		// Wait for the cached client to observe the Gateway-applied
+		// configVersion before asserting stability.
 		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			g.Expect(current.Status.ConfigVersion.Desired).To(gomega.Equal(int64(7)))
+			g.Expect(current.Status.ConfigVersion.Applied).To(gomega.Equal(int64(7)))
+		}).WithTimeout(5 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Consistently(func(g gomega.Gomega) {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
 			conflict := findCondition(current.Status.Conditions, v1alpha1.CloudflareTunnelConditionConflict)
 			g.Expect(conflict).NotTo(gomega.BeNil())
-			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionTrue))
-			g.Expect(conflict.Reason).To(gomega.Equal("ConfigurationChanged"))
-		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(conflict.Reason).To(gomega.Equal("NoConflict"))
+			// configVersion is owned by the Gateway writer; the Tunnel
+			// reconciler must carry it forward untouched.
+			g.Expect(current.Status.ConfigVersion.Desired).To(gomega.Equal(int64(7)))
+			g.Expect(current.Status.ConfigVersion.Applied).To(gomega.Equal(int64(7)))
+			g.Expect(countCall(testTunnelCloudflare.Calls(), "GetTunnelConfiguration")).To(gomega.Equal(0))
+		}).WithTimeout(5 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("orphans the remote Tunnel when deletionPolicy is Orphan", func() {
@@ -2482,6 +2507,21 @@ func (f *fakeTunnelCloudflareFactory) ListDNSRecords(_ context.Context, zoneID, 
 	var result []RemoteDNSRecord
 	for _, record := range f.dns[zoneID] {
 		if flarecloudflare.DNSHostnamesEqual(record.Name, name) {
+			result = append(result, record)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeTunnelCloudflareFactory) ListDNSRecordsByComment(_ context.Context, zoneID, commentContains string) ([]RemoteDNSRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("ListDNSRecordsByComment"); err != nil {
+		return nil, err
+	}
+	var result []RemoteDNSRecord
+	for _, record := range f.dns[zoneID] {
+		if strings.Contains(strings.ToLower(record.Comment), strings.ToLower(commentContains)) {
 			result = append(result, record)
 		}
 	}

@@ -18,6 +18,8 @@ package cfstub
 
 import (
 	"context"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +156,72 @@ func TestM2RoutesDecodeThroughCloudflareSDKAdapter(t *testing.T) {
 	}
 	if err := api.DeleteTunnel(ctx, tunnel.ID, true); err != nil {
 		t.Fatalf("DeleteTunnel(cascade=true) returned error: %v", err)
+	}
+}
+
+func TestListDNSRecordsByCommentThroughCloudflareSDKAdapter(t *testing.T) {
+	server := New(t)
+	server.State.AddZone(Zone{ID: "zone-1", Name: "example.com", AccountID: "account-1"})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-1", ZoneID: "zone-1", Type: "CNAME", Name: "a.example.com",
+		Content: "a.cfargotunnel.com", Comment: "flareway gw-a",
+	})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-2", ZoneID: "zone-1", Type: "CNAME", Name: "b.example.com",
+		Content: "b.cfargotunnel.com", Comment: "FLAREWAY gw-b",
+	})
+	server.State.AddDNSRecord(DNSRecord{
+		ID: "rec-3", ZoneID: "zone-1", Type: "A", Name: "manual.example.com",
+		Content: "192.0.2.1", Comment: "manual-admin-record",
+	})
+	api := flarecloudflare.New(
+		"api-token", "account-1", logr.Discard(),
+		flarecloudflare.WithBaseURL(server.URL),
+		flarecloudflare.WithLimiter(rate.NewLimiter(rate.Inf, 0)),
+	)
+	ctx := context.Background()
+
+	records, err := api.ListDNSRecordsByComment(ctx, "zone-1", "flareway")
+	if err != nil {
+		t.Fatalf("ListDNSRecordsByComment returned error: %v", err)
+	}
+	// Negative case: rec-3's comment does not contain the filter and must be
+	// excluded. If the stub ignored comment.contains this returns all three.
+	if len(records) != 2 || records[0].ID != "rec-1" || records[1].ID != "rec-2" {
+		t.Fatalf("ListDNSRecordsByComment = %#v", records)
+	}
+
+	// The whole zone resolves in one filtered page. cloudflare-go's
+	// V4PagePaginationArray.GetNextPage stops only on an empty result
+	// (packages/pagination/pagination.go:215-218); it ignores total_pages, so a
+	// non-empty page is always followed by one terminator request. Every
+	// ListAutoPaging caller in this repository pays that, against the real API
+	// too. What matters here is that the cost is a constant 2 rather than one
+	// request per hostname, and that both requests carry the server-side filter.
+	journal := server.Journal()
+	if len(journal) != 2 {
+		t.Fatalf("journal = %#v", journal)
+	}
+	for index, call := range journal {
+		if call.Method != http.MethodGet ||
+			!strings.Contains(call.Path, "/zones/zone-1/dns_records") ||
+			!strings.Contains(call.Path, "comment.contains=flareway") ||
+			!strings.Contains(call.Path, "per_page=1000") {
+			t.Fatalf("journal[%d] = %#v", index, call)
+		}
+	}
+	if !strings.Contains(journal[1].Path, "page=2") {
+		t.Fatalf("second call is not the terminator page: %#v", journal[1])
+	}
+
+	// An empty filter must fail before any remote call is made.
+	for _, filter := range []string{"", "   "} {
+		if _, err := api.ListDNSRecordsByComment(ctx, "zone-1", filter); err == nil {
+			t.Fatalf("ListDNSRecordsByComment(%q) succeeded", filter)
+		}
+	}
+	if got := len(server.Journal()); got != 2 {
+		t.Fatalf("journal calls after empty filters = %d, want 2", got)
 	}
 }
 

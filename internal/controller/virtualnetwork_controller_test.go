@@ -324,4 +324,3 @@ func TestVirtualNetworkBlockedDeletionReportsCleanupBlocked(t *testing.T) {
 		t.Fatalf("blocked deletion deleted the remote virtual network, calls=%v", api.callsSnapshot())
 	}
 }
-

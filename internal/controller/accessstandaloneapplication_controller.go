@@ -33,12 +33,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const (
@@ -54,6 +57,9 @@ type AccessStandaloneApplicationReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 
 	pendingUpdateMu          sync.Mutex
 	pendingUpdateGenerations map[types.UID]standaloneApplicationUpdate
@@ -120,6 +126,25 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		return r.finishObserved(ctx, object, remote, scope, metav1.ConditionTrue, "Observed", "Standalone Access application is observed without mutation")
 	}
 
+	// T1 gate: the managed path below reads the remote application before
+	// any write. ObserveOnly above stays ungated (safety condition 9).
+	// Adoption reads inside ensureManaged are T0 by construction: the gate
+	// only opens once status.applicationId is bound and the applied hash
+	// matches.
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+		Kind: "AccessStandaloneApplication", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.ApplicationID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: object.Spec, Input: input},
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+
 	remote, secretRef, err := r.ensureManaged(ctx, api, scope, object, input)
 	if err != nil {
 		if standaloneApplicationIsValidationError(err) {
@@ -128,9 +153,16 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		return r.finishRemoteError(ctx, object, err)
 	}
 	if !flarecloudflare.AccessApplicationMatchesInput(remote, input) {
-		return ctrl.Result{RequeueAfter: accessStandaloneApplicationRequeue}, r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionFalse, "Updating", "Waiting for the updated standalone Access application to be observed")
+		return ctrl.Result{RequeueAfter: accessStandaloneApplicationRequeue}, r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionFalse, "Updating", "Waiting for the updated standalone Access application to be observed", object.Status.AppliedHash, object.Status.AppliedAt)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized")
+	if err := r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessStandaloneApplicationRequeue)}, nil
 }
 
 func accessStandaloneScope(account *v1alpha1.CloudflareAccount, zoneName string) (flarecloudflare.AccessScope, error) {
@@ -876,7 +908,7 @@ func (r *AccessStandaloneApplicationReconciler) finishError(ctx context.Context,
 		r.clearStandaloneApplicationUpdate(object)
 	}
 	remote := standaloneApplicationFromStatus(object.Status)
-	if patchErr := r.patchStatus(ctx, object, remote, flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}, object.Status.OwnershipVerified, standaloneStatusSecretRef(object.Status), metav1.ConditionFalse, metav1.ConditionFalse, reason, err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, remote, flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}, object.Status.OwnershipVerified, standaloneStatusSecretRef(object.Status), metav1.ConditionFalse, metav1.ConditionFalse, reason, err.Error(), object.Status.AppliedHash, object.Status.AppliedAt); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	if terminal {
@@ -886,7 +918,7 @@ func (r *AccessStandaloneApplicationReconciler) finishError(ctx context.Context,
 }
 
 func (r *AccessStandaloneApplicationReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, err error) (ctrl.Result, error) {
-	if patchErr := r.patchStatus(ctx, object, standaloneApplicationFromStatus(object.Status), flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}, object.Status.OwnershipVerified, standaloneStatusSecretRef(object.Status), metav1.ConditionFalse, metav1.ConditionFalse, "CloudflareError", err.Error()); patchErr != nil {
+	if patchErr := r.patchStatus(ctx, object, standaloneApplicationFromStatus(object.Status), flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}, object.Status.OwnershipVerified, standaloneStatusSecretRef(object.Status), metav1.ConditionFalse, metav1.ConditionFalse, "CloudflareError", err.Error(), object.Status.AppliedHash, object.Status.AppliedAt); patchErr != nil {
 		return ctrl.Result{}, patchErr
 	}
 	return ctrl.Result{}, err
@@ -894,11 +926,13 @@ func (r *AccessStandaloneApplicationReconciler) finishRemoteError(ctx context.Co
 
 func (r *AccessStandaloneApplicationReconciler) finishObserved(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, ready metav1.ConditionStatus, reason, message string) (ctrl.Result, error) {
 	owned := object.Status.OwnershipVerified && object.Status.ApplicationID == remote.ID
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, scope, owned, standaloneStatusSecretRef(object.Status), metav1.ConditionTrue, ready, reason, message)
+	return ctrl.Result{}, r.patchStatus(ctx, object, remote, scope, owned, standaloneStatusSecretRef(object.Status), metav1.ConditionTrue, ready, reason, message, object.Status.AppliedHash, object.Status.AppliedAt)
 }
 
-func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message string) error {
+func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
 	base := client.MergeFrom(object.DeepCopy())
+	object.Status.AppliedHash = appliedHash
+	object.Status.AppliedAt = appliedAt
 	if remote.ID != "" {
 		object.Status.ApplicationID = remote.ID
 	}
@@ -1113,8 +1147,11 @@ func (r *AccessStandaloneApplicationReconciler) SetupWithManager(manager ctrl.Ma
 	}); err != nil {
 		return fmt.Errorf("index AccessStandaloneApplication policy refs: %w", err)
 	}
-	builder := ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessStandaloneApplication{}).Owns(&corev1.Secret{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.standaloneApplicationsForAccount)).Watches(&v1alpha1.AccessPolicy{}, handler.EnqueueRequestsFromMapFunc(r.standaloneApplicationsForPolicy)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&v1alpha1.AccessCustomPage{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications))
-	return builder.Complete(observedReconciler("access-standalone-application", r))
+	appBuilder := ctrl.NewControllerManagedBy(manager).For(&v1alpha1.AccessStandaloneApplication{}).Owns(&corev1.Secret{}).Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.standaloneApplicationsForAccount)).Watches(&v1alpha1.AccessPolicy{}, handler.EnqueueRequestsFromMapFunc(r.standaloneApplicationsForPolicy)).Watches(&v1alpha1.IdentityProvider{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&v1alpha1.AccessCustomPage{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications)).Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allStandaloneApplications))
+	if r.SweepEvents != nil {
+		appBuilder = appBuilder.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return appBuilder.Complete(observedReconciler("access-standalone-application", r))
 }
 
 func (r *AccessStandaloneApplicationReconciler) standaloneApplicationsForAccount(ctx context.Context, object client.Object) []reconcile.Request {

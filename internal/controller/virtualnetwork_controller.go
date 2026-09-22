@@ -27,15 +27,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 // VirtualNetworkReconciler manages Cloudflare Zero Trust virtual networks.
@@ -44,6 +48,9 @@ type VirtualNetworkReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=virtualnetworks;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -104,6 +111,16 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 
 	input := flarecloudflare.VirtualNetworkInput{Name: object.Spec.Name, IsDefault: object.Spec.IsDefault, Comment: ownerComment}
+	clusterID := gateClusterID(ctx, r.Client)
+	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeTraffic, gateInput{
+		Kind: "VirtualNetwork", Namespace: object.Namespace, Name: object.Name,
+		UID: object.UID, RemoteID: object.Status.VirtualNetworkID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Spec: object.Spec,
+	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+	if decision.Open {
+		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -115,7 +132,14 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		return r.finishRemoteError(ctx, object, err)
 	}
-	return ctrl.Result{}, r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Virtual network is synchronized")
+	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Virtual network is synchronized"); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	clearGate(r.Invalidator, "VirtualNetwork", request.NamespacedName)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, nil
 }
 
 func (r *VirtualNetworkReconciler) ensureManaged(ctx context.Context, api flarecloudflare.VirtualNetworkAPI, object *v1alpha1.VirtualNetwork, input flarecloudflare.VirtualNetworkInput) (flarecloudflare.VirtualNetwork, error) {
@@ -393,14 +417,17 @@ func (r *VirtualNetworkReconciler) SetupWithManager(manager ctrl.Manager) error 
 	}); err != nil {
 		return fmt.Errorf("index VirtualNetwork accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
-		For(&v1alpha1.VirtualNetwork{}).
+	b := ctrl.NewControllerManagedBy(manager).
+		For(&v1alpha1.VirtualNetwork{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworksForAccount)).
-		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworkPeers)).
+		Watches(&v1alpha1.VirtualNetwork{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworkPeers), builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworkForNetworkRoute)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.virtualNetworksForNamespace)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("virtual-network", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("virtual-network", r))
 }
 
 func (r *VirtualNetworkReconciler) virtualNetworksForAccount(ctx context.Context, object client.Object) []reconcile.Request {

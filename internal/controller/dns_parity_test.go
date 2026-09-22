@@ -102,7 +102,10 @@ func TestEnsureDNSNeverMutatesForeignUnicodeCollision(t *testing.T) {
 	}
 }
 
-func TestEnsureDNSReplacesOnlyExactlyOwnedNonCNAME(t *testing.T) {
+// A record carrying our ownership marker but pointing at foreign content is
+// preserved, not deleted: the marker alone never authorizes a destructive
+// write (D8), so the conflict is reported and the record is left untouched.
+func TestEnsureDNSPreservesMarkerCarryingNonCNAME(t *testing.T) {
 	const (
 		zoneID      = "zone-example"
 		clusterID   = "cluster"
@@ -122,18 +125,15 @@ func TestEnsureDNSReplacesOnlyExactlyOwnedNonCNAME(t *testing.T) {
 		context.Background(), cloudflareClient, tunnel, gatewayName, clusterID, tunnelID,
 		[]publicHostname{{Hostname: hostname, ZoneID: zoneID, ZoneName: "example"}},
 	)
-	if err != nil || conflict != "" || len(status) != 1 {
+	if err != nil || conflict == "" || !strings.Contains(conflict, "not owned") || len(status) != 0 {
 		t.Fatalf("ensureDNS() status=%#v conflict=%q error=%v", status, conflict, err)
 	}
-	if cloudflareClient.HasDNSRecord(zoneID, "owned-a") {
-		t.Fatal("owned incompatible record was not deleted")
+	record, ok := cloudflareClient.DNSRecord(zoneID, "owned-a")
+	if !ok || record.Type != "A" || record.Content != "192.0.2.1" {
+		t.Fatalf("marker-carrying A record mutated: %#v, present=%t", record, ok)
 	}
-	created, ok := cloudflareClient.DNSRecord(zoneID, status[0].RecordID)
-	if !ok || created.Type != "CNAME" || created.Name != punycode || created.Content != tunnelID+".cfargotunnel.com" || !created.Proxied {
-		t.Fatalf("replacement DNS record = %#v, present=%t", created, ok)
-	}
-	if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords", "ListDNSRecords", "DeleteDNSRecord", "CreateCNAME"}) {
-		t.Fatalf("owned incompatible DNS calls = %v", calls)
+	if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords"}) {
+		t.Fatalf("marker-carrying A record calls = %v", calls)
 	}
 }
 

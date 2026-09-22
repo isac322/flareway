@@ -493,8 +493,8 @@ var _ = ginkgo.Describe("AccessStandaloneApplication Controller", func() {
 			application := &v1alpha1.AccessStandaloneApplication{
 				ObjectMeta: metav1.ObjectMeta{Name: testCase.name, Namespace: fixture.namespace},
 				Spec: v1alpha1.AccessStandaloneApplicationSpec{
-					AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
-					Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+					AccountRef:  corev1.LocalObjectReference{Name: fixture.accountName},
+					Type:        v1alpha1.AccessStandaloneApplicationTypeBookmark,
 					Application: v1alpha1.AccessApplicationSettings{Name: testCase.name},
 					Bookmark:    &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://" + testCase.name + ".example.test/"},
 				},
@@ -541,8 +541,8 @@ var _ = ginkgo.Describe("AccessStandaloneApplication Controller", func() {
 		application := &v1alpha1.AccessStandaloneApplication{
 			ObjectMeta: metav1.ObjectMeta{Name: "bookmark", Namespace: fixture.namespace},
 			Spec: v1alpha1.AccessStandaloneApplicationSpec{
-				AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
-				Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+				AccountRef:  corev1.LocalObjectReference{Name: fixture.accountName},
+				Type:        v1alpha1.AccessStandaloneApplicationTypeBookmark,
 				Application: v1alpha1.AccessApplicationSettings{Name: "bookmark"},
 				Bookmark:    &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://bookmark.example.test/"},
 			},

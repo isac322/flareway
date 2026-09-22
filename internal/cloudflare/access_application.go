@@ -726,7 +726,7 @@ func (client *Client) GetAccessApplication(ctx context.Context, scope AccessScop
 
 // ListAccessApplications is part of the Flareway API.
 func (client *Client) ListAccessApplications(ctx context.Context, scope AccessScope) ([]AccessApplication, error) {
-	params := zero_trust.AccessApplicationListParams{PerPage: cloudflaresdk.F(int64(100))}
+	params := zero_trust.AccessApplicationListParams{PerPage: cloudflaresdk.F(int64(accessListPerPage))}
 	applyAccessScope(client.accountID, scope, func(value string) { params.AccountID = cloudflaresdk.F(value) }, func(value string) { params.ZoneID = cloudflaresdk.F(value) })
 	pager := client.sdk.ZeroTrust.Access.Applications.ListAutoPaging(ctx, params)
 	applications := make([]AccessApplication, 0)

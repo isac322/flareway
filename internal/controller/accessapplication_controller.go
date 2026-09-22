@@ -33,17 +33,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 )
@@ -94,6 +98,9 @@ type AccessApplicationReconciler struct {
 	NewCloudflareClient NewAccessApplicationCloudflareClient
 	OperatorNamespace   string
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications,verbs=get;list;watch;create;update;patch;delete
@@ -220,6 +227,34 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		return ctrl.Result{}, err
 	}
 	input := remoteApplicationInput(application, resolved.compilation.Destinations, policyIDs, idpIDs, customPageIDs, scimConfig, ownerTag)
+
+	// T1 gate: reconcileRemoteApplication reads the remote application
+	// before any write. The gate opens only when every precondition holds:
+	// status.applicationID is bound, status.appliedHash equals the desired
+	// hash computed here, status.appliedAt is inside the Authz TTL, and no
+	// sweep invalidation is latched. An unbound or unconverged object —
+	// first create, pending adoption, or a spec change — always reads
+	// fresh, so adoption and ownership scans inside
+	// reconcileRemoteApplication stay T0. Collision precedence between
+	// AccessApplications is decided locally in resolveApplication before
+	// this point, so the gate can never hide it. ObserveOnly is excluded:
+	// observation is the feature (safety condition 9).
+	var desiredHash string
+	if effectiveManagementPolicy(application.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly {
+		decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
+			Kind: "AccessApplication", Namespace: application.Namespace, Name: application.Name,
+			UID: application.UID, RemoteID: application.Status.ApplicationID,
+			AccountID: resolved.account.Spec.AccountID, ClusterID: clusterID,
+			Spec: struct {
+				Spec  any `json:"spec"`
+				Input any `json:"input"`
+			}{Spec: application.Spec, Input: input},
+		}, application.Status.AppliedHash, application.Status.AppliedAt, r.now())
+		if decision.Open {
+			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+		}
+		desiredHash = decision.DesiredHash
+	}
 	observed, err := r.reconcileRemoteApplication(ctx, remote, resolved.scope, application, input, ownerTag)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Pending", "Remote Access application reconciliation failed: "+err.Error()))
@@ -244,15 +279,22 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	_, ownerTags, _ := r.accessOwnerTags(ctx, application, ownerTag)
 	status := r.desiredStatus(application, resolved.compilation, observed.ID, children, programmed)
-	applyObservedApplicationStatus(&status, application, resolved.scope, observed, ownerTag)
+	applyObservedApplicationStatus(&status, application, resolved.scope, observed, ownerTags)
+	if programmed {
+		status.AppliedHash = desiredHash
+		appliedAt := metav1.NewTime(r.now())
+		status.AppliedAt = &appliedAt
+		clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
+	}
 	if err := r.patchStatus(ctx, application, status); err != nil {
 		return ctrl.Result{}, err
 	}
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
 func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context, application *v1alpha1.AccessApplication, invalid gatewayapi.AccessApplicationCompilation) (ctrl.Result, error) {
@@ -478,7 +520,6 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			}
 			return accessApplicationContext{}, err
 		}
-		revocationCeiling := collector.revocationState().ceiling()
 		inputs, _, err := collector.collectInputs(ctx, &gateway, &gatewayClass, config)
 		if err != nil {
 			return accessApplicationContext{}, err
@@ -506,7 +547,9 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		if err != nil {
 			return accessApplicationContext{}, err
 		}
-		collector.applyAUDRevocationLatches(&gateway, tunnel, &inputs, revocationCeiling)
+		if err := collector.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
+			return accessApplicationContext{}, err
+		}
 		_, statuses := gatewayapi.Translate(inputs)
 		compiled, found := statuses.AccessApplications[client.ObjectKeyFromObject(application)]
 		if !found {
@@ -1521,6 +1564,13 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 	if err != nil {
 		return err
 	}
+	key, signedTag := r.accessSigningIdentity(ctx, application)
+	ownerTags := []string{ownerTag}
+	if signedTag == "" {
+		log.FromContext(ctx).Info("ownership signing key unavailable; deleting only legacy ownership markers", "application", client.ObjectKeyFromObject(application))
+	} else if signedTag != ownerTag {
+		ownerTags = append(ownerTags, signedTag)
+	}
 	scope, err := accessApplicationScopeForDeletion(application, account)
 	if err != nil {
 		return err
@@ -1529,7 +1579,7 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 	if err != nil {
 		return fmt.Errorf("list Access applications for deletion recovery: %w", err)
 	}
-	parentIDs, childIDs, bypassTags, err := accessApplicationDeletionTargets(application, ownerTag, applications)
+	parentIDs, childIDs, bypassTags, err := accessApplicationDeletionTargets(application, ownerTags, key, applications)
 	if err != nil {
 		return err
 	}
@@ -1553,9 +1603,8 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 			if childName == "" {
 				childName = bypassChildApplicationName(accessApplicationRemoteName(application), status.Hostname, status.Path)
 			}
-			tagName := accessBypassTag(ownerTag, childName)
 			input := accessApplicationInputFromObserved(child)
-			input.Tags = removeAccessTags(input.Tags, accessManagedTag, ownerTag, tagName)
+			input.Tags = removeAccessTags(input.Tags, append(append([]string{accessManagedTag}, ownerTags...), accessBypassMarkersForOwners(key, ownerTags, childName)...)...)
 			if !accessApplicationMatchesInput(child, input) {
 				if _, err := remote.UpdateAccessApplication(ctx, scope, id, input); err != nil {
 					return fmt.Errorf("orphan bypass Access application %s: %w", id, err)
@@ -1582,8 +1631,10 @@ func (r *AccessApplicationReconciler) deleteManagedRemoteApplications(ctx contex
 			return fmt.Errorf("delete bypass Access tag %q: %w", tagName, err)
 		}
 	}
-	if err := remote.DeleteAccessTag(ctx, ownerTag); err != nil && !isRemoteNotFound(err) {
-		return fmt.Errorf("delete owner Access tag %q: %w", ownerTag, err)
+	for _, tag := range ownerTags {
+		if err := remote.DeleteAccessTag(ctx, tag); err != nil && !isRemoteNotFound(err) {
+			return fmt.Errorf("delete owner Access tag %q: %w", tag, err)
+		}
 	}
 	return nil
 }
@@ -1719,14 +1770,14 @@ func applyObservedApplicationStatus(
 	application *v1alpha1.AccessApplication,
 	scope flarecloudflare.AccessScope,
 	observed flarecloudflare.AccessApplication,
-	ownerTag string,
+	ownerTags []string,
 ) {
 	status.Type = v1alpha1.AccessApplicationType(observed.Type)
 	status.Domain = observed.Domain
 	status.ZoneID = scope.ZoneID
 	status.OwnershipVerified = effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly ||
 		observed.Type == flarecloudflare.AccessApplicationTypeProxyEndpoint ||
-		hasAccessTag(observed.Tags, accessManagedTag) && hasAccessTag(observed.Tags, ownerTag)
+		hasAccessTag(observed.Tags, accessManagedTag) && hasAnyAccessTag(observed.Tags, ownerTags)
 	status.Tags = canonicalStrings(observed.Tags)
 	status.ObservedGeneration = application.Generation
 }
@@ -1800,8 +1851,8 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessApplication accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.AccessApplication{}).
+	b := ctrl.NewControllerManagedBy(mgr).
+		For(&v1alpha1.AccessApplication{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
 		Watches(&gatewayv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayClassToApplications)).
@@ -1816,8 +1867,11 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.mapAccountToApplications)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToApplications)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapAUDSecretToApplication)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("access-application", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("access-application", r))
 }
 
 func accessApplicationIndexTargetKeys(application *v1alpha1.AccessApplication) []string {

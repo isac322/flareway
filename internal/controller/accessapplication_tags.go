@@ -28,10 +28,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/ownership"
 )
 
 const (
@@ -228,8 +230,59 @@ func hasAccessTag(tags []string, expected string) bool {
 	return slices.Contains(tags, expected)
 }
 
+// hasAnyAccessTag reports whether tags carries at least one of the expected
+// markers. During the HMAC transition an owned object may present either the
+// legacy plaintext tag or the signed tag.
+func hasAnyAccessTag(tags []string, expected []string) bool {
+	for _, tag := range expected {
+		if slices.Contains(tags, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// foreignAccessOwnerTags returns owner-prefixed tags that are not among mine:
+// evidence that another Flareway cluster (or a forger) claims the object.
+func foreignAccessOwnerTags(tags []string, mine []string) []string {
+	var foreign []string
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, accessOwnerTagPrefix) || slices.Contains(mine, tag) {
+			continue
+		}
+		foreign = append(foreign, tag)
+	}
+	return foreign
+}
+
+// accessBypassTag is the deterministic bypass marker derived from one owner
+// tag and the child name. Writes emit exactly one marker, derived from the
+// owner tag the reconcile writes (D13); reads accept every generation via
+// accessBypassMarkers.
 func accessBypassTag(ownerTag, childName string) string {
 	return accessDigestTag(accessBypassTagPrefix, ownerTag+"\x00"+childName)
+}
+
+// accessBypassMarkers returns every bypass marker a child may legitimately
+// carry for one owner tag: the plaintext digest first, then the HMAC marker
+// when a signing key is present.
+func accessBypassMarkers(key []byte, ownerTag, childName string) []string {
+	legacy := accessBypassTag(ownerTag, childName)
+	signed := flarecloudflare.SignAccessBypassTag(key, ownerTag, childName)
+	if signed == legacy {
+		return []string{legacy}
+	}
+	return []string{legacy, signed}
+}
+
+// accessBypassMarkersForOwners returns the union of bypass markers across all
+// accepted owner tags.
+func accessBypassMarkersForOwners(key []byte, ownerTags []string, childName string) []string {
+	var markers []string
+	for _, owner := range ownerTags {
+		markers = append(markers, accessBypassMarkers(key, owner, childName)...)
+	}
+	return markers
 }
 
 func accessDigestTag(prefix, identity string) string {
@@ -251,11 +304,65 @@ func validInternalDigestTag(tag, prefix string) bool {
 }
 
 func (r *AccessApplicationReconciler) accessIdentity(ctx context.Context, application *v1alpha1.AccessApplication) (string, string, error) {
-	var namespace corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: "kube-system"}, &namespace); err != nil {
-		return "", "", fmt.Errorf("get kube-system namespace: %w", err)
+	clusterID, err := r.accessClusterID(ctx)
+	if err != nil {
+		return "", "", err
 	}
-	clusterID := string(namespace.UID)
 	identity := flarecloudflare.OwnerTag(clusterID, application.Namespace, application.Name, application.UID)
 	return accessDigestTag(accessOwnerTagPrefix, identity), clusterID, nil
+}
+
+func (r *AccessApplicationReconciler) accessClusterID(ctx context.Context) (string, error) {
+	var namespace corev1.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Name: "kube-system"}, &namespace); err != nil {
+		return "", fmt.Errorf("get kube-system namespace: %w", err)
+	}
+	return string(namespace.UID), nil
+}
+
+// accessOwnershipKey resolves the cluster HMAC key for remote ownership
+// markers. Failures degrade to a nil key (legacy plaintext markers) rather
+// than failing the reconcile; the caller surfaces the error in status.
+func (r *AccessApplicationReconciler) accessOwnershipKey(ctx context.Context) ([]byte, error) {
+	if r.Client == nil {
+		return nil, nil
+	}
+	provider := ownership.NewSecretKeyProvider(r.Client, r.operatorNamespace())
+	return provider.GetOrCreateKey(ctx)
+}
+
+// accessSigningIdentity resolves the HMAC key and the signed owner tag for one
+// AccessApplication. Any failure degrades to empty values: writes then carry
+// only the legacy plaintext marker, matching pre-D8 behavior.
+func (r *AccessApplicationReconciler) accessSigningIdentity(ctx context.Context, application *v1alpha1.AccessApplication) ([]byte, string) {
+	key, err := r.accessOwnershipKey(ctx)
+	if err != nil {
+		log.FromContext(ctx).Info("ownership key unavailable; using legacy ownership markers", "error", err.Error())
+		return nil, ""
+	}
+	if len(key) == 0 {
+		return nil, ""
+	}
+	clusterID, err := r.accessClusterID(ctx)
+	if err != nil {
+		log.FromContext(ctx).Info("cluster ID unavailable; using legacy ownership markers", "error", err.Error())
+		return nil, ""
+	}
+	return key, flarecloudflare.SignAccessOwnerTag(key, clusterID, application.Namespace, application.Name, application.UID)
+}
+
+// accessOwnerTags resolves the markers for one AccessApplication: the signing
+// key, every owner tag a reader must accept (legacy plaintext first, then the
+// HMAC tag when the cluster key is available), and the single owner tag this
+// reconcile writes (D13). All ownership judgments share the accepted set so
+// write, read, and status paths cannot diverge.
+func (r *AccessApplicationReconciler) accessOwnerTags(ctx context.Context, application *v1alpha1.AccessApplication, ownerTag string) (key []byte, ownerTags []string, writeTag string) {
+	key, signedTag := r.accessSigningIdentity(ctx, application)
+	ownerTags = []string{ownerTag}
+	writeTag = ownerTag
+	if signedTag != "" && signedTag != ownerTag {
+		ownerTags = append(ownerTags, signedTag)
+		writeTag = signedTag
+	}
+	return key, ownerTags, writeTag
 }

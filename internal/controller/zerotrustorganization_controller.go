@@ -32,11 +32,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 const organizationStatusListLimit = 1000
@@ -48,6 +51,9 @@ type ZeroTrustOrganizationReconciler struct {
 	APIReader           client.Reader
 	NewCloudflareClient NewOrganizationCloudflareClient
 	Now                 func() time.Time
+	Freshness           freshness.Policy
+	Invalidator         *freshness.Latch
+	SweepEvents         <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=zerotrustorganizations;cloudflareaccounts;servicetokens;accesscustompages,verbs=get;list;watch;create;update;patch;delete
@@ -97,6 +103,36 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
+	var desiredDOH *flarecloudflare.OrganizationDOHInput
+	if object.Spec.DOH != nil {
+		if scope.ZoneID != "" {
+			return r.finishError(ctx, object, privateInvalid("Invalid", "spec.doh is account-scoped and cannot be used with spec.zone"))
+		}
+		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, api, object.Spec.DOH.ServiceTokenRef)
+		if resolveErr != nil {
+			return r.finishError(ctx, object, resolveErr)
+		}
+		desiredDOH = &flarecloudflare.OrganizationDOHInput{ServiceTokenID: serviceTokenID, JWTDuration: object.Spec.DOH.JWTDuration}
+	}
+
+	var decision gateDecision
+	if effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged {
+		clusterID := gateClusterID(ctx, r.Client)
+		decision = evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
+			Kind: "ZeroTrustOrganization", Namespace: object.Namespace, Name: object.Name,
+			UID:       object.UID,
+			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Spec: struct {
+				Spec  any `json:"spec"`
+				Input any `json:"input"`
+				DOH   any `json:"doh"`
+				Scope any `json:"scope"`
+			}{Spec: object.Spec, Input: input, DOH: desiredDOH, Scope: scope},
+		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
+		if decision.Open {
+			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+		}
+	}
 
 	observed, err := api.GetAccessOrganization(ctx, scope)
 	absent := isRemoteNotFound(err)
@@ -118,16 +154,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	}
 
 	var observedDOH *flarecloudflare.OrganizationDOHSettings
-	var desiredDOH *flarecloudflare.OrganizationDOHInput
 	if object.Spec.DOH != nil {
-		if scope.ZoneID != "" {
-			return r.finishError(ctx, object, privateInvalid("Invalid", "spec.doh is account-scoped and cannot be used with spec.zone"))
-		}
-		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, api, object.Spec.DOH.ServiceTokenRef)
-		if resolveErr != nil {
-			return r.finishError(ctx, object, resolveErr)
-		}
-		desiredDOH = &flarecloudflare.OrganizationDOHInput{ServiceTokenID: serviceTokenID, JWTDuration: object.Spec.DOH.JWTDuration}
 		remoteDOH, getErr := api.GetAccessOrganizationDOH(ctx)
 		if getErr != nil && !isRemoteNotFound(getErr) {
 			return r.finishRemoteError(ctx, object, getErr)
@@ -192,10 +219,14 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		}
 	}
 
+	clearGate(r.Invalidator, "ZeroTrustOrganization", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, observedDOH, nil, observedRevocation, metav1.ConditionTrue, "Ready", "Zero Trust organization is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: globalRequeue}, nil
+	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil
 }
 
 func organizationUserRevocationRequested(request *v1alpha1.ZeroTrustOrganizationUserRevocation, observed *metav1.Time) bool {
@@ -653,14 +684,17 @@ func (r *ZeroTrustOrganizationReconciler) SetupWithManager(manager ctrl.Manager)
 	}); err != nil {
 		return fmt.Errorf("index ZeroTrustOrganization accountRef: %w", err)
 	}
-	return ctrl.NewControllerManagedBy(manager).
+	b := ctrl.NewControllerManagedBy(manager).
 		For(&v1alpha1.ZeroTrustOrganization{}).
 		Watches(&v1alpha1.ZeroTrustOrganization{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.forAccount)).
 		Watches(&v1alpha1.ServiceToken{}, handler.EnqueueRequestsFromMapFunc(r.forOrganizationDependency)).
 		Watches(&v1alpha1.AccessCustomPage{}, handler.EnqueueRequestsFromMapFunc(r.forOrganizationDependency)).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange)).
-		Complete(observedReconciler("zero-trust-organization", r))
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.forWriterChange))
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("zero-trust-organization", r))
 }
 
 func (r *ZeroTrustOrganizationReconciler) forWriterChange(ctx context.Context, _ client.Object) []reconcile.Request {

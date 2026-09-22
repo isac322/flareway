@@ -50,6 +50,8 @@ const (
 	CloudflareTunnelConditionCleanupBlocked = "CleanupBlocked"
 	// CloudflareTunnelConditionConflict reports a remote ownership conflict.
 	CloudflareTunnelConditionConflict = "Conflict"
+	// CloudflareTunnelConditionDriftDetected reports whether an out-of-band configuration drift exists.
+	CloudflareTunnelConditionDriftDetected = "DriftDetected"
 )
 
 // ManagementPolicy controls whether Flareway mutates a remote resource.
@@ -415,6 +417,9 @@ type CloudflareTunnelConfigVersion struct {
 	Applied     int64        `json:"applied,omitempty"`
 	Remote      int64        `json:"remote,omitempty"`
 	CreatedAt   *metav1.Time `json:"createdAt,omitempty"`
+	// AppliedAt is when the desired configuration was last applied remotely; nil means never applied.
+	// +optional
+	AppliedAt *metav1.Time `json:"appliedAt,omitempty"`
 }
 
 // CloudflareTunnelConnectionStatus records one edge connection.
@@ -515,6 +520,29 @@ type CloudflareTunnelListenerStatus struct {
 	ProtectionDomains []CloudflareProtectionDomainStatus `json:"protectionDomains,omitempty"`
 }
 
+// CloudflareAUDRevocationLatch records an in-flight Access AUD revocation for
+// one AccessApplication bound to this Tunnel's Gateway.
+type CloudflareAUDRevocationLatch struct {
+	// Application names the AccessApplication as "namespace/name".
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Application string `json:"application"`
+
+	// ApplicationUID binds the latch to the exact AccessApplication instance.
+	// +kubebuilder:validation:Required
+	ApplicationUID types.UID `json:"applicationUid"`
+
+	// Token is the monotonically increasing generation token at which the
+	// revocation was latched.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	Token int64 `json:"token"`
+
+	// LatchedAt records when this revocation was latched.
+	// +kubebuilder:validation:Required
+	LatchedAt metav1.Time `json:"latchedAt"`
+}
+
 // CloudflareTunnelStatus contains bounded remote observations and disjoint controller-owned fields.
 type CloudflareTunnelStatus struct {
 	TunnelID                 string                       `json:"tunnelId,omitempty"`
@@ -558,6 +586,17 @@ type CloudflareTunnelStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	Listeners []CloudflareTunnelListenerStatus `json:"listeners,omitempty"`
+	// AUDRevocationSequence is the monotonic sequence counter used to allocate
+	// revocation latch tokens.
+	// +kubebuilder:validation:Minimum=0
+	AUDRevocationSequence int64 `json:"audRevocationSequence,omitempty"`
+	// AUDRevocations persists in-flight Access AUD revocation latches. Entries
+	// are removed only by the Gateway reconciler's release/prune pass; there is
+	// deliberately no item cap because dropping a latch would re-admit a
+	// revoked AUD (G3).
+	// +listType=map
+	// +listMapKey=application
+	AUDRevocations []CloudflareAUDRevocationLatch `json:"audRevocations,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=type

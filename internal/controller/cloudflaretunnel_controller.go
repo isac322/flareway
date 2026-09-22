@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,15 +39,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
+	"github.com/isac322/flareway/internal/freshness"
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 	"github.com/isac322/flareway/internal/ir"
 )
@@ -100,6 +105,14 @@ type CloudflareTunnelReconciler struct {
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewTunnelCloudflareClient
 	Now                 func() time.Time
+	// OperatorNamespace hosts the cluster ownership-key Secret. Empty falls
+	// back to dataplane.DefaultOperatorNamespace.
+	OperatorNamespace string
+	Freshness         freshness.Policy
+	Invalidator       *freshness.Latch
+	// SweepEvents carries drift wakeups from the sweep worker. When nil no
+	// raw source is registered in SetupWithManager.
+	SweepEvents <-chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=cloudflaretunnels;cloudflareaccounts,verbs=get;list;watch;create;update;patch;delete
@@ -364,6 +377,53 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			return ctrl.Result{}, err
 		}
 	}
+
+	// T2 gate: a converged Tunnel skips the remote identity, DNS, and
+	// configuration reads below. ObserveOnly tunnels are never gated —
+	// remote observation is the feature (safety condition 9). The reads
+	// this gate suppresses are T0 fresh reads by contract: the adoption
+	// and ownership checks inside ensureRemoteTunnel, the per-hostname
+	// ListDNSRecords inside ensureDNS (a fresh read before destructive
+	// writes), and the read-modify-write inside WithTunnelLock. They only
+	// execute while the gate is closed; the sweep re-opens them early via
+	// the invalidation latch when it detects drift.
+	if tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && tunnelConvergedForGate(tunnel, &account, publicHosts) {
+		gate := evaluateGateWithHash(r.Freshness, r.Invalidator, freshness.GradeTraffic, "CloudflareTunnel",
+			client.ObjectKeyFromObject(tunnel), tunnel.Status.ConfigVersion.DesiredHash, tunnel.Status.ConfigVersion.DesiredHash,
+			tunnel.Status.ConfigVersion.AppliedAt, now.Time)
+		if gate.Open {
+			// QA-001 residual: ListTunnelConnections is the T4 display read
+			// that keeps status.clients fresh; the token-secret ensures
+			// self-heal a deleted Secret without remote calls in the steady
+			// state. The status apply is skipped when the projection is
+			// unchanged so an open pass costs zero etcd writes (QA-030).
+			connectorSecretRef, err := r.ensureTokenSecret(ctx, cf, tunnel, tunnel.Status.TunnelID)
+			if err != nil {
+				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "TokenUnavailable", err)
+			}
+			managementSecretRef, err := r.ensureManagementTokenSecret(ctx, cf, tunnel, tunnel.Status.TunnelID)
+			if err != nil {
+				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "TokenUnavailable", err)
+			}
+			clients, _, err := cf.ListTunnelConnections(ctx, tunnel.Status.TunnelID, tunnelObservationLimit)
+			if err != nil {
+				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "ConnectionsUnavailable", err)
+			}
+			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
+			status.ConnectorTokenSecretRef = connectorSecretRef
+			status.ManagementTokenSecretRef = managementSecretRef
+			status.Clients = tunnelClientStatuses(clients)
+			status.Addresses = tunnelAddresses(tunnel.Status.TunnelID, len(publicHosts) > 0)
+			r.setReadyForMode(&status, tunnel, mode, now)
+			if tunnelGateStatusUnchanged(tunnel.Status, status) {
+				return ctrl.Result{RequeueAfter: gate.Requeue}, nil
+			}
+			openClear := clearIntent
+			openClear.Clients = true
+			openClear.Addresses = true
+			return ctrl.Result{RequeueAfter: gate.Requeue}, r.patchOwnedStatus(ctx, tunnel, status, openClear)
+		}
+	}
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
 	if err != nil {
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "CloudflareError", err.Error(), tunnel.Generation, now))
@@ -503,7 +563,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 
 	switch {
 	case tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal:
-		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, dnsOwnershipComment(tunnel, clusterID, dnsOwnerName), tunnel.Status.DNSRecords)
+		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, dnsOwnershipMarkers(tunnel, clusterID, dnsOwnerName), dnsRecordTargets(tunnel, remote.ID), tunnel.Status.DNSRecords)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -519,7 +579,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, reason, message, tunnel.Generation, now), now)
 	case len(publicHosts) == 0:
-		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, dnsOwnershipComment(tunnel, clusterID, dnsOwnerName), tunnel.Status.DNSRecords)
+		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, dnsOwnershipMarkers(tunnel, clusterID, dnsOwnerName), dnsRecordTargets(tunnel, remote.ID), tunnel.Status.DNSRecords)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -551,7 +611,15 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 
 	r.setReadyForMode(&status, tunnel, mode, now)
 	clearIntent.DNSRecords = true
-	return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
+	clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
+	// A disabled gate (zero TTL) preserves the pre-gate polling cadence:
+	// without gate expiry or a sweep, the periodic remote read is the only
+	// drift-detection path left.
+	requeue := r.Freshness.TTL(freshness.GradeTraffic)
+	if requeue <= 0 {
+		requeue = tunnelRequeue
+	}
+	return ctrl.Result{RequeueAfter: requeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
 }
 
 func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel) (ctrl.Result, error) {
@@ -611,7 +679,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 	}
 
 	if manageDNS && len(tunnel.Status.DNSRecords) > 0 {
-		currentOwnershipComment := ""
+		var expectedComments []string
 		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect || owner != nil {
 			clusterID, err := r.clusterID(ctx)
 			if err != nil {
@@ -621,9 +689,9 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 			if owner != nil {
 				dnsOwnerName = owner.Name
 			}
-			currentOwnershipComment = dnsOwnershipComment(tunnel, clusterID, dnsOwnerName)
+			expectedComments = dnsOwnershipMarkers(tunnel, clusterID, dnsOwnerName)
 		}
-		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, currentOwnershipComment, tunnel.Status.DNSRecords)
+		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, expectedComments, dnsRecordTargets(tunnel, ""), tunnel.Status.DNSRecords)
 		if err != nil {
 			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "DNSDeleteFailed", err)
 		}
@@ -752,6 +820,12 @@ func isRemoteNotFound(err error) bool {
 }
 
 func (r *CloudflareTunnelReconciler) ensureRemoteTunnel(ctx context.Context, cf TunnelCloudflareClient, tunnel *v1alpha1.CloudflareTunnel, clusterID, accountID string) (RemoteTunnel, string, error) {
+	// T0: the remote reads below are fresh reads by contract. The T2 gate in
+	// reconcileActive decides whether this function runs at all; once it
+	// runs, ObserveOnly observation, adoption claims, and ownership
+	// validation must see the live remote — a stale snapshot would let an
+	// adoption or a destructive update proceed on outdated ownership
+	// evidence.
 	policy := tunnel.Spec.ManagementPolicy
 	if policy == "" {
 		policy = v1alpha1.ManagementPolicyManaged
@@ -873,6 +947,9 @@ func (r *CloudflareTunnelReconciler) ensureTokenSecret(ctx context.Context, cf T
 		if !metav1.IsControlledBy(&existing, tunnel) {
 			return nil, fmt.Errorf("the Tunnel token Secret %s is not owned by this CloudflareTunnel", key)
 		}
+		if len(existing.Data[v1alpha1.CloudflareTunnelConnectorTokenSecretKey]) > 0 {
+			return &corev1.LocalObjectReference{Name: name}, nil
+		}
 	} else if !apierrors.IsNotFound(err) {
 		return nil, fmt.Errorf("get Tunnel token Secret %s: %w", key, err)
 	}
@@ -949,10 +1026,18 @@ func (r *CloudflareTunnelReconciler) reconcileOwnedTokenSecret(ctx context.Conte
 }
 
 func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelCloudflareClient, tunnel *v1alpha1.CloudflareTunnel, gatewayName, clusterID, tunnelID string, hosts []publicHostname) ([]v1alpha1.CloudflareTunnelDNSRecordStatus, string, error) {
+	// T0: every ListDNSRecords below is a fresh read before a destructive
+	// write (create/update/delete of the record for that hostname). The T2
+	// gate in reconcileActive decides whether ensureDNS runs at all; while
+	// it runs, ownership and content must be re-verified live so a stale
+	// checkpoint cannot delete or overwrite a record that changed hands
+	// (safety condition 1).
 	result := make([]v1alpha1.CloudflareTunnelDNSRecordStatus, 0, len(hosts))
 	previousByHostname := make(map[string]v1alpha1.CloudflareTunnelDNSRecordStatus, len(tunnel.Status.DNSRecords))
 	desiredHostnames := make(map[string]bool, len(hosts))
 	ownershipComment := dnsOwnershipComment(tunnel, clusterID, gatewayName)
+	ownershipMarkers := dnsOwnershipMarkers(tunnel, clusterID, gatewayName)
+	expectedTargets := dnsRecordTargets(tunnel, tunnelID)
 	for _, previous := range tunnel.Status.DNSRecords {
 		normalized, err := flarecloudflare.NormalizeDNSHostname(previous.Hostname)
 		if err != nil {
@@ -977,7 +1062,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 		if desiredHostnames[normalized] {
 			continue
 		}
-		deleted, conflict, err := deleteDNSRecordIfOwned(ctx, cf, ownershipComment, previous)
+		deleted, conflict, err := deleteDNSRecordIfOwned(ctx, cf, ownershipMarkers, expectedTargets, previous)
 		if err != nil {
 			return nil, "", fmt.Errorf("delete stale DNS record %s: %w", previous.Hostname, err)
 		}
@@ -998,7 +1083,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 	for _, host := range hosts {
 		comment := ownershipComment
 		desired := RemoteDNSRecordInput{
-			Name: host.Hostname, Content: tunnelID + ".cfargotunnel.com", Comment: comment,
+			Name: host.Hostname, Content: tunnelCNAMETarget(tunnelID), Comment: comment,
 			Proxied: &proxied, TTL: &ttl, Settings: dnsSettingsInput(tunnel.Spec.DNS.Settings),
 		}
 		records, err := cf.ListDNSRecords(ctx, host.ZoneID, host.Hostname)
@@ -1022,32 +1107,16 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 			}
 		} else {
 			record = records[0]
-			if !dnsRecordOwnedByGateway(record.Comment, tunnel, clusterID, gatewayName) {
-				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (comment %q)", host.Hostname, record.Comment))
+			owned, reason := dnsRecordOwnedByGateway(record, ownershipMarkers)
+			if !owned {
+				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (%s)", host.Hostname, reason))
 				if previous, ok := previousByHostname[host.Hostname]; ok {
 					previous.State = dnsRecordStateConflict
 					result = append(result, previous)
 				}
 				continue
 			}
-			if !strings.EqualFold(record.Type, "CNAME") {
-				deleted, conflict, deleteErr := deleteDNSRecordIfOwned(ctx, cf, ownershipComment, dnsRecordStatus(host.ZoneID, record))
-				if deleteErr != nil {
-					return nil, "", fmt.Errorf("replace DNS record %s: delete %s record: %w", host.Hostname, record.Type, deleteErr)
-				}
-				if !deleted {
-					conflicts = append(conflicts, conflict)
-					if previous, ok := previousByHostname[host.Hostname]; ok {
-						previous.State = dnsRecordStateConflict
-						result = append(result, previous)
-					}
-					continue
-				}
-				record, err = cf.CreateCNAME(ctx, host.ZoneID, desired)
-				if err != nil {
-					return nil, "", fmt.Errorf("replace DNS record %s with CNAME: %w", host.Hostname, err)
-				}
-			} else if !dnsRecordMatches(record, desired) {
+			if !dnsRecordMatches(record, desired) {
 				record, err = cf.UpdateCNAME(ctx, host.ZoneID, record.ID, desired)
 				if err != nil {
 					return nil, "", fmt.Errorf("update DNS record %s: %w", host.Hostname, err)
@@ -1340,22 +1409,11 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 	now metav1.Time,
 ) error {
 	if mode == v1alpha1.CloudflareTunnelConfigurationModeGateway {
-		if tunnel.Status.ConfigVersion.Applied == 0 {
-			return nil
-		}
-		configuration, err := cf.GetTunnelConfiguration(ctx, status.TunnelID)
-		if err != nil {
-			return fmt.Errorf("get Tunnel configuration: %w", err)
-		}
-		if err := validateRemoteConfiguration(configuration, account.Spec.AccountID, status.TunnelID); err != nil {
-			return err
-		}
+		// G4: Gateway mode configuration is owned and observed exclusively by
+		// GatewayReconciler, which also publishes status.configVersion. The
+		// Tunnel reconciler performs no remote configuration calls here and
+		// carries the existing status forward unchanged.
 		status.ConfigVersion = tunnel.Status.ConfigVersion
-		status.ConfigVersion.Remote = configuration.Version
-		status.ConfigVersion.CreatedAt = timeStatus(configuration.CreatedAt)
-		if configuration.Version != tunnel.Status.ConfigVersion.Applied {
-			setStatusCondition(status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConflict, metav1.ConditionTrue, "ConfigurationChanged", fmt.Sprintf("Cloudflare configuration version is %d, expected applied version %d", configuration.Version, tunnel.Status.ConfigVersion.Applied), tunnel.Generation, now), now)
-		}
 		return nil
 	}
 
@@ -1383,6 +1441,10 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 	}
 	var applied flarecloudflare.TunnelConfiguration
 	err = cf.WithTunnelLock(ctx, status.TunnelID, func() error {
+		// T0: reads inside this closure are never gate-served. The lock
+		// protects a read-modify-write; a stale snapshot here would let a
+		// concurrent writer's change be silently overwritten (safety
+		// condition 4).
 		remote, getErr := cf.GetTunnelConfiguration(ctx, status.TunnelID)
 		if getErr == nil {
 			if err := validateRemoteConfiguration(remote, account.Spec.AccountID, status.TunnelID); err != nil {
@@ -1416,28 +1478,99 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 	status.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{
 		Desired: applied.Version, DesiredHash: hash, Applied: applied.Version,
 		Remote: applied.Version, CreatedAt: timeStatus(applied.CreatedAt),
+		AppliedAt: &now,
 	}
 	setStatusCondition(status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionTrue, "Applied", fmt.Sprintf("Direct Tunnel configuration version %d is applied", applied.Version), tunnel.Generation, now), now)
 	return nil
 }
 
+// tunnelConvergedForGate reports whether the Tunnel is in the steady state the
+// desired-hash gate may shorten. Every check is a local read: a bound and
+// verified remote identity on the expected account, a Ready condition that
+// observed the current generation, and a checkpointed DNS record set that
+// exactly matches the desired bindings. Any doubt closes the gate and the
+// reconcile pays the normal remote reads.
+func tunnelConvergedForGate(tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1.CloudflareAccount, hosts []publicHostname) bool {
+	if tunnel.Status.TunnelID == "" || !tunnel.Status.OwnershipVerified {
+		return false
+	}
+	if tunnel.Status.AccountID != account.Spec.AccountID {
+		return false
+	}
+	ready := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != tunnel.Generation {
+		return false
+	}
+	desired := make(map[string]string, len(hosts))
+	for _, host := range hosts {
+		normalized, err := flarecloudflare.NormalizeDNSHostname(host.Hostname)
+		if err != nil {
+			return false
+		}
+		desired[normalized] = host.ZoneID
+	}
+	checkpointed := make(map[string]string, len(tunnel.Status.DNSRecords))
+	for _, record := range tunnel.Status.DNSRecords {
+		if record.State != dnsRecordStateReady {
+			return false
+		}
+		normalized, err := flarecloudflare.NormalizeDNSHostname(record.Hostname)
+		if err != nil {
+			return false
+		}
+		checkpointed[normalized] = record.ZoneID
+	}
+	return maps.Equal(desired, checkpointed)
+}
+
+// tunnelGateStatusUnchanged reports whether the fields an open-gate pass can
+// mutate are already equal to the persisted status, so the pass can skip the
+// status apply entirely (QA-030: an open pass costs zero etcd writes).
+func tunnelGateStatusUnchanged(current, projected v1alpha1.CloudflareTunnelStatus) bool {
+	return localObjectRefEqual(current.ConnectorTokenSecretRef, projected.ConnectorTokenSecretRef) &&
+		localObjectRefEqual(current.ManagementTokenSecretRef, projected.ManagementTokenSecretRef) &&
+		slices.Equal(current.Addresses, projected.Addresses) &&
+		slices.EqualFunc(current.Clients, projected.Clients, tunnelClientStatusEqual)
+}
+
+func localObjectRefEqual(left, right *corev1.LocalObjectReference) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Name == right.Name
+}
+
+func tunnelClientStatusEqual(left, right v1alpha1.CloudflareTunnelClientStatus) bool {
+	return left.ID == right.ID && left.Arch == right.Arch &&
+		left.ConfigVersion == right.ConfigVersion && left.Version == right.Version &&
+		slices.Equal(left.Features, right.Features) &&
+		timeStatusEqual(left.RunAt, right.RunAt) &&
+		slices.EqualFunc(left.Connections, right.Connections, tunnelConnectionStatusEqual)
+}
+
+func tunnelConnectionStatusEqual(left, right v1alpha1.CloudflareTunnelConnectionStatus) bool {
+	return left.ID == right.ID && left.ClientID == right.ClientID &&
+		left.ClientVersion == right.ClientVersion && left.ColoName == right.ColoName &&
+		left.OriginIP == right.OriginIP && left.UUID == right.UUID &&
+		timeStatusEqual(left.OpenedAt, right.OpenedAt)
+}
+
 // removeDNSRecords revalidates each status identity before deletion. An empty
-// currentOwnershipComment uses the per-record checkpoint and is reserved for
+// expectedComments uses the per-record checkpoint and is reserved for
 // Gateway-absent teardown, where the current owner identity is unavailable.
+// expectedTargets lists the CNAME targets this Tunnel may legitimately point
+// at; a record whose content no longer matches any of them is preserved.
 func removeDNSRecords(
 	ctx context.Context,
 	cf TunnelCloudflareClient,
-	currentOwnershipComment string,
+	expectedComments []string,
+	expectedTargets []string,
 	records []v1alpha1.CloudflareTunnelDNSRecordStatus,
 ) ([]v1alpha1.CloudflareTunnelDNSRecordStatus, string, error) {
 	remaining := make([]v1alpha1.CloudflareTunnelDNSRecordStatus, 0)
 	conflicts := make([]string, 0)
 	for _, record := range records {
-		expectedComment := currentOwnershipComment
-		if expectedComment == "" {
-			expectedComment = record.OwnershipComment
-		}
-		deleted, conflict, err := deleteDNSRecordIfOwned(ctx, cf, expectedComment, record)
+		deleted, conflict, err := deleteDNSRecordIfOwned(ctx, cf, expectedComments, expectedTargets, record)
 		if err != nil {
 			return nil, "", fmt.Errorf("delete managed DNS record %s: %w", record.Hostname, err)
 		}
@@ -1747,18 +1880,24 @@ func connectorState(status flarecloudflare.TunnelStatus) v1alpha1.ConnectorState
 	}
 }
 
+// tunnelCNAMETarget is the CNAME content a managed DNS record must point at.
+func tunnelCNAMETarget(tunnelID string) string {
+	return tunnelID + ".cfargotunnel.com"
+}
+
 func tunnelAddresses(tunnelID string, public bool) []gatewayv1.GatewayStatusAddress {
 	if !public || tunnelID == "" {
-		return []gatewayv1.GatewayStatusAddress{}
+		return nil
 	}
 	addressType := gatewayv1.HostnameAddressType
-	return []gatewayv1.GatewayStatusAddress{{Type: &addressType, Value: tunnelID + ".cfargotunnel.com"}}
+	return []gatewayv1.GatewayStatusAddress{{Type: &addressType, Value: tunnelCNAMETarget(tunnelID)}}
 }
 
 func deleteDNSRecordIfOwned(
 	ctx context.Context,
 	cf TunnelCloudflareClient,
-	expectedComment string,
+	expectedComments []string,
+	expectedTargets []string,
 	expected v1alpha1.CloudflareTunnelDNSRecordStatus,
 ) (bool, string, error) {
 	expectedName, err := flarecloudflare.NormalizeDNSHostname(expected.Hostname)
@@ -1772,6 +1911,10 @@ func deleteDNSRecordIfOwned(
 	if len(records) == 0 {
 		return true, "", nil
 	}
+	comments := expectedComments
+	if len(comments) == 0 {
+		comments = []string{expected.OwnershipComment}
+	}
 	for _, current := range records {
 		if current.ID != expected.RecordID {
 			continue
@@ -1780,15 +1923,46 @@ func deleteDNSRecordIfOwned(
 		if err != nil {
 			return false, "", fmt.Errorf("normalize current DNS hostname %q: %w", current.Name, err)
 		}
-		if expectedComment == "" {
+		matched := ""
+		for _, comment := range comments {
+			if comment != "" && current.Comment == comment {
+				matched = comment
+				break
+			}
+		}
+		if matched == "" {
+			if len(comments) == 1 && comments[0] == "" {
+				return false, fmt.Sprintf(
+					"DNS record %s (%s) has no checkpointed ownership comment",
+					expected.Hostname, expected.RecordID,
+				), nil
+			}
 			return false, fmt.Sprintf(
-				"DNS record %s (%s) has no checkpointed ownership comment",
+				"DNS record %s (%s) no longer has the exact name and ownership comment managed by this Tunnel",
 				expected.Hostname, expected.RecordID,
 			), nil
 		}
-		if currentName != expectedName || current.Comment != expectedComment {
+		if currentName != expectedName {
 			return false, fmt.Sprintf(
 				"DNS record %s (%s) no longer has the exact name and ownership comment managed by this Tunnel",
+				expected.Hostname, expected.RecordID,
+			), nil
+		}
+		// D8: the marker alone never authorizes a destructive write. The
+		// record must also still point at a tunnel target this controller
+		// manages; when no target is known the record is preserved.
+		owned := false
+		for _, target := range expectedTargets {
+			if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
+				Record: current, ExpectedComment: matched, ExpectedTarget: target,
+			}) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			return false, fmt.Sprintf(
+				"DNS record %s (%s) no longer points at a Tunnel target managed by this Tunnel",
 				expected.Hostname, expected.RecordID,
 			), nil
 		}
@@ -1800,15 +1974,73 @@ func deleteDNSRecordIfOwned(
 	return true, "", nil
 }
 
+// dnsOwnershipComment returns the comment written on DNS records managed by
+// this Tunnel: the plaintext ownership marker plus the operator's optional
+// user-facing text.
+//
+// D14: DNS markers are deliberately NOT HMAC-signed, unlike Access tags.
+// Two reasons. First, the destructive DNS path already requires the record
+// content to match a managed tunnel target (D12), so a forged marker cannot
+// make this operator delete a foreign record; adoption is convergent and
+// harmless. Second, the comment is what an operator reads in the Cloudflare
+// dashboard to find the owning cluster and Gateway, and an opaque digest
+// would destroy that. Signing would also force one UpdateCNAME per managed
+// record at upgrade purely to rewrite the marker.
 func dnsOwnershipComment(tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayName string) string {
 	return flarecloudflare.DNSRecordCommentWithText(clusterID, tunnel.Namespace, gatewayName, tunnel.Spec.DNS.RecordComment)
 }
 
-func dnsRecordOwnedByGateway(comment string, tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayName string) bool {
-	return flarecloudflare.IsOwnedDNSRecord(
-		RemoteDNSRecord{Comment: comment},
-		flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, gatewayName),
-	)
+// dnsOwnershipMarkers returns the ownership markers that may legitimately
+// appear on a DNS record managed by this Tunnel.
+//
+// This is the bare ownership marker, never the comment with the operator's
+// user-facing text appended. A record's stored comment is either exactly the
+// marker or the marker followed by that text, and IsOwnedDNSRecordStrict
+// accepts both shapes. Passing the text-bearing comment here would make a
+// record written before spec.dns.recordComment changed look unowned.
+func dnsOwnershipMarkers(tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayName string) []string {
+	return []string{flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, gatewayName)}
+}
+
+// dnsRecordTargets returns the CNAME targets this Tunnel may legitimately
+// point at: the current tunnel plus the checkpointed previous tunnel.
+func dnsRecordTargets(tunnel *v1alpha1.CloudflareTunnel, currentTunnelID string) []string {
+	targets := make([]string, 0, 2)
+	if currentTunnelID != "" {
+		targets = append(targets, tunnelCNAMETarget(currentTunnelID))
+	}
+	if tunnel.Status.TunnelID != "" && tunnel.Status.TunnelID != currentTunnelID {
+		targets = append(targets, tunnelCNAMETarget(tunnel.Status.TunnelID))
+	}
+	return targets
+}
+
+// dnsRecordOwnedByGateway judges whether an existing record at a desired
+// hostname belongs to this Tunnel. Ownership is asymmetric (D12): reclaiming
+// a marker-carrying record is convergence, not a destructive write, so the
+// marker alone authorizes the update. A forged marker can only redirect the
+// record back at this Tunnel's own target. The marker check still blocks
+// foreign records, and a non-CNAME record keeps the existing conflict path.
+// Destructive paths (deleteDNSRecordIfOwned) additionally require the record
+// content to match a managed tunnel target. The second return value explains
+// a denial for the conflict status.
+func dnsRecordOwnedByGateway(record RemoteDNSRecord, markers []string) (bool, string) {
+	owned := false
+	for _, marker := range markers {
+		if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
+			Record: record, ExpectedComment: marker,
+		}) {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return false, fmt.Sprintf("missing Flareway ownership marker (comment %q)", record.Comment)
+	}
+	if !strings.EqualFold(record.Type, "CNAME") {
+		return false, fmt.Sprintf("record type %s is not a managed CNAME", record.Type)
+	}
+	return true, ""
 }
 
 func (r *CloudflareTunnelReconciler) clusterID(ctx context.Context) (string, error) {
@@ -2418,8 +2650,8 @@ func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunne
 }
 
 // tunnelOwnedStatusMap converts the tunnel-owned status into the apply
-// document: gateway-owned fields are dropped, and in Gateway mode only the
-// tunnel-owned configVersion subfields (remote, createdAt) remain.
+// document: gateway-owned fields are dropped, and in Gateway mode the
+// configVersion object is omitted entirely because GatewayReconciler owns it.
 func tunnelOwnedStatusMap(tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus) (map[string]any, error) {
 	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&status)
 	if err != nil {
@@ -2428,19 +2660,7 @@ func tunnelOwnedStatusMap(tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.Clo
 	delete(statusMap, "hostnames")
 	delete(statusMap, "listeners")
 	if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway {
-		converted, _ := statusMap["configVersion"].(map[string]any)
-		configVersion := map[string]any{}
-		if remote, ok := converted["remote"]; ok {
-			configVersion["remote"] = remote
-		}
-		if createdAt, ok := converted["createdAt"]; ok {
-			configVersion["createdAt"] = createdAt
-		}
-		if len(configVersion) == 0 {
-			delete(statusMap, "configVersion")
-		} else {
-			statusMap["configVersion"] = configVersion
-		}
+		delete(statusMap, "configVersion")
 	}
 	// Empty owned lists are explicit so teardown can signal DNS completion.
 	// Optional scalars remain omitted when empty; applying JSON null to their
@@ -2559,13 +2779,13 @@ func statusFieldEmpty(value any) bool {
 }
 
 // tunnelConfigVersionKeys lists the configVersion subfields owned by this
-// manager. In Gateway mode only remote and createdAt are tunnel-owned; in
-// Direct mode the tunnel owns the whole object.
+// manager. In Gateway mode the GatewayReconciler owns the whole object, so the
+// tunnel owns none; in Direct mode the tunnel owns the whole object.
 func tunnelConfigVersionKeys(tunnel *v1alpha1.CloudflareTunnel) []string {
 	if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway {
-		return []string{"remote", "createdAt"}
+		return nil
 	}
-	return []string{"desired", "desiredHash", "applied", "remote", "createdAt"}
+	return []string{"desired", "desiredHash", "applied", "remote", "createdAt", "appliedAt"}
 }
 
 // tunnelConfigVersionRegresses reports whether the outgoing document drops
@@ -2653,7 +2873,7 @@ func (r *CloudflareTunnelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index CloudflareAccount credential Secret: %w", err)
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.CloudflareTunnel{}).
 		Owns(&corev1.Secret{}).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.mapGatewayToTunnel)).
@@ -2664,8 +2884,11 @@ func (r *CloudflareTunnelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapDataplaneToTunnel)).
 		Watches(&v1alpha1.HostnameRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToTunnel)).
 		Watches(&v1alpha1.NetworkRoute{}, handler.EnqueueRequestsFromMapFunc(r.mapPrivateRouteToTunnel)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(observedReconciler("cloudflare-tunnel", r))
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if r.SweepEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(observedReconciler("cloudflare-tunnel", r))
 }
 
 func (r *CloudflareTunnelReconciler) mapGatewayToTunnel(ctx context.Context, object client.Object) []reconcile.Request {
