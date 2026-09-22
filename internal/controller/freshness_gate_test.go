@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/freshness"
 )
 
@@ -108,6 +109,47 @@ func TestFreshnessGateSuppressesSteadyStateReads(t *testing.T) {
 	now = now.Add(time.Second)
 	if calls := remoteCalls(t, "rollback"); len(calls) == 0 {
 		t.Fatal("zero policy still gated reads, so --freshness-*=0 does not roll back")
+	}
+}
+
+// The gate is wired per controller, so proving it on one kind proves only that
+// kind. IdentityProvider is the other shape worth pinning: its status helper
+// returns early when the status it just built equals the one it started from,
+// which is exactly the path that used to swallow the stamp.
+func TestFreshnessGateSuppressesSteadyStateReadsForIdentityProvider(t *testing.T) {
+	ctx := context.Background()
+	api := &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}
+	now := virtualNetworkTestClock
+	world := newIdentityProviderWorld(t, api, now, v1alpha1.ManagementPolicyManaged, "")
+	world.reconciler.Now = func() time.Time { return now }
+	world.reconciler.Freshness = freshness.DefaultPolicy()
+	world.reconciler.Invalidator = freshness.NewLatch()
+
+	reads := func(t *testing.T, label string) int {
+		t.Helper()
+		before := api.gets
+		if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+			t.Fatalf("%s reconcile: %v", label, err)
+		}
+		return api.gets - before
+	}
+
+	reads(t, "create")
+	var stored v1alpha1.IdentityProvider
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &stored); err != nil {
+		t.Fatalf("get after create: %v", err)
+	}
+	if stored.Status.AppliedHash == "" || stored.Status.AppliedAt == nil {
+		t.Fatalf("gate stamp was not stored: appliedHash=%q appliedAt=%v",
+			stored.Status.AppliedHash, stored.Status.AppliedAt)
+	}
+
+	now = now.Add(5 * time.Second)
+	reads(t, "rebind")
+
+	now = now.Add(5 * time.Second)
+	if got := reads(t, "steady"); got != 0 {
+		t.Fatalf("converged pass issued %d remote reads", got)
 	}
 }
 
