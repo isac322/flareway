@@ -40,7 +40,6 @@
     "logging": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["development", "level", "encoder"],
       "properties": {
         "development": {"type": "boolean"},
         "level": {

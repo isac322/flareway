@@ -65,9 +65,14 @@ control-plane: controller-manager
 - --enable-organization-controllers={{ .Values.controllers.organization }}
 {{- end -}}
 
-{{/* Controller-manager logging flags, appended last so they always win. */}}
+{{/*
+Controller-manager logging flags, appended last so they always win.
+Releases installed before `logging` existed reuse values without it, so every
+key falls back to its values.yaml default; dig keeps an explicit false.
+*/}}
 {{- define "flareway.loggingArgs" -}}
-- --zap-devel={{ .Values.logging.development }}
-- --zap-log-level={{ .Values.logging.level }}
-- --zap-encoder={{ .Values.logging.encoder }}
+{{- $logging := .Values.logging | default dict -}}
+- --zap-devel={{ dig "development" false $logging }}
+- --zap-log-level={{ dig "level" "info" $logging }}
+- --zap-encoder={{ dig "encoder" "json" $logging }}
 {{- end -}}

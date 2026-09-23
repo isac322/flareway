@@ -205,13 +205,27 @@ jobs:
           sensitive = re.compile(
               r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
               r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
-              r'("?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|[^\s,}]+)'
+              r'((?:\\?")?\s*[:=]\s*)'
+              r'(\\"(?:[^"\\]|\\(?!"))*\\"|"(?:[^"\\]|\\.)*"|[^\s,}"\\]+)'
           )
+
+
+          def mask(match):
+              value = match.group(3)
+              if value.startswith('\\"'):
+                  masked = '\\"[REDACTED]\\"'
+              elif value.startswith('"'):
+                  masked = '"[REDACTED]"'
+              else:
+                  masked = "[REDACTED]"
+              return match.group(1) + match.group(2) + masked
+
+
           for name in ("controller.log", "dataplane.log", "resources.yaml", "events.txt"):
               path = Path("artifacts/cluster") / name
               if path.exists():
                   redacted = bearer.sub("Bearer [REDACTED]", path.read_text())
-                  path.write_text(sensitive.sub(r'\1\2"[REDACTED]"', redacted))
+                  path.write_text(sensitive.sub(mask, redacted))
           PY
       - name: Upload end-to-end artifacts
         if: always()
