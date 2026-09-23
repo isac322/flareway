@@ -103,6 +103,11 @@ type SnapshotBuilder func(*ir.Gateway, *v1alpha1.GatewayClassConfig) (*cachev3.S
 // dataplane resources.
 type GatewayReconciler struct {
 	client.Client
+	// APIReader reads live objects without the informer cache. Tunnel status
+	// condition commits and writer revalidation must observe the persisted
+	// object, not a stale cached view. SetupWithManager defaults it to the
+	// manager API reader; tests may leave it nil to reuse Client.
+	APIReader         client.Reader
 	Scheme            *runtime.Scheme
 	Snapshots         SnapshotPublisher
 	BuildSnapshot     SnapshotBuilder
@@ -400,10 +405,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				r.Recorder.Eventf(tunnel, nil, corev1.EventTypeWarning, observability.EventReasonOutOfBandChange, "ReconcileTunnel", "%s", cloudflareResult.message)
 			}
 		}
-		now := metav1.Now()
-		if r.Now != nil {
-			now = metav1.NewTime(r.Now())
-		}
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -414,38 +415,45 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		config.Remote = cloudflareResult.remoteVersion
 		config.CreatedAt = cloudflareResult.remoteCreatedAt
-		reason := "Pending"
-		message := cloudflareResult.pending
-		switch {
-		case cloudflareResult.held:
-			reason = "DriftHold"
-			message = cloudflareResult.message
-		case cloudflareResult.drift:
-			reason = "OutOfBandChange"
-			message = cloudflareResult.message
-		case message == "":
-			message = fmt.Sprintf("Waiting for cloudflared configuration version %d", config.Desired)
-		}
-		driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
-		if cloudflareResult.drift {
-			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
-		}
-		if err := r.patchTunnelGatewayStatus(
-			ctx,
-			compiled,
-			tunnel,
-			config,
-			tunnel.Status.Hostnames,
-			desiredTunnelListeners(compiled),
-			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, now),
-			privateListenerCondition(compiled, privateState, now),
-			driftCondition,
-		); err != nil {
-			return ctrl.Result{}, err
-		}
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
 		if cloudflareResult.pending != "" || cloudflareResult.drift || cloudflareResult.held {
+			// Demotion commits before the data apply: a persisted
+			// ConfigApplied=False is the durable not-yet-applied checkpoint
+			// and must never trail the fields it describes.
+			now := metav1.Now()
+			if r.Now != nil {
+				now = metav1.NewTime(r.Now())
+			}
+			reason := "Pending"
+			message := cloudflareResult.pending
+			switch {
+			case cloudflareResult.held:
+				reason = "DriftHold"
+				message = cloudflareResult.message
+			case cloudflareResult.drift:
+				reason = "OutOfBandChange"
+				message = cloudflareResult.message
+			case message == "":
+				message = fmt.Sprintf("Waiting for cloudflared configuration version %d", config.Desired)
+			}
+			driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
+			if cloudflareResult.drift {
+				driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
+			}
+			if err := r.patchTunnelGatewayStatus(
+				ctx,
+				compiled,
+				tunnel,
+				config,
+				tunnel.Status.Hostnames,
+				desiredTunnelListeners(compiled),
+				gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, now),
+				privateListenerCondition(compiled, privateState, now),
+				driftCondition,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
 			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message)
 			if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 				return ctrl.Result{}, err
@@ -477,6 +485,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
 		ready, lagging, _, err := r.cloudflareGate(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
 		if err != nil {
+			// Observation failure is not proof of convergence: demote while
+			// this Gateway still holds the writer identity, then surface the
+			// real error. The demote guard itself refuses to write when
+			// ownership or generation moved mid-pass.
+			if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "GateError", "Cloudflare programming gate observation failed; see controller logs"); demoteErr != nil {
+				return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
+			}
 			return ctrl.Result{}, err
 		}
 		if privateState.Pending != "" {
@@ -520,13 +535,57 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if cloudflareResult.drift {
 			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
 		}
-		if err := r.patchTunnelGatewayStatus(
-			ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled),
+		conditions := []metav1.Condition{
 			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, message, now),
 			privateListenerCondition(compiled, privateState, now),
 			driftCondition,
-		); err != nil {
-			return ctrl.Result{}, err
+		}
+		if conditionStatus == metav1.ConditionTrue {
+			// Promotion: the justifying configVersion must be durable before
+			// ConfigApplied=True is visible. The conditions stage still runs
+			// first — with no authored deltas — so legacy condition ownership
+			// migrates and the Ready clamp applies before the data-only apply
+			// can delete old-manager entries. configVersion.applied records
+			// the version the edge actually holds — an observation, not the
+			// readiness verdict — so it is written with the data apply; the
+			// Tier-2 guard still gates the condition commit itself.
+			if err := r.patchTunnelGatewayConditions(ctx, compiled, tunnel, now); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.patchTunnelGatewayData(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled)); err != nil {
+				return ctrl.Result{}, err
+			}
+			requireGate := !denySnapshotApplied || ready
+			if err := r.patchTunnelGatewayConditionsValidated(ctx, compiled, tunnel, now, r.gatewayPromotionGuard(ctx, compiled, cloudflareResult, version, requireGate), conditions...); err != nil {
+				switch {
+				case errors.Is(err, errTunnelConvergenceLost):
+					// Ordinary pending: convergence evidence was lost between
+					// the gate and the commit. Demote while still authorized
+					// and fall through to the shared tail so Programmed=False
+					// and route statuses persist like any other pending pass.
+					if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "Pending", err.Error()); demoteErr != nil {
+						return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
+					}
+					r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, err.Error())
+					pending = true
+				case errors.Is(err, errTunnelGateObservation):
+					// Real observation failure: demote while still
+					// authorized, then surface the error.
+					if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "GateError", "Cloudflare programming gate observation failed; see controller logs"); demoteErr != nil {
+						return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
+					}
+					return ctrl.Result{}, err
+				default:
+					// Provenance mismatch or commit failure: never demote
+					// onto another owner's or another generation's object.
+					return ctrl.Result{}, err
+				}
+			}
+		} else {
+			// Demotion commits before the data apply.
+			if err := r.patchTunnelGatewayStatus(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled), conditions...); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
 	}
@@ -1649,6 +1708,9 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("flareway-gateway")
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.HTTPRoute{}, httpRouteParentGatewayIndex, func(object client.Object) []string {
 		return httpRouteParentGatewayKeys(object.(*gatewayv1.HTTPRoute))

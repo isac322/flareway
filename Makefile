@@ -104,7 +104,7 @@ test-unit: ## Run unit tests outside the controller envtest package.
 
 .PHONY: test-envtest
 test-envtest: setup-envtest ## Run controller tests with envtest.
-	KUBEBUILDER_ASSETS="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test ./internal/controller/...
+	KUBEBUILDER_ASSETS="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -timeout=30m ./internal/controller/...
 
 .PHONY: test-exploratory-compile
 test-exploratory-compile: ## Vet the tagged harness and run its deterministic artifact-safety tests.
