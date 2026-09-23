@@ -26,8 +26,21 @@ import (
 )
 
 // BuildPDB keeps at least one dataplane Pod available during voluntary
-// disruptions.
-func BuildPDB(gw *ir.Gateway, _ *v1alpha1.GatewayClassConfig) *policyv1.PodDisruptionBudget {
+// disruptions. A singleton dataplane has no redundant Pod to keep available,
+// so it permits full disruption — including unhealthy Pods — rather than
+// blocking node drains.
+func BuildPDB(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) *policyv1.PodDisruptionBudget {
+	spec := policyv1.PodDisruptionBudgetSpec{
+		MinAvailable: ptr.To(intstr.FromInt32(1)),
+		Selector:     &metav1.LabelSelector{MatchLabels: selectorLabels(gw)},
+	}
+	if connectorReplicas(cfg) == 1 {
+		// minAvailable: 1 would deadlock voluntary eviction of the only
+		// Pod. AlwaysAllow also evicts an unhealthy singleton, which the
+		// default IfHealthyBudget policy keeps blocking.
+		spec.MinAvailable = ptr.To(intstr.FromInt32(0))
+		spec.UnhealthyPodEvictionPolicy = ptr.To(policyv1.AlwaysAllow)
+	}
 	return &policyv1.PodDisruptionBudget{
 		TypeMeta: metav1.TypeMeta{APIVersion: policyv1.SchemeGroupVersion.String(), Kind: "PodDisruptionBudget"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -37,9 +50,6 @@ func BuildPDB(gw *ir.Gateway, _ *v1alpha1.GatewayClassConfig) *policyv1.PodDisru
 			Annotations:     map[string]string{ManagedByLabelKey: managedByValue(gw)},
 			OwnerReferences: gatewayOwnerReferences(gw),
 		},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			MinAvailable: ptr.To(intstr.FromInt32(1)),
-			Selector:     &metav1.LabelSelector{MatchLabels: selectorLabels(gw)},
-		},
+		Spec: spec,
 	}
 }
