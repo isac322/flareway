@@ -64,6 +64,15 @@ The CRD validates toleration operator/effect combinations, `tolerationSeconds` r
 
 Label syntax (nodeSelector keys and values, toleration keys and values, selector internals), `namespaces` format, node selector requirement operator/value cardinality, and pod affinity `topologyKey` syntax are deferred to Deployment admission — the CRD can accept a spec that the dataplane Deployment then rejects. An `Invalid`, `Forbidden`, or `BadRequest` rejection of a Gateway-owned dataplane mutation sets Gateway and listener `Programmed=False` with reason `Invalid` and emits a `DataplaneApplyRejected` Warning Event identifying the object and rejection category. Identical retries do not repeat the Event. The controller keeps retrying without tearing down existing workloads; transient errors and observation failures do not trigger this rejection status. After the configuration is corrected, the normal programming gates must converge before `Programmed=True` is restored.
 
+### Dataplane disruption budget
+
+Flareway owns one PodDisruptionBudget per Gateway dataplane, derived from the effective connector `replicas` (class default 2; a Gateway-mode `CloudflareTunnel.spec.connector.replicas` overrides it per Gateway). The controller updates the same PDB in place when `replicas` changes; the object is not recreated.
+
+- `replicas` of 2 or more: `minAvailable: 1` with `unhealthyPodEvictionPolicy` unset, keeping the default `IfHealthyBudget`. Voluntary eviction keeps at least one dataplane Pod available. The budget stays `minAvailable`-based; it does not switch to `maxUnavailable`.
+- `replicas: 1`: `minAvailable: 0` with `unhealthyPodEvictionPolicy: AlwaysAllow`. A singleton has no redundant Pod to keep available, so the budget permits voluntary eviction of the only Pod — healthy or NotReady — instead of the PDB blocking the drain. Evicting it takes the data plane down; that downtime is unavoidable at one replica.
+
+Replica transitions converge rather than switch atomically: the Deployment and PDB updates apply sequentially and `status.disruptionsAllowed` is recomputed asynchronously, so the previous eviction behavior can persist briefly. Scaling the Deployment to zero is unaffected — the ReplicaSet controller terminates Pods directly without the Eviction API.
+
 ## Scope and authorization
 
 `CloudflareAccount` is cluster-scoped and defines the credential and tenant boundary:

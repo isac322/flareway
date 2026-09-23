@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -429,9 +430,6 @@ func TestBuildPDBAndNetworkPolicyContract(t *testing.T) {
 	if pdb.APIVersion != "policy/v1" || pdb.Kind != "PodDisruptionBudget" {
 		t.Fatalf("unexpected PDB type metadata: %s %s", pdb.APIVersion, pdb.Kind)
 	}
-	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
-		t.Fatalf("PDB minAvailable = %#v, want 1", pdb.Spec.MinAvailable)
-	}
 	assertGatewayOwner(t, pdb.OwnerReferences, gw.UID)
 
 	policy := BuildNetworkPolicy(gw, cfg, "operator-system")
@@ -453,6 +451,37 @@ func TestBuildPDBAndNetworkPolicyContract(t *testing.T) {
 	}
 	if policyHasEgressPort(policy.Spec.Egress, 80) {
 		t.Error("egress allows Service port 80 instead of EndpointSlice target port 8080")
+	}
+}
+
+func TestBuildPDBDisruptionBudgetByReplicas(t *testing.T) {
+	gw := testGateway(true)
+	configWithReplicas := func(replicas *int32) *v1alpha1.GatewayClassConfig {
+		cfg := testConfig(true)
+		cfg.Spec.Connector.Replicas = replicas
+		return cfg
+	}
+	for _, test := range []struct {
+		name            string
+		cfg             *v1alpha1.GatewayClassConfig
+		minAvailable    int32
+		unhealthyPolicy *policyv1.UnhealthyPodEvictionPolicyType
+	}{
+		{name: "singleton connector", cfg: configWithReplicas(ptr.To[int32](1)), minAvailable: 0, unhealthyPolicy: ptr.To(policyv1.AlwaysAllow)},
+		{name: "two connectors", cfg: configWithReplicas(ptr.To[int32](2)), minAvailable: 1},
+		{name: "five connectors", cfg: configWithReplicas(ptr.To[int32](5)), minAvailable: 1},
+		{name: "nil config defaults to two", cfg: nil, minAvailable: 1},
+		{name: "unset replicas defaults to two", cfg: configWithReplicas(nil), minAvailable: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pdb := BuildPDB(gw, test.cfg)
+			if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != test.minAvailable {
+				t.Fatalf("minAvailable = %#v, want %d", pdb.Spec.MinAvailable, test.minAvailable)
+			}
+			if !reflect.DeepEqual(pdb.Spec.UnhealthyPodEvictionPolicy, test.unhealthyPolicy) {
+				t.Fatalf("unhealthyPodEvictionPolicy = %#v, want %#v", pdb.Spec.UnhealthyPodEvictionPolicy, test.unhealthyPolicy)
+			}
+		})
 	}
 }
 

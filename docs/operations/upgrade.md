@@ -73,6 +73,16 @@ This release adds `GatewayClassConfig.spec.scheduling` and a default soft pod an
 - Manual edits to a dataplane Deployment's `affinity` are reverted by server-side apply. Manage placement through `GatewayClassConfig.spec.scheduling`.
 - Gateway-owned objects that this version creates are owned by server-side apply only, so removing a field from the desired state (for example a scheduling field) removes it from the live object. Objects created by earlier versions keep their existing field ownership; scheduling fields added to them by this version can still be removed.
 
+## Dataplane PodDisruptionBudget
+
+This release changes the per-Gateway dataplane PodDisruptionBudget so a single-replica data plane's PDB no longer blocks node drains.
+
+- No CRD upgrade is required; only the controller changes. On the first reconcile after the update, the controller patches each existing PDB in place — same object, same UID.
+- Gateways with an effective connector `replicas` of 2 or more keep `minAvailable: 1` and the default `IfHealthyBudget` unhealthy-Pod eviction policy.
+- Gateways with `replicas: 1` move to `minAvailable: 0` and `unhealthyPodEvictionPolicy: AlwaysAllow`, so a healthy or NotReady singleton Pod can be evicted voluntarily. Draining that node interrupts the data plane; a singleton has no redundancy to preserve.
+- A later `replicas` change updates the same PDB in place on the next reconcile. The transition is eventual, not atomic — the Deployment and PDB apply sequentially and `status.disruptionsAllowed` is recomputed asynchronously — so the previous eviction behavior can persist briefly.
+- Scaling a dataplane Deployment to zero is unchanged: the ReplicaSet controller terminates Pods directly without the Eviction API, so the PDB does not block teardown.
+
 ## Controller ownership changes
 
 Controller toggles are an ownership boundary, not a performance setting. Before disabling a group:
