@@ -17,12 +17,14 @@ limitations under the License.
 package dataplane
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/ir"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -451,6 +453,224 @@ func TestBuildPDBAndNetworkPolicyContract(t *testing.T) {
 	}
 	if policyHasEgressPort(policy.Spec.Egress, 80) {
 		t.Error("egress allows Service port 80 instead of EndpointSlice target port 8080")
+	}
+}
+
+func TestBuildDeploymentDefaultSchedulingContract(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		gw   *ir.Gateway
+		cfg  *v1alpha1.GatewayClassConfig
+	}{
+		{name: "nil config", gw: testGateway(false), cfg: nil},
+		{name: "config without scheduling", gw: testGateway(false), cfg: testConfig(false)},
+		{name: "conformance mode", gw: testGateway(true), cfg: testConfig(true)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deployment := BuildDeployment(test.gw, test.cfg, BootstrapConfigMapName(test.gw), "hash")
+			podSpec := deployment.Spec.Template.Spec
+			assertDefaultAntiAffinity(t, test.gw, podSpec.Affinity)
+			if podSpec.NodeSelector != nil || podSpec.Tolerations != nil || podSpec.TopologySpreadConstraints != nil {
+				t.Fatalf("unexpected placement fields: nodeSelector=%v tolerations=%v topologySpread=%v", podSpec.NodeSelector, podSpec.Tolerations, podSpec.TopologySpreadConstraints)
+			}
+		})
+	}
+}
+
+func TestBuildDeploymentAppliesConfiguredScheduling(t *testing.T) {
+	gw := testGateway(false)
+	cfg := testConfig(false)
+	toleration := corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "dataplane", Effect: corev1.TaintEffectNoSchedule}
+	spread := corev1.TopologySpreadConstraint{
+		MaxSkew:           1,
+		TopologyKey:       "topology.kubernetes.io/zone",
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "flareway-gateway"}},
+	}
+	nodeAffinity := &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      "node.kubernetes.io/instance-type",
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"dataplane"},
+				}},
+			}},
+		},
+	}
+	cfg.Spec.Scheduling = v1alpha1.DataplaneSchedulingSpec{
+		NodeSelector:              map[string]string{"kubernetes.io/os": "linux"},
+		Tolerations:               []corev1.Toleration{toleration},
+		Affinity:                  &corev1.Affinity{NodeAffinity: nodeAffinity},
+		TopologySpreadConstraints: []corev1.TopologySpreadConstraint{spread},
+	}
+
+	podSpec := BuildDeployment(gw, cfg, BootstrapConfigMapName(gw), "hash").Spec.Template.Spec
+	if !reflect.DeepEqual(podSpec.NodeSelector, cfg.Spec.Scheduling.NodeSelector) {
+		t.Fatalf("nodeSelector = %v, want %v", podSpec.NodeSelector, cfg.Spec.Scheduling.NodeSelector)
+	}
+	if !reflect.DeepEqual(podSpec.Tolerations, cfg.Spec.Scheduling.Tolerations) {
+		t.Fatalf("tolerations = %v, want %v", podSpec.Tolerations, cfg.Spec.Scheduling.Tolerations)
+	}
+	if !reflect.DeepEqual(podSpec.TopologySpreadConstraints, cfg.Spec.Scheduling.TopologySpreadConstraints) {
+		t.Fatalf("topologySpreadConstraints = %v, want %v", podSpec.TopologySpreadConstraints, cfg.Spec.Scheduling.TopologySpreadConstraints)
+	}
+	if podSpec.Affinity == nil || !reflect.DeepEqual(podSpec.Affinity.NodeAffinity, nodeAffinity) {
+		t.Fatalf("nodeAffinity = %#v, want configured term", podSpec.Affinity)
+	}
+	assertDefaultAntiAffinity(t, gw, podSpec.Affinity)
+}
+
+func TestBuildDeploymentUserPodAntiAffinityReplacesDefault(t *testing.T) {
+	gw := testGateway(false)
+	cfg := testConfig(false)
+	cfg.Spec.Scheduling.Affinity = &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   "topology.kubernetes.io/zone",
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "edge"}},
+			}},
+		},
+	}
+
+	affinity := BuildDeployment(gw, cfg, BootstrapConfigMapName(gw), "hash").Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.PodAntiAffinity == nil {
+		t.Fatalf("podAntiAffinity missing: %#v", affinity)
+	}
+	antiAffinity := affinity.PodAntiAffinity
+	if len(antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 1 || antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].TopologyKey != "topology.kubernetes.io/zone" {
+		t.Fatalf("required terms = %#v, want the configured zone term", antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
+	}
+	if len(antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 0 {
+		t.Fatalf("preferred terms = %#v, want none (user anti-affinity replaces the default)", antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+	}
+}
+
+func TestBuildDeploymentPodAntiAffinityOptOut(t *testing.T) {
+	nodeAffinity := &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      "node.kubernetes.io/instance-type",
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"dataplane"},
+				}},
+			}},
+		},
+	}
+	for _, test := range []struct {
+		name         string
+		affinity     *corev1.Affinity
+		wantAffinity bool
+		wantTerm     bool
+	}{
+		{name: "empty podAntiAffinity opts out", affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}}, wantAffinity: false},
+		{name: "empty preferred list opts out", affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{}}}, wantAffinity: false},
+		{name: "opt out keeps other affinity", affinity: &corev1.Affinity{NodeAffinity: nodeAffinity, PodAntiAffinity: &corev1.PodAntiAffinity{}}, wantAffinity: true},
+		{name: "empty affinity still gets default", affinity: &corev1.Affinity{}, wantAffinity: true, wantTerm: true},
+		{name: "empty nodeAffinity normalized", affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{}}, wantAffinity: true, wantTerm: true},
+		{name: "empty podAffinity normalized", affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{}}, wantAffinity: true, wantTerm: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gw := testGateway(false)
+			cfg := testConfig(false)
+			cfg.Spec.Scheduling.Affinity = test.affinity
+
+			affinity := BuildDeployment(gw, cfg, BootstrapConfigMapName(gw), "hash").Spec.Template.Spec.Affinity
+			if !test.wantAffinity {
+				if affinity != nil {
+					t.Fatalf("affinity = %#v, want nil so SSA removes applied anti-affinity", affinity)
+				}
+				return
+			}
+			if affinity == nil {
+				t.Fatal("affinity missing")
+			}
+			if test.wantTerm {
+				assertDefaultAntiAffinity(t, gw, affinity)
+				if affinity.NodeAffinity != nil || affinity.PodAffinity != nil {
+					t.Fatalf("empty affinity fields must be normalized to nil: %#v", affinity)
+				}
+				return
+			}
+			if affinity.PodAntiAffinity != nil {
+				t.Fatalf("podAntiAffinity = %#v, want nil (opt-out)", affinity.PodAntiAffinity)
+			}
+			if !reflect.DeepEqual(affinity.NodeAffinity, nodeAffinity) {
+				t.Fatalf("nodeAffinity = %#v, want configured term", affinity.NodeAffinity)
+			}
+		})
+	}
+}
+
+func TestBuildDeploymentSharedConfigIsNotMutated(t *testing.T) {
+	gw1 := testGateway(false)
+	gw2 := testGateway(false)
+	gw2.Key.Name = "other"
+	cfg := testConfig(false)
+	cfg.Spec.Scheduling = v1alpha1.DataplaneSchedulingSpec{
+		NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key:      "node.kubernetes.io/instance-type",
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{"dataplane"},
+						}},
+					}},
+				},
+			},
+		},
+	}
+	snapshot := cfg.DeepCopy()
+
+	first := BuildDeployment(gw1, cfg, BootstrapConfigMapName(gw1), "hash")
+	second := BuildDeployment(gw2, cfg, BootstrapConfigMapName(gw2), "hash")
+
+	if !reflect.DeepEqual(cfg, snapshot) {
+		t.Fatalf("shared GatewayClassConfig mutated: %#v", cfg.Spec.Scheduling)
+	}
+	firstAffinity := first.Spec.Template.Spec.Affinity
+	secondAffinity := second.Spec.Template.Spec.Affinity
+	if firstAffinity == nil || firstAffinity.PodAntiAffinity == nil || secondAffinity == nil || secondAffinity.PodAntiAffinity == nil {
+		t.Fatalf("default pod anti-affinity missing: first=%#v second=%#v", firstAffinity, secondAffinity)
+	}
+	firstSelector := firstAffinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].PodAffinityTerm.LabelSelector.MatchLabels
+	secondSelector := secondAffinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].PodAffinityTerm.LabelSelector.MatchLabels
+	if firstSelector[GatewayLabelKey] != gatewayLabelValue(gw1) || secondSelector[GatewayLabelKey] != gatewayLabelValue(gw2) {
+		t.Fatalf("anti-affinity selectors not scoped per Gateway: %v vs %v", firstSelector, secondSelector)
+	}
+}
+
+// assertDefaultAntiAffinity verifies the injected soft hostname-spread term:
+// weight 100, the stable selector labels (never the config-hash label), and
+// matchLabelKeys scoping the term to the pod's own revision.
+func assertDefaultAntiAffinity(t *testing.T, gw *ir.Gateway, affinity *corev1.Affinity) {
+	t.Helper()
+	if affinity == nil || affinity.PodAntiAffinity == nil {
+		t.Fatalf("default pod anti-affinity missing: %#v", affinity)
+	}
+	terms := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(terms) != 1 || terms[0].Weight != 100 {
+		t.Fatalf("preferred anti-affinity terms = %#v, want a single weight-100 term", terms)
+	}
+	term := terms[0].PodAffinityTerm
+	if term.TopologyKey != corev1.LabelHostname {
+		t.Fatalf("topologyKey = %q, want %q", term.TopologyKey, corev1.LabelHostname)
+	}
+	if term.LabelSelector == nil {
+		t.Fatal("anti-affinity term has no label selector")
+	}
+	if !reflect.DeepEqual(term.LabelSelector.MatchLabels, selectorLabels(gw)) {
+		t.Fatalf("anti-affinity matchLabels = %v, want stable selector labels %v", term.LabelSelector.MatchLabels, selectorLabels(gw))
+	}
+	if _, exists := term.LabelSelector.MatchLabels[ConfigHashKey]; exists {
+		t.Fatal("anti-affinity selector must not include the config-hash label")
+	}
+	if !slices.Equal(term.MatchLabelKeys, []string{appsv1.DefaultDeploymentUniqueLabelKey}) {
+		t.Fatalf("matchLabelKeys = %v, want [%s]", term.MatchLabelKeys, appsv1.DefaultDeploymentUniqueLabelKey)
 	}
 }
 

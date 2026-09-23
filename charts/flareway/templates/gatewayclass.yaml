@@ -32,6 +32,10 @@ spec:
     mode: {{ .Values.gatewayClass.config.dns.mode }}
   originJWT:
     mode: {{ .Values.gatewayClass.config.originJWT.mode }}
+  {{- with .Values.gatewayClass.config.scheduling }}
+  scheduling:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   conformance:
     serviceType: {{ .Values.gatewayClass.config.conformance.serviceType }}
 ---

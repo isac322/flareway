@@ -64,8 +64,9 @@ The chart therefore does not expose global Direct-mode or management-token value
 | `gatewayClass.create` | `false` | Create the chart-managed `GatewayClass` and `GatewayClassConfig`. |
 | `gatewayClass.config.accountRefName` | `""` | Default cluster-scoped `CloudflareAccount` reference. |
 | `gatewayClass.config.conformanceMode` | `false` | Run the generated Gateway class without Cloudflare integration. |
+| `gatewayClass.config.scheduling` | `{}` | Dataplane pod placement (`nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`) rendered into the `GatewayClassConfig`. |
 
-See `values.yaml` for pod placement, security context, resources, Service annotations, and complete `GatewayClassConfig` defaults.
+See `values.yaml` for pod placement, security context, resources, Service annotations, and complete `GatewayClassConfig` defaults. The top-level `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` values place only the controller-manager pod; dataplane pods are placed through `gatewayClass.config.scheduling`.
 
 ## Logging
 

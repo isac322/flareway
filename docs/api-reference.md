@@ -28,7 +28,41 @@ Flareway serves 22 CRD Kinds:
 
 `GatewayClassConfig` is cluster-scoped and is referenced by a Gateway API `GatewayClass.parametersRef`. `spec.accountRef` is required in Cloudflare mode and must be omitted when `conformanceMode: true`.
 
-The resource owns class defaults for the cloudflared `connector`, Envoy `proxy`, private-DNS sidecar, managed or external DNS, origin JWT mode, and the Gateway-safe `originRequest` subset. Conformance mode instead selects the direct data-plane Service type and performs no Cloudflare account operations.
+The resource owns class defaults for the cloudflared `connector`, Envoy `proxy`, private-DNS sidecar, managed or external DNS, origin JWT mode, the Gateway-safe `originRequest` subset, and dataplane pod `scheduling`. Conformance mode instead selects the direct data-plane Service type and performs no Cloudflare account operations.
+
+### Dataplane pod scheduling
+
+`spec.scheduling` places the dataplane pods of every Gateway in the class. It is class-level only: `CloudflareTunnel` has no scheduling override, so per-Gateway placement requires a separate `GatewayClass` and `GatewayClassConfig`.
+
+| Field | Effect |
+|---|---|
+| `nodeSelector` | Copied verbatim to the pod spec; at most 64 entries. |
+| `tolerations` | Copied verbatim; at most 16 entries. |
+| `affinity` | Copied verbatim except for the default pod anti-affinity below. |
+| `topologySpreadConstraints` | Copied verbatim; at most 8 entries, deduplicated on (`topologyKey`, `whenUnsatisfiable`). |
+
+Unless `affinity.podAntiAffinity` is set, Flareway adds one soft anti-affinity term so replicas prefer distinct nodes:
+
+```yaml
+podAntiAffinity:
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: flareway-gateway
+            flareway.bhyoo.com/gateway: <namespace>--<gateway-name>
+        matchLabelKeys: [pod-template-hash]
+```
+
+`matchLabelKeys` narrows the term to the current ReplicaSet revision, so a rollout surge pod is not repelled by the previous revision's pods. A user-supplied `podAntiAffinity` replaces the default entirely — it is not merged. Setting `affinity.podAntiAffinity: {}` opts out of the default; `affinity: {}`, `affinity: null`, and `podAntiAffinity: null` do not opt out. Flareway adds no default `topologySpreadConstraints`: any pod-level entry disables the scheduler's cluster default constraints, so the field stays absent unless configured.
+
+Soft rules (`preferredDuringScheduling…`, `ScheduleAnyway`) are best effort: they are evaluated only at scheduling time, never make a node infeasible, and are not rebalanced afterwards. Spread improves resilience within the selected topology domain; it is not a guarantee against simultaneous failures inside or outside that domain. Hard rules (`requiredDuringScheduling…`, `DoNotSchedule`) can stall a rollout: the dataplane Deployment uses `maxUnavailable: 0`, so when no node qualifies the surge pod stays `Pending` and the rollout cannot converge. On large clusters, inter-pod affinity scoring adds scheduler work proportional to pods per node; `affinity.podAntiAffinity: {}` opts out where scheduling latency matters more than spread.
+
+The CRD validates toleration operator/effect combinations, `tolerationSeconds` requiring `NoExecute`, `maxSkew > 0`, `whenUnsatisfiable` (`DoNotSchedule` or `ScheduleAnyway`), `minDomains` requiring `DoNotSchedule`, `nodeAffinityPolicy`/`nodeTaintsPolicy` values, `matchLabelKeys` requiring a `labelSelector` without `matchLabels` overlap, at least one `nodeSelectorTerm` in required node affinity, preferred-term weights in 1–100, and non-empty pod affinity `topologyKey`s. Two intentional divergences from the Pod API: `Lt`/`Gt` toleration operators are rejected, and `whenUnsatisfiable` is required even though the Pod API defaults it to `DoNotSchedule`.
+
+Label syntax (nodeSelector keys and values, toleration keys and values, selector internals), `namespaces` format, node selector requirement operator/value cardinality, and pod affinity `topologyKey` syntax are deferred to Deployment admission — the CRD can accept a spec that the dataplane Deployment then rejects. Such a rejection currently surfaces as controller reconcile errors; the Gateway status is not updated.
 
 ## Scope and authorization
 
@@ -326,6 +360,8 @@ The Secret uses `CF-Access-Client-Id` and `CF-Access-Client-Secret`. During a gr
 - `originRequest`: `connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`, `keepAliveConnections`, `noHappyEyeballs`, `disableChunkedEncoding`, and `http2Origin`, the subset valid for a loopback Envoy origin;
 - `listeners[]`: listener name, `Public|Private`, optional virtual network, automatic hostname-route creation;
 - `dns` and optional `managementToken.resources: [Logs]`.
+
+Dataplane pod placement is not a tunnel override. It is configured at class level through `GatewayClassConfig.spec.scheduling`.
 
 Gateway ownership is sticky and bound to both `status.gatewayRef.name` and `status.gatewayUid`. A later Gateway cannot preempt the live owner. Flareway drains the previous owner’s connector before admitting a successor. `ObserveOnly` Tunnels never issue connector tokens or create connector Secrets, and a non-empty `status.deletedAt` blocks Gateway publication, addresses, private routing, and configuration writes while cleanup drains the data plane.
 

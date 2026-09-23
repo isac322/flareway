@@ -144,6 +144,46 @@ type ConformanceSpec struct {
 	ServiceType corev1.ServiceType `json:"serviceType,omitempty"`
 }
 
+// DataplaneSchedulingSpec configures where the dataplane pods of the Gateways
+// in this class may run. It applies to every dataplane pod in both Cloudflare
+// and conformance mode; it does not affect the Flareway controller pod.
+// Soft (preferred) rules are best effort: they are evaluated only when a pod is
+// scheduled and never evict or rebalance running pods.
+// The CRD validates the common rules below; remaining Pod API validation (for
+// example label key and value syntax) happens when the dataplane Deployment is
+// admitted.
+// +kubebuilder:validation:XValidation:rule="!has(self.tolerations) || self.tolerations.all(t, (!has(t.operator) || t.operator in ['', 'Equal', 'Exists']) && (!has(t.effect) || t.effect in ['', 'NoSchedule', 'PreferNoSchedule', 'NoExecute']) && (!has(t.operator) || t.operator != 'Exists' || !has(t.value) || t.value == '') && ((has(t.key) && t.key != '') || (has(t.operator) && t.operator == 'Exists')) && (!has(t.tolerationSeconds) || (has(t.effect) && t.effect == 'NoExecute')))",message="tolerations must be valid pod tolerations"
+// +kubebuilder:validation:XValidation:rule="!has(self.topologySpreadConstraints) || self.topologySpreadConstraints.all(t, t.maxSkew > 0 && t.topologyKey != '' && t.whenUnsatisfiable in ['DoNotSchedule', 'ScheduleAnyway'] && (!has(t.minDomains) || (t.minDomains > 0 && t.whenUnsatisfiable == 'DoNotSchedule')) && (!has(t.nodeAffinityPolicy) || t.nodeAffinityPolicy in ['Honor', 'Ignore']) && (!has(t.nodeTaintsPolicy) || t.nodeTaintsPolicy in ['Honor', 'Ignore']) && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || (has(t.labelSelector) && !t.matchLabelKeys.exists(k, has(t.labelSelector.matchLabels) && k in t.labelSelector.matchLabels))))",message="topologySpreadConstraints must be valid pod topology spread constraints"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.nodeAffinity) || !has(self.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.size() > 0",message="requiredDuringSchedulingIgnoredDuringExecution must have at least one nodeSelectorTerm"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.nodeAffinity) || !has(self.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(t, t.weight >= 1 && t.weight <= 100)",message="nodeAffinity preferred term weights must be in the range 1-100"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAffinity) || ((!has(self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != '' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != '' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAffinity terms must be valid pod affinity terms"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAntiAffinity) || ((!has(self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != '' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != '' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAntiAffinity terms must be valid pod affinity terms"
+type DataplaneSchedulingSpec struct {
+	// NodeSelector limits dataplane pods to nodes carrying all of these labels.
+	// +kubebuilder:validation:MaxProperties=64
+	// +mapType=atomic
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// Tolerations lets dataplane pods schedule onto tainted nodes. The Lt and
+	// Gt operators are not accepted.
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=atomic
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// Affinity sets node and inter-pod affinity rules. Unless podAntiAffinity
+	// is set, Flareway adds a soft preferred podAntiAffinity that spreads
+	// replicas across kubernetes.io/hostname (weight 100, matchLabelKeys
+	// pod-template-hash); setting podAntiAffinity: {} opts out of that default.
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+	// TopologySpreadConstraints controls how dataplane pods spread across
+	// topology domains. Setting any constraint disables the scheduler's
+	// cluster default spread constraints for these pods. whenUnsatisfiable is
+	// required.
+	// +kubebuilder:validation:MaxItems=8
+	// +listType=map
+	// +listMapKey=topologyKey
+	// +listMapKey=whenUnsatisfiable
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+}
+
 // GatewayClassConfigSpec defines defaults and operating mode for a GatewayClass.
 // +kubebuilder:validation:XValidation:rule="!self.conformanceMode || !has(self.accountRef)",message="accountRef must be omitted when conformanceMode is true"
 // +kubebuilder:validation:XValidation:rule="self.conformanceMode || (has(self.accountRef) && has(self.accountRef.name) && size(self.accountRef.name) > 0)",message="accountRef.name is required unless conformanceMode is true"
@@ -163,6 +203,10 @@ type GatewayClassConfigSpec struct {
 	OriginRequest GatewayOriginRequestSpec `json:"originRequest,omitempty"`
 	// +kubebuilder:default=false
 	ConformanceMode bool `json:"conformanceMode,omitempty"`
+	// Scheduling configures placement of the dataplane pods of Gateways in
+	// this class.
+	// +kubebuilder:default={}
+	Scheduling DataplaneSchedulingSpec `json:"scheduling,omitempty"`
 	// +kubebuilder:default={}
 	Conformance ConformanceSpec `json:"conformance,omitempty"`
 }
