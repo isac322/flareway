@@ -32,6 +32,9 @@ const (
 	EventReasonCleanupBlocked  = "CleanupBlocked"
 	EventReasonSecurityBlocked = "SecurityBlocked"
 	EventReasonOutOfBandChange = "OutOfBandChange"
+	// EventReasonDataplaneApplyRejected marks a Kubernetes admission
+	// rejection of a Gateway-owned dataplane object mutation.
+	EventReasonDataplaneApplyRejected = "DataplaneApplyRejected"
 )
 
 var eventMessages = map[string]string{

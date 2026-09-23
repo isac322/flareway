@@ -389,7 +389,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	for _, object := range resources {
 		if err := reconcileGatewayOwnedObject(ctx, r.Client, r.Scheme, &gateway, object); err != nil {
-			return ctrl.Result{}, fmt.Errorf("reconcile %T %s/%s: %w", object, object.GetNamespace(), object.GetName(), err)
+			reconcileErr := fmt.Errorf("reconcile %T %s/%s: %w", object, object.GetNamespace(), object.GetName(), err)
+			if isDataplaneRejection(err) {
+				return ctrl.Result{}, r.reportDataplaneRejection(ctx, req.NamespacedName, &gateway, &statuses, object, reconcileErr)
+			}
+			return ctrl.Result{}, reconcileErr
 		}
 	}
 
@@ -1274,6 +1278,84 @@ func (r *GatewayReconciler) handleSnapshotBuildFailure(
 	return buildErr
 }
 
+// reportDataplaneRejection records a Kubernetes admission rejection of a
+// Gateway-owned dataplane object mutation: the Gateway and every listener
+// report Programmed=False with reason Invalid, and a Warning event names the
+// rejected object kind, namespace/name, and the canonical API reason
+// (Invalid, Forbidden, or BadRequest) captured when the rejection was
+// classified. The raw API error payload is never copied into status or
+// events. The event is emitted only when the persisted Programmed condition
+// changes, so identical retries do not re-emit and keep their
+// LastTransitionTime. The original rejection is always returned for retry; a
+// status persistence failure is joined onto it.
+func (r *GatewayReconciler) reportDataplaneRejection(
+	ctx context.Context,
+	key types.NamespacedName,
+	gateway *gatewayv1.Gateway,
+	statuses *gatewayapi.Statuses,
+	object client.Object,
+	rejection error,
+) error {
+	kind := fmt.Sprintf("%T", object)
+	if gvk, err := apiutil.GVKForObject(object, r.Scheme); err == nil {
+		kind = gvk.Kind
+	}
+	var marked *dataplaneRejectionError
+	if !errors.As(rejection, &marked) {
+		// Unreachable: callers only invoke this path when isDataplaneRejection
+		// reports the marker. Never fall back to ReasonForError, which would
+		// copy the raw payload reason into status and events.
+		return rejection
+	}
+	message := fmt.Sprintf(
+		"Kubernetes rejected the dataplane %s %s/%s: %s",
+		kind,
+		object.GetNamespace(),
+		object.GetName(),
+		marked.reason,
+	)
+
+	before := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if before != nil {
+		before = before.DeepCopy()
+	}
+
+	now := metav1.Now()
+	if r.Now != nil {
+		now = metav1.NewTime(r.Now())
+	}
+	meta.SetStatusCondition(&statuses.Gateway.Conditions, metav1.Condition{
+		Type:               string(gatewayv1.GatewayConditionProgrammed),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: gateway.Generation,
+		Reason:             string(gatewayv1.GatewayReasonInvalid),
+		Message:            message,
+		LastTransitionTime: now,
+	})
+	for index := range statuses.Gateway.Listeners {
+		meta.SetStatusCondition(&statuses.Gateway.Listeners[index].Conditions, metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			Reason:             string(gatewayv1.ListenerReasonInvalid),
+			Message:            message,
+			LastTransitionTime: now,
+		})
+	}
+
+	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
+		return errors.Join(rejection, err)
+	}
+
+	after := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	changed := before == nil || after == nil ||
+		before.Status != after.Status || before.Reason != after.Reason || before.Message != after.Message
+	if changed && r.Recorder != nil {
+		r.Recorder.Eventf(gateway, nil, corev1.EventTypeWarning, observability.EventReasonDataplaneApplyRejected, "ReconcileGateway", "%s", message)
+	}
+	return rejection
+}
+
 func (r *GatewayReconciler) setProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, key, version string, acked, deploymentReady, addressReady bool, addressMessage string) bool {
 	conditionStatus := metav1.ConditionTrue
 	reason := string(gatewayv1.GatewayReasonProgrammed)
@@ -1554,6 +1636,48 @@ func (r *GatewayReconciler) patchBackendTLSPolicyStatuses(
 	return nil
 }
 
+// dataplaneRejectionError marks a Kubernetes admission rejection (Invalid,
+// Forbidden, or BadRequest) raised by a mutation of a Gateway-owned dataplane
+// object. Only mutation callsites wrap errors: observation failures such as a
+// Forbidden GET stay unmarked and retry-only. reason is the canonical
+// metav1.StatusReason selected by exact apierrors predicates at wrap time, so
+// status and event output never copies the raw payload reason. Unwrap
+// preserves the original API error so apierrors predicates keep working.
+type dataplaneRejectionError struct {
+	err    error
+	reason metav1.StatusReason
+}
+
+func (e *dataplaneRejectionError) Error() string { return e.err.Error() }
+func (e *dataplaneRejectionError) Unwrap() error { return e.err }
+
+// rejectDataplaneMutation wraps err in a dataplaneRejectionError when it is a
+// Kubernetes admission rejection; every other error passes through unchanged.
+func rejectDataplaneMutation(err error) error {
+	if err == nil {
+		return nil
+	}
+	var reason metav1.StatusReason
+	switch {
+	case apierrors.IsInvalid(err):
+		reason = metav1.StatusReasonInvalid
+	case apierrors.IsForbidden(err):
+		reason = metav1.StatusReasonForbidden
+	case apierrors.IsBadRequest(err):
+		reason = metav1.StatusReasonBadRequest
+	default:
+		return err
+	}
+	return &dataplaneRejectionError{err: err, reason: reason}
+}
+
+// isDataplaneRejection reports whether err carries the dataplane rejection
+// marker.
+func isDataplaneRejection(err error) bool {
+	var rejection *dataplaneRejectionError
+	return errors.As(err, &rejection)
+}
+
 func reconcileGatewayOwnedObject(
 	ctx context.Context,
 	kube client.Client,
@@ -1605,7 +1729,7 @@ func reconcileGatewayOwnedObject(
 			}
 			return nil
 		} else if !apierrors.IsAlreadyExists(err) {
-			return err
+			return rejectDataplaneMutation(err)
 		} else if err := kube.Get(ctx, key, current); err != nil {
 			return fmt.Errorf("read %T after create collision: %w", desired, err)
 		}
@@ -1659,7 +1783,7 @@ func reconcileGatewayOwnedObject(
 		return fmt.Errorf("%T %s/%s has no resourceVersion", desired, key.Namespace, key.Name)
 	}
 	desired.SetResourceVersion(resourceVersion)
-	return applyObject(ctx, kube, scheme, desired, client.FieldOwner(gatewayFieldManager), client.ForceOwnership)
+	return rejectDataplaneMutation(applyObject(ctx, kube, scheme, desired, client.FieldOwner(gatewayFieldManager), client.ForceOwnership))
 }
 
 // migrateGatewayCreateOwnership converts the Update managedFields entry that
@@ -1717,7 +1841,7 @@ func migrateGatewayCreateOwnership(ctx context.Context, kube client.Client, obje
 		}
 		candidate = fresh
 	}
-	return fmt.Errorf("migrate %T %s field ownership to server-side apply: %w", object, client.ObjectKeyFromObject(object), lastErr)
+	return fmt.Errorf("migrate %T %s field ownership to server-side apply: %w", object, client.ObjectKeyFromObject(object), rejectDataplaneMutation(lastErr))
 }
 
 func replaceGatewayServicePorts(
@@ -1744,7 +1868,7 @@ func replaceGatewayServicePorts(
 	before := current.DeepCopy()
 	current.Spec.Ports = ports
 	if err := kube.Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-		return false, fmt.Errorf("replace Service %s listener ports: %w", client.ObjectKeyFromObject(current), err)
+		return false, fmt.Errorf("replace Service %s listener ports: %w", client.ObjectKeyFromObject(current), rejectDataplaneMutation(err))
 	}
 	return true, nil
 }
