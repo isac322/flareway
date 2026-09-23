@@ -1,0 +1,314 @@
+# Flareway 설계 003 — 프로덕션 로깅 기본값과 Helm 로깅 설정(issue #96) 분석·설계·QA
+
+- 작성일: 2026-09-23
+- 상태: **합의 완료, 구현 전.** 설계 결정 R1–R9와 QA 27개 ID에 대해 세 렌즈(운영자/패키징, 회귀, 검증)가 두 라운드 토론 끝에 합의했다. 구현·QA 실행·게이트는 이후 단계다.
+- 입력: issue #96 본문, `cmd/main.go`·차트·Kustomize 현재 소스, 베이스라인 스모크 실행 결과, 로거 내부 동작 실행 증거, 로그 콜사이트 분류 결과.
+- 표기: `[E]` 실행 증거, `[D]` 설계 결정, `[C]` 토론 중 기각·정정된 사항, `[INFERENCE]` 소스 판독·추론(미실행).
+
+---
+
+## 1. 요약 — 핵심 결정
+
+1. **결함**: `cmd/main.go`가 `zap.Options{Development: true}`로 초기화되고, Helm 차트와 Kustomize 매니페스트는 `--zap-*` 인자를 하나도 전달하지 않는다. 표준 설치는 개발 모드(콘솔 인코더 + DEBUG 레벨)로 동작한다 `[E]`.
+2. **수정 방향**: 엔트리포인트 기본값을 `Development: false`로 바꾸고(프로덕션: JSON, info, error 스택트레이스), 기존 `--zap-*` 플래그를 차트 `logging` 값 세 개(`development`, `level`, `encoder`)와 Kustomize 명시 인자로 노출한다. 세 표면(standalone·Helm·Kustomize)이 동일한 정책을 렌더한다 `[D]`.
+3. **단일 로깅 정책**: zap(logr 싱크)만으로는 부족하다 — client-go의 전역 klog 호출은 별도 텍스트 포맷으로 새어 나온다. `klog.SetLoggerWithOptions(logger, klog.ContextualLogger(true))` 한 줄로 같은 싱크에 묶는다. grpclog는 어댑터를 두지 않고 ERROR 전용 텍스트 라인을 문서화된 예외로 둔다 `[D]`.
+4. **샘플러 수용**: 프로덕션 모드의 zap 샘플러((level,message) 키당 초당 첫 100개 통과, 이후 100번째마다 1개)는 업스트림 의도 동작이므로 유지하고 문서화한다. 비활성화는 `logging.development=true` 또는 정수 level ≥ 2뿐이다(`debug`는 해제하지 못한다) `[D]`.
+5. **CI 분기**: e2e 배포 파이프라인은 렌더된 Kustomize 인자를 sed로 `--zap-log-level=debug`로 바꿔 V(1) Cloudflare 요청 로그를 트riage용으로 보존하고, conformance는 출하 기본값 그대로 실행해 실클러스터에서 프로덕션 로깅을 검증한다 `[D]`.
+6. **범위 외**: #92 리컨사일 루프, #97 AUD, xDS 어댑터 레벨 재매핑, 로그 콜사이트 레벨 변경, `extraArgs`·`stacktraceLevel`·`timeEncoding` 노출, grpclog 어댑터 `[D]`.
+
+---
+
+## 2. 증거와 그 한계
+
+### 2.1 실행 증거 `[E]`
+
+**베이스라인 스모크**(envtest apiserver 1.35.0 + Flareway CRD + Gateway API standard CRD, 루프백 Cloudflare 스텁, `HTTPS_PROXY` 데드 프록시로 외부 egress 차단, 실제 빌드 바이너리 45초 실행):
+
+| 모드 | 인자 | 총 라인 | JSON | 콘솔 | DEBUG | ERROR |
+|---|---|---|---|---|---|---|
+| a-default | (없음) | 421 | 0 | 349(+72 스택 연속행) | 58 | 12 |
+| b-prod | `--zap-devel=false` | 223 | 223 | 0 | 0 | 18(전부 `"stacktrace"` 필드) |
+| c-prod-debug | `--zap-devel=false --zap-log-level=debug` | 306 | 306 | 0 | 84 | 17 |
+| d-prod-console | `--zap-devel=false --zap-encoder=console` | 331 | 0 | 223(+108) | 0 | 18 |
+
+- 현재 기본값(a)은 콘솔 + DEBUG다. DEBUG의 대부분은 `internal/cloudflare/client.go:231`의 V(1) "Cloudflare API request completed"(45초에 58행)다.
+- `--zap-devel=false` 하나로 issue가 요구하는 형태(100% JSON, info+error, 비JSON 0행)가 나온다.
+- 모든 모드에서 stdout은 0바이트 — 전부 stderr다. 모든 모드에서 error 엔트리는 스택트레이스를 가진다(콘솔은 연속행, JSON은 `"stacktrace"` 필드).
+- 어떤 모드에서도 klog 텍스트(`I0923 …`)나 grpc 텍스트(`YYYY/MM/DD …`) 라인은 관측되지 않았다 — 단, 이는 해당 경로가 이 워크로드에서 발화하지 않았기 때문이다(§2.3).
+
+**klog 전역 호출 트리거**: `DISABLE_HTTP2=1`(존재 기반 — 비어있지 않은 값이면 `=false`도 발화)을 주면 client-go의 transport 구성(`k8s.io/client-go/transport/cache.go` → `k8s.io/apimachinery/pkg/util/net/http.go:134-136`)이 전역 `klog.Info("HTTP2 has been explicitly disabled")`를 호출한다. 베이스라인 바이너리에서 `I0923 16:01:37.377611   16083 http.go:136] HTTP2 has been explicitly disabled` 텍스트 라인을 실측했다. apiserver 없이도 발화하므로 결정적 트리거로 쓴다.
+
+**로거 내부 동작**(throwaway Go 프로그램으로 실행 검증):
+
+- 샘플러: 동일 (level,message) error 500회를 1초 내에 호출 → 프로덕션 기본 104개 방출(첫 100 + 이후 100번째마다), `--zap-log-level=2`와 `--zap-devel=true`는 500개 전부. 샘플 키는 (level,message)뿐이며 필드는 무시된다. 샘플링 창은 zap level -1..5 — **V(1)(zap -1)도 샘플링 대상**이고, V(2) 이하(zap < -1)만 우회한다 `[C: 라운드2에서 "V(1)은 샘플링 안 됨" 문구 정정]`.
+- 플래그 우선순위: `--zap-devel=true`는 콘솔+debug를 그대로 복원하고, `--zap-encoder`/`--zap-log-level`은 development 기본값을 개별로 덮어쓴다. `--zap-log-level=warn`·`=0`·`=-1`은 파싱 오류(exit 2, `invalid log level`), `=INFO`는 소문자화되어 수용, 정수 N>0은 logr V(N)으로 매핑된다. `--zap-time-encoding`은 `nano`가 아니라 `nanos`만 수용한다.
+- int8 래핑: `--zap-log-level`은 `zapcore.Level(int8(-N))`으로 매핑 — N=129–255는 양수 레벨로 래핑되어 **모든 로그가 침묵**하고, N=256은 info로 래핑된다. 스키마 상한 128의 근거다.
+- DPanic: 개발 모드에서는 malformed kv(홀수 개 key-value)가 panic을 일으키고, 프로덕션에서는 `"level":"dpanic"` JSON 라인 후 계속 진행한다 — 기본값 변경은 가용성 개선이기도 하다.
+- `klog.SetLogger` 후 전역 `klog.Info/Error`는 JSON으로 라우팅되고, `ContextualLogger(true)`는 로거 없는 ctx의 `FromContext` 폴백도 우리 로거로 보내 `--zap-log-level` 게이팅을 따르게 한다. `klog.Fatal*`은 여전히 exit 255지만 메시지가 `logger.Info`로 방출되는 severity 다운그레이드가 있다(알려진 퀴크).
+- grpclog 기본값은 ERROR 심각도만 stderr 텍스트로 출력하고 warning/info는 discard한다 — 드물지만 비JSON 라인이 나올 수 있는 유일한 잔여 경로다.
+- xDS(go-control-plane) 어댑터의 도달 가능한 Infof는 `open delta watch`(delta watch 생성마다, Envoy당 타입URL당 요청마다)뿐이며 Info 레벨이 적절한 운영 신호다.
+
+**로그 콜사이트 분류**(cmd/+internal/ 비테스트 Go, 155개 유닛): 실제 로그 사이트 61개(Error 43, Info 14, V(1) 4). sensitive·full-object·malformed kv 플래그는 0건 — 레벨/인코더 변경으로 숨겨지거나 깨지는 사이트가 없다.
+
+**성능 계측**: 100k info + 10k error 라인을 io.Discard에 기록 — prod-json 233 ns/line vs dev-console 735 ns/line. JSON이 라인당 약 3배 저렴하다.
+
+### 2.1.1 실행된 것과 계획된 것의 구분
+
+| 구분 | 항목 |
+|---|---|
+| **실행 완료** `[E]` | 베이스라인 4+1 모드 캡처, klog 트리거, 샘플러·플래그·DPanic·래핑 throwaway 검증, 콜사이트 분류, redaction 정규식 누출 재현, 성능 계측 |
+| **별도 추적** | 구현 후 QA 27개 ID 전부(§9 결과 열은 `미실행`), Kind 스테이지, 로컬 게이트, CI 녹색 |
+
+### 2.2 확인된 회귀와 수정 의무
+
+1. **e2e redaction 정규식이 JSON 로그에서 시크릿을 누출한다** `[E]`: 현재 `.github/workflows/e2e.yaml`의 정규식을 그대로 실행하면 `{"authorization":"Bearer tok"}`는 토큰이 남고, `"api_token":"x y"`/`"x,y"`는 공백·콤마 뒤가 노출된다. 콘솔 포맷에서도 같은 누출이 있었으나, 전환 후 스트림이 100% JSON이 되어 노출이 극대화된다 — **이 PR에서 수정이 의무**다(R7).
+2. **스키마 `additionalProperties: false`가 `logging` 키를 차단한다** `[E]`: values.schema.json 수정과 values.yaml 추가는 원자적으로 커밋되어야 한다.
+
+### 2.3 증거의 한계
+
+- 베이스라인에서 klog/grpc 텍스트 라인이 관측되지 않은 것은 "발화 경로가 없다"가 아니라 "이 워크로드에서 발화하지 않았다"다. 전역 klog는 `DISABLE_HTTP2` 트리거로 별도 입증했다.
+- 리더 일렉션 획득 라인은 out-of-cluster에서 재현 불가(namespace 파일 부재로 즉시 종료) — 실패 경로만 두 인코더로 캡처했다. 인클러스터 `leaderelection` 라인의 JSON 라우팅은 contextual 경로(`klog.FromContext` → ctrl 주입 로거)라는 `[INFERENCE]`와 Kind 스테이지(QA-22)로 커버한다.
+- 샘플러의 실운용 드롭은 이 볼륨(~5 lines/s)에서 관측되지 않았다 — 합성 500회 버스트로만 입증했다.
+- 라이브 Cloudflare/실배포 관측은 없다. 모든 증거는 envtest·throwaway·렌더 기반이다.
+
+---
+
+## 3. 근본 원인 분석
+
+### 3.1 발생 — 왜 개발 기본값이 배포까지 도달했는가
+
+1. `cmd/main.go:147-153`이 `zap.Options{Development: true}`로 하드코딩하고 `opts.BindFlags`로 플래그만 바인딩한다 — 플래그는 존재하지만 기본값이 개발 모드다.
+2. 차트 `templates/deployment.yaml`과 `config/manager/manager.yaml`은 `--zap-*` 인자를 전달하지 않으므로, 두 패키징 표면 모두 바이너리 기본값을 그대로 상속한다.
+3. 더 깊은 원인: **배포에서 보이는 단일 로깅 정책이 없다.** zap(logr 싱크), klog 전역(client-go), grpclog(gRPC)가 각자의 포맷과 게이팅을 가진 세 싱크다. contextual klog 경로만 우리 로거를 재사용하고, 전역 klog 호출은 `I0923 …` 텍스트로 새어 나온다.
+4. 개발 모드는 인코더/레벨 외에도 숨은 의미를 가진다: 샘플러 없음, malformed kv에서 DPanic panic(크래시 위험), KubeAwareEncoder 전체 오브젝트 덤프, Warn 스택트레이스 레벨.
+
+### 3.2 유출 — 왜 기존 방어가 못 막았는가
+
+- `make verify-runtime-defaults`는 env 기본값(GOMEMLIMIT/GODEBUG)만 검사하고 args는 검사하지 않는다 — 패키징 표면의 로깅 정책을 단언하는 게이트가 없었다.
+- 어떤 CI 잡이나 테스트도 controller.log를 파싱·단언하지 않는다(아티팩트 덤프 + redaction뿐) — 포맷 회귀를 잡는 관측 지점이 없었다.
+
+### 3.3 억제 — 무엇이 피해를 제한했는가
+
+- 플래그 자체는 완전히 동작하므로 운영자가 `--zap-devel=false`를 알면 수동으로 복구 가능했다 — issue도 "설정 불가"가 아니라 "기본값/설정 표면" 문제로 분류한다.
+- 민감정보·전체 오브젝트·malformed 콜사이트가 0건이라 개발 모드 노출의 직접 피해(시크릿 누출, 크래시)는 잠재적이었다.
+
+---
+
+## 4. 대안 비교
+
+| 대안 | 판정 | 근거 |
+|---|---|---|
+| **A. 채택안**: 바이너리 기본값 prod 전환 + 차트 `logging` 3키 + Kustomize 명시 인자 + klog 라우팅 + 문서 | **채택** `[D]` | issue의 구조적 개선 요구(엔트리포인트 기본값 + 기존 zap 컨트롤 노출 + 세 표면 일관성)를 정확히 충족. 새 로거/추상화 없음 |
+| B. 차트/Kustomize에만 `--zap-devel=false` 추가(바이너리 기본값 유지) | 기각 `[C]` | standalone 바이너리가 개발 모드로 남아 표면 간 불일치 — issue가 요구하는 "엔트리포인트의 일관된 프로덕션 기본값"에 실패 |
+| C. 샘플러 제거용 커스텀 zap core | 기각 `[C]` | `zap.New`/`NewRaw`를 우회해 인코더+싱크+레벨+스택트레이스 배선을 재소유해야 하고 `--zap-*` 플래그 의미를 잃는다. 업스트림 의도 동작을 끄기 위한 비용 대비 이득 없음 — 문서화로 처리 |
+| D. grpclog `SetLoggerV2` logr 어댑터 | 기각 `[C]` | ~30행의 새 어댑터 = 새 로깅 추상화. 기본 grpclog는 ERROR 전용·희소 라인이라 문서화된 예외로 충분. `GRPC_GO_LOG_*` env를 차트에 두는 것도 기각(제2의 발산 설정 표면) |
+| E. xDS 어댑터 레벨 재매핑(Infof→V(1)) | 기각 `[C]` | `open delta watch`는 "Envoy X가 타입 Y를 구독/ACK"라는 운영자가 Info에서 원하는 신호. V(1)로 내리면 xDS 라이프사이클 가시성이 debug 플래그 뒤로 숨는다 |
+| F. CI 전체를 debug로 전환 | 기각 `[C]` | 출하 기본값을 아무 잡도 행사하지 않게 된다. e2e만 debug overlay(V(1) 트riage 스트림 보존), conformance는 출하 기본값 유지로 분기 채택 |
+| G. `logging.extraArgs` / stacktraceLevel·timeEncoding 노출 | 기각 `[C]` | 범위 확장. 세 키만 노출하고 나머지는 문서로 명시("세 개만 노출됨") — 필요하면 후속 issue |
+| H. `required` 제거(스키마 완화) | 기각 `[C]` | `--set logging=null`/`logging.level=null`이 스키마 오류가 아니라 템플릿 nil-pointer로 실패하는 것을 실행 확인 — `required`는 load-bearing이다 |
+
+---
+
+## 5. 최종 설계 `[D]` (R1–R9)
+
+- **R1** `cmd/main.go`: `zap.Options{Development: false}`(JSON, info, error 스택트레이스). `opts.BindFlags` 유지.
+- **R2** `cmd/main.go`: `logger := zap.New(zap.UseFlagOptions(&opts))` → `ctrl.SetLogger(logger)` → `klog.SetLoggerWithOptions(logger, klog.ContextualLogger(true))`. `FlushLogger`·`klog.InitFlags` 없음(`-v`는 비등록 상태로 inert 유지). `k8s.io/klog/v2`가 direct 의존으로 승격 — `go mod tidy` 클린 필수.
+- **R3** grpclog 어댑터 없음. ERROR 심각도 텍스트 라인은 차트 README Logging 섹션과 QA 스트림 순수성 검사의 문서화된 예외.
+- **R4** 업스트림 샘플러 유지 + 정확한 문구로 문서화: 키는 (level,message)뿐, 초당 첫 100개 통과 후 100번째마다 1개, **zap level -1..5가 샘플링 대상이므로 debug/V(1)·info·error 모두 샘플링되고 V(N≥2)만 우회**, error는 완전 억제되지 않고 열화됨. 해제는 `logging.development=true` 또는 정수 level ≥ 2(`debug`로는 해제 불가).
+- **R5** 차트 `logging: {development: false, level: info, encoder: json}`. 스키마: object + `additionalProperties: false` + `required` 3키 전부(null → nil-pointer 대신 스키마 오류). `level`은 `oneOf [enum debug|info|error|panic, integer 1..128]`(문자열 숫자 거부, 129+는 int8 래핑 침묵 차단). `encoder`는 enum json|console. `flareway.loggingArgs` 헬퍼가 세 인자를 **무조건** args 리스트 **끝**에 렌더(index-patch 안전). `extraArgs`·`stacktraceLevel`·`timeEncoding` 없음. 문서는 "명시 level/encoder가 development 기본값을 덮어쓰므로 `development=true` 단독은 JSON/info + dev 의미(샘플러 해제, Warn 스택트레이스, 전체 오브젝트, DPanic panic)"와 "정확한 이전 동작 = development=true + level=debug + encoder=console"을 명시.
+- **R6** `config/manager/manager.yaml`에 동일 세 인자를 기존 args 뒤에 추가. `make verify-runtime-defaults`를 확장해 manager 컨테이너 args로 스코프한 검사: 두 표면 렌더가 `--zap-devel=false`·`--zap-log-level=info`·`--zap-encoder=json`을 각각 정확히 1회 포함하고 다른 `--zap-devel`/`--zap-log-level`/`--zap-encoder`가 없을 것 + `--set logging.development=true --set logging.level=debug --set logging.encoder=console` 와이어링 렌더 1건. 스키마 네거티브·변이 네거티브 컨트롤은 영구 게이트가 아니라 throwaway QA.
+- **R7** e2e.yaml 배포 파이프라인은 렌더된 Kustomize의 manager args에서 `--zap-log-level=info`를 `=debug`로 sed 치환(V(1) 트riage 스트림 보존)하고 치환 성공을 grep으로 단언해 조용한 실패를 막는다. conformance(`hack/run-conformance.sh`)는 출하 기본값 유지. e2e redaction 스크립트는 이 PR에서 수정: JSON `"key":"value"`를 값의 공백·콤마·이스케이프 따옴표까지 완전히 redact하고 Bearer 패스가 key 패스에 무력화되지 않게 한다.
+- **R8** 문서: 차트 README(값 테이블 행 + Logging 섹션: 매핑 표, 샘플러, grpc 예외, 복원 레시피, 세 키만 노출), docs/operations/upgrade.md(마이그레이션: console→JSON, debug→info, 연속행 스택트레이스→`"stacktrace"` 필드, 샘플러, klog 텍스트→JSON, Helm·Kustomize 복원 레시피, 로컬 `go run ./cmd --zap-devel=true`), docs/operations/troubleshooting.md(debug 활성화: Helm `--set`, Kustomize JSON6902 append 또는 전체 args 편집 — strategic-merge args 치환 금지, 라이브 deploy에 `kubectl patch`, `logging.level=1`로 요청당 라인), bug_report.yml 힌트. `warn`은 절대 문서화하지 않는다(플래그가 거부).
+- **R9** 범위 외: #92, #97, xDS 어댑터 재매핑, 콜사이트 레벨 변경.
+
+---
+
+## 6. 구현 대상 파일
+
+1. `cmd/main.go` — `Development: false`, logger 캡처 + `klog.SetLoggerWithOptions` (R1, R2)
+2. `go.mod`/`go.sum` — klog/v2 direct 승격(`go mod tidy`) (R2)
+3. `charts/flareway/values.yaml` — `logging` 블록 (R5)
+4. `charts/flareway/values.schema.json` — `logging` 스키마 (R5, values.yaml과 원자적 커밋)
+5. `charts/flareway/templates/_helpers.tpl` — `flareway.loggingArgs` (R5)
+6. `charts/flareway/templates/deployment.yaml` — args 끝에 include (R5)
+7. `config/manager/manager.yaml` — 세 인자 추가 (R6)
+8. `Makefile` — `verify-runtime-defaults` 확장 (R6)
+9. `.github/workflows/e2e.yaml` — debug sed + 치환 단언 + redaction 스크립트 수정 (R7)
+10. `charts/flareway/README.md`, `docs/operations/upgrade.md`, `docs/operations/troubleshooting.md`, `.github/ISSUE_TEMPLATE/bug_report.yml` (R8)
+
+---
+
+## 7. QA 목록
+
+티어: **throwaway** = 일회성 스모크(실행 후 폐기), **permanent** = `verify-runtime-defaults` 내 상주 게이트, **doc review** = 문서 리뷰, **gate/CI** = 머지 게이트. 결과 열은 구현 후 실행 시 채운다.
+
+| ID | 방어하는 주장/위험 | 절차 | 통과 기준(관측 가능) | 차단? | 티어 | 결과 |
+|---|---|---|---|---|---|---|
+| QA-01 | 기본 배포 = JSON@info, error는 stacktrace와 함께 가시; standalone 기본값 == 차트 정책; #92 error 비은폐 | 하네스 §8.1 `default` 모드: zap 인자 없이 45초 | stderr 전 라인 JSON 파싱; `"level":"info"` ≥1; `"level":"debug"`/`"Level(-N)"` 0; `"level":"error"` `Reconciler error` ≥1 + 비어있지 않은 `"stacktrace"`; `"ts"` RFC3339; stdout 0바이트 | 없음 | throwaway | 미실행 |
+| QA-02 | 명시 debug 옵트인이 debug를 방출 | `debug` 모드: `--zap-log-level=debug` | `"level":"debug"` ≥1(`logger:"cloudflare"`, `msg:"Cloudflare API request completed"`); 전부 JSON | 없음 | throwaway | 미실행 |
+| QA-03 | 명시 encoder 오버라이드 유효 | `console` 모드: `--zap-encoder=console` | 탭 구분 콘솔 라인; JSON 0; `DEBUG` 0; error 여전히 방출 | 없음 | throwaway | 미실행 |
+| QA-04 | 이전 동작을 그대로 복원 가능(복원 레시피 동작) | `devel` 모드: `--zap-devel=true --zap-log-level=debug --zap-encoder=console` | 콘솔 + `DEBUG` 라인; error 스택트레이스 연속행 — 베이스라인 모드a 형태와 일치 | 없음 | throwaway | 미실행 |
+| QA-05 | `development=true` 단독은 dev 콘솔+debug를 복원하지 않음(UX 함정, R5 문서 요건) | `devonly` 모드: `--zap-devel=true --zap-log-level=info --zap-encoder=json`(`logging.development=true`가 렌더하는 그대로) | JSON@info: `DEBUG` 0, 콘솔 0 — development는 샘플러/스택트레이스/인코더 상세도만 토글함을 입증 | 없음 | throwaway | 미실행 |
+| QA-06 | 정수 level = logr V(N) | `v1` 모드: `--zap-log-level=1` | `"level":"Level(-1)"` 라인 방출(V(1) API 라인); `"Level(-2)"` 없음; 전부 JSON | 없음 | throwaway | 미실행 |
+| QA-07 | R2: 실바이너리에서 전역 klog가 JSON 싱크로 라우팅 | `klog` 모드: `DISABLE_HTTP2=1`(존재 기반 — `=false`도 발화; client transport 구성 시 발화) + 유효 kubeconfig(데드 포트 가능). 주의: 이 모드는 실행 내내 클라이언트 HTTP/2를 끈다 — 로그 포맷 스모크로는 허용, 문서화 | `"msg":"HTTP2 has been explicitly disabled"`가 JSON 라인으로 transport 구성당 정확히 1회; `I\d{4} ` 텍스트 0 | 없음 | throwaway | 미실행 |
+| QA-08 | klog 배선 메카닉: 이중 출력 없음, V 게이팅, Fatal은 여전히 종료 | throwaway Go: `SetLoggerWithOptions(logger, ContextualLogger(true))` 후 `klog.Info/Error/Errorf`, `FromContext(로거없는ctx).V(1).Info`, `Background().Info`; 서브프로세스 `klog.Fatal` | 전부 단일 JSON 라인; V(1)은 `--zap-log-level` 게이팅; Fatal은 메시지 방출 후 exit 255 | 없음 | throwaway | 미실행 |
+| QA-09 | 플래그 파싱 계약: `--help` 동작; 바이너리가 `warn`/`0`/`-1` 거부(스키마 minimum은 바이너리 거부를 미러) | `/tmp/manager --help`; `--zap-log-level=warn`; `=0`; `=-1` | `--help` exit 0 + zap 플래그 나열; `warn`/`0`/`-1` 각각 exit 2 + `invalid log level "<v>"` | 없음 | throwaway(`--help`는 verify-container 게이트도 커버) | 미실행 |
+| QA-10 | DPanic이 더 이상 매니저를 크래시하지 않음(가용성 개선, 회귀 아님) | throwaway Go: prod opts vs dev opts에서 `logger.Info("m", "orphan-key")`(홀수 kv) | prod: `"level":"dpanic"` JSON 후 계속; dev: panic | 없음 | throwaway | 미실행 |
+| QA-11 | 스트림 순수성: 문서화된 grpclog ERROR 예외 외 비JSON 0(R3) | 모든 캡처 stderr + Kind pod 로그에 공통 단언 | klog 텍스트(`^[IWEF]\d{4} `) 0, grpc 텍스트(`^\d{4}/\d{2}/\d{2} `) 0, stdout 0바이트 — `YYYY/MM/DD … ERROR:` 형태만 허용 | 없음 | throwaway(하네스 내장) | 미실행 |
+| QA-12 | 기본 Helm 렌더가 정확히 프로덕션 인자를 가짐 | `helm template flareway charts/flareway -n flareway-system --include-crds`; `containers[name=manager].args` 추출 | `--zap-devel=false`·`--zap-log-level=info`·`--zap-encoder=json` 각 1회; 다른 `--zap-*` 없음 | 없음 | throwaway(QA-19로 영구 승격) | 미실행 |
+| QA-13 | 렌더된 인자가 설정값을 반영하고 바이너리가 수용(issue AC) | `helm template` 매트릭스: development ∈ {true,false} × level ∈ {debug,info,error,panic,1,2,128} × encoder ∈ {json,console}; 각 렌더 인자를 `go run -mod=readonly ./cmd <args> --help`에 투입. values 파일 렌더 추가: `{development: true, level: debug, encoder: console}` → 매핑 인자; `level: "2"`(따옴표) → 스키마 거부 | 각 렌더가 정확한 `--zap-*` 삼중으로 매핑; 모든 조합 exit 0; values 파일 int `level: 2` 수용, `"2"` 거부 | 없음 | throwaway | 미실행 |
+| QA-14 | Kustomize 렌더가 Helm과 동등(issue AC: 표면 일치) | `bin/kustomize build config/default`; manager 컨테이너 args 추출 | QA-12와 동일 세 zap 인자; `--leader-elect`·`--health-probe-bind-address`·`--metrics-bind-address` 유지 | 없음 | throwaway(QA-19로 영구 승격) | 미실행 |
+| QA-15 | 스키마가 무효 입력을 명확한 오류로 거부(enum\|int 1..128) | `helm template` 각각: `level=warn`/`=0`/`=-1`/`=129`/`=INFO`/`=2.5`, `--set-string level=2`, `encoder=yaml`/`=JSON`, `development=maybe`/`=1`, `logging.bogus=1`; 추가로 `level=2.0`(정수형 float — Helm이 integer로 수용, `=2` 렌더; 기록용) | 무효 입력 전부 비영 종료 + `values don't meet the specifications of the schema(s)` + 경로별 사유; Deployment 미렌더; 경계: `=128` 수용, `=129` 거부; `=2.0`은 `--zap-log-level=2` 렌더 | 없음 | throwaway | 미실행 |
+| QA-16 | null/누락 멤버 오버라이드가 템플릿 nil-pointer가 아니라 스키마로 실패(`required` 유지 근거) | `helm template --set logging.level=null`; `--set logging.encoder=null`; `--set logging=null` | 각각 경로를 명시한 스키마 `required`/`type` 오류 — `nil pointer evaluating interface {}`가 아님 | 없음 | throwaway | 미실행 |
+| QA-17 | 업그레이드 경로: `logging` 키 없는 구 values 파일도 렌더; `--reuse-values` 업그레이드가 인자 보존 | `helm template flareway charts/flareway -f old-values.yaml`(`logging` 없음); Kind 스테이지 실행 시 `helm upgrade f96 charts/flareway -n flareway-system --reuse-values` 추가 | 렌더 성공 + 프로덕션 zap 기본 인자; `logging` 부재 스키마 오류 없음; Kind 업그레이드 후 인자 유지 | 없음(Kind 부분 선택 — 차단 시 render-only로 기록) | throwaway | 미실행 |
+| QA-18 | 인자 순서 안전: logging 인자가 끝에 추가; 기존 인덱스 안정(R5/R6) | `bin/kustomize build`와 `helm template`의 args 순서 검사; `manager_metrics_patch.yaml`(args/0 삽입) 결과 유효성 | 두 표면에서 zap 인자가 기존 인자 뒤; `kustomize build` 성공; metrics 패치 출력 유효 | 없음 | throwaway | 미실행 |
+| QA-19 | 영구 게이트: `verify-runtime-defaults`가 두 표면의 manager 컨테이너 args를 스코프해 강제, 비공백 입증(R6) | `make verify-runtime-defaults`; 스크래치 사본 변이: (a) `--zap-encoder=json` 제거 → FAIL; (b) zap 인자가 다른 컨테이너에만 → FAIL; (c) `command:`에만 → FAIL; + 와이어링 렌더 `--set development=true,level=debug,encoder=console` | 실트리 exit 0; 각 변이 비영 종료; 와이어링 렌더가 `--zap-devel=true --zap-log-level=debug --zap-encoder=console` 표시 | 없음 | permanent(Makefile/CI) + throwaway 변이 | 미실행 |
+| QA-20 | R7: e2e 배포 파이프라인이 debug 주입; conformance는 출하 기본값; 치환 실패 시 시끄럽게 실패 | PR의 실제 e2e zap sed를 image sed 뒤에 적용: `bin/kustomize build config/default \| sed "<image sed>" \| sed "<PR zap sed>"`; `containers[name=manager].args`에서 `--zap-log-level=debug` 존재 AND `--zap-log-level=info` 부재 단언; `hack/run-conformance.sh` 렌더 파이프라인은 debug 인자 부재 확인. e2e.yaml 자체가 sed 후 `grep -q -- '--zap-log-level=debug'`로 치환 성공을 단언해야 함 | e2e 렌더 manager args에 `=debug` 있고 `=info` 없음; conformance 렌더는 세 prod 인자만; 워크플로우 grep 단언 존재 | 없음 | throwaway + CI 아티팩트 리뷰 | 미실행 |
+| QA-21 | R7: 수정된 redaction 스크립트가 JSON/콘솔 어떤 입력도 누출하지 않음 | PR의 교체 redaction 블록에 투입: `{"api_token":"x y"}`, `{"api_token":"x,y"}`, `{"authorization":"Bearer tok"}`, `{"client_secret":"a\"b"}`, `{"aud":"v"}`, 콘솔 `{"api_token": "v"}`, klog `api_token=v`, + `aud` 유사 부분문자열을 가진 무해 라인 | 어떤 입력도 시크릿 부분문자열이 남지 않음; Bearer 패스가 key 패스에 무력화되지 않음; 무해 라인 무수정(과잉 redaction 검사); redact된 JSON이 파싱 가능하거나 맹글링이 문서화됨 | 없음 — 아티팩트 안전 주장을 차단 | throwaway(스크립트 수정은 PR에 포함) | 미실행 |
+| QA-22 | 렌더된 차트 인자가 바이너리를 구동함을 end-to-end 입증; 인클러스터 리더 일렉션 로깅 | §8.2 Kind 스테이지: `make kind`, `docker build -t flareway:dev`, `kind load`, `helm install --set image.tag=dev --set image.pullPolicy=Never`, `rollout status`, `kubectl logs`; 선택적 `--set logging.level=debug` 재설치 | Pod Ready; pod 로그 전부 JSON; `leaderelection`/리스 획득 라인이 JSON으로 존재; `kubectl get deploy -o jsonpath args`에 세 zap 인자; debug 설치는 `"level":"debug"` 라인 방출 | soft — docker + kindest/node 풀 필요; 차단 시 QA-01/12/13 + 베이스라인 소견8(contextual 경로)로 대체 기록 | throwaway | 미실행 |
+| QA-23 | 샘플러 동작이 문서화된 opt-out과 일치(R4 정정 문구) | 이미 실행됨(§2.1: prod 기본 104/500; level=2와 devel은 500). 로거 구성이 바뀌면 throwaway probe 재실행; 문구는 QA-24로 검증 | prod 기본은 드롭(~104/500); `level=debug`도 여전히 샘플링(V(1)은 -1..5 창 안); `level=2`·`development=true`는 500 전부 | 없음 | throwaway(실행됨; 조건부 재실행) | 미실행 |
+| QA-24 | 문서 내용 리뷰: R8 요구 주제 전부 존재·정확 | 차트 README, upgrade.md, troubleshooting.md, bug_report.yml diff 판독 | README: 값 행 + Logging 섹션(매핑 표, 샘플러 정확 문구 — V(1)도 샘플링 대상 포함, grpc 예외, 복원 레시피, 세 키만 노출 명시). upgrade.md: console→JSON, debug→info, 연속행→`"stacktrace"` 필드, 샘플러, klog 텍스트→JSON, Helm·Kustomize 복원 레시피, `go run ./cmd --zap-devel=true`. troubleshooting.md: Helm `--set`, Kustomize JSON6902 append 또는 전체 args 편집(strategic-merge args 치환 금지), 라이브 deploy `kubectl patch`, `logging.level=1`. bug_report.yml: 파싱 가능 + 실존 표면 참조. `warn` 미문서화; klog Fatal severity 다운그레이드 퀴크 언급 시 기록 | 없음 | doc review | 미실행 |
+| QA-25 | 문서화된 모든 로깅 명령이 그대로 동작 — 라이브 `kubectl patch` 레시피 포함 | 실행: README `--set` 예시; upgrade.md 복원 values 블록; troubleshooting.md Helm `--set logging.level=debug`와 Kustomize JSON6902/전체 args 패치를 스크래치 overlay에 그대로 적용. Kind 스테이지(QA-22)에서 문서화된 `kubectl patch`를 라이브 deployment에 그대로 실행 | 각 `helm template`/`kustomize build` 성공 + 문서화된 인자 렌더; Kustomize 패치는 debug 인자 유효 + `--leader-elect`/metrics/zap 기본 유지(교체 아닌 추가); `kubectl patch`: debug 인자 추가(args 비교체), rollout 성공, pod 로그에 `"level":"debug"`; 문서의 출력 형식 주장이 QA-01..05 관측과 일치. Kind 차단 시 patch 명령은 reviewed-not-executed로 기록 | soft(Kind 부분) | doc review + throwaway | 미실행 |
+| QA-26 | 전체 게이트 목록 녹색 | §8.4: `make lint-fix`(이후 `git status` 클린), `make test`, `make verify-generated`, `make verify-artifacts`, `make verify-container`, `make chart`; `go mod tidy && git diff --exit-code go.mod go.sum`(klog→direct) | 전부 exit 0; `verify-generated` 후 워크트리 클린; `dist/flareway-*.tgz` 생성; go.mod diff 클린 + klog가 direct require 블록 | 없음 | gate | 미실행 |
+| QA-27 | PR의 CI 체크 기대치 | push 후 `gh pr checks` | `Generation diff`, `Lint`, `Unit and envtest`, `Envoy component tests`, `Schema, build, Helm, and Kustomize`, `Container build and runtime`, `GatewayHTTP conformance` 녹색; `e2e` 라벨 적용 시 `Cloudflare edge contracts`(권장 — debug overlay + redaction 수정을 행사) | 없음 | CI | 미실행 |
+
+---
+
+## 8. 하네스 명세
+
+### 8.1 envtest 스모크 하네스
+
+throwaway 파일(게이트 전 삭제; `.qa-*`는 gitignore 대상이 아님):
+
+- `.qa-smoke-96/main.go` — 레포 모듈 내부 Go 하네스(베이스라인 스모크와 동일 패턴):
+  - `envtest.Environment`에 `CRDDirectoryPaths = [config/crd/bases, $GOMODCACHE/sigs.k8s.io/gateway-api@v1.6.2/config/crd/standard]`; `env.Start()`가 채우는 `env.KubeConfig []byte`를 `/tmp/f96-kubeconfig`로 기록.
+  - namespace `flareway-system` + Secret `smoke-cf-token`(더미 값) 생성.
+  - `httptest` Cloudflare 스텁: `GET /user/tokens/verify` → 200 `{"status":"active"}`; 나머지 → 500(`Reconciler error` 유도).
+  - 모드별로 `/tmp/flareway-manager-new`를 `KUBECONFIG`, `CLOUDFLARE_BASE_URL=<stub>`, `HTTPS_PROXY=http://127.0.0.1:9`, `NO_PROXY=127.0.0.1,localhost,::1`(egress 차단)로 exec; stdout/stderr → `/tmp/f96-smoke/<mode>.*`; 45초 실행; ~8초에 `CloudflareAccount smoke-account-<i>` 생성; SIGINT 종료.
+  - 공통 인자: `--leader-elect=false --metrics-bind-address=0 --health-probe-bind-address=:18081 --xds-bind-address=:18000 --enable-{gateway,access,private-network,device,organization}-controllers=true`.
+
+```sh
+make setup-envtest
+bin/setup-envtest use 1.35.0 --bin-dir bin -p path
+go build -o /tmp/flareway-manager-new ./cmd
+go build -o /tmp/f96-harness ./.qa-smoke-96
+KUBEBUILDER_ASSETS="$(pwd)/bin/k8s/1.35.0-darwin-arm64" /tmp/f96-harness
+```
+
+| 모드 | 추가 인자/env | QA |
+|---|---|---|
+| `default` | — | QA-01, QA-11 |
+| `debug` | `--zap-log-level=debug` | QA-02 |
+| `console` | `--zap-encoder=console` | QA-03 |
+| `devel` | `--zap-devel=true --zap-log-level=debug --zap-encoder=console` | QA-04 |
+| `devonly` | `--zap-devel=true --zap-log-level=info --zap-encoder=json` | QA-05 |
+| `v1` | `--zap-log-level=1` | QA-06 |
+| `klog` | env `DISABLE_HTTP2=1`(존재 기반; 실행 내내 클라이언트 HTTP/2 비활성 — 문서화됨) | QA-07, QA-11 |
+| `badlevel` | `--zap-log-level=warn`(5초 내 비영 종료 예상, 45초 대기 생략) | QA-09 |
+
+단언 패스(`/tmp/f96-assert.py` 또는 하네스 내장): stderr 각 라인을 `json` / `klog-text`(`^[IWEF]\d{4} `) / `grpc-text`(`^\d{4}/\d{2}/\d{2} `) / `console` / `stack-continuation`(콘솔 모드만 허용)으로 분류하고 모드별 통과 기준 적용; PASS/FAIL 표 출력, 실패 시 비영 종료.
+
+### 8.2 Kind 스테이지(QA-22, QA-25 patch 부분, QA-17 upgrade 부분)
+
+```sh
+make kind
+docker build -t flareway:dev .
+bin/kind create cluster --name f96 --image kindest/node:v1.35.0
+bin/kind load docker-image flareway:dev --name f96
+kubectl create namespace flareway-system
+helm install f96 charts/flareway -n flareway-system \
+  --set image.repository=flareway --set image.tag=dev --set image.pullPolicy=Never
+kubectl -n flareway-system rollout status deploy/f96-flareway-controller-manager --timeout=3m
+kubectl -n flareway-system logs deploy/f96-flareway-controller-manager -c manager > /tmp/f96-kind.log
+kubectl -n flareway-system get deploy f96-flareway-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].args}'
+# QA-17: helm upgrade f96 charts/flareway -n flareway-system --reuse-values → 인자 유지
+# QA-25: 문서화된 kubectl patch를 그대로 실행 → debug 인자 추가, rollout 성공, debug 라인
+# 선택: helm upgrade f96 charts/flareway -n flareway-system --set logging.level=debug → debug 라인
+bin/kind delete cluster --name f96
+```
+
+### 8.3 렌더 + 스키마 검사(클러스터 불필요)
+
+```sh
+# QA-15 네거티브 — 각각 스키마 검증 실패해야 함:
+for v in logging.level=warn logging.level=0 logging.level=-1 logging.level=129 \
+         logging.level=INFO logging.level=2.5 logging.encoder=yaml \
+         logging.encoder=JSON logging.development=maybe logging.development=1 \
+         logging.bogus=1; do
+  helm template f96 charts/flareway --set "$v"   # 비영 종료 예상
+done
+helm template f96 charts/flareway --set-string logging.level=2   # 비영 종료(문자열 숫자 거부, R5)
+helm template f96 charts/flareway --set logging.level=128        # 경계: 수용
+helm template f96 charts/flareway --set logging.level=2.0        # 정수형 float: 수용, =2 렌더
+# QA-16 null:
+helm template f96 charts/flareway --set logging.level=null       # 스키마 오류, nil-pointer 아님
+# QA-20 e2e overlay(PR의 실제 zap sed 적용 후 manager args 단언):
+bin/kustomize build config/default | sed "s|image: controller:latest|image: x|" | sed "<PR zap sed>" \
+  | awk '/--zap-log-level=debug/{ok=1} /--zap-log-level=info/{bad=1} END{exit !(ok&&!bad)}'
+```
+
+### 8.4 게이트 목록(QA-26)
+
+```sh
+make lint-fix && git status --porcelain    # 클린
+make test                                  # unit + envtest
+make verify-generated                      # 재생성 == 커밋됨
+make verify-artifacts                      # parity + go build + helm + kustomize + runtime-defaults(QA-19)
+make verify-container                      # docker build + 이미지 검사(--help 포함, QA-09)
+make chart                                 # lint + render + package -> dist/
+go mod tidy && git diff --exit-code go.mod go.sum
+```
+
+---
+
+## 9. 범위 외와 비주장(non-claims)
+
+- **범위 외** `[D]`: #92 status/reconcile 루프(독립 결함 — 로그 레벨 변경은 그것을 고치지도 숨기지도 않는다; 샘플러는 초당 첫 100개를 항상 통과시키므로 `Reconciler error`는 관측 가능하게 남는다), #97 AUD, xDS 어댑터 레벨 재매핑, 로그 콜사이트 레벨 변경(jevify가 변경 필요 사이트 0건 확인), `extraArgs`/`stacktraceLevel`/`timeEncoding` 노출, grpclog 어댑터, Chart.yaml 버전 범프(릴리스가 주입).
+- **주장하지 않음**: 라이브 Cloudflare·실배포에서의 로그 형태 — 모든 증거는 envtest/throwaway/렌더/Kind 기반이며 Kind 스테이지조차 실엣지가 아니다.
+- **주장하지 않음**: CPU·인제스천 비용 절감 — issue 자체가 성능 주장을 기각했고, 계측(233 vs 735 ns/line)은 회귀 없음의 증거이지 절감 주장이 아니다.
+- **주장하지 않음**: 샘플러 동작은 우리가 추가한 것이 아니라 controller-runtime 프로덕션 기본값 — 문서화 의무만 우리 것이다.
+- **주장하지 않음**: CI 전체 녹색·최종 PR 체크 결과 — §7 결과 열이 `미실행`인 한 미완이다.
+
+## 10. 합의 기록
+
+세 렌즈가 독립 QA 목록을 작성하고 2라운드 투표로 수렴했다.
+
+### 렌즈
+
+- **운영·패키징(OP)**: Helm/Kustomize 패키징, 스키마 UX, 렌더링 인자 parity, 운영자 문서.
+- **적대적 회귀(RG)**: 제안 설계가 기존 동작을 망가뜨리는 모든 경로. 실행 확인 회귀 2건 발견(redaction 누출, schema atomicity).
+- **검증 설계(VF)**: 검증 설계와 테스트 엄밀성 — 실바이너리 트리거(`DISABLE_HTTP2`), 하네스 명세, 영구-vs-일회성 판별.
+
+### 라운드 1 — 수정(amendment)으로 반영된 항목
+
+- D2: 로거 값을 캡처해 재사용(`logger := zap.New(...)`), `FlushLogger`/`InitFlags` 금지, klog→direct go.mod + tidy 게이트(VF).
+- D3: grpclog 예외는 운영자 문서(chart README Logging 섹션)에 명시(OP/VF).
+- D4: 샘플러 opt-out 문구 정밀화(OP/RG/VF) — 라운드 2에서 한 번 더 정정(아래).
+- D5: 정수 level 상한 128(int8 wrap 침묵 footgun `[E]`), 문자열 숫자 형식 제거, `required` 유지 근거(null→schema error), args 끝 append, development 의미 문서화(OP/RG/VF).
+- D6: `verify-runtime-defaults`를 manager 컨테이너 args 범위 + exact-once + wiring render로(OP/RG/VF).
+- D7: e2e debug overlay로 V(1) triage 스트림 보존 + redaction 수정을 같은 PR에(RG).
+- D8: stacktrace 형식 변화, klog 텍스트→JSON, `go run` UX, index-patch 지침 추가(RG/VF).
+
+### 라운드 2 — CONSENT WITH CHANGES로 반영된 항목
+
+- **R4 문구 정정 `[C]`**: "V(N≥1)은 샘플링되지 않는다"는 사실 오류. 샘플러는 zap 레벨 -1..5를 커버하므로 debug/V(1), info, warn, error 항목이 **모두** 샘플링되고 V(N≥2)만 우회. opt-out은 `development=true` 또는 정수 `level ≥ 2`뿐(RG 실행 검증 `zapcore/sampler.go:219-227`).
+- **QA-09 정정 `[C]`**: `--zap-log-level=0`/`-1`은 "조용히 수용"이 아니라 바이너리가 exit 2로 거부(`invalid log level "<v>"`) — OP 실행 확인.
+- **QA-20 강화**: PR의 실제 e2e zap sed를 적용하고 `containers[name=manager].args` 범위에서 `=debug` 존재 + `=info` 부재를 assert; 워크플로 자체가 치환 적용을 grep으로 assert해 loud fail(OP+RG).
+- **QA-25 확장**: 문서화된 `kubectl patch`/Kustomize JSON6902 debug 레시피를 Kind 단계에서 verbatim 실행(append-not-replace + debug 라인 관측)(OP).
+- **QA-13**: values 파일 경로 추가 — `level: 2` 정수 수용, `level: "2"` 문자열 거부(OP).
+- **QA-15**: `level=2.0`(integral float) — Helm validator가 정수로 수용해 `--zap-log-level=2` 렌더링; 기록된 동작이며 결함 아님(OP).
+- **QA-07**: `DISABLE_HTTP2`는 presence-based이고 해당 실행의 client-side HTTP/2를 끄는 부수 효과를 명시(RG).
+- **QA-17**: Kind 단계가 돌면 `helm upgrade --reuse-values`로 args 보존 확인(OP).
+- **잔여 [INFERENCE]**: QA-22 Kind 단계가 skip되면 in-cluster `leaderelection` JSON 라우팅은 baseline finding 8 `[INFERENCE]` + QA-07 전역-klog 증거에 의존 — contextual 경로는 이미 입증됐고 R2는 no-ctx fallback만 바꾸므로 수용 가능한 잔여로 합의(RG).
+
+### Drop된 라운드 1 항목
+
+| Source ID | 이유 |
+|---|---|
+| OP-05 | R5에서 문자열-정수 level 형식 제거로 moot; `--set-string logging.level=2` 거부는 QA-15에 흡수 |
+| OP-10 | QA-26 게이트에 흡수(`verify-helm`/`helm lint`는 이미 게이트와 CI에서 실행) |
+| RG-02 | QA-13과 동일 경로(세 값 `--set` render) — 별개 위험 아님 |
+| RG-16 | QA-01과 동일 경로(default 모드가 이미 ≥1 `Reconciler error` JSON 라인 요구) |
+| RG-17 | R5에서 `extraArgs` 기각으로 moot; "세 키만 노출" 문서 명시는 QA-24에 흡수 |
+| RG-15 | 이미 실행·종결(prod-json 233 ns/line vs dev-console 735 ns/line — 성능 회귀 없음); 증거로 보존 |
