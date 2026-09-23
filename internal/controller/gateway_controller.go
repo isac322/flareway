@@ -43,6 +43,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/util/csaupgrade"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -1588,12 +1590,15 @@ func reconcileGatewayOwnedObject(
 	key := client.ObjectKeyFromObject(desired)
 	err = kube.Get(ctx, key, current)
 	if apierrors.IsNotFound(err) {
-		if err := kube.Create(ctx, desired, client.FieldOwner(gatewayFieldManager)); err == nil {
-			return nil
+		// Create (not Apply) keeps AlreadyExists collision detection, so a
+		// concurrently created foreign object is never adopted. Create a copy so
+		// the server response does not leak defaults and status into desired.
+		created := desired.DeepCopyObject().(client.Object)
+		if err := kube.Create(ctx, created, client.FieldOwner(gatewayFieldManager)); err == nil {
+			current = created
 		} else if !apierrors.IsAlreadyExists(err) {
 			return err
-		}
-		if err := kube.Get(ctx, key, current); err != nil {
+		} else if err := kube.Get(ctx, key, current); err != nil {
 			return fmt.Errorf("read %T after create collision: %w", desired, err)
 		}
 	} else if err != nil {
@@ -1610,6 +1615,10 @@ func reconcileGatewayOwnedObject(
 			gateway.Name,
 			gateway.UID,
 		)
+	}
+
+	if err := migrateGatewayCreateOwnership(ctx, kube, current); err != nil {
+		return err
 	}
 
 	if currentService, ok := current.(*corev1.Service); ok {
@@ -1643,6 +1652,42 @@ func reconcileGatewayOwnedObject(
 	}
 	desired.SetResourceVersion(resourceVersion)
 	return applyObject(ctx, kube, scheme, desired, client.FieldOwner(gatewayFieldManager), client.ForceOwnership)
+}
+
+// migrateGatewayCreateOwnership converts the Update managedFields entry that
+// Create records for gatewayFieldManager into an Apply entry, so later
+// server-side applies can remove fields the object was created with. Only
+// objects carrying the Update entry without any Apply entry are migrated;
+// objects already applied by an earlier controller version keep their
+// ownership unchanged. The patch pins resourceVersion, so a concurrent write
+// fails with a conflict and the next reconcile retries.
+func migrateGatewayCreateOwnership(ctx context.Context, kube client.Client, object client.Object) error {
+	var hasUpdate bool
+	for _, entry := range object.GetManagedFields() {
+		if entry.Manager != gatewayFieldManager {
+			continue
+		}
+		switch entry.Operation {
+		case metav1.ManagedFieldsOperationApply:
+			return nil
+		case metav1.ManagedFieldsOperationUpdate:
+			hasUpdate = hasUpdate || entry.Subresource == ""
+		}
+	}
+	if !hasUpdate {
+		return nil
+	}
+	patch, err := csaupgrade.UpgradeManagedFieldsPatch(object, sets.New(gatewayFieldManager), gatewayFieldManager)
+	if err != nil {
+		return fmt.Errorf("compute %T %s field ownership migration: %w", object, client.ObjectKeyFromObject(object), err)
+	}
+	if patch == nil {
+		return nil
+	}
+	if err := kube.Patch(ctx, object, client.RawPatch(types.JSONPatchType, patch)); err != nil {
+		return fmt.Errorf("migrate %T %s field ownership to server-side apply: %w", object, client.ObjectKeyFromObject(object), err)
+	}
+	return nil
 }
 
 func replaceGatewayServicePorts(

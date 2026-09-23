@@ -146,3 +146,7 @@ gatewayClass:
       mode: Required
     conformance:
       serviceType: LoadBalancer
+    # Places the dataplane pods of Gateways in this class. The top-level
+    # nodeSelector, tolerations, affinity, and topologySpreadConstraints
+    # values place only the controller-manager pod.
+    scheduling: {}

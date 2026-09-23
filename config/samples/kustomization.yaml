@@ -17,6 +17,7 @@ resources:
 - flareway_v1alpha1_devicesettings.yaml
 - flareway_v1alpha1_gatewayclassconfig.yaml
 - flareway_v1alpha1_gatewayclassconfig_conformance.yaml
+- flareway_v1alpha1_gatewayclassconfig_scheduling.yaml
 - flareway_v1alpha1_hostnameroute.yaml
 - flareway_v1alpha1_identityprovider_observeonly.yaml
 - flareway_v1alpha1_networkroute.yaml

@@ -21,6 +21,7 @@ Gateway traffic uses the upstream `gateway.networking.k8s.io/v1` `GatewayClass`,
 
 ```sh
 kubectl explain gatewayclassconfig.spec --api-version=flareway.bhyoo.com/v1alpha1
+kubectl explain gatewayclassconfig.spec.scheduling --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain cloudflareaccount.spec.grants --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain cloudflaretunnel.spec --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain accessapplication.spec --api-version=flareway.bhyoo.com/v1alpha1

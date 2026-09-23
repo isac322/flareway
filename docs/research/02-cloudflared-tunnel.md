@@ -283,7 +283,7 @@ The tunnel object reports status aggregated across active connectors:
   4. Immediate termination occurs if a second `SIGINT`/`SIGTERM` is received.
 
 ### Replica Count Recommendations
-- Production high availability requires at least **2 replicas** per tunnel, ideally scheduled on separate Kubernetes nodes.
+- Production high availability requires at least **2 replicas** per tunnel, ideally scheduled on separate Kubernetes nodes. Flareway implements the node-spread preference as a soft default pod anti-affinity on `kubernetes.io/hostname` in the dataplane Deployment; `GatewayClassConfig.spec.scheduling` controls dataplane placement.
 - Each replica creates 4 redundant duplex connections across distinct Cloudflare edge points of presence (PoPs).
 - Maximum active replicas per tunnel: **25** (Account limits table).
 

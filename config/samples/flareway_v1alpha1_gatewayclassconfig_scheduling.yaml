@@ -1,0 +1,32 @@
+apiVersion: flareway.bhyoo.com/v1alpha1
+kind: GatewayClassConfig
+metadata:
+  name: scheduling
+spec:
+  conformanceMode: true
+  conformance:
+    serviceType: LoadBalancer
+  scheduling:
+    # Restrict dataplane pods to a dedicated node pool and tolerate its taint.
+    nodeSelector:
+      node-pool: edge
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: edge
+        effect: NoSchedule
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: flareway-gateway
+        # matchLabelKeys scopes this class-level constraint to the pods of one
+        # Gateway at a time: the apiserver copies each pod's own values for
+        # flareway.bhyoo.com/gateway and pod-template-hash into the selector at
+        # admission, so skew is counted per Gateway and per revision instead of
+        # across every dataplane pod the class manages.
+        matchLabelKeys:
+          - flareway.bhyoo.com/gateway
+          - pod-template-hash

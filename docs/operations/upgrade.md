@@ -63,6 +63,15 @@ For a Kustomize install, change the three `--zap-*` args in `config/manager/mana
 
 For local development, `go run ./cmd --zap-devel=true` restores console output at `debug`; no explicit level or encoder is needed there because no other zap flags are passed.
 
+## Dataplane pod scheduling
+
+This release adds `GatewayClassConfig.spec.scheduling` and a default soft pod anti-affinity on `kubernetes.io/hostname` for dataplane pods.
+
+- Re-apply the CRDs server-side before using `spec.scheduling`. Helm does not upgrade `crds/` on `helm upgrade`; with the previous CRDs the field is pruned silently.
+- The first reconcile after the controller update rolls each dataplane Deployment once to add the default anti-affinity. `maxUnavailable: 0` keeps the old ReplicaSet available during the surge, and the rollout also re-spreads replicas that were co-located.
+- Cloudflare-mode Gateways report `Programmed=False` while the new ReplicaSet is not yet Available; the condition returns to `True` after the rollout and xDS ACK.
+- Manual edits to a dataplane Deployment's `affinity` are reverted by server-side apply. Manage placement through `GatewayClassConfig.spec.scheduling`.
+
 ## Controller ownership changes
 
 Controller toggles are an ownership boundary, not a performance setting. Before disabling a group:

@@ -202,6 +202,17 @@
               "required": ["serviceType"],
               "properties": {"serviceType": {"type": "string", "enum": ["LoadBalancer", "ClusterIP"]}}
             }
+            ,
+            "scheduling": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+                "tolerations": {"type": "array", "items": {"type": "object"}},
+                "affinity": {"type": "object"},
+                "topologySpreadConstraints": {"type": "array", "items": {"type": "object"}}
+              }
+            }
           }
         }
       }

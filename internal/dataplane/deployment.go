@@ -68,6 +68,7 @@ func BuildDeployment(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig, bootstrap
 	if privateDNS {
 		containers = append(containers, buildPrivateDNSContainer(gw, cfg))
 	}
+	nodeSelector, tolerations, affinity, topologySpread := dataplaneScheduling(gw, cfg)
 	volumes := []corev1.Volume{
 		{
 			Name: bootstrapVolumeName,
@@ -141,6 +142,10 @@ func BuildDeployment(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig, bootstrap
 						SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					TerminationGracePeriodSeconds: ptr.To[int64](90),
+					NodeSelector:                  nodeSelector,
+					Tolerations:                   tolerations,
+					Affinity:                      affinity,
+					TopologySpreadConstraints:     topologySpread,
 					Containers:                    containers,
 					Volumes:                       volumes,
 				},
