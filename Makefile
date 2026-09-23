@@ -255,30 +255,7 @@ verify-kustomize: kustomize ## Render every supported Kustomize surface.
 
 .PHONY: verify-runtime-defaults
 verify-runtime-defaults: helm kustomize ## Verify rendered runtime defaults for both packaging surfaces.
-	@tmp="$$(mktemp -d)"; \
-	trap 'rm -rf "$$tmp"' EXIT; \
-	"$(HELM)" template "$(CHART_RELEASE_NAME)" "$(CHART_DIR)" --namespace "$(CHART_NAMESPACE)" --include-crds >"$$tmp/helm.yaml"; \
-	"$(KUSTOMIZE)" build config/default >"$$tmp/kustomize.yaml"; \
-	for manifest in "$$tmp/helm.yaml" "$$tmp/kustomize.yaml"; do \
-		awk '\
-			$$1 == "-" && $$2 == "name:" { \
-				current = $$3; \
-				if (current == "GOMAXPROCS") invalid = 1; \
-				next; \
-			} \
-			current == "GOMEMLIMIT" && $$1 == "value:" { \
-				if ($$2 == "115MiB" || $$2 == "\"115MiB\"") memory = 1; \
-				current = ""; \
-			} \
-			current == "GODEBUG" && $$1 == "value:" { \
-				if ($$2 == "tracebacklabels=0" || $$2 == "\"tracebacklabels=0\"") debug = 1; \
-				current = ""; \
-			} \
-			END { exit !(memory && debug && !invalid) }' "$$manifest" || { \
-				echo "$$manifest must set GOMEMLIMIT=115MiB and GODEBUG=tracebacklabels=0 without GOMAXPROCS" >&2; \
-				exit 1; \
-			}; \
-	done
+	HELM="$(HELM)" KUSTOMIZE="$(KUSTOMIZE)" CHART_DIR="$(CHART_DIR)" CHART_RELEASE_NAME="$(CHART_RELEASE_NAME)" CHART_NAMESPACE="$(CHART_NAMESPACE)" hack/verify-runtime-defaults.sh
 
 .PHONY: verify-artifacts
 verify-artifacts: parity verify-go-build verify-helm verify-kustomize verify-runtime-defaults ## Verify schema parity, Go compilation, Helm, and Kustomize output.

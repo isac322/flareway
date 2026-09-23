@@ -48,6 +48,9 @@ The chart therefore does not expose global Direct-mode or management-token value
 | `image.digest` | `""` | Optional image digest, which takes precedence over the tag. |
 | `goRuntime.GOMEMLIMIT` | `115MiB` | Set the Go runtime soft memory limit for the controller. |
 | `goRuntime.GODEBUG` | `tracebacklabels=0` | Disable goroutine labels in Go tracebacks. |
+| `logging.development` | `false` | Run the controller logger in development mode (`--zap-devel`). |
+| `logging.level` | `info` | Controller log level (`--zap-log-level`). |
+| `logging.encoder` | `json` | Controller log encoder (`--zap-encoder`). |
 | `controllers.gateway` | `true` | Enable the Gateway and account controller group. |
 | `controllers.access` | `true` | Enable the Access controller group. |
 | `controllers.privateNetwork` | `true` | Enable private-network and WARP Connector controllers. |
@@ -63,3 +66,32 @@ The chart therefore does not expose global Direct-mode or management-token value
 | `gatewayClass.config.conformanceMode` | `false` | Run the generated Gateway class without Cloudflare integration. |
 
 See `values.yaml` for pod placement, security context, resources, Service annotations, and complete `GatewayClassConfig` defaults.
+
+## Logging
+
+The controller defaults to production logging: JSON lines on stderr at `info` level, with error entries carrying a `stacktrace` field. Three values map to the manager's zap flags and are rendered unconditionally at the end of the manager args:
+
+| Value | Flag | Accepted values |
+|---|---|---|
+| `logging.development` | `--zap-devel` | `true` or `false` |
+| `logging.level` | `--zap-log-level` | `debug`, `info`, `error`, `panic`, or an integer `1`–`128` (logr `V(N)` verbosity) |
+| `logging.encoder` | `--zap-encoder` | `json` or `console` |
+
+`warn` is not an accepted level; the flag parser and the values schema both reject it.
+
+An explicit `logging.level` or `logging.encoder` always overrides the development-mode defaults, so `logging.development=true` alone keeps JSON output at `info` and only switches development semantics: no sampling, warn-level stacktraces, full object dumps, and panics on DPanic entries. To reproduce the exact pre-change output (console encoder at `debug`), set all three:
+
+```sh
+helm upgrade flareway charts/flareway \
+  --namespace flareway-system \
+  --reuse-values \
+  --set logging.development=true \
+  --set logging.level=debug \
+  --set logging.encoder=console
+```
+
+In production mode the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Errors are degraded during bursts, never fully suppressed. The sampler is disabled by `logging.development=true` or an integer `logging.level` of `2` or higher — `logging.level=debug` does not disable it.
+
+client-go (klog) output is routed into the same logger and follows the configured format. One documented exception: gRPC's own logger may still print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`).
+
+Only these three logging knobs are exposed; other zap options such as stacktrace level, time encoding, or extra args are not configurable through the chart.

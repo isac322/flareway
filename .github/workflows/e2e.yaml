@@ -90,9 +90,23 @@ jobs:
             --name "${KIND_CLUSTER_NAME}" \
             "${controller_image}"
           kubectl apply --server-side -k config/crd
+          rendered_manifest="$(mktemp)"
           bin/kustomize build config/default | \
             sed "s|image: controller:latest|image: ${controller_image}|" | \
-            kubectl apply -f -
+            sed "s|--zap-log-level=info|--zap-log-level=debug|g" \
+            > "${rendered_manifest}"
+          # --zap-log-level=debug keeps the V(1) Cloudflare per-request stream in
+          # controller.log artifacts; the shipped default is exercised by the
+          # conformance workflow.
+          grep -q -- '--zap-log-level=debug' "${rendered_manifest}" || {
+            echo '::error::rendered manifest lacks --zap-log-level=debug; the kustomize manager args may have changed' >&2
+            exit 1
+          }
+          if grep -q -- '--zap-log-level=info' "${rendered_manifest}"; then
+            echo '::error::rendered manifest still sets --zap-log-level=info after the e2e debug override' >&2
+            exit 1
+          fi
+          kubectl apply -f "${rendered_manifest}"
           kubectl -n flareway-system rollout status \
             deployment/flareway-controller-manager --timeout=5m
       - name: Bootstrap WARP runner
@@ -187,17 +201,17 @@ jobs:
           import re
           from pathlib import Path
 
+          bearer = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
           sensitive = re.compile(
               r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
               r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
-              r'(\s*[":=]\s*)("[^"]*"|[^\s,}]+)'
+              r'("?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|[^\s,}]+)'
           )
-          bearer = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
           for name in ("controller.log", "dataplane.log", "resources.yaml", "events.txt"):
               path = Path("artifacts/cluster") / name
               if path.exists():
-                  redacted = sensitive.sub(r'\1\2"[REDACTED]"', path.read_text())
-                  path.write_text(bearer.sub("Bearer [REDACTED]", redacted))
+                  redacted = bearer.sub("Bearer [REDACTED]", path.read_text())
+                  path.write_text(sensitive.sub(r'\1\2"[REDACTED]"', redacted))
           PY
       - name: Upload end-to-end artifacts
         if: always()

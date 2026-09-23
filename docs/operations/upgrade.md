@@ -35,6 +35,33 @@ helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
 
 Use `--reuse-values` only when the previous values remain valid. For a reviewed values file, prefer `--values flareway-values.yaml`.
 
+## Logging output changes
+
+The controller now defaults to production logging. Upgrading changes the log stream even with unchanged values:
+
+- output changes from the console encoder to JSON lines on stderr;
+- the default level changes from `debug` to `info`;
+- multi-line console stacktraces become a single `stacktrace` field on JSON error entries;
+- client-go (klog) text lines such as `I0923 ...` now appear as JSON entries through the same logger;
+- the per-request `Cloudflare API request completed` lines are `V(1)` and now require `logging.level=debug` (or `1`) to appear;
+- the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Errors are degraded during bursts, never fully suppressed. The sampler is disabled by `logging.development=true` or an integer `logging.level` of `2` or higher.
+
+To restore the exact previous output (console encoder at `debug`, no sampling), set all three logging values — `logging.development=true` alone keeps JSON at `info` because explicit level and encoder override development defaults:
+
+```sh
+helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --version <release-version> \
+  --namespace flareway-system \
+  --reuse-values \
+  --set logging.development=true \
+  --set logging.level=debug \
+  --set logging.encoder=console
+```
+
+For a Kustomize install, change the three `--zap-*` args in `config/manager/manager.yaml` to `--zap-devel=true`, `--zap-log-level=debug`, and `--zap-encoder=console`, or apply the equivalent JSON6902 patch in an overlay.
+
+For local development, `go run ./cmd --zap-devel=true` restores console output at `debug`; no explicit level or encoder is needed there because no other zap flags are passed.
+
 ## Controller ownership changes
 
 Controller toggles are an ownership boundary, not a performance setting. Before disabling a group:

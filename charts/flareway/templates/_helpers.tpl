@@ -64,3 +64,10 @@ control-plane: controller-manager
 - --enable-device-controllers={{ .Values.controllers.device }}
 - --enable-organization-controllers={{ .Values.controllers.organization }}
 {{- end -}}
+
+{{/* Controller-manager logging flags, appended last so they always win. */}}
+{{- define "flareway.loggingArgs" -}}
+- --zap-devel={{ .Values.logging.development }}
+- --zap-log-level={{ .Values.logging.level }}
+- --zap-encoder={{ .Values.logging.encoder }}
+{{- end -}}

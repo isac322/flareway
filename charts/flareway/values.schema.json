@@ -37,6 +37,21 @@
         "GODEBUG": {"type": "string", "minLength": 1}
       }
     },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["development", "level", "encoder"],
+      "properties": {
+        "development": {"type": "boolean"},
+        "level": {
+          "oneOf": [
+            {"type": "string", "enum": ["debug", "info", "error", "panic"]},
+            {"type": "integer", "minimum": 1, "maximum": 128}
+          ]
+        },
+        "encoder": {"type": "string", "enum": ["json", "console"]}
+      }
+    },
     "controllers": {
       "type": "object",
       "additionalProperties": false,
