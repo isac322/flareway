@@ -1599,7 +1599,9 @@ func reconcileGatewayOwnedObject(
 			// reconcile free of an Apply that would race the status writes other
 			// controllers make on a fresh object.
 			if err := migrateGatewayCreateOwnership(ctx, kube, created); err != nil {
-				ctrl.LoggerFrom(ctx).Error(err, "Unable to migrate field ownership on created object", "object", client.ObjectKeyFromObject(created))
+				// Expected when another writer changes the fresh object first; the
+				// next reconcile migrates before it applies, so this is not an error.
+				ctrl.LoggerFrom(ctx).V(1).Info("Deferred field ownership migration on created object", "object", client.ObjectKeyFromObject(created), "reason", err.Error())
 			}
 			return nil
 		} else if !apierrors.IsAlreadyExists(err) {
