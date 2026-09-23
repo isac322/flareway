@@ -201,7 +201,9 @@ jobs:
           import re
           from pathlib import Path
 
-          bearer = re.compile(r'(?i)\bBearer\s+([A-Za-z0-9._~+/=-]+)')
+          # The lookahead lets every "Bearer" start a match, so a token that is
+          # itself the word Bearer cannot hide the credential that follows it.
+          bearer = re.compile(r'(?i)\bBearer(?=\s+([A-Za-z0-9._~+/=-]+))')
           sensitive = re.compile(
               r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
               r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
