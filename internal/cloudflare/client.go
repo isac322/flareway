@@ -24,6 +24,7 @@ package cloudflare
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -195,10 +196,19 @@ func New(token, accountID string, logger logr.Logger, opts ...ClientOption) *Cli
 	}
 }
 
+// ErrRateLimitWait marks a failure of the client-side rate limiter's Wait
+// before a request was ever sent: the reservation could not be satisfied
+// within the request context. The wrapped error keeps the original cause
+// (for example x/time/rate's bare "would exceed context deadline" error,
+// which matches neither context.Canceled nor context.DeadlineExceeded), so
+// callers must detect this pacing origin with errors.Is rather than by
+// message matching or by the absence of an HTTP status.
+var ErrRateLimitWait = errors.New("wait for Cloudflare API rate limit")
+
 func rateLimitMiddleware(limiter *rate.Limiter) option.Middleware {
 	return func(request *http.Request, next option.MiddlewareNext) (*http.Response, error) {
 		if err := limiter.Wait(request.Context()); err != nil {
-			return nil, fmt.Errorf("wait for Cloudflare API rate limit: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrRateLimitWait, err)
 		}
 		return next(request)
 	}

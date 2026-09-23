@@ -48,11 +48,19 @@ limitations under the License.
 // # Partial failure is fail-closed
 //
 // A listing that fails partway is never committed as a complete listing:
-// the kind's judgement for that pass is abandoned entirely (result=partial),
-// no object is invalidated, and no object is reported missing. Only a fully
+// the kind's judgement for that pass is abandoned (result=partial), no
+// object is invalidated, and no object is reported missing. Only a fully
 // collected listing may produce drift items (result=ok). A definitive
 // client-side rejection (HTTP 4xx) is recorded as result=error and likewise
 // abandons judgement for that kind only — other kinds keep sweeping.
+//
+// One exception, currently only the DNS target: a multi-scope listing that
+// fails for some scopes returns a *scopedListingError. The pass is still
+// partial — last-success stays stale and the aggregate names the failed
+// scopes — but items judged against the scopes that listed completely are
+// safe and are dispatched normally. Scopes that did not list contribute no
+// records and no judgement, so a denied zone can never produce a false
+// missing verdict. Every other target keeps the strict contract above.
 //
 // # Orphans are observe-only
 //
