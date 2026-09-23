@@ -19,7 +19,9 @@ package sweep
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +58,64 @@ func listFailure(err error) error {
 		return err
 	}
 	return errIncompleteListing
+}
+
+// zoneFailure records one listing scope that could not be collected,
+// preserving the scope identifier and the wrapped cause.
+type zoneFailure struct {
+	zoneID string
+	err    error
+}
+
+func (e *zoneFailure) Error() string {
+	return "zone " + e.zoneID + ": " + e.err.Error()
+}
+
+func (e *zoneFailure) Unwrap() error {
+	return e.err
+}
+
+// scopedListingError marks a multi-scope listing that completed for some
+// scopes but failed for others. Unlike errIncompleteListing it is a typed
+// partial: the DriftItems returned alongside it are safe — they were judged
+// only against scopes whose listings completed — and the aggregate preserves
+// which scopes failed and why, in discovery order.
+//
+// Is reports errIncompleteListing so the aggregate still classifies as an
+// incomplete listing; RunTargetOnce must test for *scopedListingError before
+// the generic sentinel or the safe items would be discarded. Unwrap returns
+// the stored per-scope causes (each a *zoneFailure) so errors.Is/As reach
+// both the scope identifiers and the original errors.
+type scopedListingError struct {
+	failures []error
+}
+
+func (e *scopedListingError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "scoped listing incomplete: %d zone failure(s)", len(e.failures))
+	for _, f := range e.failures {
+		fmt.Fprintf(&b, "; %v", f)
+	}
+	return b.String()
+}
+
+func (e *scopedListingError) Is(target error) bool {
+	return target == errIncompleteListing
+}
+
+func (e *scopedListingError) Unwrap() []error {
+	return e.failures
+}
+
+// scopedListingErr aggregates per-zone listing failures. A non-empty slice
+// yields a *scopedListingError so RunTargetOnce can report a scoped partial
+// that preserves the items judged against completed zones; an empty slice
+// yields nil.
+func scopedListingErr(failures []error) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	return &scopedListingError{failures: failures}
 }
 
 // sweepClientFactory is an optional extension of ClientFactory: when the
@@ -198,10 +258,21 @@ func (as *AccountSweeper) runTarget(ctx context.Context, target TargetDescriptor
 	switch {
 	case err != nil && errors.Is(err, context.Canceled):
 		// Shutdown: no metric, no log.
+	case result == observability.SweepResultPartial:
+		if err != nil {
+			// Scoped partial: the aggregate names the failed scopes. Info,
+			// not Error — a persistently denied scope produces this every
+			// pass and must not become permanent error noise.
+			as.logger.Info("target sweep partial: scoped listing incomplete (fail-closed for unlisted scopes)",
+				"kind", target.Kind, "error", err.Error())
+		} else {
+			as.logger.Info("target sweep abandoned: incomplete listing (fail-closed)", "kind", target.Kind)
+		}
+		// Safe items from a scoped partial are dispatched normally; a
+		// generic partial carries nil items and this is a no-op.
+		as.handleDriftResults(ctx, items)
 	case err != nil:
 		as.logger.Error(err, "target sweep failed", "kind", target.Kind)
-	case result == observability.SweepResultPartial:
-		as.logger.Info("target sweep abandoned: incomplete listing (fail-closed)", "kind", target.Kind)
 	default:
 		as.handleDriftResults(ctx, items)
 	}
@@ -209,13 +280,23 @@ func (as *AccountSweeper) runTarget(ctx context.Context, target TargetDescriptor
 
 // RunTargetOnce performs a single sweep pass for target and reports the
 // outcome. It is exported so tests can drive passes without waiting for
-// timers. The returned result is one of ok/partial/error; a partial pass
-// returns nil items and nil error.
+// timers. The returned result is one of ok/partial/error. A partial pass
+// returns nil items and nil error, except a scoped partial: when SweepFunc
+// returns a *scopedListingError the pass is partial but the items judged
+// against completed scopes are safe, so they are returned together with the
+// aggregate error.
 func (as *AccountSweeper) RunTargetOnce(ctx context.Context, target TargetDescriptor) ([]DriftItem, string, error) {
 	items, err := target.SweepFunc(ctx, as)
+	var scoped *scopedListingError
 	switch {
 	case err != nil && errors.Is(err, context.Canceled):
 		return nil, "", err
+	case err != nil && errors.As(err, &scoped):
+		// Typed partial: must precede the errIncompleteListing branch —
+		// scopedListingError.Is matches the sentinel, so the generic branch
+		// would silently discard the safe items.
+		observability.ObserveSweep(target.Kind, observability.SweepResultPartial)
+		return items, observability.SweepResultPartial, err
 	case err != nil && errors.Is(err, errIncompleteListing):
 		observability.ObserveSweep(target.Kind, observability.SweepResultPartial)
 		return nil, observability.SweepResultPartial, nil

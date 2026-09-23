@@ -174,23 +174,80 @@ func TestListFailureClassification(t *testing.T) {
 	}
 }
 
+// TestZoneFailureIsolation covers the per-zone classifier used by
+// sweepDNSRecords: only HTTP 403/404, zone-local 5xx, and transport errors
+// (no decodable status) are isolated per zone; context errors, 429, 401,
+// every other 4xx, and client-side pacing failures (ErrRateLimitWait) abort
+// the whole pass (QA-10/QA-11).
+func TestZoneFailureIsolation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"403 forbidden", dnsListError(403), true},
+		{"404 not found", dnsListError(404), true},
+		{"500 internal", dnsListError(500), true},
+		{"503 unavailable", dnsListError(503), true},
+		{"transport error", transportZoneError(errors.New("connection reset")), true},
+		{"bare transport error", errors.New("connection reset"), true},
+		{"context canceled", context.Canceled, false},
+		{"wrapped canceled", fmt.Errorf("zone list: %w", context.Canceled), false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"wrapped deadline", fmt.Errorf("zone list: %w", context.DeadlineExceeded), false},
+		{"rate limit wait", fmt.Errorf("zone list: %w: %w", flarecloudflare.ErrRateLimitWait, errors.New("would exceed context deadline")), false},
+		{"rate limit wait canceled", fmt.Errorf("zone list: %w: %w", flarecloudflare.ErrRateLimitWait, context.Canceled), false},
+		{"401 unauthorized", dnsListError(401), false},
+		{"429 rate limited", dnsListError(429), false},
+		{"400 bad request", dnsListError(400), false},
+		{"409 conflict", dnsListError(409), false},
+		{"422 unprocessable", dnsListError(422), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := zoneFailureIsolatable(tc.err); got != tc.want {
+				t.Fatalf("zoneFailureIsolatable(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunTargetOnceResultMapping(t *testing.T) {
 	t.Parallel()
 	as := NewAccountSweeper(AccountSweeperOptions{Logger: logr.Discard()})
 	ctx := context.Background()
 
 	cases := []struct {
-		name       string
-		items      []DriftItem
-		err        error
-		wantResult string
-		wantErr    bool
+		name         string
+		items        []DriftItem
+		err          error
+		wantResult   string
+		wantErr      bool
+		wantItemsNil bool
+		wantItemsLen int
 	}{
 		{name: "complete listing", items: []DriftItem{}, wantResult: observability.SweepResultOK},
-		{name: "nil items is partial", items: nil, wantResult: observability.SweepResultPartial},
-		{name: "incomplete listing error is partial", err: errIncompleteListing, wantResult: observability.SweepResultPartial},
-		{name: "wrapped incomplete listing is partial", err: fmt.Errorf("list: %w", errIncompleteListing), wantResult: observability.SweepResultPartial},
-		{name: "definitive error", err: errors.New("403 forbidden"), wantResult: observability.SweepResultError, wantErr: true},
+		{name: "nil items is partial", items: nil, wantResult: observability.SweepResultPartial, wantItemsNil: true},
+		{name: "incomplete listing error is partial", err: errIncompleteListing, wantResult: observability.SweepResultPartial, wantItemsNil: true},
+		{name: "wrapped incomplete listing is partial", err: fmt.Errorf("list: %w", errIncompleteListing), wantResult: observability.SweepResultPartial, wantItemsNil: true},
+		{name: "definitive error", err: errors.New("403 forbidden"), wantResult: observability.SweepResultError, wantErr: true, wantItemsNil: true},
+		// QA-10(b): a deadline exceeded reaches the generic error branch —
+		// the existing asymmetry with context.Canceled is deliberate.
+		{name: "deadline exceeded is error", err: context.DeadlineExceeded, wantResult: observability.SweepResultError, wantErr: true, wantItemsNil: true},
+		// QA-13: items returned with a generic incomplete-listing error are
+		// unsafe and must be discarded; only the typed scoped error may
+		// carry safe items.
+		{name: "unsafe items on generic partial are discarded",
+			items: []DriftItem{{Case: DriftCaseMissing, RemoteID: "r1"}}, err: errIncompleteListing,
+			wantResult: observability.SweepResultPartial, wantItemsNil: true},
+		// Scoped partial: the typed aggregate carries the safe items through.
+		{name: "scoped listing error carries safe items",
+			items: []DriftItem{{Case: DriftCaseMissing, RemoteID: "r1"}},
+			err: &scopedListingError{failures: []error{
+				&zoneFailure{zoneID: "zone-a", err: errors.New("denied")},
+			}},
+			wantResult: observability.SweepResultPartial, wantErr: true, wantItemsLen: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,12 +257,18 @@ func TestRunTargetOnceResultMapping(t *testing.T) {
 					return tc.items, tc.err
 				},
 			}
-			_, result, err := as.RunTargetOnce(ctx, target)
+			got, result, err := as.RunTargetOnce(ctx, target)
 			if result != tc.wantResult {
 				t.Fatalf("RunTargetOnce result = %q, want %q", result, tc.wantResult)
 			}
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("RunTargetOnce err = %v, wantErr %t", err, tc.wantErr)
+			}
+			if (got == nil) != tc.wantItemsNil {
+				t.Fatalf("RunTargetOnce items = %#v, wantItemsNil %t", got, tc.wantItemsNil)
+			}
+			if tc.wantItemsLen > 0 && len(got) != tc.wantItemsLen {
+				t.Fatalf("RunTargetOnce items = %#v, want %d item(s)", got, tc.wantItemsLen)
 			}
 		})
 	}

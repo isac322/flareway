@@ -89,12 +89,28 @@ reconciler budget, so the two together stay inside Cloudflare's `4.0 req/s`
 account limit. It starts each kind on a staggered delay so a restart does not
 produce a burst.
 
-If a listing fails partway through pagination, the sweep discards that pass
-entirely rather than treating a partial page as a complete list. A partial list
-would make healthy objects look missing. Such a pass is reported as
-`result="partial"`, and `flareway_sweep_last_success_timestamp` deliberately
-does **not** advance, so a degraded sweep is visible rather than silently
-reassuring.
+If a listing fails partway through, the sweep never treats a partial page as a
+complete list — a partial list would make healthy objects look missing. For
+most kinds the pass is discarded entirely.
+
+DNS records are the one exception, because a single account can span zones the
+token cannot read. When listing one zone fails with an access or server error
+(HTTP 403, 404, or 5xx, or a transport failure mid-pagination), the sweep drops
+that zone's records, continues through the remaining zones, and still reports
+drift found in the zones it could read. A zone that could not be listed is
+never treated as empty, so its records cannot be misreported as deleted.
+Authentication failures, rate limiting, and cancellation still abort the whole
+pass, as does any listing failure on the other kinds.
+
+A DNS pass with isolated zone failures is reported as `result="partial"`,
+never `ok`, even when every zone was denied. It preserves findings from
+completed zones and logs an aggregate diagnostic naming the failed zones
+and their causes. `flareway_sweep_last_success_timestamp` does not advance.
+Per-zone authentication, rate-limiting, pacing, and deadline failures abort
+the pass with `result="error"`; context cancellation aborts silently.
+Account-wide zone discovery and other resource kinds retain their existing
+generic partial or error outcomes, without partial findings or a DNS zone
+aggregate.
 
 ## Rolling back
 
