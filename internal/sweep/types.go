@@ -89,6 +89,11 @@ type TargetDescriptor struct {
 	//     abandoned for this pass (result=partial). Equivalent to returning
 	//     an error wrapping errIncompleteListing.
 	//   - (nil, err): definitive failure (result=error).
+	//   - (items, err) where err is a *scopedListingError: scoped partial —
+	//     some listing scopes failed but the returned items were judged only
+	//     against completed scopes and are safe to dispatch (result=partial,
+	//     non-nil aggregate error). Items returned with any other error are
+	//     unsafe and are discarded.
 	SweepFunc func(ctx context.Context, runner *AccountSweeper) ([]DriftItem, error)
 }
 

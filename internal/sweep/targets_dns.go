@@ -18,7 +18,9 @@ package sweep
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +61,14 @@ type dnsTunnelInfo struct {
 // populated from the checkpoint's tunnel target; when the tunnel ID is
 // unknown the record is treated as not owned — never as owned-by-default —
 // and it is not even an orphan candidate.
+//
+// Zone failures are isolated per zoneFailureIsolatable: an isolatable
+// failure discards that zone's collected records, excludes its checkpoints
+// from judgement via listedZones, and is aggregated into a
+// *scopedListingError. Items judged against completed zones are still
+// returned — they are safe — alongside the aggregate, which RunTargetOnce
+// reports as a scoped partial. Terminal errors (context, 429, 401, other
+// 4xx, pacing) abort the pass and discard everything.
 func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
 	api, wait := as.remote()
 	zones, err := as.zones(ctx)
@@ -71,17 +81,24 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 	}
 	key := as.ownershipKey(ctx)
 
-	// Collect the complete filtered listing across zones. Any zone that
-	// fails makes the whole listing incomplete (fail-closed).
+	// Collect the filtered listing across zones. A zone whose listing fails
+	// with an isolatable error contributes no records and no judgement; a
+	// terminal error aborts the whole pass (fail-closed).
 	remoteByID := make(map[string]flarecloudflare.DNSRecord)
 	listedZones := make(map[string]bool, len(zones))
+	var failures []error
 	for _, zone := range zones {
 		if err := wait(ctx); err != nil {
+			// Pacing failure is global, not zone-scoped: terminal.
 			return nil, err
 		}
 		records, err := api.ListDNSRecordsByComment(ctx, zone.ID, dnsCommentFilter)
 		if err != nil {
-			return nil, listFailure(err)
+			if !zoneFailureIsolatable(err) {
+				return nil, err
+			}
+			failures = append(failures, &zoneFailure{zoneID: zone.ID, err: err})
+			continue
 		}
 		listedZones[zone.ID] = true
 		for _, record := range records {
@@ -162,7 +179,47 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 			items = append(items, item)
 		}
 	}
-	return items, nil
+	return items, scopedListingErr(failures)
+}
+
+// zoneFailureIsolatable reports whether a zone-scoped listing error may be
+// isolated to that zone so the sweep can continue with the remaining zones.
+// The allowlist is exactly: HTTP 403 and 404 (per-zone authorization and
+// deleted zones), HTTP 5xx, and transport errors for which
+// flarecloudflare.StatusCode cannot decode an HTTP status (including
+// mid-pagination failures — the adapter returns (nil, err), so a partial
+// page never reaches the sweeper).
+//
+// Everything else is terminal: context cancellation/deadline, HTTP 429
+// (account-level throttling — continuing would worsen it), HTTP 401
+// (conservative abort on authentication uncertainty, not proof of a
+// globally invalid token), unlisted 4xx (400/405/409/422 — request shape
+// defects or conflicts that would recur identically in every zone), and
+// flarecloudflare.ErrRateLimitWait (a client-side pacing failure is global,
+// not zone-scoped — its cause may carry no context sentinel and no HTTP
+// status, so it must be rejected before the no-status transport branch).
+// Context errors must never be absorbed into a scopedListingError: the
+// RunTargetOnce cancellation branch precedes the scoped branch and must
+// still see them.
+func zoneFailureIsolatable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, flarecloudflare.ErrRateLimitWait) {
+		return false
+	}
+	status, ok := flarecloudflare.StatusCode(err)
+	if !ok {
+		// No HTTP status: transport-level failure, zone-local.
+		return true
+	}
+	switch {
+	case status == http.StatusForbidden || status == http.StatusNotFound:
+		return true
+	case status >= 500:
+		return true
+	default:
+		// 401, 429, and every other 4xx abort the pass.
+		return false
+	}
 }
 
 // dnsOwnershipMarkers returns every marker a reader must accept for one
