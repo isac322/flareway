@@ -111,7 +111,9 @@ body:
       description: |
         Relevant lines from the controller
         (kubectl -n flareway-system logs deployment/flareway-controller-manager
-        or your release name). Redact tokens and account IDs.
+        or your release name). When reproducing, enable debug logs with the
+        Helm value logging.level=debug (or --zap-log-level=debug). Redact
+        tokens and account IDs.
       render: text
     validations:
       required: false

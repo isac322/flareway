@@ -57,6 +57,52 @@ When `metrics.enabled=true`, the chart exposes the controller metrics Service. S
 
 Alert on sustained reconcile errors, rate limiting, a programmed gauge of `0`, or a desired/applied version gap. The metrics NetworkPolicy admits namespaces matching `metrics: enabled` by default; adjust `networkPolicy.metrics.namespaceSelector` for the monitoring namespace.
 
+## Debug logging
+
+The controller logs JSON to stderr at `info` by default. Enable `debug` to see `V(1)` entries such as the per-request `Cloudflare API request completed` lines.
+
+For a Helm install:
+
+```sh
+helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --namespace flareway-system \
+  --reuse-values \
+  --set logging.level=debug
+```
+
+For a Kustomize install, append the flag with a JSON6902 patch in the overlay — Go flags take the last value, so the appended `--zap-log-level=debug` wins over the shipped `--zap-log-level=info`:
+
+```yaml
+patches:
+- patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --zap-log-level=debug
+  target:
+    kind: Deployment
+```
+
+Do not use a strategic-merge patch on `args`: it replaces the whole list and drops required flags such as `--leader-elect`, the probe and metrics bind addresses, and the other `--zap-*` args. Editing the full args list in `config/manager/manager.yaml` directly is also fine.
+
+For a live Kustomize-installed Deployment, patch it in place:
+
+```sh
+kubectl -n flareway-system patch deployment flareway-controller-manager --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--zap-log-level=debug"}]'
+```
+
+Helm installs should use `helm upgrade` instead; a live `kubectl patch` drifts from the chart-rendered manifest and is reverted by the next upgrade.
+
+JSON logs can be filtered with `jq`, for example:
+
+```sh
+kubectl -n flareway-system logs deployment/flareway-controller-manager -c manager | jq -cR 'fromjson? | select(.level == "error")'
+```
+
+Integer levels add more controller-runtime detail: `logging.level=1` (or `--zap-log-level=1`) enables `V(1)`, and integers `2` or higher also disable the production log sampler. The chart accepts integers `1` through `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents; do not use them outside isolated debugging.
+
+Rare client-go (klog) lines keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases, and like gRPC's rare ERROR lines they are not JSON. The `-R` and `fromjson?` in the example above skip those lines; plain `jq` stops at the first non-JSON line.
+
 ## Ownership and adoption
 
 `managementPolicy: Managed` permits writes. `ObserveOnly` requires an `externalRef` and never claims an object by name. To adopt an existing remote object, set `externalRef`, `adoption.mode: AdoptById`, and expected attributes. Flareway compares the remote ID and expectation before setting `status.ownershipVerified`.

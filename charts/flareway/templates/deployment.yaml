@@ -59,6 +59,7 @@ spec:
             {{- else }}
             - --metrics-bind-address=0
             {{- end }}
+            {{- include "flareway.loggingArgs" . | nindent 12 }}
           env:
             - name: GOMEMLIMIT
               value: {{ .Values.goRuntime.GOMEMLIMIT | quote }}
