@@ -45,7 +45,7 @@
         "level": {
           "oneOf": [
             {"type": "string", "enum": ["debug", "info", "error", "panic"]},
-            {"type": "integer", "minimum": 1, "maximum": 128}
+            {"type": "integer", "minimum": 1, "maximum": 6}
           ]
         },
         "encoder": {"type": "string", "enum": ["json", "console"]}

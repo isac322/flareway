@@ -31,7 +31,7 @@ goRuntime:
 logging:
   # --zap-devel: development mode (enables DPanic panics and disables sampling).
   development: false
-  # --zap-log-level: debug, info, error, panic, or an integer 1-128 for logr V(N).
+  # --zap-log-level: debug, info, error, panic, or an integer 1-6 for logr V(N).
   level: info
   # --zap-encoder: json or console.
   encoder: json

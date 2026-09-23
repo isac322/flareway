@@ -74,7 +74,7 @@ The controller defaults to production logging: JSON lines on stderr at `info` le
 | Value | Flag | Accepted values |
 |---|---|---|
 | `logging.development` | `--zap-devel` | `true` or `false` |
-| `logging.level` | `--zap-log-level` | `debug`, `info`, `error`, `panic`, or an integer `1`–`128` (logr `V(N)` verbosity) |
+| `logging.level` | `--zap-log-level` | `debug`, `info`, `error`, `panic`, or an integer `1`–`6` (logr `V(N)` verbosity) |
 | `logging.encoder` | `--zap-encoder` | `json` or `console` |
 
 `warn` is not an accepted level; the flag parser and the values schema both reject it.
@@ -92,6 +92,8 @@ helm upgrade flareway charts/flareway \
 
 In production mode the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Errors are degraded during bursts, never fully suppressed. The sampler is disabled by `logging.development=true` or an integer `logging.level` of `2` or higher — `logging.level=debug` does not disable it.
 
-client-go (klog) output is routed into the same logger and follows the configured format. One documented exception: gRPC's own logger may still print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`).
+Two documented exceptions do not use the configured format. Rare client-go (klog) lines, such as `HTTP2 has been explicitly disabled` or invalid `HTTP2_*` environment warnings, keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases. gRPC's own logger may also print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`). Neither is JSON.
+
+The chart schema caps integer levels at `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log full API request and response bodies, including Secret contents. Do not use them outside isolated debugging.
 
 Only these three logging knobs are exposed; other zap options such as stacktrace level, time encoding, or extra args are not configurable through the chart.

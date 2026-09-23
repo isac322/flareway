@@ -42,9 +42,10 @@ The controller now defaults to production logging. Upgrading changes the log str
 - output changes from the console encoder to JSON lines on stderr;
 - the default level changes from `debug` to `info`;
 - multi-line console stacktraces become a single `stacktrace` field on JSON error entries;
-- client-go (klog) text lines such as `I0923 ...` now appear as JSON entries through the same logger;
+- rare client-go (klog) text lines such as `I0923 ...` keep klog's own text format, unchanged from before; like gRPC's rare ERROR lines, they are not JSON;
 - the per-request `Cloudflare API request completed` lines are `V(1)` and now require `logging.level=debug` (or `1`) to appear;
 - the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Errors are degraded during bursts, never fully suppressed. The sampler is disabled by `logging.development=true` or an integer `logging.level` of `2` or higher.
+- integer levels are limited to `1`–`6` in the chart schema. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log full API request and response bodies, including Secret contents; do not use them outside isolated debugging.
 
 To restore the exact previous output (console encoder at `debug`, no sampling), set all three logging values — `logging.development=true` alone keeps JSON at `info` because explicit level and encoder override development defaults:
 

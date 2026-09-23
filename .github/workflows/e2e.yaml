@@ -206,7 +206,8 @@ jobs:
               r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
               r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
               r'((?:\\?")?\s*[:=]\s*)'
-              r'(\\"(?:[^"\\]|\\(?!"))*\\"|"(?:[^"\\]|\\.)*"|[^\s,}"\\]+)'
+              r'(\\"(?:[^"\\]|\\(?!"))*\\"|"(?:[^"\\]|\\.)*"|'
+              r'[^\s,}"\\]+(?:(?:\\(?!")|"(?![\s,}]|\Z))[^\s,}"\\]*)*)'
           )
 
 

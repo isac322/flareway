@@ -31,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -151,11 +150,7 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	logger := zap.New(zap.UseFlagOptions(&opts))
-	ctrl.SetLogger(logger)
-	// client-go and other Kubernetes libraries log through klog. Route klog into
-	// the same logger so one encoder and level govern all manager output.
-	klog.SetLoggerWithOptions(logger, klog.ContextualLogger(true))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	driftPolicy, err := controller.ParseDriftPolicy(driftPolicyFlag)
 	if err != nil {
