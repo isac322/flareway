@@ -201,17 +201,39 @@ jobs:
           import re
           from pathlib import Path
 
-          bearer = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
+          bearer = re.compile(r'(?i)\bBearer\s+([A-Za-z0-9._~+/=-]+)')
           sensitive = re.compile(
               r'(?i)(cf-access-client-(?:id|secret)|cf-access-jwt-assertion|cf[_-]?authorization|'
               r'client[_-]?secret|application[_-]?aud|aud|api[_-]?token|tunnel[_-]?token|authorization)'
               r'(\s*[":=]\s*)("[^"]*"|[^\s,}]+)'
           )
+
+
+          def redact(text):
+              # Mask the union of key values and Bearer tokens found in the
+              # original text, so neither pattern can hide a secret from the
+              # other regardless of the log format.
+              spans = [(m.start(3), m.end(3), '"[REDACTED]"') for m in sensitive.finditer(text)]
+              spans += [(m.start(1), m.end(1), "[REDACTED]") for m in bearer.finditer(text)]
+              merged = []
+              for start, end, mask in sorted(spans):
+                  if merged and start < merged[-1][1]:
+                      last = merged[-1]
+                      quoted = '"[REDACTED]"' in (last[2], mask)
+                      merged[-1] = (last[0], max(last[1], end), '"[REDACTED]"' if quoted else mask)
+                  else:
+                      merged.append((start, end, mask))
+              parts, pos = [], 0
+              for start, end, mask in merged:
+                  parts += [text[pos:start], mask]
+                  pos = end
+              return "".join(parts) + text[pos:]
+
+
           for name in ("controller.log", "dataplane.log", "resources.yaml", "events.txt"):
               path = Path("artifacts/cluster") / name
               if path.exists():
-                  redacted = bearer.sub("Bearer [REDACTED]", path.read_text())
-                  path.write_text(sensitive.sub(r'\1\2"[REDACTED]"', redacted))
+                  path.write_text(redact(path.read_text()))
           PY
       - name: Upload end-to-end artifacts
         if: always()
