@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,19 +41,77 @@ import (
 )
 
 // serviceTokenFakeAPI implements only the service-token surface the reconciler
-// uses; missing tokens report a typed Cloudflare 404.
+// uses; missing tokens report a typed Cloudflare 404. Remote state is scoped —
+// account tokens key by bare ID, zone tokens by "zone:<zoneID>/<id>" — and IDs
+// are monotonic so a deletion never recycles one. The bare counters record
+// committed mutations (deletes keeps its original attempt-count semantics);
+// calls journals every attempted remote operation in order.
 type serviceTokenFakeAPI struct {
 	flarecloudflare.AccessAPI
-	now       func() time.Time
+	now     func() time.Time
+	next    int
+	tokens  map[string]flarecloudflare.ServiceToken
+	secrets map[string]string
+	calls   []string
+
+	createCalls int
+	creates     int
+	updates     int
+	rotates     int
+	refreshes   int
+	lists       int
+	deletes     int
+
 	getErr    error
 	updateErr error
 	deleteErr error
-	deletes   int
-	tokens    map[string]flarecloudflare.ServiceToken
+	createErr error
+	rotateErr error
+	listErr   error
+
+	// failCreateAt fails the Nth create call before commit;
+	// commitThenFailCreateAt commits the Nth create and then reports an error
+	// (a lost create response). createNameOverride rewrites the committed
+	// token's name (provider divergence). rejectDuplicateName answers a
+	// committed 409 when the requested name already exists in scope.
+	failCreateAt           int
+	commitThenFailCreateAt int
+	createNameOverride     string
+	rejectDuplicateName    bool
 }
 
-func (f *serviceTokenFakeAPI) CreateServiceToken(_ context.Context, _ flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceTokenSecret, error) {
-	id := fmt.Sprintf("token-%d", len(f.tokens)+1)
+// serviceTokenInScope reports whether a scoped storage key belongs to the
+// account endpoint (no ZoneID) or the given zone endpoint.
+func serviceTokenInScope(scope flarecloudflare.AccessScope, key string) bool {
+	if scope.ZoneID == "" {
+		return !strings.HasPrefix(key, "zone:")
+	}
+	return strings.HasPrefix(key, "zone:"+scope.ZoneID+"/")
+}
+
+// mutations counts committed remote mutations; reads are excluded.
+func (f *serviceTokenFakeAPI) mutations() int {
+	return f.creates + f.updates + f.rotates + f.refreshes + f.deletes
+}
+
+func (f *serviceTokenFakeAPI) CreateServiceToken(_ context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceTokenSecret, error) {
+	f.createCalls++
+	f.calls = append(f.calls, "create:"+input.Name)
+	if f.createErr != nil {
+		return flarecloudflare.ServiceTokenSecret{}, f.createErr
+	}
+	if f.failCreateAt > 0 && f.createCalls == f.failCreateAt {
+		return flarecloudflare.ServiceTokenSecret{}, fmt.Errorf("injected service token create failure")
+	}
+	if f.rejectDuplicateName {
+		for key, remote := range f.tokens {
+			if remote.Name == input.Name && serviceTokenInScope(scope, key) {
+				return flarecloudflare.ServiceTokenSecret{}, cloudflareAPIError(http.StatusConflict)
+			}
+		}
+	}
+	f.next++
+	id := fmt.Sprintf("token-%d", f.next)
 	remote := flarecloudflare.ServiceToken{
 		ID:        id,
 		ClientID:  "client-" + id,
@@ -61,26 +120,59 @@ func (f *serviceTokenFakeAPI) CreateServiceToken(_ context.Context, _ flarecloud
 		Enabled:   input.Enabled,
 		ExpiresAt: f.now().Add(24 * time.Hour),
 	}
-	f.tokens[id] = remote
-	return flarecloudflare.ServiceTokenSecret{ServiceToken: remote, ClientSecret: "secret-" + id}, nil
+	if f.createNameOverride != "" {
+		remote.Name = f.createNameOverride
+	}
+	key := parityServiceTokenKey(scope, id)
+	if f.tokens == nil {
+		f.tokens = make(map[string]flarecloudflare.ServiceToken)
+	}
+	if f.secrets == nil {
+		f.secrets = make(map[string]string)
+	}
+	f.tokens[key] = remote
+	f.secrets[key] = "secret-" + id
+	f.creates++
+	if f.commitThenFailCreateAt > 0 && f.createCalls == f.commitThenFailCreateAt {
+		return flarecloudflare.ServiceTokenSecret{}, fmt.Errorf("injected service token create response loss")
+	}
+	return flarecloudflare.ServiceTokenSecret{ServiceToken: remote, ClientSecret: f.secrets[key]}, nil
 }
 
-func (f *serviceTokenFakeAPI) GetServiceToken(_ context.Context, _ flarecloudflare.AccessScope, id string) (flarecloudflare.ServiceToken, error) {
+func (f *serviceTokenFakeAPI) GetServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string) (flarecloudflare.ServiceToken, error) {
+	f.calls = append(f.calls, "get:"+id)
 	if f.getErr != nil {
 		return flarecloudflare.ServiceToken{}, f.getErr
 	}
-	remote, found := f.tokens[id]
+	remote, found := f.tokens[parityServiceTokenKey(scope, id)]
 	if !found {
 		return flarecloudflare.ServiceToken{}, cloudflareAPIError(http.StatusNotFound)
 	}
 	return remote, nil
 }
 
-func (f *serviceTokenFakeAPI) UpdateServiceToken(_ context.Context, _ flarecloudflare.AccessScope, id string, input flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceToken, error) {
+func (f *serviceTokenFakeAPI) ListServiceTokens(_ context.Context, scope flarecloudflare.AccessScope) ([]flarecloudflare.ServiceToken, error) {
+	f.calls = append(f.calls, "list")
+	f.lists++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	result := make([]flarecloudflare.ServiceToken, 0)
+	for key, remote := range f.tokens {
+		if serviceTokenInScope(scope, key) {
+			result = append(result, remote)
+		}
+	}
+	return result, nil
+}
+
+func (f *serviceTokenFakeAPI) UpdateServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string, input flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceToken, error) {
+	f.calls = append(f.calls, "update:"+id)
 	if f.updateErr != nil {
 		return flarecloudflare.ServiceToken{}, f.updateErr
 	}
-	remote, found := f.tokens[id]
+	key := parityServiceTokenKey(scope, id)
+	remote, found := f.tokens[key]
 	if !found {
 		return flarecloudflare.ServiceToken{}, cloudflareAPIError(http.StatusNotFound)
 	}
@@ -89,24 +181,78 @@ func (f *serviceTokenFakeAPI) UpdateServiceToken(_ context.Context, _ flarecloud
 	if input.Duration != "" {
 		remote.Duration = input.Duration
 	}
-	f.tokens[id] = remote
+	f.tokens[key] = remote
+	f.updates++
 	return remote, nil
 }
 
-func (f *serviceTokenFakeAPI) DeleteServiceToken(_ context.Context, _ flarecloudflare.AccessScope, id string) error {
+func (f *serviceTokenFakeAPI) DeleteServiceToken(_ context.Context, scope flarecloudflare.AccessScope, id string) error {
+	f.calls = append(f.calls, "delete:"+id)
 	f.deletes++
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
-	delete(f.tokens, id)
+	key := parityServiceTokenKey(scope, id)
+	if _, found := f.tokens[key]; !found {
+		return cloudflareAPIError(http.StatusNotFound)
+	}
+	delete(f.tokens, key)
+	delete(f.secrets, key)
 	return nil
+}
+
+// RotateServiceToken is account-scoped only, like the real API surface: zone
+// tokens are unreachable here and report a typed 404.
+func (f *serviceTokenFakeAPI) RotateServiceToken(_ context.Context, id string, _ time.Time) (flarecloudflare.ServiceTokenSecret, error) {
+	f.calls = append(f.calls, "rotate:"+id)
+	if f.rotateErr != nil {
+		return flarecloudflare.ServiceTokenSecret{}, f.rotateErr
+	}
+	remote, found := f.tokens[id]
+	if !found {
+		return flarecloudflare.ServiceTokenSecret{}, cloudflareAPIError(http.StatusNotFound)
+	}
+	f.rotates++
+	f.secrets[id] = fmt.Sprintf("rotated-%d", f.rotates)
+	return flarecloudflare.ServiceTokenSecret{ServiceToken: remote, ClientSecret: f.secrets[id]}, nil
+}
+
+func (f *serviceTokenFakeAPI) RefreshServiceToken(_ context.Context, id string) (flarecloudflare.ServiceToken, error) {
+	f.calls = append(f.calls, "refresh:"+id)
+	remote, found := f.tokens[id]
+	if !found {
+		return flarecloudflare.ServiceToken{}, cloudflareAPIError(http.StatusNotFound)
+	}
+	f.refreshes++
+	remote.ExpiresAt = f.now().Add(24 * time.Hour)
+	f.tokens[id] = remote
+	return remote, nil
 }
 
 type serviceTokenWorld struct {
 	kube       client.Client
+	scheme     *runtime.Scheme
+	api        *serviceTokenFakeAPI
+	clock      time.Time
 	reconciler *ServiceTokenReconciler
 	account    *v1alpha1.CloudflareAccount
 	request    ctrl.Request
+}
+
+// restart swaps in a fresh reconciler over the same world — the controller
+// restart the recovery tests simulate. A nil client reuses the world client;
+// APIReader always reads the authoritative store directly.
+func (w *serviceTokenWorld) restart(kubeClient client.Client) {
+	if kubeClient == nil {
+		kubeClient = w.kube
+	}
+	w.reconciler = &ServiceTokenReconciler{
+		Client:              kubeClient,
+		APIReader:           w.kube,
+		Scheme:              w.scheme,
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return w.api, nil },
+		Now:                 func() time.Time { return w.clock },
+	}
 }
 
 func newServiceTokenWorld(t *testing.T, api *serviceTokenFakeAPI, clock time.Time) *serviceTokenWorld {
@@ -165,17 +311,16 @@ func newServiceTokenWorld(t *testing.T, api *serviceTokenFakeAPI, clock time.Tim
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"}, Data: map[string][]byte{"token": []byte("api-token")}},
 			account, token,
 		).Build()
-	return &serviceTokenWorld{
-		kube: kube,
-		reconciler: &ServiceTokenReconciler{
-			Client:              kube,
-			Scheme:              scheme,
-			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil },
-			Now:                 func() time.Time { return clock },
-		},
+	world := &serviceTokenWorld{
+		kube:    kube,
+		scheme:  scheme,
+		api:     api,
+		clock:   clock,
 		account: account,
 		request: ctrl.Request{NamespacedName: client.ObjectKeyFromObject(token)},
 	}
+	world.restart(nil)
+	return world
 }
 
 func serviceTokenCondition(conditions []metav1.Condition, conditionType string) *metav1.Condition {

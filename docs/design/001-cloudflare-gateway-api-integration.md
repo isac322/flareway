@@ -1,7 +1,7 @@
 # Flareway 설계 001 — Cloudflare(cloudflared · Access · WARP)와 Kubernetes Gateway API의 통합 모델
 
 - 작성일: 2026-09-13
-- 구현 동기화: 2026-09-15
+- 구현 동기화: 2026-09-23
 - 상태: 구현된 `v1alpha1` 계약. 이 문서는 기능 경계와 소유권을 설명하며, 필드 이름·enum·기본값의 최종 기준은 `config/crd/bases/`의 생성 CRD다.
 - 입력: `docs/research/01..10-*.md`, `config/crd/bases/`, 구현 및 검증 결과.
 - API group: `flareway.bhyoo.com`. controllerName: `flareway.bhyoo.com/gateway-controller`.
@@ -264,7 +264,7 @@ Direct mode의 마지막 ingress rule은 hostname/path가 없는 catch-all이어
 | `AccessCustomPage` | `IdentityDenied`, `Forbidden`, `Login`, `Interstitial`; HTML/Liquid와 `contractVersion` |
 | `DevicePostureIntegration` | `WorkspaceOne`, `CrowdstrikeS2S`, `Uptycs`, `Intune`, `Kolide`, `TaniumS2S`, `SentinelOneS2S`, `CustomS2S`; 모든 credential은 Secret key reference |
 | `AccessInfrastructureTarget` | hostname + IPv4/IPv6, 각 address의 `virtualNetworkRef` 또는 external `virtualNetworkId` |
-| `ServiceToken` | account/zone endpoint, enable/duration, `Manual|OnExpiry` rotation; Secret keys `CF-Access-Client-Id`, `CF-Access-Client-Secret`과 grace-period previous keys |
+| `ServiceToken` | account/zone endpoint, enable/duration, `Manual|OnExpiry` rotation; Secret keys `CF-Access-Client-Id`, `CF-Access-Client-Secret`과 grace-period previous keys; managed 신규 생성은 create-intent journal Secret(`flareway-st-intent-<cr-uid>`)을 사용(§6.7) |
 
 ### 5.5 WARP와 typed private routes
 
@@ -649,6 +649,16 @@ status: {tokenId: "<uuid>", clientId: "<client-id>", expiresAt: "...", rotatedAt
 
 - Secret 키 `CF-Access-Client-Id`, `CF-Access-Client-Secret`. Secret이 사라져도 자동 회전 금지(기획서 §10.3); `rotation.mode: Manual`이면 `spec.rotation.requestedAt` 갱신으로 회전.
 
+**create-intent journal(구현됨).** 일회성 credential은 원격 create 응답에만 존재하므로, managed 신규 생성은 원격 CREATE **이전에** 의도를 내구성 journal에 기록한다. `AdoptById`, `ObserveOnly`, established(`status.tokenId` 존재) 경로는 journal을 만들지 않는다.
+
+- journal은 CR UID에서 파생된 이름(`flareway-st-intent-<cr-uid>`)의 controller-owned Secret이며, live CR UID·cluster UID(kube-system Namespace UID)·account CR UID+account ID·resolved zone ID·destination Secret·`spec.name`·attempt nonce를 바인딩한다. pending 중 이 tuple이 drift하면 `Conflict`로 fail-closed하며, 복원은 자동이 아니라 운영자의 명시적 조치(재생성 또는 journal 정리 후 재시도)가 필요하다.
+- 원격 create 이름은 `flareway/<clusterUID>/<ns>/<crUID>/<specName>-<nonce>`(200자 상한, specName 절단)로 attempt마다 고유하다. mutation은 journal nonce를 포함한 전체 이름의 정확한 일치에만 허용하고, prefix 일치는 미추적 충돌의 감지·block에만 쓰인다. create 응답이 다른 이름을 반환하면 credential을 먼저 checkpoint한 뒤 `Conflict`로 block한다.
+- journal은 `prepared`(create 미발송) → `dispatched`(원격 create 직전에 커밋) → (zone 복구 시) `retiring` phase를 거친다. `prepared`+원격 후보 0건만 create 발송을 정당화한다. `dispatched`+후보 0건은 "없음"이 아니라 "모름"이므로 mutation 없이 `RecoveryPending`으로 block/relist한다; 2건 이상 또는 foreign 바인딩은 `Conflict`.
+- pending 복구는 scope에 따라 다르다: account scope는 검증된 토큰에 `RotateServiceToken`으로 새 credential을 발급받아 capture하고 delete fallback은 없다. zone scope는 rotate가 없으므로 retiring ID/name을 journal에 checkpoint하고, 원격 삭제가 확인된 후에만 새 attempt로 재생성한다.
+- credential 판정은 Secret 존재가 아니라 `CF-Access-Client-Id`+`CF-Access-Client-Secret` 데이터 키와 `flareway.bhyoo.com/service-token-id` annotation이 모두 비어있지 않은 경우에만 성립한다. journal/credential read는 informer가 아니라 `APIReader` authoritative read다.
+- journal은 status checkpoint(`status.tokenId`+`Ready`) 성공 후에만 삭제된다. checkpoint 이후 잔여 journal은 reap 대상일 뿐 resume/rotate 근거가 아니다.
+- pending 상태의 CR 삭제는 `status.tokenId`가 비어 있어도 journal을 조회해 미완료 원격 토큰을 정리한다. journal이 없으면 attempt prefix로 scoped sweep을 시도하고, 미해결 dispatch·모호한 후보·원격 삭제 실패 시 finalizer를 유지하고 `CleanupBlocked`를 보고한다. `deletionPolicy: Orphan`은 원격을 유지한다.
+
 ### 6.8 `VirtualNetwork` / 6.9 `NetworkRoute` / 6.10 `HostnameRoute`
 
 ```yaml
@@ -930,7 +940,8 @@ Ledger:
 | Access app | 사전 생성한 `flareway-managed`, `flareway-owner-<digest>` tag. child bypass는 `flareway-bypass-<digest>` 추가. 내부 tag 이름은 35자 이하이며 Flareway가 생명주기를 관리 |
 | DNS record | 100자 이하의 결정적 `comment: "flareway <cluster>/<ns>/<name>"`; 긴 identity는 SHA-256 marker |
 | Tunnel | `name` prefix + `status.tunnelId`; 원격 metadata 없음 → 인수는 `AdoptById`만 |
-| Access policy/group/service token | `name` prefix `flareway/<cluster>/<ns>/<name>` |
+| Access policy/group | `name` prefix `flareway/<cluster>/<ns>/<name>` |
+| Service token | 수렴 후 canonical `flareway/<cluster>/<ns>/<specName>`; pending attempt는 `flareway/<cluster>/<ns>/<crUID>/<specName>-<nonce>` + journal Secret |
 | Posture rule | `description` |
 | teamnet route / hostname route / vnet | `comment` |
 | device profile / settings / org | 표식 없음 → ObserveOnly 기본, Managed는 `AdoptById`+expect 필수 |

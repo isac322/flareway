@@ -51,6 +51,9 @@ const (
 // ServiceTokenReconciler manages Cloudflare Access service tokens and their one-time Secrets.
 type ServiceTokenReconciler struct {
 	client.Client
+	// APIReader reads journals and credential Secrets authoritatively,
+	// bypassing the informer cache; SetupWithManager self-initializes it.
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -89,13 +92,33 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		_ = r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, privateErrorReason(err), err.Error(), serviceTokenStatusUpdate{})
 		return ctrl.Result{}, err
 	}
+	journalSecret, journal, journalErr := r.loadServiceTokenJournal(ctx, object)
+	if journalErr != nil {
+		if errors.Is(journalErr, errServiceTokenJournalForeign) {
+			return ctrl.Result{}, r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal is not controlled by this ServiceToken", serviceTokenStatusUpdate{})
+		}
+		return ctrl.Result{}, journalErr
+	}
 	scope, err := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
 	if err != nil {
-		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Invalid", err.Error(), serviceTokenStatusUpdate{})
+		if journal != nil && !journal.matchesSpecIdentity(object, account) {
+			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal identity does not match the live spec; refusing to resume", serviceTokenStatusUpdate{})
+		}
+		if journal == nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Invalid", err.Error(), serviceTokenStatusUpdate{})
+		}
+		// A verified-zone status flap must not strand a pending attempt: resume
+		// under the journaled zone binding after normal grant authorization.
+		scope = flarecloudflare.AccessScope{ZoneID: journal.zoneID}
+	} else if journal != nil && journal.matchesSpecIdentity(object, account) && journal.zoneID != scope.ZoneID {
+		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "journaled service token zone binding no longer resolves", serviceTokenStatusUpdate{})
 	}
 
 	id := object.Status.TokenID
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+		if journal != nil && object.Status.TokenID == "" {
+			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "RecoveryPending", "an unresolved service token journal blocks observation", serviceTokenStatusUpdate{})
+		}
 		if object.Spec.ExternalRef == nil {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Invalid", "ObserveOnly requires externalRef", serviceTokenStatusUpdate{})
 		}
@@ -121,7 +144,24 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if rejected, rejectErr := r.rejectServiceTokenSecretCollision(ctx, object, scope, flarecloudflare.ServiceToken{}); rejected || rejectErr != nil {
 		return ctrl.Result{}, rejectErr
 	}
-	clusterID := gateClusterID(ctx, r.Client)
+	clusterID, err := r.authoritativeClusterID(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if journal != nil {
+		if object.Status.TokenID != "" {
+			// The status checkpoint already landed: a lingering journal is
+			// reap-only and never grounds resume or rotation.
+			if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			return r.recoverServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal)
+		}
+	}
 	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
 		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TokenID,
@@ -185,22 +225,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return ctrl.Result{RequeueAfter: r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is adopted without rotating credentials", update)
 		}
 
-		if rejected, rejectErr := r.rejectServiceTokenSecretCollision(ctx, object, scope, remote); rejected || rejectErr != nil {
-			return ctrl.Result{}, rejectErr
-		}
-
-		issued, createErr := api.CreateServiceToken(ctx, scope, input)
-		if createErr != nil {
-			return ctrl.Result{}, r.finishRemoteError(ctx, object, createErr)
-		}
-		if err = r.writeInitialSecret(ctx, object, issued.ID, issued.ClientID, issued.ClientSecret); err != nil {
-			return ctrl.Result{}, err
-		}
-		remote, err = api.GetServiceToken(ctx, scope, issued.ID)
-		if err != nil {
-			remote = issued.ServiceToken
-		}
-		return ctrl.Result{RequeueAfter: r.requeueAfter(remote.ExpiresAt, remote.Duration, nil)}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true})
+		return r.createServiceToken(ctx, object, api, account, scope, input, clusterID)
 	}
 
 	remote, err = api.GetServiceToken(ctx, scope, id)
@@ -345,34 +370,6 @@ func (r *ServiceTokenReconciler) rejectServiceTokenSecretCollision(ctx context.C
 	return true, r.patchStatus(ctx, object, scope, remote, metav1.ConditionFalse, "Conflict", message, serviceTokenStatusUpdate{})
 }
 
-func (r *ServiceTokenReconciler) writeInitialSecret(ctx context.Context, object *v1alpha1.ServiceToken, tokenID, clientID, clientSecret string) error {
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-		if secret.UID != "" && !metav1.IsControlledBy(secret, object) {
-			return fmt.Errorf("secret %s/%s is not controlled by this ServiceToken", secret.Namespace, secret.Name)
-		}
-		if err := controllerutil.SetControllerReference(object, secret, r.Scheme); err != nil {
-			return err
-		}
-		prepareServiceTokenSecret(secret)
-		secret.Annotations[v1alpha1.ServiceTokenIDAnnotation] = tokenID
-		delete(secret.Annotations, v1alpha1.ServiceTokenPreviousClientSecretExpiresAtAnnotation)
-		delete(secret.Annotations, v1alpha1.ServiceTokenRotatedAtAnnotation)
-		delete(secret.Annotations, v1alpha1.ServiceTokenRefreshExpiresAtAnnotation)
-		delete(secret.Data, v1alpha1.ServiceTokenPreviousClientIDKey)
-		delete(secret.Data, v1alpha1.ServiceTokenPreviousClientSecretKey)
-		secret.Data[v1alpha1.ServiceTokenClientIDKey] = []byte(clientID)
-		secret.Data[v1alpha1.ServiceTokenClientSecretKey] = []byte(clientSecret)
-		if object.Spec.Rotation.RequestedAt != nil {
-			secret.Annotations[v1alpha1.ServiceTokenRotationRequestAnnotation] = object.Spec.Rotation.RequestedAt.UTC().Format(time.RFC3339Nano)
-		} else {
-			delete(secret.Annotations, v1alpha1.ServiceTokenRotationRequestAnnotation)
-		}
-		return nil
-	})
-	return err
-}
-
 func (r *ServiceTokenReconciler) writeRotatedSecret(ctx context.Context, object *v1alpha1.ServiceToken, tokenID, clientID, clientSecret string, previousExpiresAt, rotatedAt time.Time) error {
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
@@ -419,7 +416,7 @@ func prepareServiceTokenSecret(secret *corev1.Secret) {
 
 func (r *ServiceTokenReconciler) cleanupPreviousCredentials(ctx context.Context, object *v1alpha1.ServiceToken) (*time.Time, error) {
 	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
 		return nil, err
 	}
 	if !metav1.IsControlledBy(secret, object) {
@@ -448,7 +445,7 @@ func (r *ServiceTokenReconciler) rotationApplied(ctx context.Context, object *v1
 		return false, nil, nil
 	}
 	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
 		return false, nil, err
 	}
 	if !metav1.IsControlledBy(secret, object) {
@@ -468,7 +465,7 @@ func (r *ServiceTokenReconciler) rotationApplied(ctx context.Context, object *v1
 
 func (r *ServiceTokenReconciler) clearRefreshExpiry(ctx context.Context, object *v1alpha1.ServiceToken) error {
 	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
 		return err
 	}
 	if !metav1.IsControlledBy(secret, object) {
@@ -484,7 +481,7 @@ func (r *ServiceTokenReconciler) clearRefreshExpiry(ctx context.Context, object 
 
 func (r *ServiceTokenReconciler) recordRefreshExpiry(ctx context.Context, object *v1alpha1.ServiceToken, expiresAt time.Time) error {
 	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
 		return err
 	}
 	if !metav1.IsControlledBy(secret, object) {
@@ -500,7 +497,7 @@ func (r *ServiceTokenReconciler) recordRefreshExpiry(ctx context.Context, object
 
 func (r *ServiceTokenReconciler) effectiveRefreshExpiry(ctx context.Context, object *v1alpha1.ServiceToken, remote time.Time) time.Time {
 	secret := new(corev1.Secret)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, secret); err != nil {
 		return remote
 	}
 	refreshed, err := time.Parse(time.RFC3339Nano, secret.Annotations[v1alpha1.ServiceTokenRefreshExpiresAtAnnotation])
@@ -512,7 +509,7 @@ func (r *ServiceTokenReconciler) effectiveRefreshExpiry(ctx context.Context, obj
 
 func (r *ServiceTokenReconciler) recoverTokenID(ctx context.Context, object *v1alpha1.ServiceToken) (string, error) {
 	var secret corev1.Secret
-	err := r.Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, &secret)
+	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, &secret)
 	if apierrors.IsNotFound(err) {
 		return "", nil
 	}
@@ -524,29 +521,50 @@ func (r *ServiceTokenReconciler) recoverTokenID(ctx context.Context, object *v1a
 	}
 	return secret.Annotations[v1alpha1.ServiceTokenIDAnnotation], nil
 }
-
 func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1alpha1.ServiceToken) error {
 	if !controllerutil.ContainsFinalizer(object, v1alpha1.ServiceTokenFinalizer) {
 		return nil
 	}
-	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete && object.Status.TokenID != "" && object.Status.OwnershipVerified {
-		api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
-		if err != nil {
-			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
-		}
-		scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
-		if scopeErr != nil {
-			if object.Status.ZoneID == "" {
-				return r.patchCleanupBlocked(ctx, object, "Invalid", scopeErr)
+	journalSecret, journal, journalErr := r.loadServiceTokenJournal(ctx, object)
+	if journalErr != nil && !errors.Is(journalErr, errServiceTokenJournalForeign) {
+		return r.patchCleanupBlocked(ctx, object, "JournalError", journalErr)
+	}
+	attemptMarked := controllerutil.ContainsFinalizer(object, serviceTokenAttemptFinalizer)
+	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
+		if object.Status.TokenID != "" && object.Status.OwnershipVerified {
+			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
+			if err != nil {
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
-			scope.ZoneID = object.Status.ZoneID
+			scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
+			if scopeErr != nil {
+				if object.Status.ZoneID == "" {
+					return r.patchCleanupBlocked(ctx, object, "Invalid", scopeErr)
+				}
+				scope.ZoneID = object.Status.ZoneID
+			}
+			if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+			}
 		}
-		if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
-			return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+		if journal != nil {
+			if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+			}
+		} else if object.Status.TokenID == "" && attemptMarked {
+			if err := r.cleanupUntrackedServiceTokenAttempts(ctx, object); err != nil {
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+			}
+		}
+	}
+	if journalSecret != nil {
+		if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
+			return r.patchCleanupBlocked(ctx, object, "JournalError", err)
 		}
 	}
 	base := client.MergeFrom(object.DeepCopy())
 	controllerutil.RemoveFinalizer(object, v1alpha1.ServiceTokenFinalizer)
+	controllerutil.RemoveFinalizer(object, serviceTokenAttemptFinalizer)
 	return r.Patch(ctx, object, base)
 }
 
@@ -651,6 +669,9 @@ func (r *ServiceTokenReconciler) now() time.Time {
 
 // SetupWithManager registers the ServiceToken controller and account watch.
 func (r *ServiceTokenReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ServiceToken{}, serviceTokenAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.ServiceToken).Spec.AccountRef.Name}
 	}); err != nil {
