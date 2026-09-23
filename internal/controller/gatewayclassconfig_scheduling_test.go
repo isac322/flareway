@@ -774,6 +774,16 @@ var _ = ginkgo.Describe("GatewayClassConfig scheduling propagation", ginkgo.Orde
 	})
 
 	ginkgo.It("opts out of and back into the default anti-affinity on the live Deployment", func() {
+		// Precondition: the live Deployment already carries the default term, so
+		// the opt-out below must remove it rather than create an opted-out object.
+		gomega.Eventually(func(g gomega.Gomega) {
+			var deployment appsv1.Deployment
+			g.Expect(testClient.Get(testContext, dataplaneKey, &deployment)).To(gomega.Succeed())
+			affinity := deployment.Spec.Template.Spec.Affinity
+			g.Expect(affinity).NotTo(gomega.BeNil())
+			g.Expect(affinity.PodAntiAffinity).NotTo(gomega.BeNil())
+			g.Expect(affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(gomega.HaveLen(1))
+		}).WithTimeout(30 * time.Second).WithPolling(250 * time.Millisecond).Should(gomega.Succeed())
 		var config v1alpha1.GatewayClassConfig
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: configName}, &config)).To(gomega.Succeed())
 		config.Spec.Scheduling.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{}

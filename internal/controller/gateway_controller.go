@@ -43,8 +43,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/util/csaupgrade"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -1595,7 +1593,15 @@ func reconcileGatewayOwnedObject(
 		// the server response does not leak defaults and status into desired.
 		created := desired.DeepCopyObject().(client.Object)
 		if err := kube.Create(ctx, created, client.FieldOwner(gatewayFieldManager)); err == nil {
-			current = created
+			// Migrate the Create-time Update managedFields entry to Apply now so
+			// the next reconcile can prune fields. Best-effort: a failure is
+			// retried by the next reconcile. Returning here keeps the first
+			// reconcile free of an Apply that would race the status writes other
+			// controllers make on a fresh object.
+			if err := migrateGatewayCreateOwnership(ctx, kube, created); err != nil {
+				ctrl.LoggerFrom(ctx).Error(err, "Unable to migrate field ownership on created object", "object", client.ObjectKeyFromObject(created))
+			}
+			return nil
 		} else if !apierrors.IsAlreadyExists(err) {
 			return err
 		} else if err := kube.Get(ctx, key, current); err != nil {
@@ -1659,35 +1665,57 @@ func reconcileGatewayOwnedObject(
 // server-side applies can remove fields the object was created with. Only
 // objects carrying the Update entry without any Apply entry are migrated;
 // objects already applied by an earlier controller version keep their
-// ownership unchanged. The patch pins resourceVersion, so a concurrent write
-// fails with a conflict and the next reconcile retries.
+// ownership unchanged. The JSON patch touches only the gatewayFieldManager
+// entry and does not pin resourceVersion, so concurrent writes by other
+// managers neither conflict nor get dropped. If the entry moved between the
+// read and the patch, the object is re-read and the patch retried a small
+// bounded number of times.
 func migrateGatewayCreateOwnership(ctx context.Context, kube client.Client, object client.Object) error {
-	var hasUpdate bool
-	for _, entry := range object.GetManagedFields() {
-		if entry.Manager != gatewayFieldManager {
-			continue
+	candidate := object
+	var lastErr error
+	for range 3 {
+		index := -1
+		migrated := false
+		for i, entry := range candidate.GetManagedFields() {
+			if entry.Manager != gatewayFieldManager {
+				continue
+			}
+			switch entry.Operation {
+			case metav1.ManagedFieldsOperationApply:
+				migrated = true
+			case metav1.ManagedFieldsOperationUpdate:
+				if entry.Subresource == "" && index < 0 {
+					index = i
+				}
+			}
 		}
-		switch entry.Operation {
-		case metav1.ManagedFieldsOperationApply:
+		if migrated || index < 0 {
 			return nil
-		case metav1.ManagedFieldsOperationUpdate:
-			hasUpdate = hasUpdate || entry.Subresource == ""
 		}
+		ops := []map[string]any{
+			{"op": "test", "path": fmt.Sprintf("/metadata/managedFields/%d/manager", index), "value": gatewayFieldManager},
+			{"op": "test", "path": fmt.Sprintf("/metadata/managedFields/%d/operation", index), "value": string(metav1.ManagedFieldsOperationUpdate)},
+			{"op": "replace", "path": fmt.Sprintf("/metadata/managedFields/%d/operation", index), "value": string(metav1.ManagedFieldsOperationApply)},
+		}
+		patch, err := json.Marshal(ops)
+		if err != nil {
+			return fmt.Errorf("compute %T %s field ownership migration: %w", object, client.ObjectKeyFromObject(object), err)
+		}
+		lastErr = kube.Patch(ctx, candidate, client.RawPatch(types.JSONPatchType, patch))
+		if lastErr == nil {
+			// Keep the caller's object current so a following Apply does not
+			// reuse the pre-patch resourceVersion.
+			object.SetResourceVersion(candidate.GetResourceVersion())
+			object.SetManagedFields(candidate.GetManagedFields())
+			return nil
+		}
+		fresh := candidate.DeepCopyObject().(client.Object)
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(candidate), fresh); err != nil {
+			return fmt.Errorf("re-read %T %s for field ownership migration: %w", object, client.ObjectKeyFromObject(object), err)
+		}
+		candidate = fresh
 	}
-	if !hasUpdate {
-		return nil
-	}
-	patch, err := csaupgrade.UpgradeManagedFieldsPatch(object, sets.New(gatewayFieldManager), gatewayFieldManager)
-	if err != nil {
-		return fmt.Errorf("compute %T %s field ownership migration: %w", object, client.ObjectKeyFromObject(object), err)
-	}
-	if patch == nil {
-		return nil
-	}
-	if err := kube.Patch(ctx, object, client.RawPatch(types.JSONPatchType, patch)); err != nil {
-		return fmt.Errorf("migrate %T %s field ownership to server-side apply: %w", object, client.ObjectKeyFromObject(object), err)
-	}
-	return nil
+	return fmt.Errorf("migrate %T %s field ownership to server-side apply: %w", object, client.ObjectKeyFromObject(object), lastErr)
 }
 
 func replaceGatewayServicePorts(

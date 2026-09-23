@@ -95,9 +95,9 @@ var _ = ginkgo.Describe("Gateway-owned object field ownership", func() {
 		}).WithTimeout(30 * time.Second).WithPolling(250 * time.Millisecond).Should(gomega.Succeed())
 	}
 
-	gatewayManagerEntries := func(deployment *appsv1.Deployment, operation metav1.ManagedFieldsOperationType) []metav1.ManagedFieldsEntry {
+	gatewayManagerEntries := func(object client.Object, operation metav1.ManagedFieldsOperationType) []metav1.ManagedFieldsEntry {
 		var entries []metav1.ManagedFieldsEntry
-		for _, entry := range deployment.ManagedFields {
+		for _, entry := range object.GetManagedFields() {
 			if entry.Manager == gatewayFieldManager && entry.Operation == operation && entry.Subresource == "" {
 				entries = append(entries, entry)
 			}
@@ -157,5 +157,48 @@ var _ = ginkgo.Describe("Gateway-owned object field ownership", func() {
 		var deployment appsv1.Deployment
 		gomega.Expect(testClient.Get(testContext, deploymentKey, &deployment)).To(gomega.Succeed())
 		gomega.Expect(gatewayManagerEntries(&deployment, metav1.ManagedFieldsOperationUpdate)).To(gomega.HaveLen(1), "earlier-controller Update entry must not be migrated")
+	})
+
+	ginkgo.It("migrates a stale Create-time entry without dropping concurrent status ownership", func() {
+		current, _ := deploymentDataplaneObjects(namespaceName, "dataplane")
+		deployment := current.(*appsv1.Deployment)
+		gomega.Expect(testClient.Create(testContext, deployment, client.FieldOwner(gatewayFieldManager))).To(gomega.Succeed())
+		gomega.Expect(gatewayManagerEntries(deployment, metav1.ManagedFieldsOperationUpdate)).To(gomega.HaveLen(1))
+
+		// Keep the Create-time view, then let another manager write status: the
+		// live object gains a resourceVersion and a status managedFields entry
+		// the stale copy does not know about.
+		stale := deployment.DeepCopy()
+		deployment.Status.ObservedGeneration = 1
+		gomega.Expect(testClient.Status().Update(testContext, deployment, client.FieldOwner("status-writer"))).To(gomega.Succeed())
+		gomega.Expect(deployment.ResourceVersion).NotTo(gomega.Equal(stale.ResourceVersion))
+
+		gomega.Expect(migrateGatewayCreateOwnership(testContext, testClient, stale)).To(gomega.Succeed())
+
+		var migrated appsv1.Deployment
+		gomega.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(deployment), &migrated)).To(gomega.Succeed())
+		gomega.Expect(gatewayManagerEntries(&migrated, metav1.ManagedFieldsOperationApply)).To(gomega.HaveLen(1))
+		gomega.Expect(gatewayManagerEntries(&migrated, metav1.ManagedFieldsOperationUpdate)).To(gomega.BeEmpty())
+		var statusEntries []metav1.ManagedFieldsEntry
+		for _, entry := range migrated.ManagedFields {
+			if entry.Manager == "status-writer" && entry.Subresource == "status" {
+				statusEntries = append(statusEntries, entry)
+			}
+		}
+		gomega.Expect(statusEntries).To(gomega.HaveLen(1), "the other manager's status entry must survive the migration")
+	})
+
+	ginkgo.It("leaves a created object Apply-owned on the first reconcile", func() {
+		gateway := httpGateway(gatewayKey, className)
+		gomega.Expect(testClient.Create(testContext, gateway)).To(gomega.Succeed())
+
+		_, desired := configMapDataplaneObjects(namespaceName, "dataplane")
+		gomega.Expect(reconcileGatewayOwnedObject(testContext, testClient, testClient.Scheme(), gateway, desired)).To(gomega.Succeed())
+
+		var created corev1.ConfigMap
+		gomega.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(desired), &created)).To(gomega.Succeed())
+		gomega.Expect(created.Data).To(gomega.Equal(map[string]string{"desired": "value"}))
+		gomega.Expect(gatewayManagerEntries(&created, metav1.ManagedFieldsOperationApply)).To(gomega.HaveLen(1))
+		gomega.Expect(gatewayManagerEntries(&created, metav1.ManagedFieldsOperationUpdate)).To(gomega.BeEmpty())
 	})
 })

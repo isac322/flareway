@@ -67,10 +67,11 @@ For local development, `go run ./cmd --zap-devel=true` restores console output a
 
 This release adds `GatewayClassConfig.spec.scheduling` and a default soft pod anti-affinity on `kubernetes.io/hostname` for dataplane pods.
 
-- Re-apply the CRDs server-side before using `spec.scheduling`. Helm does not upgrade `crds/` on `helm upgrade`; with the previous CRDs the field is pruned silently.
-- The first reconcile after the controller update rolls each dataplane Deployment once to add the default anti-affinity. `maxUnavailable: 0` keeps the old ReplicaSet available during the surge, and the rollout also re-spreads replicas that were co-located.
+- Re-apply the CRDs server-side before using `spec.scheduling`. Helm does not upgrade `crds/` on `helm upgrade`. With the previous CRDs, clients that use strict field validation (the `kubectl` default) reject the field, and clients without strict validation have it pruned silently, so the setting has no effect.
+- The first reconcile after the controller update rolls each dataplane Deployment once to add the default anti-affinity. `maxUnavailable: 0` keeps the old ReplicaSet available during the surge. The new pods are scheduled with the soft anti-affinity, so replicas that were co-located can move to separate nodes when another eligible node has capacity; this is a preference, not a guarantee.
 - Cloudflare-mode Gateways report `Programmed=False` while the new ReplicaSet is not yet Available; the condition returns to `True` after the rollout and xDS ACK.
 - Manual edits to a dataplane Deployment's `affinity` are reverted by server-side apply. Manage placement through `GatewayClassConfig.spec.scheduling`.
+- Gateway-owned objects that this version creates are owned by server-side apply only, so removing a field from the desired state (for example a scheduling field) removes it from the live object. Objects created by earlier versions keep their existing field ownership; scheduling fields added to them by this version can still be removed.
 
 ## Controller ownership changes
 
