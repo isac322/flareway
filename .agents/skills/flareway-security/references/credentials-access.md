@@ -12,9 +12,11 @@ Discovery hints:
   `internal/controller/gateway_controller.go` and
   `accessapplication_controller.go`; key/label constants in
   `api/v1alpha1/accessapplication_types.go`.
-- ServiceToken Secret: `rejectServiceTokenSecretCollision`, `writeInitialSecret`,
+- ServiceToken Secret: `rejectServiceTokenSecretCollision`,
   `writeRotatedSecret`, `cleanupPreviousCredentials` in
-  `internal/controller/servicetoken_controller.go`.
+  `internal/controller/servicetoken_controller.go`; `writeInitialSecret`,
+  `reserveServiceTokenDestination`, `committedServiceTokenCredential` in
+  `internal/controller/servicetoken_recovery.go`.
 - SCIM Secret: `validateSCIMSecretDestination`, `reserveSCIMSecret`,
   `captureSCIMSecret` in `internal/controller/identityprovider_controller.go`.
 
@@ -124,9 +126,16 @@ Discovery hints:
   `findOwnedSCIMCreateJournal`, `prepareSCIMSecretForEnable`, `captureSCIMSecret`,
   `recoverSCIMProviderID` in `internal/controller/identityprovider_controller.go`;
   `scimConfig.secretRef` immutability CEL in `api/v1alpha1/identityprovider_types.go`.
-- ServiceToken: `writeInitialSecret`, `writeRotatedSecret`,
-  `cleanupPreviousCredentials`, `rotationApplied` in
-  `internal/controller/servicetoken_controller.go`; key/annotation constants in
+- ServiceToken: `writeRotatedSecret`, `cleanupPreviousCredentials`,
+  `rotationApplied`, `recoverTokenID` in
+  `internal/controller/servicetoken_controller.go`; journal and recovery
+  helpers (`createServiceTokenJournal`, `recoverServiceToken`,
+  `resumePreparedServiceToken`, `dispatchServiceTokenCreate`,
+  `resumeDispatchedServiceToken`, `resumeRetiringServiceToken`,
+  `reserveServiceTokenDestination`, `writeInitialSecret`,
+  `committedServiceTokenCredential`, `cleanupPendingServiceTokenJournal`,
+  `cleanupUntrackedServiceTokenAttempts`) in
+  `internal/controller/servicetoken_recovery.go`; key/annotation constants in
   `api/v1alpha1/servicetoken_types.go`.
 
 Procedure:
@@ -145,33 +154,55 @@ Procedure:
    bound to the same remote ID, do not overwrite it; if bound to a different
    remote ID, fail. If capture fails, SCIM is disabled again so the next
    reconcile retries the enable.
-3. ServiceToken captures after creating. `rejectServiceTokenSecretCollision`
-   runs before `CreateServiceToken`, then `writeInitialSecret` captures the
-   returned credential and stamps the `service-token-id` annotation, and the
-   status patch records `tokenID` + `ownershipVerified`. There is no
-   pre-create journal: a crash between the remote create and the Secret write
-   orphans the remote token and loses its secret, and `recoverTokenID` only
-   resumes when the Secret already carries the annotation. `secretRef` is not
-   immutable for ServiceToken — the `secretRef` immutability CEL is SCIM-only —
-   so the controller-reference collision check is the only destination guard.
-   Do not document a ServiceToken pre-capture journal or `secretRef`
-   immutability that does not exist.
+3. ServiceToken journals before creating. A managed fresh create first
+   persists a private attempt marker on the CR, then writes a dedicated
+   journal Secret (`flareway-st-intent-<cr-uid>`) binding the CR UID, cluster
+   UID, account UID/ID, resolved zone ID, destination Secret, `spec.name`,
+   and a random per-attempt nonce, and reserves the destination Secret —
+   all before the remote create. The remote create name is
+   `flareway/<clusterUID>/<namespace>/<crUID>/<specName>-<nonce>`; the journal
+   commits `dispatched` before the request is sent, so a crash between the
+   remote create and the credential write resumes through
+   `recoverServiceToken` instead of blindly re-creating. Resume is
+   fail-closed: `prepared` + zero remote candidates is the only state that
+   may send a create; `dispatched` + zero candidates blocks with
+   `RecoveryPending` (absence is unknown, not absent); multiple or foreign
+   candidates block with `Conflict`. Account scope recovers via
+   `RotateServiceToken` on the verified token; zone scope has no rotate, so
+   the retiring ID/name is journaled and a replacement is created only after
+   the delete is confirmed. `writeInitialSecret` captures the credential and
+   stamps the `service-token-id` annotation; `committedServiceTokenCredential`
+   requires both data keys plus the annotation before any state counts as
+   captured. The journal is reaped only after the status checkpoint
+   (`tokenID` + `ownershipVerified`). `secretRef` is not immutable for
+   ServiceToken — the `secretRef` immutability CEL is SCIM-only — so the
+   controller-reference collision check plus the journal's destination
+   binding are the destination guards; a `secretRef` edit during a pending
+   attempt fails closed with `Conflict`.
 4. An immutable destination Secret cannot journal or capture — SCIM detects it
-   and fails early rather than losing the one-time value.
+   and fails early rather than losing the one-time value; ServiceToken
+   reservation likewise rejects an immutable or foreign destination before
+   any remote mutation.
 5. On ServiceToken rotation, retain the previous client ID/secret only until
    its recorded expiry, then remove those keys; never accumulate historical
    credentials.
 6. For SCIM, the destination binding (`scimConfig.secretRef`) is immutable once
    set — keep the CEL rule and the controller's ownership check aligned so a
    rebound Secret cannot siphon a credential.
+7. An established ServiceToken (`status.tokenId` recorded) whose credential
+   Secret is lost reports `SecretMissing` and never rotates or re-creates on
+   its own; recovery is an explicit `spec.rotation.requestedAt` rotation or
+   administrative restore of the Secret. A leftover journal after the status
+   checkpoint is reap-only and never grounds a resume or rotation.
 
 Verification:
 
 - SCIM crash-recovery tests: a reconcile interrupted between remote create and
   capture must resume via the journal and still record the credential.
-- ServiceToken recovery tests: a Secret carrying the `service-token-id`
-  annotation recovers ownership; a missing Secret surfaces `SecretMissing`
-  instead of silently re-creating.
+- ServiceToken recovery tests: a reconcile interrupted between remote create
+  and capture must resume through the journal (rotate on account scope,
+  verified delete+create on zone scope) without a second create; a missing
+  established Secret surfaces `SecretMissing` instead of silently re-creating.
 - Rotation tests: previous-credential keys disappear after expiry and the Secret
   stays bound to the same token ID annotation.
 

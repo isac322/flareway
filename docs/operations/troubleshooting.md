@@ -22,6 +22,7 @@ kubectl describe accessapplication -n <namespace> <name>
 | `ConfigApplied=False` | Compare `CloudflareTunnel.status.configVersion.desired` and `.applied`; inspect data-plane Pods and cloudflared `/config` reachability. Flareway does not mark the Gateway programmed until every active Pod converges. |
 | `DNSReady=False` | The zone is not granted, the zone was not discovered, or an existing record has a foreign ownership comment. Flareway omits DNS tags and will not overwrite a foreign record. |
 | `CleanupBlocked=True` | A finalizer is preserving teardown order. Remove remaining `NetworkRoute`/`HostnameRoute` references or restore the Cloudflare permission needed for deletion. Do not strip the finalizer unless you accept remote leaks or exposed traffic. |
+| `Ready=False`, reason `RecoveryPending` | A ServiceToken create attempt was journaled as dispatched but the remote token is not yet visible, or a zone-scope recovery is waiting for the retiring token's deletion to be confirmed. Absence in the remote list is treated as unknown, not absent: the controller blocks and re-lists instead of issuing a blind create or rotate. This bounded non-convergence is intentional fail-closed behavior, not a stuck bug. |
 | `PrivateListenerDegraded=True` | A private listener uses the Pod-IP fallback instead of loopback. Verify the NetworkPolicy before treating it as ready. |
 
 Deleting an `AccessApplication` never makes a protected route public. The route remains blocked unless no Access application targets it and `CloudflareAccount.spec.grants[].unprotectedHostnames` explicitly permits the hostname.
@@ -115,8 +116,7 @@ For WARP Connector HA, `AWS` requires `highAvailability.enabled: true` and `aws.
 ### Secret recovery
 
 One-time values are not recoverable from Cloudflare and never appear in status:
-
-- `ServiceToken` writes `CF-Access-Client-Id` and `CF-Access-Client-Secret`, plus previous keys during a rotation grace period;
+- `ServiceToken` writes `CF-Access-Client-Id` and `CF-Access-Client-Secret`, plus previous keys during a rotation grace period; a pending create is journaled (see "ServiceToken create journal" below);
 - SaaS application creation stores the generated client secret in the controller-owned Secret referenced by `status.saas.clientSecretRef`;
 - SCIM HTTP Basic passwords, bearer tokens, OAuth client secrets, and Access service tokens come from Secret or `ServiceToken` references;
 - identity-provider and posture-integration credentials use Secret key references;
@@ -125,6 +125,16 @@ One-time values are not recoverable from Cloudflare and never appear in status:
 For `IdentityProvider` SCIM, `spec.scimConfig.secretRef` is immutable after it is set. Flareway reserves the owned Secret before creating or enabling SCIM, journals ambiguous create responses, and verifies that the stored token is bound to the same remote provider ID. Replace the resource through a deliberate migration if the Secret destination must change.
 
 If one of these Secrets is missing, restore it from the original secure source or create a deliberate rotation/replacement plan. Adoption does not rotate credentials, and the controller cannot reconstruct a create-only secret from status.
+
+### ServiceToken create journal
+
+A managed fresh create records its intent in a controller-owned journal Secret (`flareway-st-intent-<cr-uid>`) and reserves the credential destination before the remote create. The journal binds the CR UID, cluster UID, account UID and account ID, resolved zone ID, destination Secret, `spec.name`, and a per-attempt nonce; the remote create name is `flareway/<clusterUID>/<namespace>/<crUID>/<specName>-<nonce>`.
+
+- `Ready=False`, reason `RecoveryPending`: a dispatched create is not yet visible in the remote list, or a zone-scope recovery is waiting for the retiring token's confirmed deletion. The controller re-lists and never re-creates blindly; the state resolves on its own once the remote becomes visible.
+- `Ready=False`, reason `Conflict` on a pending attempt: the journal's identity tuple drifted (a `spec.zone`, `spec.accountRef`, `spec.name`, or `spec.secretRef` edit, or an account/cluster identity change), the journal or destination Secret is foreign-owned or corrupt, or remote candidates are ambiguous. Recovery is administrative: fix the drifted field back or delete and recreate the ServiceToken so a fresh journal is bound. Flareway never adopts an ambiguous or foreign token.
+- Deleting a pending ServiceToken still cleans up journaled remote tokens even when `status.tokenId` is empty. If the journal is missing, a scoped prefix sweep runs; ambiguity or a failed remote delete keeps the finalizer with `CleanupBlocked` rather than leaking the token.
+- After the status checkpoint the journal is reaped. A journal left behind after checkpoint is reap-only and never grounds a resume or rotation.
+- An established ServiceToken whose credential Secret is lost reports `SecretMissing` and never rotates or recreates on its own; restore the Secret from the original secure source or request an explicit rotation via `spec.rotation.requestedAt`.
 
 Cloudflare response envelopes (`success`, `errors`, `messages`, `result`, pagination) and server-owned fields are intentionally absent from spec. Diagnose them through controller conditions and bounded status rather than adding untyped fields to manifests.
 
