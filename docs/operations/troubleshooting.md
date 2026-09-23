@@ -99,7 +99,7 @@ JSON logs can be filtered with `jq`, for example:
 kubectl -n flareway-system logs deployment/flareway-controller-manager -c manager | jq -cR 'fromjson? | select(.level == "error")'
 ```
 
-Integer levels add more controller-runtime detail: `logging.level=1` (or `--zap-log-level=1`) enables `V(1)`, and integers `2` or higher also disable the production log sampler. The chart accepts integers `1` through `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log full API request and response bodies, including Secret contents; do not use them outside isolated debugging.
+Integer levels add more controller-runtime detail: `logging.level=1` (or `--zap-log-level=1`) enables `V(1)`, and integers `2` or higher also disable the production log sampler. The chart accepts integers `1` through `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents; do not use them outside isolated debugging.
 
 Rare client-go (klog) lines keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases, and like gRPC's rare ERROR lines they are not JSON. The `-R` and `fromjson?` in the example above skip those lines; plain `jq` stops at the first non-JSON line.
 

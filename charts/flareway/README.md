@@ -94,6 +94,6 @@ In production mode the controller-runtime sampler applies: for each (level, mess
 
 Two documented exceptions do not use the configured format. Rare client-go (klog) lines, such as `HTTP2 has been explicitly disabled` or invalid `HTTP2_*` environment warnings, keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases. gRPC's own logger may also print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`). Neither is JSON.
 
-The chart schema caps integer levels at `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log full API request and response bodies, including Secret contents. Do not use them outside isolated debugging.
+The chart schema caps integer levels at `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents. Do not use them outside isolated debugging.
 
 Only these three logging knobs are exposed; other zap options such as stacktrace level, time encoding, or extra args are not configurable through the chart.
