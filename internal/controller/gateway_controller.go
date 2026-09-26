@@ -291,8 +291,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// including conformance mode — and record the rejection without
 		// publishing a new snapshot. AUD revocation latches and owned child
 		// resources are deliberately retained.
+		programmedReason := gatewayv1.GatewayReasonInvalid
 		programmedMessage := "Gateway configuration is invalid"
 		if block != nil {
+			// Admission already carries the config verdict; Programmed names
+			// the tunnel state the Gateway is actually waiting on.
+			programmedReason = gatewayv1.GatewayReasonPending
 			programmedMessage += "; " + block.message
 		}
 		r.clearSnapshot(req.NamespacedName)
@@ -305,7 +309,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: gateway.Generation,
-			Reason:             string(gatewayv1.GatewayReasonInvalid),
+			Reason:             string(programmedReason),
 			Message:            programmedMessage,
 			LastTransitionTime: now,
 		})
@@ -330,6 +334,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
+		}
+		if block != nil && !block.terminal {
+			return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 		}
 		return ctrl.Result{}, nil
 	}
