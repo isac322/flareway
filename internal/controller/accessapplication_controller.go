@@ -125,6 +125,9 @@ func (r *AccessApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
+		if err := releaseGoneObject(r.Invalidator, "AccessApplication", req.NamespacedName, err); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.collectOrphanedHandoffs(ctx, req.NamespacedName, nil)
 	}
 	if err := r.collectOrphanedHandoffs(ctx, req.NamespacedName, &application); err != nil {
@@ -176,24 +179,31 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "RefNotPermitted", "Cloudflare Access client is unavailable: "+err.Error()))
 	}
-	policyIDs, err := r.resolvePolicies(ctx, application, resolved.account, remote)
+	var referenceChecks remoteReferenceChecks
+	policyIDs, err := r.resolvePolicies(ctx, application, resolved.account, remote, &referenceChecks)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
-	idpIDs, err := r.resolveIdentityProviders(ctx, application, resolved.account, remote)
+	idpIDs, err := r.resolveIdentityProviders(ctx, application, resolved.account, remote, &referenceChecks)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
-	customPageIDs, err := r.resolveCustomPages(ctx, application, resolved.account, remote)
+	customPageIDs, err := r.resolveCustomPages(ctx, application, resolved.account, remote, &referenceChecks)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
-	scimConfig, err := r.resolveApplicationSCIMConfig(ctx, application, resolved.account, remote)
+	scimConfig, err := r.resolveApplicationSCIMConfig(ctx, application, resolved.account, remote, &referenceChecks)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
 
 	if _, latched := application.Annotations[accessApplicationRevocationAnnotation]; latched {
+		// A latched revocation goes to Cloudflare regardless of the gate, so
+		// the referenced remote objects are confirmed here, before any token
+		// is revoked or the latch released.
+		if err := referenceChecks.run(ctx); err != nil {
+			return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
+		}
 		acknowledged, message, reason, err := r.revocationAcknowledged(ctx, application)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -270,6 +280,9 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			return ctrl.Result{}, err
 		}
 	}
+	if err := referenceChecks.run(ctx); err != nil {
+		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
+	}
 	observed, err := r.reconcileRemoteApplication(ctx, remote, resolved.scope, application, input, ownerTag)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Pending", "Remote Access application reconciliation failed: "+err.Error()))
@@ -298,9 +311,13 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	status := r.desiredStatus(application, resolved.compilation, observed.ID, children, programmed)
 	applyObservedApplicationStatus(&status, application, resolved.scope, observed, ownerTags)
 	if programmed {
-		status.AppliedHash = desiredHash
-		appliedAt := metav1.NewTime(r.now())
-		status.AppliedAt = &appliedAt
+		// appliedAt moves only with appliedHash; an unchanged re-verify is
+		// recorded in the latch below. ObserveOnly applies nothing, so it
+		// records no stamp at all.
+		status.AppliedHash, status.AppliedAt = "", nil
+		if desiredHash != "" {
+			status.AppliedHash, status.AppliedAt, _ = nextGateStamp(application.Status.AppliedHash, application.Status.AppliedAt, newGateStamp(desiredHash, r.now()))
+		}
 		clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	}
 	if err := r.patchStatus(ctx, application, status); err != nil {
@@ -309,6 +326,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
+	r.Invalidator.MarkVerified("AccessApplication", client.ObjectKeyFromObject(application), desiredHash, r.now())
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 

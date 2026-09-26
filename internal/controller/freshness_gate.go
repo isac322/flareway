@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -145,12 +146,27 @@ func evaluateGateWithHash(
 ) gateDecision {
 	invalidated := latch.IsInvalidated(kind, key)
 
+	// The gate's age is measured from the most recent confirmation of this
+	// exact desired hash: either the persisted appliedAt, or a later re-verify
+	// kept in memory so that an unchanged re-verify need not write status. A
+	// restart loses the in-memory record, which only ever makes the age
+	// larger and the gate more likely to close.
 	var applied time.Time
 	if appliedAt != nil {
 		applied = appliedAt.Time
 	}
+	if verified, ok := latch.VerifiedAt(kind, key, desiredHash); ok && verified.After(applied) {
+		applied = verified
+	}
 
 	gate := policy.Evaluate(grade, appliedHash, desiredHash, applied, now, invalidated)
+	// A closed gate sends this pass to the remote. Until it converges and
+	// records again, nothing verified earlier may re-open the gate: a desired
+	// state that changes and then changes back must not find the old verify
+	// and skip the pass that brings status back in line.
+	if !gate.Open && gate.Decision != freshness.DecisionNotGated {
+		latch.Forget(kind, key)
+	}
 	// freshness.Policy.Evaluate already names the first condition that closed
 	// the gate, so the label is never recomputed here and cannot drift from the
 	// judgement it describes. DecisionNotGated means a T0 caller reached this
@@ -166,6 +182,18 @@ func evaluateGateWithHash(
 // converged, so the next pass is judged on hash and age alone.
 func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 	latch.Clear(kind, key)
+}
+
+// releaseGoneObject is the NotFound branch of every gated reconciler's
+// initial Get: an object that no longer exists (deleted, or finalized after
+// cleanup) must not keep freshness records in memory for the life of the
+// process. Other errors are returned unchanged.
+func releaseGoneObject(latch *freshness.Latch, kind string, key types.NamespacedName, err error) error {
+	if apierrors.IsNotFound(err) {
+		latch.Remove(kind, key)
+		return nil
+	}
+	return err
 }
 
 // gateClusterID resolves the cluster identity used in the gate hash.
@@ -214,7 +242,22 @@ func newGateStamp(hash string, at time.Time) gateStamp {
 	return gateStamp{Hash: hash, At: metav1.NewTime(at)}
 }
 
-// persistGateStamp writes the converged gate stamp as its own status patch.
+// nextGateStamp decides what status must hold after a converged pass.
+// status.appliedAt documents when appliedHash was recorded, so it moves only
+// when the hash does; a re-verify that confirms the recorded hash leaves
+// status untouched and reports changed=false. The verify time itself belongs
+// in the latch (freshness.Latch.MarkVerified), which the caller records once
+// the pass has persisted whatever it had to.
+func nextGateStamp(storedHash string, storedAt *metav1.Time, stamp gateStamp) (string, *metav1.Time, bool) {
+	if stamp.Hash == storedHash && storedAt != nil {
+		return storedHash, storedAt, false
+	}
+	at := stamp.At
+	return stamp.Hash, &at, true
+}
+
+// persistGateStamp records the converged gate stamp and, when the applied
+// hash changed, writes it as its own status patch.
 //
 // It exists because most status patch helpers capture their merge base from
 // the live object (client.MergeFrom(object.DeepCopy())). A caller that assigns
@@ -228,11 +271,13 @@ func newGateStamp(hash string, at time.Time) gateStamp {
 // independent of how each controller's own helper builds its base, so the
 // mechanism is identical for every kind instead of correct for some.
 //
-// The extra patch lands only on a pass that actually converged, which is
-// exactly the pass that stops happening once the gate starts opening.
+// A re-verify that confirms the already-recorded hash writes nothing: the
+// verify time lives in the latch, so a converged object produces no status
+// writes and no watch events in the steady state.
 func persistGateStamp(
 	ctx context.Context,
 	writer kubeclient.Client,
+	latch *freshness.Latch,
 	object kubeclient.Object,
 	stamp gateStamp,
 ) error {
@@ -252,62 +297,68 @@ func persistGateStamp(
 	if !ok {
 		return nil
 	}
-	if !applyGateStamp(current, stamp) {
+	kind, hash, at, ok := gateStampFields(current)
+	if !ok {
 		return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", current)
 	}
-	if err := writer.Status().Patch(ctx, current, kubeclient.MergeFrom(before)); err != nil {
-		return fmt.Errorf("persist freshness gate stamp: %w", err)
+	key := kubeclient.ObjectKeyFromObject(current)
+	nextHash, nextAt, changed := nextGateStamp(*hash, *at, stamp)
+	if changed {
+		*hash, *at = nextHash, nextAt
+		if err := writer.Status().Patch(ctx, current, kubeclient.MergeFrom(before)); err != nil {
+			return fmt.Errorf("persist freshness gate stamp: %w", err)
+		}
 	}
+	latch.MarkVerified(kind, key, stamp.Hash, stamp.At.Time)
 	return nil
 }
 
-// applyGateStamp writes the stamp onto a gated object and reports whether the
-// kind is one this operator gates. A gated controller whose kind is missing
-// here would otherwise persist nothing and lose its saving silently, so the
-// false result is turned into an error by the caller rather than ignored.
-func applyGateStamp(object kubeclient.Object, stamp gateStamp) bool {
-	at := stamp.At
+// gateStampFields returns the gate kind and the status fields holding the
+// stamp of a gated object, and reports whether the kind is one this operator
+// gates. A gated controller whose kind is missing here would otherwise
+// persist nothing and lose its saving silently, so the false result is turned
+// into an error by the caller rather than ignored.
+func gateStampFields(object kubeclient.Object) (string, *string, **metav1.Time, bool) {
 	switch typed := object.(type) {
 	case *v1alpha1.VirtualNetwork:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "VirtualNetwork", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.NetworkRoute:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "NetworkRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.HostnameRoute:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "HostnameRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.IdentityProvider:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "IdentityProvider", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessGroup:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessGroup", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessPolicy:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessCustomPage:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessCustomPage", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessInfrastructureTarget:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessInfrastructureTarget", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessStandaloneApplication:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessStandaloneApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.AccessApplication:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "AccessApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.DeviceSettings:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "DeviceSettings", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.DeviceProfile:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "DeviceProfile", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.DevicePostureRule:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "DevicePostureRule", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.DevicePostureIntegration:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "DevicePostureIntegration", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.ServiceToken:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "ServiceToken", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.WARPConnector:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "WARPConnector", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.ZeroTrustList:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "ZeroTrustList", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.ZeroTrustGatewayPolicy:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "ZeroTrustGatewayPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	case *v1alpha1.ZeroTrustOrganization:
-		typed.Status.AppliedHash, typed.Status.AppliedAt = stamp.Hash, &at
+		return "ZeroTrustOrganization", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
 	default:
-		return false
+		return "", nil, nil, false
 	}
-	return true
 }

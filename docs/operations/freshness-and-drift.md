@@ -30,6 +30,25 @@ gate immediately.
 Nothing else changes. Conditions, events, ownership rules, and every
 fail-closed behaviour are identical.
 
+### What `status.appliedAt` means
+
+`status.appliedAt` records when `status.appliedHash` was last written, so it
+changes only when the desired state changes. On a `CloudflareTunnel`,
+`status.configVersion.appliedAt` changes only when a configuration is written
+to Cloudflare. A re-verify that finds Cloudflare already matching does not
+touch status, so a converged object produces no status writes and wakes no
+other controllers.
+
+The time of that last re-verify is kept in operator memory. After a restart
+or leader change it is gone, and each object's first pass reads Cloudflare
+again unless its hash was recorded within the last TTL.
+
+References from an `AccessApplication` to Cloudflare objects it does not own
+(`externalRef` policies, external identity providers and custom pages, and
+`ObserveOnly` policies and identity providers) are checked on the same
+schedule: only on passes that go to Cloudflare anyway. A deleted reference is
+found within the TTL, and the application stops being `Programmed`.
+
 ## Freshness grades
 
 Every Cloudflare-backed kind carries a grade chosen by how directly a stale
