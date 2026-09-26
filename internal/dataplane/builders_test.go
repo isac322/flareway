@@ -248,6 +248,35 @@ func TestBuildServiceMapsListenerPorts(t *testing.T) {
 	}
 }
 
+func TestBuildServiceExistsOnlyInConformanceMode(t *testing.T) {
+	// Cloudflare mode binds public listeners to loopback ports allocated per
+	// protection domain, so a listener Service would publish a port nothing
+	// can reach.
+	cloudflare := testGateway(false)
+	cloudflare.Listeners = []ir.Listener{
+		{Name: "public", Port: 443, EnvoyPort: 18080, Protocol: "HTTPS", Exposure: ir.ExposurePublic},
+		{Name: "private", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+	}
+	if service := BuildService(cloudflare, testConfig(false)); service != nil {
+		t.Fatalf("Cloudflare-mode Service = %#v, want none", service.Spec)
+	}
+
+	for name, tc := range map[string]struct {
+		gateway bool
+		config  bool
+	}{
+		"Gateway conformance flag": {gateway: true},
+		"class conformance flag":   {config: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			gw := testGateway(tc.gateway)
+			if service := BuildService(gw, testConfig(tc.config)); service == nil {
+				t.Fatal("conformance-mode Service was not built")
+			}
+		})
+	}
+}
+
 func TestBuildServiceSkipsNonPositiveListenerPorts(t *testing.T) {
 	gw := testGateway(true)
 	gw.Listeners = []ir.Listener{

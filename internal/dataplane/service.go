@@ -26,7 +26,13 @@ import (
 
 // BuildService returns the Service that exposes Gateway listeners to the
 // conformance runner. Each declared listener port targets its Envoy bind port.
+// It returns nil in Cloudflare mode: Envoy binds those listeners to loopback
+// ports that only the co-located cloudflared can reach, so a Service would
+// publish ports that refuse every connection.
 func BuildService(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) *corev1.Service {
+	if !conformanceMode(gw, cfg) {
+		return nil
+	}
 	ports := make([]corev1.ServicePort, 0, len(gw.Listeners))
 	seen := make(map[int32]struct{}, len(gw.Listeners))
 	for i, listener := range gw.Listeners {
@@ -61,7 +67,7 @@ func BuildService(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) *corev1.Serv
 	}
 
 	serviceType := corev1.ServiceTypeClusterIP
-	if selector != nil && conformanceMode(gw, cfg) {
+	if selector != nil {
 		serviceType = corev1.ServiceTypeLoadBalancer
 		if cfg != nil && cfg.Spec.Conformance.ServiceType != "" {
 			serviceType = cfg.Spec.Conformance.ServiceType
