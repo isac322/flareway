@@ -689,6 +689,44 @@ func TestBuildRejectsProtectedEmptyAUDSet(t *testing.T) {
 	}
 }
 
+// Envoy resources are addressed by name, and a snapshot keeps one resource per
+// name. Two route tables that land on the same name would leave one listener
+// serving the other listener's hosts, so Build must refuse instead of letting
+// the snapshot drop one of them.
+func TestBuildRejectsRouteTablesThatShareAName(t *testing.T) {
+	access := &ir.AccessGuard{AUDs: []string{"aud"}, AuthDomain: "team.cloudflareaccess.com"}
+	domain := func(name string, port int32, host string) ir.ProtectionDomain {
+		return ir.ProtectionDomain{
+			Name: name, ListenerName: "preview", EnvoyPort: port, Protected: true, Guard: ir.GuardForwarding, Access: access,
+			VirtualHosts: []ir.VirtualHost{{Name: host, Hostname: host}},
+		}
+	}
+	for _, test := range []struct {
+		name    string
+		domains []ir.ProtectionDomain
+	}{
+		{name: "same domain name on two ports", domains: []ir.ProtectionDomain{
+			domain("preview-access", 18082, "app1.example.com"),
+			domain("preview-access", 18083, "app2.example.com"),
+		}},
+		{name: "names that normalize to one resource name", domains: []ir.ProtectionDomain{
+			domain("preview/access", 18082, "app1.example.com"),
+			domain("preview-access", 18083, "app2.example.com"),
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gateway := &ir.Gateway{
+				Key:       types.NamespacedName{Namespace: "default", Name: "collision"},
+				Listeners: []ir.Listener{{Name: "preview", Hostname: "*.example.com", EnvoyPort: 18081}},
+				Domains:   test.domains,
+			}
+			if _, err := Build(gateway, nil); err == nil {
+				t.Fatal("Build() published two route tables under one name")
+			}
+		})
+	}
+}
+
 func TestBuildBlockedProtectionDomainReturns403WithoutJWTConfig(t *testing.T) {
 	gateway := &ir.Gateway{
 		Key:       types.NamespacedName{Namespace: "default", Name: "blocked-access"},

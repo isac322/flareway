@@ -18,6 +18,8 @@ limitations under the License.
 package gatewayapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	pathpkg "path"
@@ -610,8 +612,14 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		protected := base
 		protected.Name = base.Name + "-access-" + strings.ReplaceAll(owner, "/", "-")
 		if listener := listenerByName(gateway.Listeners, base.ListenerName); listener != nil && listener.Exposure == ir.ExposurePrivate {
+			// Private hosts share the listener port and its SNI filter chain,
+			// so every host an application claims stays in one route table.
 			protected.EnvoyPort = listener.Port
 		} else {
+			// Each public host gets its own Envoy port, and so its own route
+			// table. The name identifies that table in xDS and status, so it
+			// must differ per host too.
+			protected.Name += "-" + accessHostSuffix(owner, host.Hostname)
 			protected.EnvoyPort = *nextPublicPort
 			(*nextPublicPort)++
 		}
@@ -662,6 +670,14 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		})
 		statuses.AccessApplications[key] = compilation
 	}
+}
+
+// accessHostSuffix distinguishes one application's per-host protection
+// domains on a public listener. It hashes the owner as well as the host
+// because the owner's "namespace-name" spelling alone is ambiguous.
+func accessHostSuffix(owner, hostname string) string {
+	sum := sha256.Sum256([]byte(owner + "\x00" + strings.ToLower(hostname)))
+	return hex.EncodeToString(sum[:4])
 }
 
 func accessApplicationReady(in Inputs, applicationKey types.NamespacedName) bool {

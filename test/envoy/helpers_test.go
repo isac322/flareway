@@ -233,28 +233,36 @@ func validateWithEnvoy(t *testing.T, configPath string) {
 }
 
 type runningEnvoy struct {
-	name        string
-	listenerURL string
+	name         string
+	listenerURL  string
+	listenerURLs map[int]string
 }
 
-func startEnvoy(t *testing.T, configPath string, listenerPort int) runningEnvoy {
+// startEnvoy runs Envoy with listenerPort and any extraPorts published on
+// loopback. listenerURL addresses listenerPort; listenerURLs maps every
+// published listener port to its host address.
+func startEnvoy(t *testing.T, configPath string, listenerPort int, extraPorts ...int) runningEnvoy {
 	t.Helper()
 	requireDocker(t)
-	if listenerPort <= 0 || listenerPort > 65535 {
-		t.Fatalf("invalid Envoy listener port %d", listenerPort)
+	ports := append([]int{listenerPort}, extraPorts...)
+	for _, port := range ports {
+		if port <= 0 || port > 65535 {
+			t.Fatalf("invalid Envoy listener port %d", port)
+		}
 	}
 	name := "flareway-envoy-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	mount := configPath + ":/etc/envoy/envoy.json:ro"
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	args := []string{
-		"run", "-d", "--name", name,
-		"--add-host", "host.docker.internal:host-gateway",
-		"-p", "127.0.0.1::" + strconv.Itoa(listenerPort),
-		"-p", "127.0.0.1::" + strconv.Itoa(envoyAdminPort),
+	args := []string{"run", "-d", "--name", name, "--add-host", "host.docker.internal:host-gateway"}
+	for _, port := range ports {
+		args = append(args, "-p", "127.0.0.1::"+strconv.Itoa(port))
+	}
+	args = append(args,
+		"-p", "127.0.0.1::"+strconv.Itoa(envoyAdminPort),
 		"-v", mount,
 		envoyImage, "envoy", "-c", "/etc/envoy/envoy.json", "--concurrency", "1", "--disable-hot-restart",
-	}
+	)
 	if output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
 		t.Fatalf("start Envoy container: %v\n%s", err, output)
 	}
@@ -264,8 +272,12 @@ func startEnvoy(t *testing.T, configPath string, listenerPort int) runningEnvoy 
 		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", name).Run()
 	})
 
-	listenerAddress := dockerPort(t, name, listenerPort)
-	return runningEnvoy{name: name, listenerURL: "http://" + listenerAddress}
+	running := runningEnvoy{name: name, listenerURLs: make(map[int]string, len(ports))}
+	for _, port := range ports {
+		running.listenerURLs[port] = "http://" + dockerPort(t, name, port)
+	}
+	running.listenerURL = running.listenerURLs[listenerPort]
+	return running
 }
 
 func listenerPort(bootstrap *bootstrapv3.Bootstrap) (int, error) {
