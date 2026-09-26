@@ -1993,6 +1993,27 @@ func (c *concurrentDataplaneOwnerClient) Apply(ctx context.Context, object runti
 	return c.Client.Apply(ctx, object, options...)
 }
 
+// concurrentDeleteClient runs beforeDelete once, immediately before the first
+// Delete reaches the API server, to model a writer racing the deletion.
+type concurrentDeleteClient struct {
+	client.Client
+	once         sync.Once
+	beforeDelete func(context.Context) error
+}
+
+func (c *concurrentDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	var hookErr error
+	c.once.Do(func() {
+		if c.beforeDelete != nil {
+			hookErr = c.beforeDelete(ctx)
+		}
+	})
+	if hookErr != nil {
+		return hookErr
+	}
+	return c.Client.Delete(ctx, object, options...)
+}
+
 type concurrentStatusWriterClient struct {
 	client.Client
 	once             sync.Once

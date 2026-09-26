@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -472,6 +473,111 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		ginkgo.Entry("ownerless Service", dataplaneObjectFactory(serviceDataplaneObjects), false),
 		ginkgo.Entry("foreign Service", dataplaneObjectFactory(serviceDataplaneObjects), true),
 	)
+
+	ginkgo.Describe("removing the listener Service in Cloudflare mode", func() {
+		var gateway *gatewayv1.Gateway
+		var serviceKey types.NamespacedName
+
+		ginkgo.BeforeEach(func() {
+			fixtureID := fixtureCounter.Add(1)
+			namespaceName := fmt.Sprintf("gateway-listener-service-%d", fixtureID)
+			namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName}}
+			gomega.Expect(testClient.Create(testContext, namespace)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(func() { _ = testClient.Delete(testContext, namespace) })
+
+			gateway = &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: namespaceName},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "missing-class",
+					Listeners:        []gatewayv1.Listener{{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType}},
+				},
+			}
+			gomega.Expect(testClient.Create(testContext, gateway)).To(gomega.Succeed())
+			serviceKey = types.NamespacedName{
+				Namespace: namespaceName,
+				Name:      dataplane.ResourceName(&ir.Gateway{Key: client.ObjectKeyFromObject(gateway)}),
+			}
+		})
+
+		// createService stores a v0.3.0-shaped listener Service and waits
+		// until the cached client observes it.
+		createService := func(owners []metav1.OwnerReference) *corev1.Service {
+			service := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceKey.Name, Namespace: serviceKey.Namespace, OwnerReferences: owners},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{"app": "dataplane"},
+					Ports:    []corev1.ServicePort{{Name: "listener-0", Protocol: corev1.ProtocolTCP, Port: 443, TargetPort: intstr.FromInt32(18080)}},
+				},
+			}
+			gomega.Expect(testClient.Create(testContext, service, client.FieldOwner(gatewayFieldManager))).To(gomega.Succeed())
+			gomega.Eventually(func() error {
+				return testClient.Get(testContext, serviceKey, &corev1.Service{})
+			}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
+			return service
+		}
+
+		ginkgo.It("deletes the Service this Gateway UID controls", func() {
+			createService([]metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())})
+			reconciler := &GatewayReconciler{Client: testClient, Scheme: testClient.Scheme()}
+
+			gomega.Expect(reconciler.retractCloudflareListenerService(testContext, gateway)).To(gomega.Succeed())
+			err := testAPIReader.Get(testContext, serviceKey, &corev1.Service{})
+			gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "expected the owned Service to be deleted, got %v", err)
+
+			gomega.Eventually(func() error {
+				return reconciler.retractCloudflareListenerService(testContext, gateway)
+			}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed(), "an absent Service is already converged")
+		})
+
+		ginkgo.DescribeTable("leaves a Service it does not control untouched",
+			func(owners func() []metav1.OwnerReference) {
+				createService(owners())
+				before := &corev1.Service{}
+				gomega.Expect(testAPIReader.Get(testContext, serviceKey, before)).To(gomega.Succeed())
+				reconciler := &GatewayReconciler{Client: testClient, Scheme: testClient.Scheme()}
+
+				gomega.Expect(reconciler.retractCloudflareListenerService(testContext, gateway)).To(gomega.Succeed())
+				after := &corev1.Service{}
+				gomega.Expect(testAPIReader.Get(testContext, serviceKey, after)).To(gomega.Succeed())
+				gomega.Expect(after).To(gomega.Equal(before))
+			},
+			ginkgo.Entry("ownerless", func() []metav1.OwnerReference { return nil }),
+			ginkgo.Entry("controlled by a previous Gateway with the same name", func() []metav1.OwnerReference {
+				previous := gateway.DeepCopy()
+				previous.UID = "previous-gateway-uid"
+				return []metav1.OwnerReference{*metav1.NewControllerRef(previous, gatewayControllerGVK())}
+			}),
+			ginkgo.Entry("owned by this Gateway without controller", func() []metav1.OwnerReference {
+				owner := metav1.NewControllerRef(gateway, gatewayControllerGVK())
+				owner.Controller = nil
+				return []metav1.OwnerReference{*owner}
+			}),
+		)
+
+		ginkgo.It("keeps a Service whose controller changes before the delete", func() {
+			foreign := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "foreign-owner", Namespace: serviceKey.Namespace}}
+			gomega.Expect(testClient.Create(testContext, foreign)).To(gomega.Succeed())
+			createService([]metav1.OwnerReference{*metav1.NewControllerRef(gateway, gatewayControllerGVK())})
+			racing := &concurrentDeleteClient{
+				Client: testClient,
+				beforeDelete: func(ctx context.Context) error {
+					var raced corev1.Service
+					if err := testAPIReader.Get(ctx, serviceKey, &raced); err != nil {
+						return err
+					}
+					raced.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, corev1.SchemeGroupVersion.WithKind("ConfigMap"))}
+					return testClient.Update(ctx, &raced)
+				},
+			}
+			reconciler := &GatewayReconciler{Client: racing, Scheme: testClient.Scheme()}
+
+			err := reconciler.retractCloudflareListenerService(testContext, gateway)
+			gomega.Expect(apierrors.IsConflict(err)).To(gomega.BeTrue(), "expected a delete precondition conflict, got %v", err)
+			var preserved corev1.Service
+			gomega.Expect(testAPIReader.Get(testContext, serviceKey, &preserved)).To(gomega.Succeed())
+			gomega.Expect(metav1.GetControllerOf(&preserved).UID).To(gomega.Equal(foreign.UID))
+		})
+	})
 
 	ginkgo.It("returns a conflict when the controller owner changes before server-side apply", func() {
 		fixtureID := fixtureCounter.Add(1)
