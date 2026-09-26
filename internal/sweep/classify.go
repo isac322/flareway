@@ -40,6 +40,10 @@ type classifyOptions[R any] struct {
 	// extra performs kind-specific content checks on a matched pair and
 	// returns a mismatch reason, or "" when the pair agrees.
 	extra func(ref localRef, remote R) string
+	// content checks a matched pair whose identity checks passed against the
+	// reconciler's last verified desired content (see contentCheck). It
+	// reports true when the listed object no longer matches. nil skips it.
+	content func(ref localRef, remote R) bool
 	// orphan inspects one unclaimed remote object and reports whether it is
 	// an orphan candidate plus the owning object's key when attributable.
 	// claimed contains every remote ID referenced by a local status.
@@ -114,10 +118,19 @@ func matchReason[R any](ref localRef, remote R, opts classifyOptions[R]) string 
 		}
 	}
 	if opts.extra != nil {
-		return opts.extra(ref, remote)
+		if reason := opts.extra(ref, remote); reason != "" {
+			return reason
+		}
+	}
+	if opts.content != nil && opts.content(ref, remote) {
+		return contentMismatchReason
 	}
 	return ""
 }
+
+// contentMismatchReason is reported when a listed object no longer carries the
+// desired content its reconciler last verified.
+const contentMismatchReason = "remote content no longer matches the desired state last verified by the reconciler"
 
 // accessRemoteNameValue reproduces the controller's accessRemoteName:
 // "flareway/<clusterID>/<namespace>/<specName>".

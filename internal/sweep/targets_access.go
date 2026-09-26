@@ -118,6 +118,7 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 	}
 	var refs []localRef
 	markers := make(map[types.NamespacedName][]string)
+	needProviders, needPages := false, false
 	for i := range list.Items {
 		app := &list.Items[i]
 		if app.Spec.AccountRef.Name != as.accountName || deleting(app) || observeOnly(app.Spec.ManagementPolicy) {
@@ -127,6 +128,8 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		if !ok {
 			continue
 		}
+		needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
+		needPages = needPages || len(app.Spec.Application.CustomPageRefs) > 0
 		expectedName := app.Spec.Application.Name
 		if expectedName == "" {
 			expectedName = app.Namespace + "/" + app.Name
@@ -140,11 +143,52 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		markers[ref.key] = accessOwnerMarkers(key, clusterID, app.Namespace, app.Name, app.UID)
 	}
 
+	// References an application's content check resolves against: its
+	// bypass children (in the application listing itself), and the identity
+	// providers and custom pages it names by ID. Those listings belong to this
+	// pass, so a failure abandons the pass and nothing is confirmed.
+	listing := flarecloudflare.AccessApplicationListing{Applications: make(map[string]flarecloudflare.AccessApplication, len(remotes))}
+	for _, remote := range remotes {
+		listing.Applications[remote.ID] = remote
+	}
+	if needProviders {
+		if err := wait(ctx); err != nil {
+			return nil, err
+		}
+		providers, err := api.ListIdentityProviders(ctx)
+		if err != nil {
+			return nil, listFailure(err)
+		}
+		listing.IdentityProviders = make(map[string]struct{}, len(providers))
+		for _, provider := range providers {
+			listing.IdentityProviders[provider.ID] = struct{}{}
+		}
+	}
+	if needPages {
+		if err := wait(ctx); err != nil {
+			return nil, err
+		}
+		pages, err := api.ListAccessCustomPages(ctx)
+		if err != nil {
+			return nil, listFailure(err)
+		}
+		listing.CustomPages = make(map[string]flarecloudflare.AccessCustomPageSummary, len(pages))
+		for _, page := range pages {
+			listing.CustomPages[page.ID] = page
+		}
+	}
+	content := contentCheckWith(ctx, as, func(remote flarecloudflare.AccessApplication) any {
+		observed := listing
+		observed.Application = remote
+		return observed
+	})
+
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessApplication]{
-		kind:   "AccessApplication",
-		idOf:   func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed: scopeListed(listed),
-		nameOf: func(a flarecloudflare.AccessApplication) string { return a.Name },
+		kind:    "AccessApplication",
+		content: content,
+		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
+		listed:  scopeListed(listed),
+		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		extra: func(ref localRef, remote flarecloudflare.AccessApplication) string {
 			mine := markers[ref.key]
 			if !hasAnyTag(remote.Tags, []string{accessManagedTag}) {
@@ -227,10 +271,11 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 	}
 
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessApplication]{
-		kind:   "AccessStandaloneApplication",
-		idOf:   func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed: scopeListed(listed),
-		nameOf: func(a flarecloudflare.AccessApplication) string { return a.Name },
+		kind:    "AccessStandaloneApplication",
+		content: contentCheck[flarecloudflare.AccessApplication](ctx, as),
+		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
+		listed:  scopeListed(listed),
+		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(a flarecloudflare.AccessApplication) string { return a.ID },
 			func(a flarecloudflare.AccessApplication) string { return a.Name }),
@@ -294,10 +339,11 @@ func sweepAccessPolicies(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 		decisions[key] = string(policy.Spec.Decision)
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessPolicy]{
-		kind:   "AccessPolicy",
-		idOf:   func(p flarecloudflare.AccessPolicy) string { return p.ID },
-		listed: accountScopeListed,
-		nameOf: func(p flarecloudflare.AccessPolicy) string { return p.Name },
+		kind:    "AccessPolicy",
+		content: contentCheck[flarecloudflare.AccessPolicy](ctx, as),
+		idOf:    func(p flarecloudflare.AccessPolicy) string { return p.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(p flarecloudflare.AccessPolicy) string { return p.Name },
 		extra: func(ref localRef, remote flarecloudflare.AccessPolicy) string {
 			if want := decisions[ref.key]; want != "" && remote.Decision != want {
 				return fmt.Sprintf("remote decision %q does not match spec decision %q", remote.Decision, want)
@@ -359,10 +405,11 @@ func sweepAccessGroups(ctx context.Context, as *AccountSweeper) ([]DriftItem, er
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessGroup]{
-		kind:   "AccessGroup",
-		idOf:   func(g flarecloudflare.AccessGroup) string { return g.ID },
-		listed: scopeListed(listed),
-		nameOf: func(g flarecloudflare.AccessGroup) string { return g.Name },
+		kind:    "AccessGroup",
+		content: contentCheck[flarecloudflare.AccessGroup](ctx, as),
+		idOf:    func(g flarecloudflare.AccessGroup) string { return g.ID },
+		listed:  scopeListed(listed),
+		nameOf:  func(g flarecloudflare.AccessGroup) string { return g.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(g flarecloudflare.AccessGroup) string { return g.ID },
 			func(g flarecloudflare.AccessGroup) string { return g.Name }),
@@ -418,10 +465,11 @@ func sweepServiceTokens(ctx context.Context, as *AccountSweeper) ([]DriftItem, e
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.ServiceToken]{
-		kind:   "ServiceToken",
-		idOf:   func(t flarecloudflare.ServiceToken) string { return t.ID },
-		listed: scopeListed(listed),
-		nameOf: func(t flarecloudflare.ServiceToken) string { return t.Name },
+		kind:    "ServiceToken",
+		content: contentCheck[flarecloudflare.ServiceToken](ctx, as),
+		idOf:    func(t flarecloudflare.ServiceToken) string { return t.ID },
+		listed:  scopeListed(listed),
+		nameOf:  func(t flarecloudflare.ServiceToken) string { return t.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(t flarecloudflare.ServiceToken) string { return t.ID },
 			func(t flarecloudflare.ServiceToken) string { return t.Name }),
@@ -459,10 +507,11 @@ func sweepIdentityProviders(ctx context.Context, as *AccountSweeper) ([]DriftIte
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.IdentityProvider]{
-		kind:   "IdentityProvider",
-		idOf:   func(p flarecloudflare.IdentityProvider) string { return p.ID },
-		listed: accountScopeListed,
-		nameOf: func(p flarecloudflare.IdentityProvider) string { return p.Name },
+		kind:    "IdentityProvider",
+		content: contentCheck[flarecloudflare.IdentityProvider](ctx, as),
+		idOf:    func(p flarecloudflare.IdentityProvider) string { return p.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(p flarecloudflare.IdentityProvider) string { return p.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(p flarecloudflare.IdentityProvider) string { return p.ID },
 			func(p flarecloudflare.IdentityProvider) string { return p.Name }),
@@ -500,10 +549,11 @@ func sweepAccessCustomPages(ctx context.Context, as *AccountSweeper) ([]DriftIte
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessCustomPageSummary]{
-		kind:   "AccessCustomPage",
-		idOf:   func(p flarecloudflare.AccessCustomPageSummary) string { return p.ID },
-		listed: accountScopeListed,
-		nameOf: func(p flarecloudflare.AccessCustomPageSummary) string { return p.Name },
+		kind:    "AccessCustomPage",
+		content: contentCheck[flarecloudflare.AccessCustomPageSummary](ctx, as),
+		idOf:    func(p flarecloudflare.AccessCustomPageSummary) string { return p.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(p flarecloudflare.AccessCustomPageSummary) string { return p.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(p flarecloudflare.AccessCustomPageSummary) string { return p.ID },
 			func(p flarecloudflare.AccessCustomPageSummary) string { return p.Name }),
@@ -537,6 +587,7 @@ func sweepAccessInfrastructureTargets(ctx context.Context, as *AccountSweeper) (
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessInfrastructureTarget]{
 		kind:      "AccessInfrastructureTarget",
+		content:   contentCheck[flarecloudflare.AccessInfrastructureTarget](ctx, as),
 		idOf:      func(t flarecloudflare.AccessInfrastructureTarget) string { return t.ID },
 		listed:    accountScopeListed,
 		nameOf:    func(t flarecloudflare.AccessInfrastructureTarget) string { return t.Hostname },

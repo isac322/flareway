@@ -12,10 +12,13 @@ or disable it.
 
 ## What you gain
 
-Steady-state Cloudflare API traffic no longer scales with object count. A
-converged object reads nothing until its freshness TTL expires or the sweep
-reports drift on it. The sweep itself lists once per resource kind per period,
-regardless of how many objects exist.
+The sweep lists each resource kind once per period, regardless of how many
+objects exist. For kinds whose listing shows everything a reconciler checks,
+that listing also stands in for each object's own re-verify (see
+[Content confirmation](#content-confirmation)), so a converged object reads
+nothing until the sweep reports drift on it or the sweep stops. For those
+objects, steady-state Cloudflare API traffic no longer grows with their
+number. Every other object reads its remote once per freshness TTL.
 
 ## What you give up
 
@@ -103,6 +106,64 @@ Orphans are reported, never deleted. Deleting a remote object is destructive and
 stays with the owning reconciler's teardown path, which re-reads the remote
 fresh before acting.
 
+### Content confirmation
+
+After a reconciler verifies an object against Cloudflare, it records the
+desired content it verified. On each pass the sweep compares every listed
+object against that record, as well as against its name and ownership tags:
+
+- A match counts as a fresh verify. The object's own TTL wake-up finds the gate
+  open and reads nothing.
+- A difference is reported as a `mismatch`. The sweep invalidates the object's
+  gate and wakes its reconciler, which re-reads Cloudflare and repairs the
+  object (or holds, under `--drift-policy=Hold`).
+
+A sweep confirmation keeps the gate open for two periods, so a new pass always
+lands before the previous one expires. Detection bounds for an out-of-band
+change on a confirmed object:
+
+| Sweep state | Detected within |
+|---|---|
+| Running | The next pass: at most 1.2 × TTL plus the listing time |
+| Stopped, failing, or `--disable-sweep` | 2 × TTL, when the object's own verify resumes |
+
+Only a complete listing confirms anything. A pass that fails or is partial
+confirms nothing, and objects fall back to their own verify.
+
+Content confirmation applies only where the listing shows everything the
+reconciler checks:
+
+| Kind | Confirmed by the sweep unless |
+|---|---|
+| `AccessApplication` | it is a `ProxyEndpoint` |
+| `AccessStandaloneApplication` | it holds a one-time SaaS client secret |
+| `AccessPolicy`, `AccessGroup`, `AccessInfrastructureTarget` | — |
+| `IdentityProvider` | SCIM is enabled |
+| `VirtualNetwork`, `HostnameRoute`, `ZeroTrustGatewayPolicy` | — |
+| `NetworkRoute` | it uses `ipLookup` |
+
+Every other object keeps its own verify once per TTL. `ServiceToken` is one of
+them: its verify also checks the credential Secret and refreshes the token
+before it expires.
+
+An `AccessApplication` is checked against more than its own listed entry:
+
+- Application listings embed each attached policy in full, so a policy
+  deleted out of band shows up as changed content.
+- Its bypass children are applications in the same listing. Each one must
+  still match its desired content, and no other application may carry the
+  parent's bypass marker.
+- When any application references identity providers or custom pages, the
+  same pass also lists them. A referenced one missing from that listing is
+  drift. If either listing fails, the pass confirms nothing.
+
+Local state an `AccessApplication` depends on, such as its Gateways, data
+planes, and the tunnel's forwarding status, is part of the gate's desired hash,
+so a change there still runs the full pass without waiting for the sweep.
+
+Confirmations live in operator memory. After a restart or leader change, each
+object verifies itself once and records its content again.
+
 The sweep runs on a dedicated `0.5 req/s` budget, separate from the `3.5 req/s`
 reconciler budget, so the two together stay inside Cloudflare's `4.0 req/s`
 account limit. It starts each kind on a staggered delay so a restart does not
@@ -143,9 +204,10 @@ aggregate.
 
 ## Rolling back
 
-`--disable-sweep` stops the sweep worker. Freshness gates keep working, so
-out-of-band drift is then detected only when a TTL expires. To return fully to
-the previous behaviour, set every freshness flag to `0`:
+`--disable-sweep` stops the sweep worker. Freshness gates keep working, and
+every object goes back to reading its remote once per TTL, so out-of-band
+drift is then detected only when that TTL expires. To return fully to the
+previous behaviour, set every freshness flag to `0`:
 
 ```
 --freshness-authz=0 --freshness-traffic=0 --freshness-indirect=0 --freshness-display=0

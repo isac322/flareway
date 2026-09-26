@@ -296,7 +296,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 				}},
 			}}},
 		}}
-		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+		children, _, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 			testContext, remote, flarecloudflare.AccessScope{}, application,
 			[]gatewayapi.AccessBypass{{Hostname: "api.example.test", Path: "/public"}},
 			accessDigestTag(accessOwnerTagPrefix, "owner"), "cluster",
@@ -332,7 +332,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			},
 			Status: v1alpha1.AccessApplicationStatus{ApplicationID: "parent-id"},
 		}
-		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+		children, _, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 			testContext,
 			remote,
 			flarecloudflare.AccessScope{},
@@ -1369,7 +1369,7 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 				},
 			},
 		}
-		children, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+		children, _, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 			testContext, remote, flarecloudflare.AccessScope{}, application, nil, ownerTag, "cluster-id",
 		)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1815,6 +1815,7 @@ type fakeAccessApplicationCloudflare struct {
 	inputs             map[string]flarecloudflare.AccessApplicationInput
 	policies           map[string]flarecloudflare.AccessPolicy
 	providers          map[string]flarecloudflare.IdentityProvider
+	customPages        map[string]flarecloudflare.AccessCustomPage
 	tags               map[string]flarecloudflare.AccessTag
 	calls              []string
 	failures           map[string]error
@@ -1843,6 +1844,7 @@ func (f *fakeAccessApplicationCloudflare) Reset() {
 		"policy-allow": {ID: "policy-allow", Name: "allow", Decision: "Allow"},
 	}
 	f.providers = make(map[string]flarecloudflare.IdentityProvider)
+	f.customPages = make(map[string]flarecloudflare.AccessCustomPage)
 	f.tags = make(map[string]flarecloudflare.AccessTag)
 	f.calls = nil
 	f.failures = make(map[string]error)
@@ -2052,7 +2054,7 @@ func (f *fakeAccessApplicationCloudflare) GetAccessApplication(_ context.Context
 	if !found {
 		return flarecloudflare.AccessApplication{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
 	}
-	return application, nil
+	return f.embedPolicies(application), nil
 }
 
 func (f *fakeAccessApplicationCloudflare) ListAccessApplications(_ context.Context, _ flarecloudflare.AccessScope) ([]flarecloudflare.AccessApplication, error) {
@@ -2063,9 +2065,28 @@ func (f *fakeAccessApplicationCloudflare) ListAccessApplications(_ context.Conte
 	}
 	result := make([]flarecloudflare.AccessApplication, 0, len(f.applications))
 	for _, application := range f.applications {
-		result = append(result, application)
+		result = append(result, f.embedPolicies(application))
 	}
 	return result, nil
+}
+
+// embedPolicies returns the application the way Cloudflare reads it back:
+// every attachment to a policy that exists carries that policy's name and
+// decision, and an attachment to a deleted policy carries neither. The
+// caller holds f.mu.
+func (f *fakeAccessApplicationCloudflare) embedPolicies(application flarecloudflare.AccessApplication) flarecloudflare.AccessApplication {
+	application.Policies = slices.Clone(application.Policies)
+	for i := range application.Policies {
+		policy, found := f.policies[application.Policies[i].ID]
+		if !found && application.Policies[i].ID == f.bypassPolicy.ID {
+			policy, found = f.bypassPolicy, true
+		}
+		if found {
+			application.Policies[i].Name = policy.Name
+			application.Policies[i].Decision = flarecloudflare.AccessApplicationPolicyDecision(policy.Decision)
+		}
+	}
+	return application
 }
 
 func (f *fakeAccessApplicationCloudflare) DeleteAccessApplication(_ context.Context, _ flarecloudflare.AccessScope, id string) error {
@@ -2165,12 +2186,44 @@ func (f *fakeAccessApplicationCloudflare) DeleteAccessTag(_ context.Context, nam
 	return nil
 }
 
-func (f *fakeAccessApplicationCloudflare) GetAccessCustomPage(_ context.Context, _ string) (flarecloudflare.AccessCustomPage, error) {
-	return flarecloudflare.AccessCustomPage{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
+func (f *fakeAccessApplicationCloudflare) GetAccessCustomPage(_ context.Context, id string) (flarecloudflare.AccessCustomPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("GetCustomPage:" + id); err != nil {
+		return flarecloudflare.AccessCustomPage{}, err
+	}
+	page, found := f.customPages[id]
+	if !found {
+		return flarecloudflare.AccessCustomPage{}, &cloudflaresdk.Error{StatusCode: http.StatusNotFound}
+	}
+	return page, nil
 }
 
 func (f *fakeAccessApplicationCloudflare) ListAccessCustomPages(context.Context) ([]flarecloudflare.AccessCustomPageSummary, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.customPages) == 0 {
+		return nil, nil
+	}
+	pages := make([]flarecloudflare.AccessCustomPageSummary, 0, len(f.customPages))
+	for _, page := range f.customPages {
+		pages = append(pages, page.AccessCustomPageSummary)
+	}
+	return pages, nil
+}
+
+// SetCustomPage stores a remote custom page; DeleteCustomPage removes it the
+// way a dashboard deletion would.
+func (f *fakeAccessApplicationCloudflare) SetCustomPage(page flarecloudflare.AccessCustomPage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.customPages[page.ID] = page
+}
+
+func (f *fakeAccessApplicationCloudflare) DeleteCustomPage(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.customPages, id)
 }
 
 func (f *fakeAccessApplicationCloudflare) GetAccessPolicy(_ context.Context, id string) (flarecloudflare.AccessPolicy, error) {

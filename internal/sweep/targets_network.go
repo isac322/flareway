@@ -107,10 +107,11 @@ func sweepVirtualNetworks(ctx context.Context, as *AccountSweeper) ([]DriftItem,
 		}
 	}
 	return classify(refs, live, classifyOptions[flarecloudflare.VirtualNetwork]{
-		kind:   "VirtualNetwork",
-		idOf:   func(v flarecloudflare.VirtualNetwork) string { return v.ID },
-		listed: accountScopeListed,
-		nameOf: func(v flarecloudflare.VirtualNetwork) string { return v.Name },
+		kind:    "VirtualNetwork",
+		content: contentCheck[flarecloudflare.VirtualNetwork](ctx, as),
+		idOf:    func(v flarecloudflare.VirtualNetwork) string { return v.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(v flarecloudflare.VirtualNetwork) string { return v.Name },
 		extra: func(ref localRef, remote flarecloudflare.VirtualNetwork) string {
 			if remote.IsDefault != defaults[ref.key] {
 				return fmt.Sprintf("remote isDefault %t does not match spec isDefault %t", remote.IsDefault, defaults[ref.key])
@@ -165,10 +166,11 @@ func sweepNetworkRoutes(ctx context.Context, as *AccountSweeper) ([]DriftItem, e
 		}
 	}
 	return classify(refs, live, classifyOptions[flarecloudflare.NetworkRoute]{
-		kind:   "NetworkRoute",
-		idOf:   func(r flarecloudflare.NetworkRoute) string { return r.ID },
-		listed: accountScopeListed,
-		nameOf: func(flarecloudflare.NetworkRoute) string { return "" },
+		kind:    "NetworkRoute",
+		content: contentCheck[flarecloudflare.NetworkRoute](ctx, as),
+		idOf:    func(r flarecloudflare.NetworkRoute) string { return r.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(flarecloudflare.NetworkRoute) string { return "" },
 		extra: func(ref localRef, remote flarecloudflare.NetworkRoute) string {
 			want, ok := networks[ref.key]
 			if !ok {
@@ -233,10 +235,11 @@ func sweepHostnameRoutes(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 		}
 	}
 	return classify(refs, live, classifyOptions[flarecloudflare.HostnameRoute]{
-		kind:   "HostnameRoute",
-		idOf:   func(r flarecloudflare.HostnameRoute) string { return r.ID },
-		listed: accountScopeListed,
-		nameOf: func(flarecloudflare.HostnameRoute) string { return "" },
+		kind:    "HostnameRoute",
+		content: contentCheck[flarecloudflare.HostnameRoute](ctx, as),
+		idOf:    func(r flarecloudflare.HostnameRoute) string { return r.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(flarecloudflare.HostnameRoute) string { return "" },
 		extra: func(ref localRef, remote flarecloudflare.HostnameRoute) string {
 			want := hostnames[ref.key]
 			if want != "" && !strings.EqualFold(remote.Hostname, want) {

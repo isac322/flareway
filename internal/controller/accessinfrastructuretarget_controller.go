@@ -141,7 +141,14 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	// The sweep's target listing carries the hostname and both addresses
+	// infrastructureTargetMatches compares; virtual network references are
+	// resolved before the gate on every pass.
+	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
+		target, ok := listed.(flarecloudflare.AccessInfrastructureTarget)
+		return ok && target.ID == remote.ID && infrastructureTargetMatches(input, target)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName)

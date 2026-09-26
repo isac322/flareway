@@ -438,6 +438,14 @@ func TestLatchNilReceiver(t *testing.T) {
 		t.Error("nil latch must report no invalidation")
 	}
 	l.Clear("AccessPolicy", key)
+	l.MarkVerified("AccessPolicy", key, "h", time.Now())
+	l.SetBaseline("AccessPolicy", key, "h", func(any) bool { return true })
+	if l.ConfirmContent("AccessPolicy", key, "remote", time.Now()) {
+		t.Error("nil latch must never report content drift")
+	}
+	if _, ok := l.ConfirmedAt("AccessPolicy", key, "h"); ok {
+		t.Error("nil latch must report no sweep confirmation")
+	}
 }
 
 func TestLatchConcurrent(*testing.T) {
@@ -445,14 +453,18 @@ func TestLatchConcurrent(*testing.T) {
 	key := types.NamespacedName{Namespace: "ns", Name: "obj"}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				l.Invalidate("AccessPolicy", key, "drift")
 				l.IsInvalidated("AccessPolicy", key)
 				l.Clear("AccessPolicy", key)
+				l.MarkVerified("AccessPolicy", key, "h", time.Now())
+				l.SetBaseline("AccessPolicy", key, "h", func(any) bool { return true })
+				l.ConfirmContent("AccessPolicy", key, "remote", time.Now())
+				l.ConfirmedAt("AccessPolicy", key, "h")
 			}
 		}()
 	}
@@ -480,9 +492,105 @@ func TestLatchForgetAndRemove(t *testing.T) {
 		t.Fatal("Forget dropped the invalidation")
 	}
 
+	l.SetBaseline("AccessPolicy", key, "h", func(any) bool { return true })
+	l.ConfirmContent("AccessPolicy", key, "listed", time.Unix(3, 0))
 	l.Remove("AccessPolicy", key)
 	l.Remove("AccessPolicy", other)
-	if len(l.reasons) != 0 || len(l.verified) != 0 {
-		t.Fatalf("Remove left records behind: reasons=%v verified=%v", l.reasons, l.verified)
+	if len(l.reasons) != 0 || len(l.verified) != 0 || len(l.baselines) != 0 || len(l.confirmed) != 0 {
+		t.Fatalf("Remove left records behind: reasons=%v verified=%v baselines=%d confirmed=%v", l.reasons, l.verified, len(l.baselines), l.confirmed)
+	}
+}
+
+// A sweep confirmation may stand in for a verify only for the exact desired
+// content the reconciler last verified, and never after drift was found.
+func TestLatchContentBaseline(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "app"}
+	at := time.Unix(1_000_000, 0)
+	matchesWanted := func(observed any) bool { return observed == "wanted" }
+
+	l := NewLatch()
+	if l.ConfirmContent("AccessApplication", key, "anything", at) {
+		t.Fatal("an object without a baseline was reported as drifted")
+	}
+	if _, ok := l.ConfirmedAt("AccessApplication", key, "h1"); ok {
+		t.Fatal("an object without a baseline was confirmed")
+	}
+
+	l.SetBaseline("AccessApplication", key, "h1", matchesWanted)
+	if l.ConfirmContent("AccessApplication", key, "wanted", at) {
+		t.Fatal("a matching listing was reported as drift")
+	}
+	if got, ok := l.ConfirmedAt("AccessApplication", key, "h1"); !ok || !got.Equal(at) {
+		t.Fatalf("ConfirmedAt(h1) = %v, %v; want %v", got, ok, at)
+	}
+	if _, ok := l.ConfirmedAt("AccessApplication", key, "h2"); ok {
+		t.Fatal("a confirmation of h1 was reported for h2")
+	}
+	l.ConfirmContent("AccessApplication", key, "wanted", at.Add(-time.Minute))
+	if got, _ := l.ConfirmedAt("AccessApplication", key, "h1"); !got.Equal(at) {
+		t.Fatalf("an older listing moved the confirmation back to %v", got)
+	}
+
+	if !l.ConfirmContent("AccessApplication", key, "changed", at.Add(time.Minute)) {
+		t.Fatal("a listing that no longer matches was not reported as drift")
+	}
+	if got, _ := l.ConfirmedAt("AccessApplication", key, "h1"); !got.Equal(at) {
+		t.Fatalf("a drifted listing advanced the confirmation to %v", got)
+	}
+
+	l.Invalidate("AccessApplication", key, "drift")
+	if _, ok := l.ConfirmedAt("AccessApplication", key, "h1"); ok {
+		t.Fatal("invalidation kept the sweep confirmation")
+	}
+
+	// A new verify replaces the baseline and voids confirmations of the old
+	// one; a nil matcher withdraws the object from sweep confirmation.
+	l.SetBaseline("AccessApplication", key, "h1", matchesWanted)
+	l.ConfirmContent("AccessApplication", key, "wanted", at)
+	l.SetBaseline("AccessApplication", key, "h2", nil)
+	if _, ok := l.ConfirmedAt("AccessApplication", key, "h1"); ok {
+		t.Fatal("replacing the baseline kept the old confirmation")
+	}
+	if l.ConfirmContent("AccessApplication", key, "changed", at) {
+		t.Fatal("an object withdrawn from sweep confirmation was reported as drifted")
+	}
+	if _, ok := l.ConfirmedAt("AccessApplication", key, "h2"); ok {
+		t.Fatal("an object withdrawn from sweep confirmation was confirmed")
+	}
+}
+
+func TestEvaluateSweepConfirmed(t *testing.T) {
+	p := DefaultPolicy()
+	ttl := p.TTL(GradeAuthz)
+	window := p.SweepConfirmationWindow(GradeAuthz)
+	now := time.Unix(1_000_000, 0)
+	cases := []struct {
+		name        string
+		policy      Policy
+		grade       Grade
+		applied     string
+		desired     string
+		confirmed   time.Time
+		invalidated bool
+		open        bool
+		decision    Decision
+		requeue     time.Duration
+	}{
+		{name: "past the TTL but inside the window", policy: p, grade: GradeAuthz, applied: "h", desired: "h", confirmed: now.Add(-ttl - time.Second), open: true, decision: DecisionOpen, requeue: window - ttl - time.Second},
+		{name: "window boundary closes", policy: p, grade: GradeAuthz, applied: "h", desired: "h", confirmed: now.Add(-window), decision: DecisionClosedTTL},
+		{name: "future confirmation fails closed", policy: p, grade: GradeAuthz, applied: "h", desired: "h", confirmed: now.Add(time.Second), decision: DecisionClosedTTL},
+		{name: "invalidated", policy: p, grade: GradeAuthz, applied: "h", desired: "h", confirmed: now, invalidated: true, decision: DecisionClosedInvalidated},
+		{name: "desired state changed", policy: p, grade: GradeAuthz, applied: "h", desired: "h2", confirmed: now, decision: DecisionClosedHash},
+		{name: "zero policy", policy: Policy{}, grade: GradeAuthz, applied: "h", desired: "h", confirmed: now, decision: DecisionClosedTTL},
+		{name: "on-demand grade", policy: p, grade: GradeDisplay, applied: "h", desired: "h", confirmed: now, decision: DecisionClosedTTL},
+		{name: "never gated", policy: p, grade: GradeAlways, applied: "h", desired: "h", confirmed: now, decision: DecisionNotGated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := tc.policy.EvaluateSweepConfirmed(tc.grade, tc.applied, tc.desired, tc.confirmed, now, tc.invalidated)
+			if gate.Open != tc.open || gate.Decision != tc.decision || gate.Requeue != tc.requeue {
+				t.Fatalf("EvaluateSweepConfirmed = %+v, want open=%v decision=%s requeue=%v", gate, tc.open, tc.decision, tc.requeue)
+			}
+		})
 	}
 }

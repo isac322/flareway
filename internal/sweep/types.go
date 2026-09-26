@@ -37,6 +37,16 @@ type Invalidator interface {
 	Clear(kind string, key types.NamespacedName)
 }
 
+// ContentConfirmer is the optional path the sweep uses to check a listed
+// remote object against the desired content its reconciler last verified
+// (freshness.Latch implements it). ConfirmContent reports true when the
+// listed object no longer matches; a match counts as a fresh verify of the
+// object as of at, which must not be later than the start of the listing.
+// An Invalidator that does not implement it gets identity-only checks.
+type ContentConfirmer interface {
+	ConfirmContent(kind string, key types.NamespacedName, observed any, at time.Time) bool
+}
+
 // DriftCase is the classified drift type for one remote/local pair.
 type DriftCase string
 

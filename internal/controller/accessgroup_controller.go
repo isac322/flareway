@@ -171,7 +171,13 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	// The sweep's group listing carries every field accessGroupMatchesInput
+	// compares; rule references are resolved before the gate on every pass.
+	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
+		group, ok := listed.(flarecloudflare.AccessGroup)
+		return ok && group.ID == remote.ID && accessGroupMatchesInput(group, input)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessGroup", request.NamespacedName)

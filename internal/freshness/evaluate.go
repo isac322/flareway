@@ -78,3 +78,43 @@ func (p Policy) Evaluate(grade Grade, appliedHash, desiredHash string, appliedAt
 
 	return Gate{Open: true, Requeue: requeue, Decision: DecisionOpen}
 }
+
+// SweepConfirmationWindow is how long a sweep confirmation keeps an object's
+// gate open: two grade periods. The sweep lists each kind once per period
+// plus up to a fifth of jitter, so with a healthy sweep a new confirmation
+// always lands before the previous one expires and the object never has to
+// read the remote itself. If the sweep stops, confirmations stop, and the
+// object's own verify resumes within this window.
+func (p Policy) SweepConfirmationWindow(grade Grade) time.Duration {
+	return 2 * p.TTL(grade)
+}
+
+// EvaluateSweepConfirmed judges the gate for an object whose content a sweep
+// listing confirmed at confirmedAt. It applies the same fail-closed checks as
+// Evaluate, in the same order, but measures age against
+// SweepConfirmationWindow instead of the TTL. Callers use it only after
+// Evaluate did not open the gate, and only with a confirmation recorded for
+// desiredHash.
+func (p Policy) EvaluateSweepConfirmed(grade Grade, appliedHash, desiredHash string, confirmedAt, now time.Time, invalidated bool) Gate {
+	if grade == GradeAlways {
+		return Gate{Open: false, Decision: DecisionNotGated}
+	}
+	window := p.SweepConfirmationWindow(grade)
+	if window <= 0 {
+		return Gate{Open: false, Decision: DecisionClosedTTL}
+	}
+	if invalidated {
+		return Gate{Open: false, Decision: DecisionClosedInvalidated}
+	}
+	if appliedHash == "" || desiredHash == "" || appliedHash != desiredHash {
+		return Gate{Open: false, Decision: DecisionClosedHash}
+	}
+	if confirmedAt.IsZero() {
+		return Gate{Open: false, Decision: DecisionClosedTTL}
+	}
+	age := now.Sub(confirmedAt)
+	if age < 0 || age >= window {
+		return Gate{Open: false, Decision: DecisionClosedTTL}
+	}
+	return Gate{Open: true, Requeue: window - age, Decision: DecisionOpen}
+}

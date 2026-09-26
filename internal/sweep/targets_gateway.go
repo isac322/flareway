@@ -59,10 +59,11 @@ func sweepZeroTrustGatewayPolicies(ctx context.Context, as *AccountSweeper) ([]D
 		descriptions[key] = policy.Spec.Description
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.GatewayRule]{
-		kind:   "ZeroTrustGatewayPolicy",
-		idOf:   func(r flarecloudflare.GatewayRule) string { return r.ID },
-		listed: accountScopeListed,
-		nameOf: func(r flarecloudflare.GatewayRule) string { return r.Name },
+		kind:    "ZeroTrustGatewayPolicy",
+		content: contentCheck[flarecloudflare.GatewayRule](ctx, as),
+		idOf:    func(r flarecloudflare.GatewayRule) string { return r.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(r flarecloudflare.GatewayRule) string { return r.Name },
 		extra: func(ref localRef, remote flarecloudflare.GatewayRule) string {
 			if want := descriptions[ref.key]; want != nil && remote.Description != *want {
 				return fmt.Sprintf("remote description %q does not match spec description %q", remote.Description, *want)
@@ -105,10 +106,11 @@ func sweepZeroTrustLists(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 		typesByKey[key] = string(ztList.Spec.Type)
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.GatewayList]{
-		kind:   "ZeroTrustList",
-		idOf:   func(l flarecloudflare.GatewayList) string { return l.ID },
-		listed: accountScopeListed,
-		nameOf: func(l flarecloudflare.GatewayList) string { return l.Name },
+		kind:    "ZeroTrustList",
+		content: contentCheck[flarecloudflare.GatewayList](ctx, as),
+		idOf:    func(l flarecloudflare.GatewayList) string { return l.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(l flarecloudflare.GatewayList) string { return l.Name },
 		extra: func(ref localRef, remote flarecloudflare.GatewayList) string {
 			if want := typesByKey[ref.key]; want != "" && string(remote.Type) != want {
 				return fmt.Sprintf("remote list type %q does not match spec type %q", remote.Type, want)

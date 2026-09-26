@@ -636,6 +636,21 @@ type AccessApplicationCreateResult struct {
 	SaaSClientSecret string
 }
 
+// AccessApplicationListing is one Access application as a drift sweep pass
+// saw it, together with the other listings of the same pass that its
+// references resolve against. Every map is built from a complete listing; a
+// nil map means that listing was not taken in this pass.
+type AccessApplicationListing struct {
+	Application AccessApplication
+	// Applications holds every application listed in the pass, by ID, so
+	// bypass children can be checked alongside their parent.
+	Applications map[string]AccessApplication
+	// IdentityProviders holds the account's identity provider IDs.
+	IdentityProviders map[string]struct{}
+	// CustomPages holds the account's custom pages by ID.
+	CustomPages map[string]AccessCustomPageSummary
+}
+
 // CreateAccessApplication is part of the Flareway API.
 func (client *Client) CreateAccessApplication(ctx context.Context, scope AccessScope, input AccessApplicationInput) (AccessApplicationCreateResult, error) {
 	body, err := accessApplicationNewBody(input)

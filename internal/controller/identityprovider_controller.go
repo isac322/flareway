@@ -335,7 +335,18 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if err := r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if !identityProviderRemoteSCIMEnabled(remote.SCIMConfig) {
+		// The sweep's provider listing carries every field compared above.
+		// With SCIM enabled this verify also reads the SCIM directory, which
+		// the listing does not show, so such a provider keeps its own verify.
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			provider, ok := listed.(flarecloudflare.IdentityProvider)
+			return ok && provider.ID == remote.ID && !identityProviderRemoteSCIMEnabled(provider.SCIMConfig) &&
+				identityProviderMatchesInput(provider, input)
+		}, remote))
+	}
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "IdentityProvider", request.NamespacedName)

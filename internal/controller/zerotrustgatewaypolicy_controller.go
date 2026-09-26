@@ -134,7 +134,14 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, "Ready", "Zero Trust Gateway policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	// ListGatewayRules returns the full rule, so the sweep's listing can
+	// stand in for this pass's own read.
+	stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+		rule, ok := listed.(flarecloudflare.GatewayRule)
+		return ok && rule.ID == remote.ID && !rule.ReadOnly && gatewayRuleMatchesInput(rule, input)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeTraffic, globalRequeue)}, nil

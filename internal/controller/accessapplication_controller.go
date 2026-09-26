@@ -263,6 +263,16 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	// observation is the feature (safety condition 9).
 	var desiredHash string
 	if effectiveManagementPolicy(application.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly {
+		// The closed path also publishes AUD handoffs, commits the private
+		// tunnel ledger, and derives status from the compilation and the
+		// data plane. Those change without a spec change, so the local state
+		// they read is part of the hash: a change closes the gate and the
+		// next pass runs them. Without it, an object the sweep keeps
+		// confirming would never pick up a newly attached Gateway.
+		forwarding, err := r.forwardingApplied(ctx, application, resolved.compilation)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 		decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
 			Kind: "AccessApplication", Namespace: application.Namespace, Name: application.Name,
 			UID: application.UID, RemoteID: application.Status.ApplicationID,
@@ -270,7 +280,13 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			Spec: struct {
 				Spec  any `json:"spec"`
 				Input any `json:"input"`
-			}{Spec: application.Spec, Input: input},
+				Local any `json:"local"`
+			}{Spec: application.Spec, Input: input, Local: struct {
+				Compilation    gatewayapi.AccessApplicationCompilation `json:"compilation"`
+				Gateways       []types.NamespacedName                  `json:"gateways"`
+				PrivateTunnels any                                     `json:"privateTunnels"`
+				Forwarding     bool                                    `json:"forwarding"`
+			}{Compilation: resolved.compilation, Gateways: resolved.gateways, PrivateTunnels: desiredPrivateTunnels, Forwarding: forwarding}},
 		}, application.Status.AppliedHash, application.Status.AppliedAt, r.now())
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
@@ -293,7 +309,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		}
 		application.Status.ApplicationID = observed.ID
 	}
-	children, err := r.reconcileBypassApplications(ctx, remote, resolved.scope, application, resolved.compilation.Bypass, ownerTag, clusterID)
+	children, bypassState, err := r.reconcileBypassApplications(ctx, remote, resolved.scope, application, resolved.compilation.Bypass, ownerTag, clusterID)
 	if err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, "Pending", "Remote bypass application reconciliation failed: "+err.Error()))
 	}
@@ -326,7 +342,33 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
-	r.Invalidator.MarkVerified("AccessApplication", client.ObjectKeyFromObject(application), desiredHash, r.now())
+	stamp := newGateStamp(desiredHash, r.now())
+	// The sweep hands the matcher this application as it was listed, together
+	// with the pass's full application listing (bypass children) and, when any
+	// application references them, the account's identity providers and
+	// custom pages. That is everything this pass compared: attached policies
+	// are embedded in each listed application, so a policy deleted out of band
+	// shows up as changed content, and a referenced identity provider or
+	// custom page missing from a complete listing is drift.
+	written := r.writtenApplicationInput(ctx, application, input, ownerTag)
+	applicationMatches := func(remote flarecloudflare.AccessApplication) bool {
+		return remote.ID == observed.ID && accessApplicationPoliciesEmbedded(remote) && accessApplicationMatchesInput(remote, written)
+	}
+	if applicationMatches(observed) {
+		providers := slices.Clone(idpIDs)
+		if scimConfig != nil && scimConfig.IdentityProviderUID != "" {
+			providers = append(providers, scimConfig.IdentityProviderUID)
+		}
+		pages := slices.Clone(customPageIDs)
+		stamp = stamp.withContent(func(listed any) bool {
+			listing, ok := listed.(flarecloudflare.AccessApplicationListing)
+			return ok && applicationMatches(listing.Application) &&
+				bypassState.matches(listing.Applications) &&
+				listedIdentityProviders(listing, providers) &&
+				listedCustomPages(listing, pages)
+		})
+	}
+	recordGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), stamp)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 

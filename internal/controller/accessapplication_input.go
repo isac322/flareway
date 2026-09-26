@@ -35,6 +35,61 @@ import (
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 )
 
+// accessApplicationPoliciesEmbedded reports whether every attached policy in a
+// listed application is embedded with its decision, which is how Cloudflare
+// returns an attachment to a policy that still exists.
+func accessApplicationPoliciesEmbedded(application flarecloudflare.AccessApplication) bool {
+	for _, policy := range application.Policies {
+		if policy.ID == "" || policy.Decision == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// listedIdentityProviders reports whether every referenced identity provider
+// appears in the sweep pass's provider listing. With no references it holds
+// without a listing; with references, a pass that took no listing proves
+// nothing and does not confirm.
+func listedIdentityProviders(listing flarecloudflare.AccessApplicationListing, ids []string) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	if listing.IdentityProviders == nil {
+		return false
+	}
+	for _, id := range ids {
+		if _, found := listing.IdentityProviders[id]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+// listedCustomPages reports whether every referenced custom page appears in
+// the sweep pass's custom page listing, still with at most one page per type,
+// which is what the reconciler's own reference check requires.
+func listedCustomPages(listing flarecloudflare.AccessApplicationListing, ids []string) bool {
+	if len(ids) == 0 {
+		return true
+	}
+	if listing.CustomPages == nil {
+		return false
+	}
+	types := make(map[v1alpha1.AccessCustomPageType]struct{}, len(ids))
+	for _, id := range ids {
+		page, found := listing.CustomPages[id]
+		if !found {
+			return false
+		}
+		if _, duplicate := types[page.Type]; duplicate {
+			return false
+		}
+		types[page.Type] = struct{}{}
+	}
+	return true
+}
+
 // remoteReferenceChecks queues confirmations that Cloudflare objects referenced
 // by an AccessApplication still exist. The reference resolvers run before the
 // freshness gate, so a remote read there would be paid on every pass, including

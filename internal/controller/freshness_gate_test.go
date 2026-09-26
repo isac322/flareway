@@ -457,6 +457,44 @@ func TestEvaluateGateInMemoryVerification(t *testing.T) {
 	}
 }
 
+// A sweep confirmation keeps the gate open past the TTL, up to the
+// confirmation window. Once a pass has gone to the remote for another desired
+// state, the old confirmation must not re-open the gate when the desired state
+// changes back: that pass may have left status describing a failure, and only
+// a new converged pass may bring it back in line.
+func TestEvaluateGateSweepConfirmation(t *testing.T) {
+	key := types.NamespacedName{Namespace: "tenant", Name: "app"}
+	policy := freshness.DefaultPolicy()
+	ttl := policy.TTL(freshness.GradeAuthz)
+	now := virtualNetworkTestClock
+	stale := metav1.NewTime(now.Add(-3 * ttl))
+	evaluate := func(latch *freshness.Latch, desired string, at time.Time) freshness.Gate {
+		return evaluateGateWithHash(policy, latch, freshness.GradeAuthz, "AccessApplication", key, "h1", desired, &stale, at).Gate
+	}
+	confirmed := func() *freshness.Latch {
+		latch := freshness.NewLatch()
+		latch.SetBaseline("AccessApplication", key, "h1", func(any) bool { return true })
+		latch.ConfirmContent("AccessApplication", key, "listed", now.Add(-ttl-time.Second))
+		return latch
+	}
+
+	latch := confirmed()
+	if gate := evaluate(latch, "h1", now); !gate.Open || gate.Requeue != ttl-time.Second {
+		t.Fatalf("gate past the TTL but inside the confirmation window = %+v, want open until the window ends", gate)
+	}
+	if gate := evaluate(latch, "h1", now.Add(ttl)); gate.Open {
+		t.Fatal("a confirmation older than two TTLs kept the gate open")
+	}
+
+	latch = confirmed()
+	if gate := evaluate(latch, "h2", now); gate.Open {
+		t.Fatal("a confirmation of h1 opened the gate for h2")
+	}
+	if gate := evaluate(latch, "h1", now); gate.Open {
+		t.Fatal("after a pass went to the remote for h2, the old confirmation of h1 re-opened the gate")
+	}
+}
+
 // gateStampFields decides whether a gated kind can persist its stamp at all,
 // and under which latch kind its verify time is kept. A kind missing from it
 // writes nothing and loses its saving with no symptom, and a kind name that

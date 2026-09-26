@@ -82,11 +82,28 @@ limitations under the License.
 //     so the first pass after a restart reads fresh unless the hash itself
 //     was recorded within the last TTL. Keeping the verify time out of
 //     status is what lets a converged object produce no status writes.
+//  6. Lost content baselines and sweep confirmations only mean the sweep
+//     cannot stand in for an object's verify until that object verifies
+//     itself once more and registers a new baseline.
+//
+// # Sweep confirmation
+//
+// A reconciler whose verify compared nothing the sweep's listing cannot show
+// registers a content baseline (SetBaseline) with a matcher that applies the
+// same comparison. The sweep calls ConfirmContent with each listed object: a
+// match records a confirmation of the baseline hash, and the gate treats it as
+// a verify valid for SweepConfirmationWindow (two grade periods, longer than
+// the sweep's own interval). A mismatch is drift. A confirmation never outlives
+// an invalidation or a newer baseline, and it opens the gate only for the
+// exact desired hash that was confirmed. When the sweep stops, confirmations
+// stop, and the object's own verify resumes within the window.
 //
 // # Latch caller contract
 //
 // The owning reconciler MUST call Latch.Clear only after the object has
 // re-converged (successful remote sync). Clearing earlier re-opens the gate
-// on a still-drifted object. All Latch methods are safe on a nil receiver so
+// on a still-drifted object. A content matcher MUST report false for any
+// value it does not recognize and MUST NOT accept a remote the reconciler's
+// own verify would reject. All Latch methods are safe on a nil receiver so
 // reconcilers can treat an uninjected latch as "no invalidations".
 package freshness

@@ -135,7 +135,16 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Virtual network is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	// ListVirtualNetworks returns every field this pass compared, so the
+	// sweep's listing can stand in for this pass's own read.
+	stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+		vnet, ok := listed.(flarecloudflare.VirtualNetwork)
+		return ok && vnet.ID == remote.ID && !vnet.Deleted &&
+			privateCommentOwnedBy(vnet.Comment, input.Comment) &&
+			!virtualNetworkNeedsUpdate(input, vnet)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "VirtualNetwork", request.NamespacedName)
