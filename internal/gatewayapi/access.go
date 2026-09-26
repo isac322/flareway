@@ -444,10 +444,54 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, &nextPublicPort, dropped, remaining)
 		}
 	}
+	disambiguateDerivedDomainNames(gateway, statuses)
 	applyAccessRouteDrops(statuses, in, dropped, remaining, now)
 	for key, compiled := range statuses.AccessApplications {
 		sortAccessCompilation(&compiled)
 		statuses.AccessApplications[key] = compiled
+	}
+}
+
+// disambiguateDerivedDomainNames keeps protection domain names unique across
+// listeners. A derived domain is named after its listener plus a suffix
+// ("-public", "-blocked", "-access-..."), so it can spell the same name as
+// another listener ("web" + "-public" and a listener named "web-public").
+// Envoy names each route table after its domain, and the translator refuses
+// two route tables with one name, so a derived name that another listener
+// also uses gets a suffix derived from its own listener. Names that do not
+// collide stay unchanged.
+func disambiguateDerivedDomainNames(gateway *ir.Gateway, statuses *Statuses) {
+	listenersByName := make(map[string]map[string]struct{}, len(gateway.Domains))
+	for _, domain := range gateway.Domains {
+		listeners := listenersByName[domain.Name]
+		if listeners == nil {
+			listeners = make(map[string]struct{}, 1)
+			listenersByName[domain.Name] = listeners
+		}
+		listeners[domain.ListenerName] = struct{}{}
+	}
+	renamed := make(map[[2]string]string)
+	for index := range gateway.Domains {
+		domain := &gateway.Domains[index]
+		if domain.Name == domain.ListenerName || len(listenersByName[domain.Name]) < 2 {
+			continue
+		}
+		sum := sha256.Sum256([]byte(domain.ListenerName))
+		name := domain.Name + "-" + hex.EncodeToString(sum[:4])
+		renamed[[2]string{domain.ListenerName, domain.Name}] = name
+		domain.Name = name
+	}
+	if len(renamed) == 0 {
+		return
+	}
+	for key, compilation := range statuses.AccessApplications {
+		for index := range compilation.DataPlanes {
+			dataPlane := &compilation.DataPlanes[index]
+			if name, ok := renamed[[2]string{dataPlane.Listener, dataPlane.ProtectionDomain}]; ok {
+				dataPlane.ProtectionDomain = name
+			}
+		}
+		statuses.AccessApplications[key] = compilation
 	}
 }
 

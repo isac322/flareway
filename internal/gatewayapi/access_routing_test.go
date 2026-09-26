@@ -19,16 +19,19 @@ package gatewayapi
 import (
 	"slices"
 	"testing"
+	"time"
 
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/xds/translator"
 )
 
@@ -84,6 +87,61 @@ func TestAccessOnWildcardListenerRoutesEveryHostOnItsOwnPort(t *testing.T) {
 		}
 		if dataPlaneDomains[domain.Name] != domain.EnvoyPort {
 			t.Errorf("status reports domain %q on port %d, Envoy serves it on %d", domain.Name, dataPlaneDomains[domain.Name], domain.EnvoyPort)
+		}
+	}
+}
+
+// A public carve-out on listener "http" is a domain named "http-public",
+// which is also the name of a second listener. Both used to share one route
+// table name, so one port silently served the other's hosts; with the
+// translator's duplicate-name check the whole Gateway would fail instead.
+// The derived name must be made unique so both listeners keep working.
+func TestDerivedDomainNameThatEqualsAnotherListenerStaysRoutable(t *testing.T) {
+	in := accessInputs(true)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "tools", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: new(gatewayv1.SectionName("http"))}}},
+			Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("dashboard", "/", "dashboard"), namedRouteRule("api-v1", "/v1", "api")},
+		},
+	}}
+	key := types.NamespacedName{Namespace: "default", Name: "dashboard"}
+	in.AccessApplications = []v1alpha1.AccessApplication{accessApplication(key.Name, "HTTPRoute", "tools", "dashboard")}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{key: {AUD: "aud-dashboard", ApplicationID: "app-dashboard", Ready: true}}
+	in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
+		Name: "http-public", Hostname: new(gatewayv1.Hostname("other.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	})
+	grant := &in.CloudflareAccount.Spec.Grants[0]
+	grant.Hostnames = append(grant.Hostnames, "other.example.com")
+	grant.UnprotectedHostnames = append(grant.UnprotectedHostnames, "other.example.com")
+	other := routeWithBackend("other", "backend", 8080)
+	other.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http-public"))
+	in.HTTPRoutes = append(in.HTTPRoutes, other)
+
+	gateway, statuses := Translate(in)
+	if compiled := statuses.AccessApplications[key]; !compiled.Accepted {
+		t.Fatalf("application compilation = %#v", compiled)
+	}
+	listenerOf := make(map[string]string)
+	for _, domain := range gateway.Domains {
+		if listener, seen := listenerOf[domain.Name]; seen && listener != domain.ListenerName {
+			t.Fatalf("protection domain name %q is used by listeners %q and %q", domain.Name, listener, domain.ListenerName)
+		}
+		listenerOf[domain.Name] = domain.ListenerName
+	}
+
+	snapshot, err := translator.Build(gateway, nil)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	portHosts := routedHostsByPort(t, snapshot.GetResources(resourcev3.ListenerType), snapshot.GetResources(resourcev3.RouteType))
+	for _, domain := range gateway.Domains {
+		if domain.Guard != ir.GuardUnprotected {
+			continue
+		}
+		want := domain.VirtualHosts[0].Hostname
+		if !slices.Equal(portHosts[domain.EnvoyPort], []string{want}) {
+			t.Errorf("domain %q (listener %s): Envoy port %d routes %v, want only %s", domain.Name, domain.ListenerName, domain.EnvoyPort, portHosts[domain.EnvoyPort], want)
 		}
 	}
 }

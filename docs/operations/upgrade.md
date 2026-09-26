@@ -90,6 +90,8 @@ This release gives each hostname an AccessApplication protects on a public liste
 - Re-apply the CRDs server-side before upgrading the controller. `CloudflareTunnel.status.listeners[].protectionDomains` now holds up to 256 entries instead of 64, one per protected public hostname plus the listener's own domains. With the previous CRDs, a listener with more than 64 entries fails its status update.
 - Envoy ports and the remote tunnel configuration do not change. On the first reconcile after the update, the protection domain names in `CloudflareTunnel.status` and `AccessApplication.status.dataPlanes` change once, and Envoy receives renamed route tables for those listeners.
 - Private listeners keep one protection domain per application, because their hostnames share the listener port.
+- A protection domain derived from one listener (`<listener>-public`, `<listener>-blocked`, `<listener>-access-...`) that spells the name of another listener on the same Gateway now gets a short hash suffix. Earlier releases gave both the same route table, so one of the two listeners served the other's hosts. Other names are unchanged.
+- The controller now refuses to publish an Envoy configuration in which two route tables share a name. The Gateway reports `Programmed=False` with reason `Invalid`. Running Envoy Pods keep serving the last configuration they received, but a Pod that starts while the Gateway is in this state has no listeners until the configuration compiles again.
 
 ## Controller ownership changes
 
