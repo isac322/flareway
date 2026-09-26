@@ -515,6 +515,45 @@ func TestAccessBlockFirstGatewayMixedPublicCarveOut(t *testing.T) {
 	}
 }
 
+// Protection domain names can change between releases while the host, its
+// port, and its application stay the same. A host the tunnel still reports as
+// Forwarding under the previous name must go through block-first like any
+// other forwarding host, or a config change would reach it unblocked.
+func TestAccessBlockFirstGatewayFollowsRenamedProtectionDomain(t *testing.T) {
+	gateway := &ir.Gateway{
+		Cloudflare: &ir.Cloudflare{AccountID: "account-id"},
+		Listeners:  []ir.Listener{{Name: "preview", Exposure: ir.ExposurePublic}},
+		Domains: []ir.ProtectionDomain{{
+			Name: "preview-access-apps-web-1a2b3c4d", ListenerName: "preview", EnvoyPort: 18082, Protected: true, Guard: ir.GuardForwarding,
+			AccessApplication: "apps/web",
+			Access:            &ir.AccessGuard{AUDs: []string{"new-aud"}, TeamName: "team", AuthDomain: "team.cloudflareaccess.com"},
+			VirtualHosts:      []ir.VirtualHost{{Hostname: "app1.example.com"}},
+		}},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{Status: v1alpha1.CloudflareTunnelStatus{
+		ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{DesiredHash: "old-config"},
+		Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+			Hostname: "app1.example.com", ProtectionDomain: "preview-access-apps-web", AccessApplication: "apps/web", Guard: v1alpha1.HostnameGuardForwarding,
+		}},
+	}}
+	blocked, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transitioning || blocked.Domains[0].Guard != ir.GuardBlocked || blocked.Domains[0].Access != nil {
+		t.Fatalf("renamed forwarding domain skipped block-first: transitioning %v, gateway %#v", transitioning, blocked)
+	}
+
+	tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+	desired, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transitioning || desired != gateway {
+		t.Fatalf("blocked host under the previous name did not release desired config: transitioning %v", transitioning)
+	}
+}
+
 func TestDesiredTunnelHostnamesPreservePerDomainHandshake(t *testing.T) {
 	gateway := &ir.Gateway{
 		Domains: []ir.ProtectionDomain{

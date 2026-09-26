@@ -514,7 +514,9 @@ type CloudflareTunnelListenerStatus struct {
 	Name     gatewayv1.SectionName `json:"name"`
 	Exposure Exposure              `json:"exposure"`
 	Binding  ListenerBinding       `json:"binding,omitempty"`
-	// +kubebuilder:validation:MaxItems=64
+	// Each public Access-protected host has its own entry, so the bound
+	// matches status.hostnames.
+	// +kubebuilder:validation:MaxItems=256
 	// +listType=map
 	// +listMapKey=name
 	ProtectionDomains []CloudflareProtectionDomainStatus `json:"protectionDomains,omitempty"`

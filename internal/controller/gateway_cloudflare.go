@@ -101,10 +101,20 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 	}
 
 	currentGuards := make(map[string]v1alpha1.HostnameGuard, len(tunnel.Status.Hostnames))
+	// applicationGuards records each host's guard per Access application
+	// regardless of protection domain name, so a domain renamed across
+	// releases still sees the guard the tunnel reports for its host.
+	applicationGuards := make(map[string]v1alpha1.HostnameGuard, len(tunnel.Status.Hostnames))
 	unprotectedHosts := make(map[string]bool)
 	for _, hostname := range tunnel.Status.Hostnames {
 		host := strings.ToLower(hostname.Hostname)
 		currentGuards[strings.Join([]string{host, hostname.ProtectionDomain, hostname.AccessApplication}, "\x00")] = hostname.Guard
+		if hostname.AccessApplication != "" {
+			applicationKey := host + "\x00" + hostname.AccessApplication
+			if applicationGuards[applicationKey] != v1alpha1.HostnameGuardForwarding {
+				applicationGuards[applicationKey] = hostname.Guard
+			}
+		}
 		if hostname.Guard == v1alpha1.HostnameGuardUnprotected {
 			unprotectedHosts[host] = true
 		}
@@ -116,7 +126,10 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 		}
 		for _, virtualHost := range domain.VirtualHosts {
 			host := strings.ToLower(virtualHost.Hostname)
-			guard := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
+			guard, found := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
+			if !found && domain.AccessApplication != "" {
+				guard = applicationGuards[host+"\x00"+domain.AccessApplication]
+			}
 			if guard == v1alpha1.HostnameGuardBlocked {
 				// The block-first handshake already completed for this domain;
 				// a public carve-out on the same hostname must not re-block it.
@@ -992,16 +1005,18 @@ func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelList
 				status.Binding = v1alpha1.ListenerBindingPodIP
 			}
 		}
-		// One ir.ProtectionDomain is produced per virtual host, and hosts that
-		// need no Access claim reuse the listener's base domain verbatim --
-		// same name, same port, same guard. A wildcard listener therefore
-		// yields as many identically named domains as it has hosts.
+		// One ir.ProtectionDomain is produced per virtual host. Fragments that
+		// share a name are one Envoy route table on one port: hosts with no
+		// Access claim reuse the listener's base domain, and private Access
+		// hosts share the listener port. translator.Build rejects a name that
+		// maps to more than one route table, so the fragments are identical
+		// here, and each public Access host carries its own name and port.
 		//
-		// ProtectionDomains is +listMapKey=name, so emitting them one-for-one
-		// makes the whole status object unpatchable: server-side apply rejects
-		// it with "duplicate entries for key [name=...]" and the Gateway
-		// reconcile fails before any route status is written. Report each
-		// distinct protection domain once instead.
+		// ProtectionDomains is +listMapKey=name, so emitting fragments
+		// one-for-one makes the whole status object unpatchable: server-side
+		// apply rejects it with "duplicate entries for key [name=...]" and the
+		// Gateway reconcile fails before any route status is written. Report
+		// each distinct protection domain once instead.
 		seen := make(map[string]struct{}, len(gateway.Domains))
 		for _, domain := range gateway.Domains {
 			if domain.ListenerName != listener.Name {

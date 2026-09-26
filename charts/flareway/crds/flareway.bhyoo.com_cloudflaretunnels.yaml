@@ -1404,6 +1404,9 @@ spec:
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     protectionDomains:
+                      description: |-
+                        Each public Access-protected host has its own entry, so the bound
+                        matches status.hostnames.
                       items:
                         description: CloudflareProtectionDomainStatus records one
                           Envoy protection domain.
@@ -1420,7 +1423,7 @@ spec:
                         - name
                         - protected
                         type: object
-                      maxItems: 64
+                      maxItems: 256
                       type: array
                       x-kubernetes-list-map-keys:
                       - name

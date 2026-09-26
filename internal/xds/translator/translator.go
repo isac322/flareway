@@ -159,6 +159,9 @@ func Build(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) (*cachev3.Snapshot,
 		resourcev3.EndpointType: toResources(assignments),
 		resourcev3.SecretType:   toResources(secrets),
 	}
+	if err := rejectDuplicateResourceNames(resources); err != nil {
+		return nil, err
+	}
 	snapshot, err := cachev3.NewSnapshot(version, resources)
 	if err != nil {
 		return nil, fmt.Errorf("create xDS snapshot: %w", err)
@@ -170,6 +173,26 @@ func Build(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) (*cachev3.Snapshot,
 		return nil, fmt.Errorf("construct Delta xDS version map: %w", err)
 	}
 	return snapshot, nil
+}
+
+// rejectDuplicateResourceNames fails the build when two resources of one type
+// share a name. A snapshot indexes resources by name and keeps only the last,
+// so a duplicate would silently replace one listener's routes or cluster with
+// another's while every reference still resolves.
+func rejectDuplicateResourceNames(resources map[resourcev3.Type][]cachetypes.Resource) error {
+	for _, typeURL := range []resourcev3.Type{
+		resourcev3.ListenerType, resourcev3.RouteType, resourcev3.ClusterType, resourcev3.EndpointType, resourcev3.SecretType,
+	} {
+		seen := make(map[string]struct{}, len(resources[typeURL]))
+		for _, resource := range resources[typeURL] {
+			name := cachev3.GetResourceName(resource)
+			if _, duplicate := seen[name]; duplicate {
+				return fmt.Errorf("xDS resource name %q is used by more than one %s", name, typeURL)
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // SnapshotVersion returns the single version shared by every resource type.
