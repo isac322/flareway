@@ -29,10 +29,19 @@ func handoffGCScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
+// accessApplicationTestClientBuilder mirrors the field index SetupWithManager
+// installs on corev1.Secret. Every fake-client fixture that drives
+// AccessApplicationReconciler.Reconcile must start from it: Reconcile lists
+// handoff Secrets through the index, so a builder without it fails the way an
+// unregistered index does against the real manager cache.
+func accessApplicationTestClientBuilder(scheme *runtime.Scheme) *fakeclient.ClientBuilder {
+	return fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithIndex(&corev1.Secret{}, accessApplicationHandoffOwnerIndex, accessHandoffOwnerIndexKeys(accessApplicationAUDNamespace))
+}
+
 func handoffGCClient(t *testing.T, objects ...client.Object) client.WithWatch {
 	t.Helper()
-	return fakeclient.NewClientBuilder().WithScheme(handoffGCScheme(t)).
-		WithIndex(&corev1.Secret{}, accessApplicationHandoffOwnerIndex, accessHandoffOwnerIndexKeys(accessApplicationAUDNamespace)).
+	return accessApplicationTestClientBuilder(handoffGCScheme(t)).
 		WithObjects(objects...).Build()
 }
 

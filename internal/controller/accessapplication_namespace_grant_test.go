@@ -29,7 +29,6 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -95,8 +94,7 @@ func TestAccessApplicationInUngrantedNamespaceReportsRefNotPermitted(t *testing.
 			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
 		},
 	}
-	kube := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
+	kube := accessApplicationTestClientBuilder(scheme).
 		WithStatusSubresource(&v1alpha1.AccessApplication{}).
 		WithObjects(namespace, account, gateway, application).
 		Build()
