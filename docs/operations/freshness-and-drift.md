@@ -93,8 +93,18 @@ If a listing fails partway through, the sweep never treats a partial page as a
 complete list — a partial list would make healthy objects look missing. For
 most kinds the pass is discarded entirely.
 
-DNS records are the one exception, because a single account can span zones the
-token cannot read. When listing one zone fails with an access or server error
+The DNS sweep lists only the zones this installation can own records in: every
+zone named in the account's `spec.grants[].zones` (all zones when any grant
+lists `"*"`), plus every zone where a managed `CloudflareTunnel` still has a
+record in `status.dnsRecords`, which covers zones whose grant was later
+revoked. Other zones in the account are never called, so a token that can read
+DNS only in the granted zones produces `result="ok"` when everything is
+healthy. A zone ID in `status.dnsRecords` that is no longer in the account is
+skipped, and its checkpoints are not judged.
+
+DNS records are also the one exception to discarding a failed listing, because
+a zone in that set can still be unreadable, for example after the token was
+narrowed. When listing one zone fails with an access or server error
 (HTTP 403, 404, or 5xx, or a transport failure mid-pagination), the sweep drops
 that zone's records, continues through the remaining zones, and still reports
 drift found in the zones it could read. A zone that could not be listed is

@@ -508,6 +508,17 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 			g.Expect(application.Status.ApplicationID).To(gomega.BeEmpty())
 		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 		gomega.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Create:" + fixture.remoteName()))
+
+		// Resolution failed before any Cloudflare write, so losing the grant
+		// must not strand deletion behind the grant-gated remote cleanup.
+		fixture.setGrantedNamespace("revoked-" + fixture.namespace)
+		var application v1alpha1.AccessApplication
+		gomega.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, &application)).To(gomega.Succeed())
+		awaitRevocationLatchAndBlock(fixture, &application)
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(testClient.Get(testContext, fixture.applicationKey, &application))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
 	})
 	ginkgo.It("resolves a route-authorized private destination without publishing an AUD Secret", func() {
 		fixture := newAccessFixture("private-route", false, false)
@@ -1099,6 +1110,78 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
 	})
 
+	ginkgo.It("finalizes an application whose namespace the account never granted", func() {
+		fixture := newAccessFixture("ungranted", false, false)
+		fixture.create()
+		deniedNamespace := fixture.namespace + "-denied"
+		gomega.Expect(testClient.Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: deniedNamespace}})).To(gomega.Succeed())
+		ginkgo.DeferCleanup(forceDeleteAccessNamespace, deniedNamespace)
+		denied := fixture.application.DeepCopy()
+		denied.ObjectMeta = metav1.ObjectMeta{Name: "access", Namespace: deniedNamespace}
+		denied.Spec.Application.Name = deniedNamespace + "/access"
+		gomega.Expect(testClient.Create(testContext, denied)).To(gomega.Succeed())
+		deniedKey := client.ObjectKeyFromObject(denied)
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var application v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, deniedKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Finalizers).To(gomega.ContainElement(v1alpha1.AccessApplicationFinalizer))
+			accepted := findCondition(application.Status.Conditions, accessApplicationConditionAccepted)
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		gomega.Expect(testClient.Delete(testContext, denied)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			var application v1alpha1.AccessApplication
+			return apierrors.IsNotFound(testClient.Get(testContext, deniedKey, &application))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Expect(testAccessCloudflare.Calls()).NotTo(gomega.ContainElement("Create:" + denied.Spec.Application.Name))
+	})
+
+	ginkgo.It("keeps grant-gated recovery for a failed create after the grant is revoked", func() {
+		fixture := newAccessFixture("attempt-revoked", false, false)
+		testAccessCloudflare.Fail("Create:"+fixture.remoteName(), errors.New("injected create failure"))
+		fixture.create()
+		// ensureAccessTags runs before the create, so the failed attempt leaves
+		// owner tags behind that only grant-gated deletion recovery removes.
+		var ownerTags []string
+		gomega.Eventually(func(g gomega.Gomega) {
+			var application v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+			g.Expect(application.Status.ApplicationID).To(gomega.BeEmpty())
+			g.Expect(testAccessCloudflare.Calls()).To(gomega.ContainElement("Create:" + fixture.remoteName()))
+			ownerTags = slices.DeleteFunc(testAccessCloudflare.Tags(), func(tag string) bool { return tag == accessManagedTag })
+			g.Expect(ownerTags).NotTo(gomega.BeEmpty())
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		fixture.setGrantedNamespace("revoked-" + fixture.namespace)
+		var application v1alpha1.AccessApplication
+		gomega.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, &application)).To(gomega.Succeed())
+		awaitRevocationLatchAndBlock(fixture, &application)
+		gomega.Eventually(func(g gomega.Gomega) {
+			var current v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &current)).To(gomega.Succeed())
+			blocked := findCondition(current.Status.Conditions, accessApplicationConditionCleanupBlocked)
+			g.Expect(blocked).NotTo(gomega.BeNil())
+			g.Expect(blocked.Status).To(gomega.Equal(metav1.ConditionTrue))
+			g.Expect(blocked.Message).To(gomega.ContainSubstring("RefNotPermitted"))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Consistently(func(g gomega.Gomega) {
+			var current v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, fixture.applicationKey, &current)).To(gomega.Succeed())
+			g.Expect(testAccessCloudflare.Tags()).To(gomega.ContainElements(ownerTags))
+		}).WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+
+		fixture.setGrantedNamespace(fixture.namespace)
+		gomega.Eventually(func() bool {
+			var current v1alpha1.AccessApplication
+			return apierrors.IsNotFound(testClient.Get(testContext, fixture.applicationKey, &current))
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Expect(testAccessCloudflare.Tags()).NotTo(gomega.ContainElement(gomega.BeElementOf(ownerTags)))
+	})
+
 	ginkgo.It("maps AUD handoff Secrets and Namespaces back to their applications", func() {
 		fixture := newAccessFixture("watch-map", false, false)
 		fixture.create()
@@ -1449,6 +1532,19 @@ func (f *accessFixture) create() {
 	gomega.Expect(testClient.Create(testContext, f.application)).To(gomega.Succeed())
 }
 
+// setGrantedNamespace points the fixture account's only grant at the
+// namespace carrying the given tenant label value, revoking or restoring the
+// grant for the fixture namespace.
+func (f *accessFixture) setGrantedNamespace(tenant string) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		var account v1alpha1.CloudflareAccount
+		g.Expect(testClient.Get(testContext, types.NamespacedName{Name: f.account}, &account)).To(gomega.Succeed())
+		before := account.DeepCopy()
+		account.Spec.Grants[0].NamespaceSelector = metav1.LabelSelector{MatchLabels: map[string]string{"flareway.bhyoo.com/tenant": tenant}}
+		g.Expect(testClient.Patch(testContext, &account, client.MergeFrom(before))).To(gomega.Succeed())
+	}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
+}
+
 func (f *accessFixture) createAdditionalGateway(gatewayName, tunnelName, hostnameValue string) (*gatewayv1.Gateway, *v1alpha1.CloudflareTunnel) {
 	group := gatewayv1.Group(v1alpha1.Group)
 	hostname := gatewayv1.Hostname(hostnameValue)
@@ -1537,6 +1633,17 @@ func programAccessFixture(fixture *accessFixture, application *v1alpha1.AccessAp
 		g.Expect(condition).NotTo(gomega.BeNil())
 		g.Expect(condition.Status).To(gomega.Equal(metav1.ConditionTrue))
 	}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+}
+
+// awaitRevocationLatchAndBlock waits for deletion to latch revocation and then
+// reports the latched hostnames as Blocked, so deletion can move past the
+// fail-closed data-plane handshake.
+func awaitRevocationLatchAndBlock(fixture *accessFixture, application *v1alpha1.AccessApplication) {
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(testClient.Get(testContext, fixture.applicationKey, application)).To(gomega.Succeed())
+		g.Expect(application.Annotations[accessApplicationRevocationAnnotation]).NotTo(gomega.BeEmpty())
+	}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	applyBlockedAfterLatch(fixture, application)
 }
 
 func applyBlockedAfterLatch(fixture *accessFixture, application *v1alpha1.AccessApplication) {

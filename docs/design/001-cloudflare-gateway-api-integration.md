@@ -107,7 +107,7 @@ flowchart LR
 
 | 컨트롤러 | 입력 | 출력(원격) | 출력(클러스터) |
 |---|---|---|---|
-| gateway/tunnel | GatewayClass, Gateway, HTTPRoute, ReferenceGrant, BackendTLSPolicy, CloudflareTunnel | Tunnel lifecycle, Gateway-compiled config or Direct whole-object config, DNS record | Deployment(cloudflared+Envoy), Service, PDB, NetworkPolicy, CoreDNS ConfigMap, Delta ADS/SDS snapshot, connector/management-token Secrets |
+| gateway/tunnel | GatewayClass, Gateway, HTTPRoute, ReferenceGrant, BackendTLSPolicy, CloudflareTunnel | Tunnel lifecycle, Gateway-compiled config or Direct whole-object config, DNS record | Deployment(cloudflared+Envoy), listener Service(conformance mode 전용), PDB, NetworkPolicy, CoreDNS ConfigMap, Delta ADS/SDS snapshot, connector/management-token Secrets |
 | access | AccessApplication, AccessStandaloneApplication, AccessPolicy, AccessGroup, IdentityProvider, AccessCustomPage, DevicePostureRule, DevicePostureIntegration, AccessInfrastructureTarget, ServiceToken | apps/policies/groups/idps/custom_pages/posture/integrations/targets/service_tokens | AUD, SaaS client, SCIM, and service-token Secrets; status |
 | private-network | VirtualNetwork, NetworkRoute, HostnameRoute, WARPConnector | teamnet routes, virtual networks, hostname routes, WARP Connector tunnel/HA/failover | connector-token Secret, platform-created HostnameRoute when granted |
 | device | DeviceProfile, DeviceSettings | devices/policy(+include/exclude/fallback), devices/settings | status |
@@ -1007,7 +1007,7 @@ route가 attach된 상태에서 Gateway 또는 Tunnel을 삭제하면 다음 순
 
 `GatewayClassConfig.spec.conformanceMode: true`일 때 listener hostname은 선택이며 모든 port를 허용한다. HTTPS listener는 Envoy가 종료하므로 `certificateRefs`를 허용하고 필수로 요구한다. account grant, Edge hostname 깊이, Tunnel, DNS, Access 검사를 적용하지 않는다.
 
-Envoy는 `0.0.0.0:(10000 + listener.port)`에 바인딩하고 Service가 선언 listener port를 그 target port로 매핑한다. `Programmed`는 xDS ACK, Deployment Available, Service address 확보를 뜻한다. LoadBalancer Service는 ingress IP/hostname을, ClusterIP Service는 ClusterIP를 `Gateway.status.addresses`로 게시한다. 이 모드는 `accountRef`와 함께 사용할 수 없다.
+Envoy는 `0.0.0.0:(10000 + listener.port)`에 바인딩하고 Service가 선언 listener port를 그 target port로 매핑한다. `Programmed`는 xDS ACK, Deployment Available, Service address 확보를 뜻한다. LoadBalancer Service는 ingress IP/hostname을, ClusterIP Service는 ClusterIP를 `Gateway.status.addresses`로 게시한다. 이 모드는 `accountRef`와 함께 사용할 수 없다. 이 listener Service는 conformance mode에서만 만든다. Cloudflare 모드의 listener는 loopback에만 바인딩하므로 Service가 도달할 port가 없다. Gateway가 Cloudflare 모드가 되면 controller는 같은 Gateway UID가 controller인 기존 Service(v0.3.0 이하가 만든 것 포함)를 삭제하고, 다른 소유자의 Service는 건드리지 않는다.
 
 ### 12.3 관측성
 

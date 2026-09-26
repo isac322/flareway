@@ -143,7 +143,8 @@ func (r *GatewayReconciler) operatorNamespace() string {
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status;backendtlspolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=gatewayclassconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=services;configmaps,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch
@@ -205,6 +206,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if !cfg.Spec.ConformanceMode {
+		// Cloudflare mode never builds the listener Service. Remove a leftover
+		// before any readiness gate so Gateways still waiting on their tunnel
+		// or account shed it too.
+		if err := r.retractCloudflareListenerService(ctx, &gateway); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	rejected, err := r.rejectDirectTunnelAttachment(ctx, &gateway, cfg)
 	if err != nil {
@@ -1143,10 +1152,13 @@ func (r *GatewayReconciler) desiredResources(gateway *ir.Gateway, cfg *v1alpha1.
 		return nil, err
 	}
 	deployment := dataplane.BuildDeployment(gateway, cfg, bootstrap.Name, hash)
-	service := dataplane.BuildService(gateway, cfg)
+	resources := []client.Object{bootstrap, deployment}
+	if service := dataplane.BuildService(gateway, cfg); service != nil {
+		resources = append(resources, service)
+	}
 	pdb := dataplane.BuildPDB(gateway, cfg)
 	networkPolicy := dataplane.BuildNetworkPolicy(gateway, cfg, r.OperatorNamespace)
-	resources := []client.Object{bootstrap, deployment, service, pdb, networkPolicy}
+	resources = append(resources, pdb, networkPolicy)
 	if privateDNS := dataplane.BuildPrivateDNSConfigMap(gateway); privateDNS != nil {
 		resources = append(resources, privateDNS)
 	}
@@ -1216,6 +1228,58 @@ func (r *GatewayReconciler) retractGatewayDataplane(ctx context.Context, gateway
 	deployment.Spec.Replicas = &zero
 	if err := r.Patch(ctx, &deployment, client.MergeFrom(before)); err != nil {
 		return fmt.Errorf("scale dataplane Deployment %s to zero: %w", key, err)
+	}
+	return nil
+}
+
+// retractCloudflareListenerService deletes the conformance listener Service
+// of a Cloudflare-mode Gateway. Cloudflare mode binds Envoy listeners to
+// loopback, so the Service could only publish unreachable ports; v0.3.0 and
+// earlier conformance-mode reconciles may have left one behind. Only a Service
+// controlled by this exact Gateway UID is deleted, and the delete is pinned to
+// the observed UID and resourceVersion so a concurrent owner change fails with
+// a conflict instead of removing another writer's object. A Service without
+// that controller reference is left untouched.
+//
+// An admission rejection of the delete is reported through a Warning event
+// and does not fail the reconcile: the Service carries no Cloudflare-mode
+// traffic, so a denied cleanup must not stall tunnel and dataplane
+// convergence. Transient failures are returned so the caller retries.
+func (r *GatewayReconciler) retractCloudflareListenerService(ctx context.Context, gateway *gatewayv1.Gateway) error {
+	if gateway == nil || gateway.UID == "" {
+		return nil
+	}
+	key := types.NamespacedName{
+		Namespace: gateway.Namespace,
+		Name:      dataplane.ResourceName(&ir.Gateway{Key: client.ObjectKeyFromObject(gateway)}),
+	}
+	var service corev1.Service
+	if err := r.Get(ctx, key, &service); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get Cloudflare-mode listener Service %s: %w", key, err)
+	}
+	expected := metav1.NewControllerRef(gateway, schema.GroupVersion{Group: gatewayv1.GroupVersion.Group, Version: gatewayv1.GroupVersion.Version}.WithKind("Gateway"))
+	if !sameControllerIdentity(metav1.GetControllerOf(&service), expected) {
+		ctrl.LoggerFrom(ctx).V(1).Info(
+			"Leaving Service untouched in Cloudflare mode: not controlled by this Gateway UID",
+			"gateway", client.ObjectKeyFromObject(gateway), "gatewayUID", gateway.UID, "service", key,
+		)
+		return nil
+	}
+	err := r.Delete(ctx, &service, client.Preconditions{UID: &service.UID, ResourceVersion: &service.ResourceVersion})
+	if err == nil || apierrors.IsNotFound(err) {
+		return nil
+	}
+	var rejection *dataplaneRejectionError
+	if !errors.As(rejectDataplaneMutation(err), &rejection) {
+		return fmt.Errorf("delete Cloudflare-mode listener Service %s: %w", key, err)
+	}
+	message := fmt.Sprintf("Kubernetes rejected deleting the unused listener Service %s: %s", key, rejection.reason)
+	ctrl.LoggerFrom(ctx).Info(message, "gateway", client.ObjectKeyFromObject(gateway))
+	if r.Recorder != nil {
+		r.Recorder.Eventf(gateway, nil, corev1.EventTypeWarning, observability.EventReasonDataplaneApplyRejected, "RetractListenerService", "%s", message)
 	}
 	return nil
 }
