@@ -75,7 +75,7 @@ type AccessStandaloneApplicationReconciler struct {
 func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.AccessStandaloneApplication)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName, err)
 	}
 	r.observeStandaloneApplicationGeneration(object)
 	if !object.DeletionTimestamp.IsZero() {
@@ -158,7 +158,7 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if err := r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)

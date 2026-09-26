@@ -48,14 +48,16 @@ limitations under the License.
 //
 // # Why the latch is in-memory (verified)
 //
-// The Latch deliberately keeps no persistent state. The reasoning was
-// verified against internal/sweep:
+// The Latch deliberately keeps no persistent state. It holds two records per
+// object: the sweep's drift invalidation and the reconciler's last
+// verification (the time a pass confirmed the remote against a desired hash).
+// The reasoning was verified against internal/sweep:
 //
-//  1. Latch entries are only ever created for kinds the sweep actually
-//     sweeps (internal/sweep/targets.go). Non-swept kinds — tunnel ingress
-//     configuration, tunnel connections, IdP SCIM, tunnel tokens,
+//  1. Invalidation entries are only ever created for kinds the sweep
+//     actually sweeps (internal/sweep/targets.go). Non-swept kinds — tunnel
+//     ingress configuration, tunnel connections, IdP SCIM, tunnel tokens,
 //     ZeroTrustOrganization, DeviceSettings (sweep/doc.go "Non-sweepable
-//     kinds") — never carry latch entries, so a restart loses nothing for
+//     kinds") — never carry invalidations, so a restart loses nothing for
 //     them. Their drift detection already relies on the per-object
 //     TTL-expiry path by design.
 //  2. If a restart drops a latch for a swept kind, two cases bound the
@@ -74,6 +76,12 @@ limitations under the License.
 //     access or asserts convergence — an open gate only skips a read.
 //     Persisting it to etcd would add status write churn for zero safety
 //     gain.
+//  5. A lost verification record only makes the gate older. The gate then
+//     falls back to status.appliedAt, which records when the applied hash
+//     was last written and never moves on a re-verify that changed nothing,
+//     so the first pass after a restart reads fresh unless the hash itself
+//     was recorded within the last TTL. Keeping the verify time out of
+//     status is what lets a converged object produce no status writes.
 //
 // # Latch caller contract
 //

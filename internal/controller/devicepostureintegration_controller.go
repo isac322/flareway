@@ -75,7 +75,7 @@ type DevicePostureIntegrationReconciler struct {
 func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.DevicePostureIntegration)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "DevicePostureIntegration", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.reconcileDelete(ctx, object)
@@ -183,7 +183,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 	if err := r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "DevicePostureIntegration", request.NamespacedName)

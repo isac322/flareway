@@ -130,7 +130,7 @@ type CloudflareTunnelReconciler struct {
 func (r *CloudflareTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var tunnel v1alpha1.CloudflareTunnel
 	if err := r.Get(ctx, req.NamespacedName, &tunnel); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "CloudflareTunnel", req.NamespacedName, err)
 	}
 
 	if !tunnel.DeletionTimestamp.IsZero() {
@@ -632,7 +632,15 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if requeue <= 0 {
 		requeue = tunnelRequeue
 	}
-	return ctrl.Result{RequeueAfter: requeue}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
+	if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
+		return ctrl.Result{}, err
+	}
+	if mode == v1alpha1.CloudflareTunnelConfigurationModeDirect && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
+		// The Direct configuration was confirmed or written on this pass;
+		// the Gateway reconciler records Gateway-mode verifies itself.
+		r.Invalidator.MarkVerified("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), status.ConfigVersion.DesiredHash, now.Time)
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel) (ctrl.Result, error) {
@@ -1453,6 +1461,7 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 		return err
 	}
 	var applied flarecloudflare.TunnelConfiguration
+	appliedAt := &now
 	err = cf.WithTunnelLock(ctx, status.TunnelID, func() error {
 		// T0: reads inside this closure are never gate-served. The lock
 		// protects a read-modify-write; a stale snapshot here would let a
@@ -1467,6 +1476,11 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 				tunnel.Status.ConfigVersion.Desired > 0 &&
 				remote.Version == tunnel.Status.ConfigVersion.Desired {
 				applied = remote
+				// Confirming the recorded version is not an apply:
+				// appliedAt keeps the time the configuration was written.
+				if recorded := tunnel.Status.ConfigVersion.AppliedAt; recorded != nil {
+					appliedAt = recorded
+				}
 				return nil
 			}
 			if tunnel.Status.ConfigVersion.Applied > 0 && remote.Version != tunnel.Status.ConfigVersion.Applied {
@@ -1491,7 +1505,7 @@ func (r *CloudflareTunnelReconciler) reconcileConfiguration(
 	status.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{
 		Desired: applied.Version, DesiredHash: hash, Applied: applied.Version,
 		Remote: applied.Version, CreatedAt: timeStatus(applied.CreatedAt),
-		AppliedAt: &now,
+		AppliedAt: appliedAt,
 	}
 	setStatusCondition(status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionTrue, "Applied", fmt.Sprintf("Direct Tunnel configuration version %d is applied", applied.Version), tunnel.Generation, now), now)
 	return nil

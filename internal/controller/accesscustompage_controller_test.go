@@ -426,13 +426,23 @@ func TestResolveCustomPagesEnforcesGrantExistenceAndTypeUniqueness(t *testing.T)
 		Spec:       v1alpha1.AccessApplicationSpec{Application: v1alpha1.AccessApplicationSettings{CustomPageRefs: []v1alpha1.AccessCustomPageReference{{ObjectRef: &v1alpha1.NamespacedLocalObjectReference{Name: page.Name, Namespace: page.Namespace}}}}},
 	}
 	reconciler := &AccessApplicationReconciler{Client: kube}
+	// resolve runs the resolver and then the remote reference checks it
+	// queued, which is what a pass that goes to Cloudflare does.
+	resolve := func() ([]string, error) {
+		var checks remoteReferenceChecks
+		ids, err := reconciler.resolveCustomPages(ctx, application, account, remote, &checks)
+		if err != nil {
+			return nil, err
+		}
+		return ids, checks.run(ctx)
+	}
 
-	if _, err := reconciler.resolveCustomPages(ctx, application, account, remote); err == nil || accessValidationReason(err) != "RefNotPermitted" {
+	if _, err := resolve(); err == nil || accessValidationReason(err) != "RefNotPermitted" {
 		t.Fatalf("denied grant error = %v", err)
 	}
 	account.Spec.Grants[0].AccessCustomPageRefs = v1alpha1.GrantPermissionAllowed
 	account.Spec.Grants[0].PlatformObjects = v1alpha1.GrantPermissionAllowed
-	ids, err := reconciler.resolveCustomPages(ctx, application, account, remote)
+	ids, err := resolve()
 	if err != nil || !slices.Equal(ids, []string{"page-one"}) {
 		t.Fatalf("resolved custom pages = %v, %v", ids, err)
 	}
@@ -441,12 +451,12 @@ func TestResolveCustomPagesEnforcesGrantExistenceAndTypeUniqueness(t *testing.T)
 	remote.pages["page-two"] = flarecloudflare.AccessCustomPage{
 		AccessCustomPageSummary: flarecloudflare.AccessCustomPageSummary{ID: "page-two", Name: "page-two", Type: v1alpha1.AccessCustomPageTypeForbidden},
 	}
-	if _, err := reconciler.resolveCustomPages(ctx, application, account, remote); err == nil || accessValidationReason(err) != "Conflict" {
+	if _, err := resolve(); err == nil || accessValidationReason(err) != "Conflict" {
 		t.Fatalf("duplicate page type error = %v", err)
 	}
 	delete(remote.pages, "page-one")
 	application.Spec.Application.CustomPageRefs = application.Spec.Application.CustomPageRefs[:1]
-	if _, err := reconciler.resolveCustomPages(ctx, application, account, remote); err == nil || accessValidationReason(err) != "TargetNotFound" {
+	if _, err := resolve(); err == nil || accessValidationReason(err) != "TargetNotFound" {
 		t.Fatalf("missing remote page error = %v", err)
 	}
 }

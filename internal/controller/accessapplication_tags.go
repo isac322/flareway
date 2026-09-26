@@ -140,7 +140,7 @@ func desiredStandaloneAccessTags(applicationType v1alpha1.AccessStandaloneApplic
 	}
 }
 
-func (r *AccessApplicationReconciler) resolveCustomPages(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient) ([]string, error) {
+func (r *AccessApplicationReconciler) resolveCustomPages(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient, checks *remoteReferenceChecks) ([]string, error) {
 	authorization := authz.Request{}
 	for _, reference := range application.Spec.Application.CustomPageRefs {
 		if reference.ExternalID != "" {
@@ -157,58 +157,71 @@ func (r *AccessApplicationReconciler) resolveCustomPages(ctx context.Context, ap
 		}
 	}
 
-	ids := make([]string, 0, len(application.Spec.Application.CustomPageRefs))
-	pageTypes := make(map[v1alpha1.AccessCustomPageType]string, len(application.Spec.Application.CustomPageRefs))
+	// Each reference resolves to a page ID locally; reading the pages, which
+	// also yields their types for the one-page-per-type rule, is queued as a
+	// remote reference check.
+	type pageReference struct {
+		id      string
+		missing string
+	}
+	references := make([]pageReference, 0, len(application.Spec.Application.CustomPageRefs))
 	for index, reference := range application.Spec.Application.CustomPageRefs {
-		var page flarecloudflare.AccessCustomPage
 		if reference.ExternalID != "" {
-			observed, err := remote.GetAccessCustomPage(ctx, reference.ExternalID)
+			references = append(references, pageReference{id: reference.ExternalID, missing: fmt.Sprintf("external Access custom page %q", reference.ExternalID)})
+			continue
+		}
+		if reference.ObjectRef == nil {
+			return nil, accessValidationError{reason: "Invalid", message: fmt.Sprintf("customPageRefs[%d] is empty", index)}
+		}
+		targetNamespace := reference.ObjectRef.Namespace
+		if targetNamespace == "" {
+			targetNamespace = application.Namespace
+		}
+		var object v1alpha1.AccessCustomPage
+		key := types.NamespacedName{Namespace: targetNamespace, Name: reference.ObjectRef.Name}
+		if err := r.Get(ctx, key, &object); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s was not found", key)}
+			}
+			return nil, fmt.Errorf("get AccessCustomPage %s: %w", key, err)
+		}
+		if !object.DeletionTimestamp.IsZero() {
+			return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s is deleting", key)}
+		}
+		if object.Spec.AccountRef.Name != account.Name {
+			return nil, accessValidationError{reason: "RefNotPermitted", message: fmt.Sprintf("the AccessCustomPage %s uses CloudflareAccount %q, want %q", key, object.Spec.AccountRef.Name, account.Name)}
+		}
+		if object.Status.CustomPageID == "" || !metaConditionTrue(object.Status.Conditions, v1alpha1.AccessCustomPageConditionAccepted) {
+			return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s is not accepted", key)}
+		}
+		references = append(references, pageReference{id: object.Status.CustomPageID, missing: fmt.Sprintf("the AccessCustomPage %s remote page", key)})
+	}
+	if len(references) == 0 {
+		return []string{}, nil
+	}
+	checks.add(func(ctx context.Context) error {
+		pageTypes := make(map[v1alpha1.AccessCustomPageType]string, len(references))
+		for _, reference := range references {
+			page, err := remote.GetAccessCustomPage(ctx, reference.id)
 			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external Access custom page %q could not be resolved: %v", reference.ExternalID, err)}
+				return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("%s could not be resolved: %v", reference.missing, err)}
 			}
-			page = observed
-		} else {
-			if reference.ObjectRef == nil {
-				return nil, accessValidationError{reason: "Invalid", message: fmt.Sprintf("customPageRefs[%d] is empty", index)}
+			if err := confirmResolvedID("Access custom page", reference.id, page.ID); err != nil {
+				return err
 			}
-			targetNamespace := reference.ObjectRef.Namespace
-			if targetNamespace == "" {
-				targetNamespace = application.Namespace
-			}
-			var object v1alpha1.AccessCustomPage
-			key := types.NamespacedName{Namespace: targetNamespace, Name: reference.ObjectRef.Name}
-			if err := r.Get(ctx, key, &object); err != nil {
-				if apierrors.IsNotFound(err) {
-					return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s was not found", key)}
+			if existing, found := pageTypes[page.Type]; found {
+				return accessValidationError{
+					reason:  "Conflict",
+					message: fmt.Sprintf("the Access custom pages %q and %q both have type %s", existing, page.ID, page.Type),
 				}
-				return nil, fmt.Errorf("get AccessCustomPage %s: %w", key, err)
 			}
-			if !object.DeletionTimestamp.IsZero() {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s is deleting", key)}
-			}
-			if object.Spec.AccountRef.Name != account.Name {
-				return nil, accessValidationError{reason: "RefNotPermitted", message: fmt.Sprintf("the AccessCustomPage %s uses CloudflareAccount %q, want %q", key, object.Spec.AccountRef.Name, account.Name)}
-			}
-			if object.Status.CustomPageID == "" || !metaConditionTrue(object.Status.Conditions, v1alpha1.AccessCustomPageConditionAccepted) {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s is not accepted", key)}
-			}
-			observed, err := remote.GetAccessCustomPage(ctx, object.Status.CustomPageID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessCustomPage %s remote page could not be resolved: %v", key, err)}
-			}
-			page = observed
+			pageTypes[page.Type] = page.ID
 		}
-		if page.ID == "" {
-			return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the Access custom page reference %d resolved without an ID", index)}
-		}
-		if existing, found := pageTypes[page.Type]; found {
-			return nil, accessValidationError{
-				reason:  "Conflict",
-				message: fmt.Sprintf("the Access custom pages %q and %q both have type %s", existing, page.ID, page.Type),
-			}
-		}
-		pageTypes[page.Type] = page.ID
-		ids = append(ids, page.ID)
+		return nil
+	})
+	ids := make([]string, 0, len(references))
+	for _, reference := range references {
+		ids = append(ids, reference.id)
 	}
 	slices.Sort(ids)
 	return slices.Compact(ids), nil

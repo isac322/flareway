@@ -458,3 +458,31 @@ func TestLatchConcurrent(*testing.T) {
 	}
 	wg.Wait()
 }
+
+// Remove must leave nothing behind for an object that no longer exists, and
+// Forget must drop only the verify so an invalidation keeps the gate closed.
+func TestLatchForgetAndRemove(t *testing.T) {
+	key := types.NamespacedName{Namespace: "ns", Name: "obj"}
+	other := types.NamespacedName{Namespace: "ns", Name: "other"}
+	l := NewLatch()
+	l.MarkVerified("AccessPolicy", key, "h", time.Unix(1, 0))
+	l.MarkVerified("AccessPolicy", other, "h", time.Unix(1, 0))
+	l.Invalidate("AccessPolicy", other, "drift")
+
+	l.Forget("AccessPolicy", key)
+	if _, ok := l.VerifiedAt("AccessPolicy", key, "h"); ok {
+		t.Fatal("Forget kept the verify record")
+	}
+	l.MarkVerified("AccessPolicy", key, "h", time.Unix(2, 0))
+	l.Invalidate("AccessPolicy", key, "drift")
+	l.Forget("AccessPolicy", key)
+	if !l.IsInvalidated("AccessPolicy", key) {
+		t.Fatal("Forget dropped the invalidation")
+	}
+
+	l.Remove("AccessPolicy", key)
+	l.Remove("AccessPolicy", other)
+	if len(l.reasons) != 0 || len(l.verified) != 0 {
+		t.Fatalf("Remove left records behind: reasons=%v verified=%v", l.reasons, l.verified)
+	}
+}

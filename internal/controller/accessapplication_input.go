@@ -35,7 +35,40 @@ import (
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 )
 
-func (r *AccessApplicationReconciler) resolvePolicies(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient) ([]string, error) {
+// remoteReferenceChecks queues confirmations that Cloudflare objects referenced
+// by an AccessApplication still exist. The reference resolvers run before the
+// freshness gate, so a remote read there would be paid on every pass, including
+// the ones the gate lets skip Cloudflare entirely. The resolvers therefore take
+// the referenced ID from the spec or the referenced object's status and queue
+// the read; the reconciler runs the queue only on passes that go to Cloudflare
+// anyway (closed gate, ObserveOnly, or a latched revocation).
+type remoteReferenceChecks []func(context.Context) error
+
+func (checks *remoteReferenceChecks) add(check func(context.Context) error) {
+	*checks = append(*checks, check)
+}
+
+// run executes the queued checks in order and returns the first failure.
+func (checks remoteReferenceChecks) run(ctx context.Context) error {
+	for _, check := range checks {
+		if err := check(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// confirmResolvedID rejects a remote read that answered with a different
+// object than the one referenced; the referenced ID is already part of the
+// desired input and the gate hash.
+func confirmResolvedID(subject, want, got string) error {
+	if got != want {
+		return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the %s %q resolved to a different remote object %q", subject, want, got)}
+	}
+	return nil
+}
+
+func (r *AccessApplicationReconciler) resolvePolicies(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient, checks *remoteReferenceChecks) ([]string, error) {
 	ids := make([]string, 0, len(application.Spec.Policies))
 	var namespace corev1.Namespace
 	if err := r.Get(ctx, types.NamespacedName{Name: application.Namespace}, &namespace); err != nil {
@@ -43,11 +76,15 @@ func (r *AccessApplicationReconciler) resolvePolicies(ctx context.Context, appli
 	}
 	for _, reference := range application.Spec.Policies {
 		if reference.ExternalRef != nil {
-			policy, err := remote.GetAccessPolicy(ctx, reference.ExternalRef.PolicyID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external Access policy %q could not be resolved: %v", reference.ExternalRef.PolicyID, err)}
-			}
-			ids = append(ids, policy.ID)
+			policyID := reference.ExternalRef.PolicyID
+			checks.add(func(ctx context.Context) error {
+				policy, err := remote.GetAccessPolicy(ctx, policyID)
+				if err != nil {
+					return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external Access policy %q could not be resolved: %v", policyID, err)}
+				}
+				return confirmResolvedID("external Access policy", policyID, policy.ID)
+			})
+			ids = append(ids, policyID)
 			continue
 		}
 		if reference.PolicyRef == nil {
@@ -85,20 +122,23 @@ func (r *AccessApplicationReconciler) resolvePolicies(ctx context.Context, appli
 		}
 		policyID := policy.Status.PolicyID
 		if effectiveManagementPolicy(policy.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
-			observed, err := remote.GetAccessPolicy(ctx, policyID)
-			if err != nil {
-				return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessPolicy %s/%s remote policy could not be resolved: %v", policyNamespace, policy.Name, err)}
-			}
-			policyID = observed.ID
+			policyName := policy.Name
+			checks.add(func(ctx context.Context) error {
+				observed, err := remote.GetAccessPolicy(ctx, policyID)
+				if err != nil {
+					return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the AccessPolicy %s/%s remote policy could not be resolved: %v", policyNamespace, policyName, err)}
+				}
+				return confirmResolvedID("AccessPolicy "+policyNamespace+"/"+policyName, policyID, observed.ID)
+			})
 		}
 		ids = append(ids, policyID)
 	}
 	return ids, nil
 }
-func (r *AccessApplicationReconciler) resolveIdentityProviders(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient) ([]string, error) {
+func (r *AccessApplicationReconciler) resolveIdentityProviders(ctx context.Context, application *v1alpha1.AccessApplication, account *v1alpha1.CloudflareAccount, remote AccessApplicationCloudflareClient, checks *remoteReferenceChecks) ([]string, error) {
 	ids := make([]string, 0, len(application.Spec.Application.AllowedIDPRefs))
 	for _, reference := range application.Spec.Application.AllowedIDPRefs {
-		id, err := r.resolveIdentityProviderReference(ctx, application.Namespace, reference, account, remote)
+		id, err := r.resolveIdentityProviderReference(ctx, application.Namespace, reference, account, remote, checks)
 		if err != nil {
 			return nil, err
 		}
@@ -113,13 +153,18 @@ func (r *AccessApplicationReconciler) resolveIdentityProviderReference(
 	reference v1alpha1.AccessIdentityProviderReference,
 	account *v1alpha1.CloudflareAccount,
 	remote AccessApplicationCloudflareClient,
+	checks *remoteReferenceChecks,
 ) (string, error) {
 	if reference.ExternalID != "" {
-		provider, err := remote.GetIdentityProvider(ctx, reference.ExternalID)
-		if err != nil {
-			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q could not be resolved: %v", reference.ExternalID, err)}
-		}
-		return provider.ID, nil
+		providerID := reference.ExternalID
+		checks.add(func(ctx context.Context) error {
+			provider, err := remote.GetIdentityProvider(ctx, providerID)
+			if err != nil {
+				return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q could not be resolved: %v", providerID, err)}
+			}
+			return confirmResolvedID("external IdentityProvider", providerID, provider.ID)
+		})
+		return providerID, nil
 	}
 	var provider v1alpha1.IdentityProvider
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: reference.Name}, &provider); err != nil {
@@ -139,11 +184,14 @@ func (r *AccessApplicationReconciler) resolveIdentityProviderReference(
 	}
 	providerID := provider.Status.IDPID
 	if effectiveManagementPolicy(provider.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
-		observed, err := remote.GetIdentityProvider(ctx, providerID)
-		if err != nil {
-			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the IdentityProvider %s/%s remote provider could not be resolved: %v", namespace, provider.Name, err)}
-		}
-		providerID = observed.ID
+		providerName := provider.Name
+		checks.add(func(ctx context.Context) error {
+			observed, err := remote.GetIdentityProvider(ctx, providerID)
+			if err != nil {
+				return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("the IdentityProvider %s/%s remote provider could not be resolved: %v", namespace, providerName, err)}
+			}
+			return confirmResolvedID("IdentityProvider "+namespace+"/"+providerName, providerID, observed.ID)
+		})
 	}
 	return providerID, nil
 }
@@ -153,12 +201,13 @@ func (r *AccessApplicationReconciler) resolveApplicationSCIMConfig(
 	application *v1alpha1.AccessApplication,
 	account *v1alpha1.CloudflareAccount,
 	remote AccessApplicationCloudflareClient,
+	checks *remoteReferenceChecks,
 ) (*flarecloudflare.AccessSCIMConfigInput, error) {
 	config := application.Spec.Application.SCIMConfig
 	if config == nil {
 		return nil, nil
 	}
-	idpID, err := r.resolveIdentityProviderReference(ctx, application.Namespace, config.IDPRef, account, remote)
+	idpID, err := r.resolveIdentityProviderReference(ctx, application.Namespace, config.IDPRef, account, remote, checks)
 	if err != nil {
 		return nil, err
 	}

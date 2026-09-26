@@ -81,7 +81,7 @@ type IdentityProviderReconciler struct {
 func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.IdentityProvider)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "IdentityProvider", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.reconcileDelete(ctx, object)
@@ -335,7 +335,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if err := r.patchStatus(ctx, object, remote, directory, metav1.ConditionTrue, "Ready", "Identity provider is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "IdentityProvider", request.NamespacedName)

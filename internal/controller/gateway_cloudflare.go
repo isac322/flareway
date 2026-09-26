@@ -747,7 +747,13 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			result.version = tunnel.Status.ConfigVersion.Desired
 			result.remoteVersion = remote.Version
 			result.remoteCreatedAt = timeStatus(remote.CreatedAt)
+			// Confirming the recorded version is not an apply: appliedAt
+			// keeps the time the configuration was written, and the
+			// verify time goes to the latch below.
 			result.appliedAt = &freshAppliedAt
+			if recorded := tunnel.Status.ConfigVersion.AppliedAt; recorded != nil {
+				result.appliedAt = recorded
+			}
 			return nil
 		}
 		baseline := tunnel.Status.ConfigVersion.Applied
@@ -813,9 +819,11 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	}
 	if result.appliedAt != nil {
 		// The remote state was freshly confirmed or written: release any
-		// sweep invalidation and requeue at the freshness horizon so the
-		// next pass re-evaluates the gate exactly when it expires (D10).
+		// sweep invalidation, record the verify time, and requeue at the
+		// freshness horizon so the next pass re-evaluates the gate exactly
+		// when it expires (D10).
 		clearGate(r.Invalidator, "CloudflareTunnel", gateKey)
+		r.Invalidator.MarkVerified("CloudflareTunnel", gateKey, hash, now)
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
 	}
 	return result, nil

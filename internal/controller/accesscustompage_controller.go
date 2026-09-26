@@ -73,7 +73,7 @@ type AccessCustomPageReconciler struct {
 func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.AccessCustomPage)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "AccessCustomPage", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, object)
@@ -142,7 +142,7 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved, object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessCustomPage", request.NamespacedName)

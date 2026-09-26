@@ -96,7 +96,7 @@ type DeviceProfileReconciler struct {
 func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.DeviceProfile)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "DeviceProfile", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.reconcileDelete(ctx, object)
@@ -202,13 +202,18 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishRemoteError(ctx, object, err)
 	}
 	status := deviceProfileStatus(object, profileID, true, desired, nil, nil, metav1.ConditionTrue, "Ready", "Device profile fields and whole lists are synchronized")
+	verifiedAt := time.Now()
 	if decision.DesiredHash != "" {
-		status.AppliedHash = decision.DesiredHash
-		appliedAt := metav1.Now()
-		status.AppliedAt = &appliedAt
+		// appliedAt moves only with appliedHash; an unchanged re-verify is
+		// recorded in the latch once status is persisted.
+		status.AppliedHash, status.AppliedAt, _ = nextGateStamp(object.Status.AppliedHash, object.Status.AppliedAt, newGateStamp(decision.DesiredHash, verifiedAt))
 	}
 	clearGate(r.Invalidator, "DeviceProfile", request.NamespacedName)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, r.patchStatus(ctx, object, status)
+	if err := r.patchStatus(ctx, object, status); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Invalidator.MarkVerified("DeviceProfile", request.NamespacedName, decision.DesiredHash, verifiedAt)
+	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
 type aggregatedDeviceProfile struct {

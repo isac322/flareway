@@ -92,7 +92,7 @@ type WARPConnectorReconciler struct {
 func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(flarewayv1alpha1.WARPConnector)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "WARPConnector", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, object)
@@ -194,7 +194,7 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 	if err := r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != ""); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil

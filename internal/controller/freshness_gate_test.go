@@ -18,11 +18,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
@@ -153,21 +159,327 @@ func TestFreshnessGateSuppressesSteadyStateReadsForIdentityProvider(t *testing.T
 	}
 }
 
-// applyGateStamp decides whether a gated kind can persist its stamp at all. A
-// kind missing from it reaches persistGateStamp, writes nothing, and loses its
-// saving with no symptom, so the miss must surface as an error.
-func TestApplyGateStampRejectsUngatedKind(t *testing.T) {
-	stamp := newGateStamp("hash", virtualNetworkTestClock)
+// statusWriteCounter counts status patches and updates that change the stored
+// object. An empty merge patch reaches the API server but changes nothing, so
+// it produces no watch event and is not counted.
+type statusWriteCounter struct {
+	writes int
+}
 
-	vnet := &v1alpha1.VirtualNetwork{}
-	if !applyGateStamp(vnet, stamp) {
-		t.Fatal("applyGateStamp rejected a gated kind")
+func (c *statusWriteCounter) funcs() interceptor.Funcs {
+	return interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, kube client.Client, sub string, object client.Object, patch client.Patch, options ...client.SubResourcePatchOption) error {
+			if data, err := patch.Data(object); err != nil || string(data) != "{}" {
+				c.writes++
+			}
+			return kube.SubResource(sub).Patch(ctx, object, patch, options...)
+		},
+		SubResourceUpdate: func(ctx context.Context, kube client.Client, sub string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			c.writes++
+			return kube.SubResource(sub).Update(ctx, object, options...)
+		},
 	}
-	if vnet.Status.AppliedHash != "hash" || vnet.Status.AppliedAt == nil {
-		t.Fatalf("stamp not applied: %+v", vnet.Status)
+}
+
+// A converged object whose re-verify finds nothing to change must not write
+// status. Every rewrite of appliedAt is a watch event that other controllers
+// react to, and the field documents when the hash was recorded, not when the
+// remote was last read. The gate must still open between re-verifies, which
+// only works if the verify time is kept somewhere other than status.
+func TestFreshnessGateReverifyWithoutChangeWritesNoStatus(t *testing.T) {
+	ctx := context.Background()
+	vnet := virtualNetworkFixture("tenant", "prod", virtualNetworkTestClock)
+	scheme := virtualNetworkTestScheme(t)
+	counter := &statusWriteCounter{}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.VirtualNetwork{}).
+		WithObjects(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"}, Data: map[string][]byte{"token": []byte("value")}},
+			virtualNetworkTestAccount(),
+			vnet,
+		).
+		WithInterceptorFuncs(counter.funcs()).
+		Build()
+	api := newFakePrivateNetworkCloudflare()
+	now := virtualNetworkTestClock
+	reconciler := &VirtualNetworkReconciler{
+		Client: kube, Scheme: scheme, NewCloudflareClient: api.Client,
+		Now:         func() time.Time { return now },
+		Freshness:   freshness.DefaultPolicy(),
+		Invalidator: freshness.NewLatch(),
+	}
+	key := client.ObjectKeyFromObject(vnet)
+	pass := func(t *testing.T, label string) (int, ctrl.Result) {
+		t.Helper()
+		before := len(api.calls)
+		result, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		if err != nil {
+			t.Fatalf("%s reconcile: %v", label, err)
+		}
+		return len(api.calls) - before, result
+	}
+	stored := func(t *testing.T) v1alpha1.VirtualNetwork {
+		t.Helper()
+		var current v1alpha1.VirtualNetwork
+		if err := kube.Get(ctx, key, &current); err != nil {
+			t.Fatalf("get VirtualNetwork: %v", err)
+		}
+		return current
 	}
 
-	if applyGateStamp(&v1alpha1.CloudflareAccount{}, stamp) {
-		t.Fatal("applyGateStamp accepted a kind that carries no gate stamp fields")
+	pass(t, "create")
+	now = now.Add(10 * time.Second)
+	_, result := pass(t, "rebind")
+	converged := stored(t)
+	if converged.Status.AppliedHash == "" || converged.Status.AppliedAt == nil {
+		t.Fatalf("fixture never converged: %+v", converged.Status)
+	}
+	counter.writes = 0
+
+	// Follow the reconciler's own requeue across several TTLs. Each wake-up
+	// re-verifies the remote, finds it unchanged, and must leave status alone.
+	for cycle := range 3 {
+		now = now.Add(result.RequeueAfter)
+		var calls int
+		calls, result = pass(t, "re-verify")
+		if calls == 0 {
+			t.Fatalf("cycle %d: expired gate did not re-verify the remote", cycle)
+		}
+		if result.RequeueAfter <= 0 {
+			t.Fatalf("cycle %d: converged object stopped requeueing", cycle)
+		}
+	}
+	if counter.writes != 0 {
+		t.Fatalf("unchanged re-verifies wrote status %d times", counter.writes)
+	}
+	if got := stored(t).Status.AppliedAt; !got.Equal(converged.Status.AppliedAt) {
+		t.Fatalf("appliedAt moved from %v to %v although appliedHash did not change", converged.Status.AppliedAt, got)
+	}
+
+	// Between re-verifies the gate still opens: the verify time is anchored in
+	// memory rather than in status.
+	now = now.Add(10 * time.Second)
+	if calls, _ := pass(t, "between re-verifies"); calls != 0 {
+		t.Fatalf("gate stayed closed after an unchanged re-verify: %d remote calls", calls)
+	}
+
+	// A restart loses the in-memory record. The stored appliedAt is older than
+	// the TTL, so the first pass must read the remote rather than trust it.
+	reconciler.Invalidator = freshness.NewLatch()
+	now = now.Add(10 * time.Second)
+	if calls, _ := pass(t, "after restart"); calls == 0 {
+		t.Fatal("first pass after a restart trusted a stale appliedAt")
+	}
+	if counter.writes != 0 {
+		t.Fatalf("post-restart re-verify wrote status %d times", counter.writes)
+	}
+
+	// A spec change records a new hash, and appliedAt moves with it.
+	current := stored(t)
+	current.Spec.Comment = "changed"
+	if err := kube.Update(ctx, &current); err != nil {
+		t.Fatalf("update spec: %v", err)
+	}
+	now = now.Add(time.Second)
+	pass(t, "spec change")
+	changed := stored(t)
+	if changed.Status.AppliedHash == converged.Status.AppliedHash {
+		t.Fatal("spec change did not record a new applied hash")
+	}
+	if changed.Status.AppliedAt == nil || !changed.Status.AppliedAt.Time.Equal(now) {
+		t.Fatalf("appliedAt = %v, want the time the new hash was recorded (%v)", changed.Status.AppliedAt, now)
+	}
+}
+
+// failingVirtualNetworkAPI fails remote updates on demand, so a pass can go to
+// Cloudflare for a new desired state and not converge.
+type failingVirtualNetworkAPI struct {
+	*fakePrivateNetworkCloudflare
+	failUpdates bool
+}
+
+func (f *failingVirtualNetworkAPI) UpdateVirtualNetwork(ctx context.Context, id string, input flarecloudflare.VirtualNetworkInput) (flarecloudflare.VirtualNetwork, error) {
+	if f.failUpdates {
+		return flarecloudflare.VirtualNetwork{}, errors.New("injected update failure")
+	}
+	return f.fakePrivateNetworkCloudflare.UpdateVirtualNetwork(ctx, id, input)
+}
+
+// gatedVirtualNetworkWorld is a converged VirtualNetwork whose latest verify
+// lives only in memory: status.appliedAt is older than the TTL.
+func gatedVirtualNetworkWorld(t *testing.T) (*VirtualNetworkReconciler, *failingVirtualNetworkAPI, client.Client, types.NamespacedName, *time.Time) {
+	t.Helper()
+	vnet := virtualNetworkFixture("tenant", "prod", virtualNetworkTestClock)
+	kube, scheme := virtualNetworkWriterClient(t, vnet)
+	api := &failingVirtualNetworkAPI{fakePrivateNetworkCloudflare: newFakePrivateNetworkCloudflare()}
+	now := virtualNetworkTestClock
+	reconciler := &VirtualNetworkReconciler{
+		Client: kube, Scheme: scheme,
+		NewCloudflareClient: func(string, string) (flarecloudflare.NetworkAPI, error) { return api, nil },
+		Now:                 func() time.Time { return now },
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	key := client.ObjectKeyFromObject(vnet)
+	for _, step := range []time.Duration{0, 10 * time.Second, reconciler.Freshness.TTL(freshness.GradeTraffic) + time.Second} {
+		now = now.Add(step)
+		if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("converge: %v", err)
+		}
+	}
+	return reconciler, api, kube, key, &now
+}
+
+// A pass that goes to Cloudflare for a new desired state and fails must void
+// the earlier verify. If the spec then changes back, the old in-memory record
+// must not re-open the gate and hide the failed state behind a skipped pass.
+func TestFreshnessGateRevertAfterFailedPassReadsAgain(t *testing.T) {
+	ctx := context.Background()
+	reconciler, api, kube, key, now := gatedVirtualNetworkWorld(t)
+	pass := func() (int, error) {
+		before := len(api.calls)
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		return len(api.calls) - before, err
+	}
+	setComment := func(comment string) {
+		var current v1alpha1.VirtualNetwork
+		if err := kube.Get(ctx, key, &current); err != nil {
+			t.Fatal(err)
+		}
+		current.Spec.Comment = comment
+		if err := kube.Update(ctx, &current); err != nil {
+			t.Fatal(err)
+		}
+	}
+	*now = now.Add(10 * time.Second)
+	if calls, err := pass(); err != nil || calls != 0 {
+		t.Fatalf("fixture gate is not open from its in-memory verify: calls=%d err=%v", calls, err)
+	}
+
+	api.failUpdates = true
+	setComment("changed")
+	*now = now.Add(time.Second)
+	if _, err := pass(); err == nil {
+		t.Fatal("the injected update failure did not fail the pass")
+	}
+
+	api.failUpdates = false
+	setComment("")
+	*now = now.Add(time.Second)
+	if calls, err := pass(); err != nil || calls == 0 {
+		t.Fatalf("after a failed pass, reverting the spec re-opened the gate on the old verify: calls=%d err=%v", calls, err)
+	}
+}
+
+// A deleted object must not keep freshness records for the life of the
+// process; the latch would otherwise grow with every object ever created.
+func TestDeletedObjectReleasesFreshnessRecords(t *testing.T) {
+	ctx := context.Background()
+	reconciler, _, kube, key, now := gatedVirtualNetworkWorld(t)
+	var stored v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reconciler.Invalidator.VerifiedAt("VirtualNetwork", key, stored.Status.AppliedHash); !ok {
+		t.Fatal("fixture recorded no verify")
+	}
+	reconciler.Invalidator.Invalidate("VirtualNetwork", key, "drift")
+
+	stored.Finalizers = nil
+	if err := kube.Update(ctx, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &stored); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile of a deleted object: %v", err)
+	}
+	if _, ok := reconciler.Invalidator.VerifiedAt("VirtualNetwork", key, stored.Status.AppliedHash); ok {
+		t.Fatal("a deleted object kept its verify record")
+	}
+	if reconciler.Invalidator.IsInvalidated("VirtualNetwork", key) {
+		t.Fatal("a deleted object kept its invalidation")
+	}
+}
+
+// The in-memory verify record may only extend the gate for the exact desired
+// state it verified, and never past what the policy and latch allow.
+func TestEvaluateGateInMemoryVerification(t *testing.T) {
+	key := types.NamespacedName{Namespace: "tenant", Name: "prod"}
+	policy := freshness.DefaultPolicy()
+	ttl := policy.TTL(freshness.GradeTraffic)
+	now := virtualNetworkTestClock
+	stale := metav1.NewTime(now.Add(-2 * ttl))
+	evaluate := func(latch *freshness.Latch, policy freshness.Policy, desired string) freshness.Gate {
+		return evaluateGateWithHash(policy, latch, freshness.GradeTraffic, "VirtualNetwork", key, "applied", desired, &stale, now).Gate
+	}
+
+	latch := freshness.NewLatch()
+	latch.MarkVerified("VirtualNetwork", key, "applied", now.Add(-time.Minute))
+	if gate := evaluate(latch, policy, "applied"); !gate.Open || gate.Requeue != ttl-time.Minute {
+		t.Fatalf("recent verify of the applied hash did not open the gate: %+v", gate)
+	}
+	if gate := evaluate(latch, policy, "changed"); gate.Open {
+		t.Fatal("verify of an older desired state opened the gate for a new one")
+	}
+
+	superseded := freshness.NewLatch()
+	superseded.MarkVerified("VirtualNetwork", key, "superseded", now.Add(-time.Minute))
+	if gate := evaluate(superseded, policy, "applied"); gate.Open {
+		t.Fatal("verify recorded for a different hash opened the gate")
+	}
+
+	latch.Invalidate("VirtualNetwork", key, "sweep found drift")
+	if gate := evaluate(latch, policy, "applied"); gate.Open || gate.Decision != freshness.DecisionClosedInvalidated {
+		t.Fatalf("invalidation did not take precedence over the verify record: %+v", gate)
+	}
+	// Drift found after the verify voids it: releasing the invalidation
+	// without a new verify must not re-open the gate on the old record.
+	latch.Clear("VirtualNetwork", key)
+	if gate := evaluate(latch, policy, "applied"); gate.Open {
+		t.Fatal("a verify recorded before the drift re-opened the gate")
+	}
+
+	future := freshness.NewLatch()
+	future.MarkVerified("VirtualNetwork", key, "applied", now.Add(time.Minute))
+	if gate := evaluate(future, policy, "applied"); gate.Open {
+		t.Fatal("a verify time in the future was trusted")
+	}
+
+	recent := freshness.NewLatch()
+	recent.MarkVerified("VirtualNetwork", key, "applied", now.Add(-time.Minute))
+	if gate := evaluate(recent, freshness.Policy{}, "applied"); gate.Open {
+		t.Fatal("zero policy was bypassed by the verify record")
+	}
+}
+
+// gateStampFields decides whether a gated kind can persist its stamp at all,
+// and under which latch kind its verify time is kept. A kind missing from it
+// writes nothing and loses its saving with no symptom, and a kind name that
+// differs from the gate's would record verifications the gate never reads.
+func TestGateStampFieldsCoverEveryGatedKind(t *testing.T) {
+	for _, object := range []client.Object{
+		&v1alpha1.VirtualNetwork{}, &v1alpha1.NetworkRoute{}, &v1alpha1.HostnameRoute{},
+		&v1alpha1.IdentityProvider{}, &v1alpha1.AccessGroup{}, &v1alpha1.AccessPolicy{},
+		&v1alpha1.AccessCustomPage{}, &v1alpha1.AccessInfrastructureTarget{},
+		&v1alpha1.AccessStandaloneApplication{}, &v1alpha1.AccessApplication{},
+		&v1alpha1.DeviceSettings{}, &v1alpha1.DeviceProfile{}, &v1alpha1.DevicePostureRule{},
+		&v1alpha1.DevicePostureIntegration{}, &v1alpha1.ServiceToken{}, &v1alpha1.WARPConnector{},
+		&v1alpha1.ZeroTrustList{}, &v1alpha1.ZeroTrustGatewayPolicy{}, &v1alpha1.ZeroTrustOrganization{},
+	} {
+		kind, hash, at, ok := gateStampFields(object)
+		if !ok || hash == nil || at == nil {
+			t.Fatalf("%T has no gate stamp fields", object)
+		}
+		if _, graded := freshness.GradeForKind(kind); !graded {
+			t.Fatalf("%T records verifications under %q, which has no freshness grade", object, kind)
+		}
+	}
+	if _, _, _, ok := gateStampFields(&v1alpha1.CloudflareAccount{}); ok {
+		t.Fatal("gateStampFields accepted a kind that carries no gate stamp fields")
 	}
 }

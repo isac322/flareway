@@ -69,7 +69,7 @@ type AccessInfrastructureTargetReconciler struct {
 func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.AccessInfrastructureTarget)
 	if err := r.reader().Get(ctx, request.NamespacedName, object); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.reconcileDelete(ctx, object)
@@ -141,7 +141,7 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Infrastructure target is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName)
