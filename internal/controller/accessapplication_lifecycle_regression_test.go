@@ -292,3 +292,132 @@ func TestAccessApplicationDeletionWithdrawsProgrammedAndRetainsDeniedCleanup(t *
 		t.Fatal("remote application survived completed deletion")
 	}
 }
+
+// deniedDeletionWorld is an AccessApplication under deletion whose namespace
+// the CloudflareAccount does not grant. factoryCalls counts every attempt to
+// construct a Cloudflare client, which happens only after the grant gate and
+// the credential Secret read succeed.
+type deniedDeletionWorld struct {
+	kube         client.Client
+	reconciler   *AccessApplicationReconciler
+	remote       *fakeAccessApplicationCloudflare
+	account      *v1alpha1.CloudflareAccount
+	request      ctrl.Request
+	factoryCalls *int
+}
+
+func newDeniedDeletionWorld(t *testing.T, application *v1alpha1.AccessApplication) deniedDeletionWorld {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.NewTime(time.Unix(10, 0))
+	application.DeletionTimestamp = &now
+	application.Finalizers = []string{v1alpha1.AccessApplicationFinalizer}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec:       v1alpha1.CloudflareAccountSpec{AccountID: "0123456789abcdef0123456789abcdef", Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: "token", Namespace: "flareway-system", Key: "token"}}},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", LastTransitionTime: now},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Verified", LastTransitionTime: now},
+		}},
+	}
+	remote := newFakeAccessApplicationCloudflare()
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(application).WithObjects(application, account,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: application.Namespace}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "flareway-system"}, Data: map[string][]byte{"token": []byte("test-token")}},
+	).Build()
+	factoryCalls := new(int)
+	r := &AccessApplicationReconciler{Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time }, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) {
+		*factoryCalls++
+		return remote, nil
+	}}
+	return deniedDeletionWorld{kube: kube, reconciler: r, remote: remote, account: account, request: ctrl.Request{NamespacedName: client.ObjectKeyFromObject(application)}, factoryCalls: factoryCalls}
+}
+
+func (w deniedDeletionWorld) grantAll(t *testing.T) {
+	t.Helper()
+	w.account.Spec.Grants = []v1alpha1.CloudflareAccountGrant{{NamespaceSelector: metav1.LabelSelector{}, Hostnames: []string{"*"}, Zones: []string{"*"}, Exposures: []v1alpha1.Exposure{v1alpha1.ExposurePublic}}}
+	if err := w.kube.Update(context.Background(), w.account); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccessApplicationDeletionWithoutRemoteEvidenceSkipsDeniedGrant(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		policy v1alpha1.DeletionPolicy
+	}{
+		{name: "delete policy", policy: v1alpha1.DeletionPolicyDelete},
+		{name: "orphan policy", policy: v1alpha1.DeletionPolicyOrphan},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			world := newDeniedDeletionWorld(t, &v1alpha1.AccessApplication{
+				ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 1},
+				Spec:       v1alpha1.AccessApplicationSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: testCase.policy},
+			})
+			ctx := context.Background()
+			for attempt := range 3 {
+				if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+					t.Fatalf("reconcile %d: %v", attempt, err)
+				}
+				var stored v1alpha1.AccessApplication
+				if err := world.kube.Get(ctx, world.request.NamespacedName, &stored); apierrors.IsNotFound(err) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+			}
+			var stored v1alpha1.AccessApplication
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &stored); !apierrors.IsNotFound(err) {
+				t.Fatalf("never-provisioned application kept its finalizer: err=%v finalizers=%v conditions=%v", err, stored.Finalizers, stored.Status.Conditions)
+			}
+			if *world.factoryCalls != 0 || len(world.remote.Calls()) != 0 {
+				t.Fatalf("deletion without remote evidence reached Cloudflare: factory=%d calls=%v", *world.factoryCalls, world.remote.Calls())
+			}
+		})
+	}
+}
+
+func TestAccessApplicationDeletionWithRemoteAttemptKeepsGrantGatedRecovery(t *testing.T) {
+	ctx := context.Background()
+	// The attempt marker without status evidence is the create-then-lost-status
+	// window: an owner-tagged remote application exists but status never
+	// recorded it. Cleanup must stay grant-gated and recover it by owner tag.
+	world := newDeniedDeletionWorld(t, &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 1, Annotations: map[string]string{accessApplicationRemoteAttemptAnnotation: "true"}},
+		Spec:       v1alpha1.AccessApplicationSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete},
+	})
+	ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
+	world.remote.Put(flarecloudflare.AccessApplication{ID: "lost-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
+	for range 3 {
+		_, _ = world.reconciler.Reconcile(ctx, world.request)
+	}
+	var stored v1alpha1.AccessApplication
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &stored); err != nil {
+		t.Fatalf("denied cleanup with a remote attempt released the object: %v", err)
+	}
+	blocked := meta.FindStatusCondition(stored.Status.Conditions, accessApplicationConditionCleanupBlocked)
+	if blocked == nil || blocked.Status != metav1.ConditionTrue {
+		t.Fatalf("denied cleanup was not reported: %#v", blocked)
+	}
+	if *world.factoryCalls != 0 || len(world.remote.Calls()) != 0 || !world.remote.Has("lost-id") {
+		t.Fatalf("denied cleanup reached Cloudflare: factory=%d calls=%v", *world.factoryCalls, world.remote.Calls())
+	}
+
+	world.grantAll(t)
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &stored); !apierrors.IsNotFound(err) {
+		t.Fatalf("deletion did not finish after grant restoration: %v", err)
+	}
+	if world.remote.Has("lost-id") {
+		t.Fatal("owner-tagged application recorded only by the attempt marker leaked")
+	}
+}
