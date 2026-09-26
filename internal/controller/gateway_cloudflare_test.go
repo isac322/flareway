@@ -27,7 +27,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -153,31 +152,31 @@ func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
 	reconciler := &GatewayReconciler{Client: kube}
 	cfg := defaultGatewayClassConfig()
 
-	_, selectedAccount, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), first, cfg)
+	_, selectedAccount, _, block, err := reconciler.resolveCloudflareContext(context.Background(), first, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stop || selectedAccount == nil {
-		t.Fatalf("recorded owner resolution stopped=%v account=%#v", stop, selectedAccount)
+	if block != nil || selectedAccount == nil {
+		t.Fatalf("recorded owner resolution block=%#v account=%#v", block, selectedAccount)
 	}
 
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || selectedAccount != nil {
-		t.Fatalf("non-owner Gateway resolution stopped=%v account=%#v", stop, selectedAccount)
+	if block == nil {
+		t.Fatalf("non-owner Gateway resolution block=%#v account=%#v", block, selectedAccount)
 	}
 
 	if err := kube.Delete(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || selectedAccount != nil {
-		t.Fatalf("successor bypassed ownership checkpoint stopped=%v account=%#v", stop, selectedAccount)
+	if block == nil {
+		t.Fatalf("successor bypassed ownership checkpoint block=%#v account=%#v", block, selectedAccount)
 	}
 	var currentTunnel v1alpha1.CloudflareTunnel
 	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
@@ -189,12 +188,12 @@ func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
 	if err := kube.Status().Patch(context.Background(), &currentTunnel, client.MergeFrom(beforeStatus)); err != nil {
 		t.Fatal(err)
 	}
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), second, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stop || selectedAccount == nil {
-		t.Fatalf("checkpointed successor resolution stopped=%v account=%#v", stop, selectedAccount)
+	if block != nil || selectedAccount == nil {
+		t.Fatalf("checkpointed successor resolution block=%#v account=%#v", block, selectedAccount)
 	}
 
 	staleFirst := first.DeepCopy()
@@ -212,12 +211,12 @@ func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), staleFirst, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), staleFirst, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || selectedAccount != nil {
-		t.Fatalf("stale same-name UID resolution stopped=%v account=%#v", stop, selectedAccount)
+	if block == nil {
+		t.Fatalf("stale same-name UID resolution block=%#v account=%#v", block, selectedAccount)
 	}
 	var untouchedReplacement gatewayv1.Gateway
 	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(replacement), &untouchedReplacement); err != nil {
@@ -226,12 +225,12 @@ func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
 	if len(untouchedReplacement.Status.Conditions) != 0 {
 		t.Fatalf("stale UID patched replacement Gateway status: %#v", untouchedReplacement.Status)
 	}
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || selectedAccount != nil {
-		t.Fatalf("replacement bypassed UID ownership checkpoint stopped=%v account=%#v", stop, selectedAccount)
+	if block == nil {
+		t.Fatalf("replacement bypassed UID ownership checkpoint block=%#v account=%#v", block, selectedAccount)
 	}
 	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(tunnel), &currentTunnel); err != nil {
 		t.Fatal(err)
@@ -242,12 +241,12 @@ func TestGatewayCloudflareContextEnforcesExactLiveTunnelOwner(t *testing.T) {
 	if err := kube.Status().Patch(context.Background(), &currentTunnel, client.MergeFrom(beforeStatus)); err != nil {
 		t.Fatal(err)
 	}
-	_, selectedAccount, _, stop, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
+	_, selectedAccount, _, block, err = reconciler.resolveCloudflareContext(context.Background(), replacement, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stop || selectedAccount == nil {
-		t.Fatalf("checkpointed replacement resolution stopped=%v account=%#v", stop, selectedAccount)
+	if block != nil || selectedAccount == nil {
+		t.Fatalf("checkpointed replacement resolution block=%#v account=%#v", block, selectedAccount)
 	}
 }
 
@@ -304,26 +303,15 @@ func TestGatewayCloudflareRejectsRemotelyDeletedTunnel(t *testing.T) {
 		Build()
 	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
 
-	selectedTunnel, selectedAccount, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), gateway, defaultGatewayClassConfig())
+	selectedTunnel, _, _, block, err := reconciler.resolveCloudflareContext(context.Background(), gateway, defaultGatewayClassConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || selectedAccount != nil || selectedTunnel == nil {
-		t.Fatalf("soft-deleted Tunnel resolution stopped=%v account=%#v tunnel=%#v", stop, selectedAccount, selectedTunnel)
+	if block == nil || selectedTunnel == nil {
+		t.Fatalf("soft-deleted Tunnel resolution block=%#v tunnel=%#v", block, selectedTunnel)
 	}
-	if snapshots.Version(key.String()) != "" {
-		t.Fatal("soft-deleted Tunnel retained its xDS snapshot")
-	}
-	var observedGateway gatewayv1.Gateway
-	if err := kube.Get(context.Background(), key, &observedGateway); err != nil {
-		t.Fatal(err)
-	}
-	if len(observedGateway.Status.Addresses) != 0 {
-		t.Fatalf("soft-deleted Tunnel retained Gateway addresses: %#v", observedGateway.Status.Addresses)
-	}
-	programmed := meta.FindStatusCondition(observedGateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	if programmed == nil || programmed.Status != metav1.ConditionFalse || !strings.Contains(programmed.Message, "remotely deleted") {
-		t.Fatalf("soft-deleted Tunnel Programmed condition = %#v", programmed)
+	if !block.retractDataplane || !strings.Contains(block.message, "remotely deleted") {
+		t.Fatalf("soft-deleted Tunnel block = %#v, want a retracting remote-deletion block", block)
 	}
 
 	compiled := &ir.Gateway{Key: key, UID: gateway.UID}
@@ -706,70 +694,6 @@ func TestRetainAccessRevocationDomainAfterTargetDisappears(t *testing.T) {
 	}
 }
 
-func TestGatewayCloudflareContextWaitsForVerifiedConnectorCredentials(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := gatewayv1.Install(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := v1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-
-	key := types.NamespacedName{Namespace: "apps", Name: "edge"}
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: "gateway-uid", Generation: 2},
-		Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
-			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
-		}}},
-	}
-	tunnel := &v1alpha1.CloudflareTunnel{
-		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: key.Namespace, UID: "tunnel-uid"},
-		Spec: v1alpha1.CloudflareTunnelSpec{
-			AccountRef:       corev1.LocalObjectReference{Name: "account"},
-			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
-		},
-		Status: v1alpha1.CloudflareTunnelStatus{
-			OwnershipVerified: true,
-			GatewayRef:        &corev1.LocalObjectReference{Name: gateway.Name},
-			GatewayUID:        gateway.UID,
-		},
-	}
-	snapshots := newFakeSnapshotPublisher()
-	snapshots.versions[key.String()] = "stale"
-	kube := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		WithStatusSubresource(gateway, tunnel).
-		WithObjects(gateway, tunnel).
-		Build()
-	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
-
-	selectedTunnel, account, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), gateway, defaultGatewayClassConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !stop || account != nil || selectedTunnel == nil {
-		t.Fatalf("credential wait resolution stopped=%v account=%#v tunnel=%#v", stop, account, selectedTunnel)
-	}
-	if snapshots.Version(key.String()) != "" {
-		t.Fatal("credential wait retained the published xDS snapshot")
-	}
-	var observed gatewayv1.Gateway
-	if err := kube.Get(context.Background(), key, &observed); err != nil {
-		t.Fatal(err)
-	}
-	programmed := meta.FindStatusCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	if programmed == nil || programmed.Status != metav1.ConditionFalse ||
-		!strings.Contains(programmed.Message, "waiting for verified connector credentials") {
-		t.Fatalf("credential wait Programmed condition = %#v", programmed)
-	}
-	if len(observed.Status.Addresses) != 0 {
-		t.Fatalf("credential wait retained Gateway addresses: %#v", observed.Status.Addresses)
-	}
-}
-
 func TestGatewayCloudflareContextBlocksSuccessorUntilPriorDataplaneDrains(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -821,33 +745,24 @@ func TestGatewayCloudflareContextBlocksSuccessorUntilPriorDataplaneDrains(t *tes
 		},
 		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
 	}
-	snapshots := newFakeSnapshotPublisher()
-	snapshots.versions[key.String()] = "stale"
+	account := &v1alpha1.CloudflareAccount{ObjectMeta: metav1.ObjectMeta{Name: tunnel.Spec.AccountRef.Name}}
 	kube := fakeclient.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(successor, tunnel).
-		WithObjects(prior, successor, tunnel, priorDataplane).
+		WithObjects(prior, successor, tunnel, priorDataplane, account).
 		Build()
-	reconciler := &GatewayReconciler{Client: kube, Snapshots: snapshots}
+	reconciler := &GatewayReconciler{Client: kube}
 
-	_, account, _, stop, err := reconciler.resolveCloudflareContext(context.Background(), successor, defaultGatewayClassConfig())
+	_, _, _, block, err := reconciler.resolveCloudflareContext(context.Background(), successor, defaultGatewayClassConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stop || account != nil {
-		t.Fatalf("drain-blocked successor resolution stopped=%v account=%#v", stop, account)
+	if block == nil || !block.retractDataplane || !strings.Contains(block.message, "draining its prior Gateway UID dataplane") {
+		t.Fatalf("drain-blocked successor block = %#v", block)
 	}
-	if snapshots.Version(key.String()) != "" {
-		t.Fatal("drain-blocked successor retained the published xDS snapshot")
-	}
-	var observed gatewayv1.Gateway
-	if err := kube.Get(context.Background(), key, &observed); err != nil {
+	// The blocked gate retracts only the successor's own dataplane.
+	if err := reconciler.retractGatewayDataplane(context.Background(), successor); err != nil {
 		t.Fatal(err)
-	}
-	programmed := meta.FindStatusCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	if programmed == nil || programmed.Status != metav1.ConditionFalse ||
-		!strings.Contains(programmed.Message, "draining its prior Gateway UID dataplane") {
-		t.Fatalf("drain-blocked Programmed condition = %#v", programmed)
 	}
 
 	// Draining the recorded owner's dataplane is the Tunnel controller's job:

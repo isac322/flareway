@@ -951,9 +951,26 @@ var _ = ginkgo.Describe("Gateway dependency loss", func() {
 
 		expectDataplanePreserved(kube, f)
 	}
-	expectWaitingUnprogrammed := func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, message string, result ctrl.Result, err error) {
+	// grantTenant makes the fixture's tenant namespace and hostname granted by
+	// the tunnel's CloudflareAccount and attaches an HTTPRoute, so a blocked
+	// tunnel is the only reason the Gateway cannot be programmed.
+	grantTenant := func(f *dependencyFixture) {
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: f.gateway.Namespace, Labels: map[string]string{"tenant": f.gateway.Namespace}}}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: f.tunnel.Spec.AccountRef.Name},
+			Spec: v1alpha1.CloudflareAccountSpec{Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": f.gateway.Namespace}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+			}}},
+		}
+		route := httpRoute(types.NamespacedName{Namespace: f.gateway.Namespace, Name: "route"}, client.ObjectKeyFromObject(f.gateway), "backend")
+		f.extra = append(f.extra, namespace, account, route)
+	}
+	expectWaitingUnprogrammed := func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, message string, wantResult ctrl.Result, result ctrl.Result, err error) {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		gomega.Expect(result).To(gomega.Equal(ctrl.Result{RequeueAfter: programmedRequeue}))
+		gomega.Expect(result).To(gomega.Equal(wantResult))
 		gomega.Expect(snapshots.Version(client.ObjectKeyFromObject(f.gateway).String())).To(gomega.BeEmpty())
 
 		var observed gatewayv1.Gateway
@@ -961,12 +978,22 @@ var _ = ginkgo.Describe("Gateway dependency loss", func() {
 		accepted := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
 		gomega.Expect(accepted).NotTo(gomega.BeNil())
 		gomega.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(accepted.ObservedGeneration).To(gomega.Equal(f.gateway.Generation))
 		programmed := findCondition(observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 		gomega.Expect(programmed).NotTo(gomega.BeNil())
 		gomega.Expect(programmed.Status).To(gomega.Equal(metav1.ConditionFalse))
 		gomega.Expect(programmed.Reason).To(gomega.Equal(string(gatewayv1.GatewayReasonPending)))
 		gomega.Expect(programmed.Message).To(gomega.ContainSubstring(message))
 		gomega.Expect(observed.Status.Addresses).To(gomega.BeEmpty())
+		gomega.Expect(observed.Status.Listeners).To(gomega.HaveLen(1))
+		listenerAccepted := findCondition(observed.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionAccepted))
+		gomega.Expect(listenerAccepted).NotTo(gomega.BeNil())
+		gomega.Expect(listenerAccepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(listenerAccepted.ObservedGeneration).To(gomega.Equal(f.gateway.Generation))
+
+		var route gatewayv1.HTTPRoute
+		gomega.Expect(kube.Get(context.Background(), types.NamespacedName{Namespace: f.gateway.Namespace, Name: "route"}, &route)).To(gomega.Succeed())
+		gomega.Expect(route.Status.Parents).To(gomega.ContainElement(gomega.HaveField("ParentRef.Name", gatewayv1.ObjectName(f.gateway.Name))))
 	}
 
 	ginkgo.DescribeTable("retracts publication and reports the lost dependency",
@@ -997,7 +1024,7 @@ var _ = ginkgo.Describe("Gateway dependency loss", func() {
 			snapshots.versions[gatewayKey.String()] = "stale"
 			kube := fakeclient.NewClientBuilder().
 				WithScheme(scheme).
-				WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
+				WithStatusSubresource(&gatewayv1.Gateway{}, &gatewayv1.HTTPRoute{}, &v1alpha1.CloudflareTunnel{}).
 				WithObjects(objects...).
 				Build()
 			reconciler := &GatewayReconciler{Client: kube, Scheme: scheme, Snapshots: snapshots}
@@ -1111,38 +1138,53 @@ var _ = ginkgo.Describe("Gateway dependency loss", func() {
 			}),
 		ginkgo.Entry("clears publication but keeps the owned dataplane running while the verified Tunnel waits for connector credentials",
 			func(f *dependencyFixture) {
+				grantTenant(f)
 				f.tunnel.Status.ConnectorTokenSecretRef = nil
 			},
 			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
-				expectWaitingUnprogrammed(kube, f, snapshots, "waiting for verified connector credentials", result, err)
+				expectWaitingUnprogrammed(kube, f, snapshots, "waiting for verified connector credentials", ctrl.Result{RequeueAfter: programmedRequeue}, result, err)
 				expectDataplanePreserved(kube, f)
 			}),
 		ginkgo.Entry("clears publication but keeps the owned dataplane running while the verified Tunnel waits for a remote tunnel ID",
 			func(f *dependencyFixture) {
+				grantTenant(f)
 				f.tunnel.Status.TunnelID = ""
 			},
 			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
-				expectWaitingUnprogrammed(kube, f, snapshots, "waiting for verified connector credentials", result, err)
+				expectWaitingUnprogrammed(kube, f, snapshots, "waiting for verified connector credentials", ctrl.Result{RequeueAfter: programmedRequeue}, result, err)
 				expectDataplanePreserved(kube, f)
 			}),
 		ginkgo.Entry("clears publication and scales the owned dataplane to zero while the Tunnel has not verified remote ownership",
 			func(f *dependencyFixture) {
+				grantTenant(f)
 				f.tunnel.Status.OwnershipVerified = false
 			},
 			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
-				expectWaitingUnprogrammed(kube, f, snapshots, "has not verified remote ownership", result, err)
+				expectWaitingUnprogrammed(kube, f, snapshots, "has not verified remote ownership", ctrl.Result{RequeueAfter: programmedRequeue}, result, err)
 				expectDataplaneScaledToZero(kube, f)
 			}),
-		ginkgo.Entry("clears publication and scales the owned dataplane to zero when the Tunnel is ObserveOnly",
+		ginkgo.Entry("clears publication, scales the owned dataplane to zero, and stops polling when the Tunnel is ObserveOnly",
 			func(f *dependencyFixture) {
+				grantTenant(f)
 				f.tunnel.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
 			},
 			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
-				expectWaitingUnprogrammed(kube, f, snapshots, "ObserveOnly", result, err)
+				expectWaitingUnprogrammed(kube, f, snapshots, "ObserveOnly", ctrl.Result{}, result, err)
+				expectDataplaneScaledToZero(kube, f)
+			}),
+		ginkgo.Entry("clears publication and scales the owned dataplane to zero while the remotely deleted Tunnel drains",
+			func(f *dependencyFixture) {
+				grantTenant(f)
+				deletedAt := metav1.NewTime(time.Unix(300, 0))
+				f.tunnel.Status.DeletedAt = &deletedAt
+			},
+			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
+				expectWaitingUnprogrammed(kube, f, snapshots, "remotely deleted", ctrl.Result{RequeueAfter: programmedRequeue}, result, err)
 				expectDataplaneScaledToZero(kube, f)
 			}),
 		ginkgo.Entry("clears publication and scales the owned dataplane to zero when the Tunnel is owned by another Gateway",
 			func(f *dependencyFixture) {
+				grantTenant(f)
 				owner := httpGateway(types.NamespacedName{Namespace: f.gateway.Namespace, Name: "owner"}, f.class.Name)
 				owner.UID = "owner-uid"
 				owner.Spec.Infrastructure = f.gateway.Spec.Infrastructure.DeepCopy()
@@ -1151,7 +1193,7 @@ var _ = ginkgo.Describe("Gateway dependency loss", func() {
 				f.tunnel.Status.GatewayUID = owner.UID
 			},
 			func(kube client.Client, f *dependencyFixture, snapshots *fakeSnapshotPublisher, result ctrl.Result, err error) {
-				expectWaitingUnprogrammed(kube, f, snapshots, "owned by Gateway", result, err)
+				expectWaitingUnprogrammed(kube, f, snapshots, "owned by Gateway", ctrl.Result{RequeueAfter: programmedRequeue}, result, err)
 				expectDataplaneScaledToZero(kube, f)
 			}),
 	)
