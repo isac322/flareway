@@ -21,11 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/types"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 )
 
@@ -57,6 +59,11 @@ type dnsTunnelInfo struct {
 // comment-filtered listing (D6). Local truth is the CloudflareTunnel
 // status.dnsRecords checkpoint, not a DNSRecord CR (none exists).
 //
+// Only the zones in dnsScanZones are listed: the zones the account's grants
+// name plus the zones the judged tunnels checkpoint records in. The account
+// and tunnels are read first, so a failed read aborts the pass before any
+// Cloudflare call.
+//
 // Ownership is asymmetric per D12/C14#3: ExpectedTarget is always
 // populated from the checkpoint's tunnel target; when the tunnel ID is
 // unknown the record is treated as not owned — never as owned-by-default —
@@ -70,16 +77,57 @@ type dnsTunnelInfo struct {
 // reports as a scoped partial. Terminal errors (context, 429, 401, other
 // 4xx, pacing) abort the pass and discard everything.
 func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
-	api, wait := as.remote()
-	zones, err := as.zones(ctx)
-	if err != nil {
-		return nil, err
-	}
 	clusterID, err := as.clusterID(ctx)
 	if err != nil {
 		return nil, err
 	}
 	key := as.ownershipKey(ctx)
+
+	var account v1alpha1.CloudflareAccount
+	if err := as.client.Get(ctx, types.NamespacedName{Name: as.accountName}, &account); err != nil {
+		return nil, fmt.Errorf("get CloudflareAccount %s: %w", as.accountName, err)
+	}
+	var list v1alpha1.CloudflareTunnelList
+	if err := as.client.List(ctx, &list); err != nil {
+		return nil, fmt.Errorf("list CloudflareTunnels: %w", err)
+	}
+	var tunnels []dnsTunnelInfo
+	claimed := make(map[string]bool)
+	checkpointZones := make(map[string]bool)
+	for i := range list.Items {
+		tunnel := &list.Items[i]
+		if tunnel.Spec.AccountRef.Name != as.accountName || deleting(tunnel) || observeOnly(tunnel.Spec.ManagementPolicy) {
+			continue
+		}
+		info := dnsTunnelInfo{
+			key:         types.NamespacedName{Namespace: tunnel.Namespace, Name: tunnel.Name},
+			tunnelID:    tunnel.Status.TunnelID,
+			checkpoints: make(map[string]v1alpha1.CloudflareTunnelDNSRecordStatus, len(tunnel.Status.DNSRecords)),
+		}
+		ownerNames := []string{tunnel.Name}
+		if tunnel.Status.GatewayRef != nil && tunnel.Status.GatewayRef.Name != "" {
+			ownerNames = append(ownerNames, tunnel.Status.GatewayRef.Name)
+		}
+		for _, ownerName := range ownerNames {
+			info.markers = append(info.markers, dnsOwnershipMarkers(tunnel, key, clusterID, ownerName)...)
+		}
+		for _, checkpoint := range tunnel.Status.DNSRecords {
+			if checkpoint.RecordID == "" {
+				continue
+			}
+			info.checkpoints[checkpoint.RecordID] = checkpoint
+			claimed[checkpoint.RecordID] = true
+			checkpointZones[checkpoint.ZoneID] = true
+		}
+		tunnels = append(tunnels, info)
+	}
+
+	api, wait := as.remote()
+	inventory, err := as.zones(ctx)
+	if err != nil {
+		return nil, err
+	}
+	zones := dnsScanZones(inventory, account.Spec.Grants, checkpointZones)
 
 	// Collect the filtered listing across zones. A zone whose listing fails
 	// with an isolatable error contributes no records and no judgement; a
@@ -104,39 +152,6 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 		for _, record := range records {
 			remoteByID[record.ID] = record
 		}
-	}
-
-	var list v1alpha1.CloudflareTunnelList
-	if err := as.client.List(ctx, &list); err != nil {
-		return nil, fmt.Errorf("list CloudflareTunnels: %w", err)
-	}
-	var tunnels []dnsTunnelInfo
-	claimed := make(map[string]bool)
-	for i := range list.Items {
-		tunnel := &list.Items[i]
-		if tunnel.Spec.AccountRef.Name != as.accountName || deleting(tunnel) || observeOnly(tunnel.Spec.ManagementPolicy) {
-			continue
-		}
-		info := dnsTunnelInfo{
-			key:         types.NamespacedName{Namespace: tunnel.Namespace, Name: tunnel.Name},
-			tunnelID:    tunnel.Status.TunnelID,
-			checkpoints: make(map[string]v1alpha1.CloudflareTunnelDNSRecordStatus, len(tunnel.Status.DNSRecords)),
-		}
-		ownerNames := []string{tunnel.Name}
-		if tunnel.Status.GatewayRef != nil && tunnel.Status.GatewayRef.Name != "" {
-			ownerNames = append(ownerNames, tunnel.Status.GatewayRef.Name)
-		}
-		for _, ownerName := range ownerNames {
-			info.markers = append(info.markers, dnsOwnershipMarkers(tunnel, key, clusterID, ownerName)...)
-		}
-		for _, checkpoint := range tunnel.Status.DNSRecords {
-			if checkpoint.RecordID == "" {
-				continue
-			}
-			info.checkpoints[checkpoint.RecordID] = checkpoint
-			claimed[checkpoint.RecordID] = true
-		}
-		tunnels = append(tunnels, info)
 	}
 
 	items := make([]DriftItem, 0)
@@ -180,6 +195,30 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 		}
 	}
 	return items, scopedListingErr(failures)
+}
+
+// dnsScanZones returns the inventory zones a DNS pass lists, in inventory
+// order: zones named by any grant (the union over every grant, matched with
+// the same rule authorizeBindings applies before any DNS write, so "*"
+// keeps the whole inventory), plus zones holding a checkpoint of a tunnel
+// the pass judges. Checkpoints keep a zone in scope after its grant is
+// revoked, while the records there still need drift detection and
+// cleanup. Zones absent from the inventory are never listed: a checkpoint
+// whose zone left the account must not manufacture a 404.
+//
+// Every other zone is skipped. Flareway cannot have written a record
+// there, and a least-privilege token cannot read it, so listing it would
+// only turn every pass into a partial.
+func dnsScanZones(inventory []flarecloudflare.Zone, grants []v1alpha1.CloudflareAccountGrant, checkpointZones map[string]bool) []flarecloudflare.Zone {
+	scan := make([]flarecloudflare.Zone, 0, len(inventory))
+	for _, zone := range inventory {
+		if checkpointZones[zone.ID] || slices.ContainsFunc(grants, func(grant v1alpha1.CloudflareAccountGrant) bool {
+			return authz.ZoneMatches(grant.Zones, zone.Name)
+		}) {
+			scan = append(scan, zone)
+		}
+	}
+	return scan
 }
 
 // zoneFailureIsolatable reports whether a zone-scoped listing error may be

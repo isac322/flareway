@@ -124,7 +124,7 @@ func evaluateGrant(grant *v1alpha1.CloudflareAccountGrant, namespace *corev1.Nam
 	if request.Hostname != "" && !matchesHostnameSet(grant.Hostnames, request.Hostname) {
 		return denied(ReasonUnsupportedValue, fmt.Sprintf("hostname %q is not granted", request.Hostname))
 	}
-	if request.Zone != "" && !matchesNameSet(grant.Zones, request.Zone) {
+	if request.Zone != "" && !ZoneMatches(grant.Zones, request.Zone) {
 		return denied(ReasonUnsupportedValue, fmt.Sprintf("zone %q is not granted", request.Zone))
 	}
 	if request.Exposure != "" && !containsExposure(grant.Exposures, request.Exposure) {
@@ -254,7 +254,10 @@ func HostnameMatches(pattern, hostname string) bool {
 	return prefix != "" && !strings.Contains(prefix, ".")
 }
 
-func matchesNameSet(patterns []string, value string) bool {
+// ZoneMatches reports whether a grant's zones list contains zone: an exact
+// zone name or "*", compared after DNS name normalization. It is the single
+// zone rule shared by grant evaluation and the DNS drift sweep's scan set.
+func ZoneMatches(patterns []string, value string) bool {
 	value = normalizeDNSName(value)
 	for _, pattern := range patterns {
 		pattern = normalizeDNSName(pattern)
