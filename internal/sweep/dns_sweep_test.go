@@ -177,6 +177,12 @@ type dnsProbeConfig struct {
 	forbidWrites bool
 	// factory overrides the probe factory (QA-07 uses a real SDK client).
 	factory flarecloudflare.ClientFactory
+	// grantZones sets the zones of the seeded CloudflareAccount's single
+	// grant; nil grants "*" (full enumeration). The account is seeded only
+	// when objects carries none and withoutAccount is false.
+	grantZones []string
+	// withoutAccount drops the seeded CloudflareAccount so its read fails.
+	withoutAccount bool
 }
 
 type dnsProbeFixture struct {
@@ -202,6 +208,16 @@ func newDNSProbeFixture(t *testing.T, cfg dnsProbeConfig) *dnsProbeFixture {
 			Data:       map[string][]byte{ownership.SecretKey: probeOwnershipKey},
 		},
 	}, cfg.objects...)
+	if !cfg.withoutAccount && !slices.ContainsFunc(cfg.objects, func(object client.Object) bool {
+		_, ok := object.(*v1alpha1.CloudflareAccount)
+		return ok
+	}) {
+		zones := cfg.grantZones
+		if zones == nil {
+			zones = []string{"*"}
+		}
+		objects = append(objects, probeAccount(zones))
+	}
 	if !cfg.withoutKubeSystem {
 		objects = append(objects, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID(probeClusterID)},
@@ -296,6 +312,17 @@ func probeTunnel(name string, checkpoints ...v1alpha1.CloudflareTunnelDNSRecordS
 			TunnelID:   "tid-" + name,
 			DNSRecords: checkpoints,
 		},
+	}
+}
+
+// probeAccount builds this sweeper's CloudflareAccount with one grant over
+// the given zones.
+func probeAccount(zones []string) *v1alpha1.CloudflareAccount {
+	return &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: probeAccountName},
+		Spec: v1alpha1.CloudflareAccountSpec{AccountID: "account-1", Grants: []v1alpha1.CloudflareAccountGrant{{
+			Hostnames: []string{"*"}, Zones: zones,
+		}}},
 	}
 }
 
@@ -1147,7 +1174,7 @@ func TestDNSSweepAccountLevelFailures(t *testing.T) {
 		})
 	}
 
-	t.Run("tunnel list failure is error", func(t *testing.T) {
+	t.Run("tunnel list failure is error before any DNS listing", func(t *testing.T) {
 		t.Parallel()
 		f := newDNSProbeFixture(t, dnsProbeConfig{
 			zones:   []probeZone{{id: "zone-a"}},
@@ -1158,6 +1185,7 @@ func TestDNSSweepAccountLevelFailures(t *testing.T) {
 		if result != observability.SweepResultError || err == nil || items != nil {
 			t.Fatalf("RunTargetOnce = (%v, %q, %v), want error", items, result, err)
 		}
+		requireDNSCalls(t, f.api)
 	})
 
 	t.Run("cluster id failure is error", func(t *testing.T) {
