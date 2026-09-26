@@ -552,6 +552,7 @@ status:
 - wildcard listener에서는 cloudflared와 Gateway API가 더 깊은 hostname까지 매치하지만 Access destination `*.x`는 한 레이블만 보호한다. 더 깊은 hostname은 JWT 없이 보호 cloudflared rule에 도달해 403으로 fail-closed하며, condition 메시지는 "Access wildcard covers one label; deeper hostnames are denied at origin".
 - 같은 hostname에 두 AccessApplication이 겹치는 path를 target하면 후발(생성 timestamp) `Accepted=False/Conflicted`(F-2).
 - AUD는 `status`, event, log에 기록하지 않고 컨트롤러 내부 캐시인 오퍼레이터 소유 Secret `flareway-system/aud-<uid>`에 보관한다.
+- 이 Secret과 private-tunnel ledger `flareway-system/private-tunnels-<uid>`는 네임스페이스를 넘는 ownerReference를 가질 수 없다. finalizer가 제거된 채 앱이 사라지거나 같은 이름으로 재생성되면, 컨트롤러는 기록된 앱 UID가 더 이상 존재하지 않는 Secret을 삭제한다. 부재는 API 서버에서 직접 확인하고, 같은 UID의 살아 있는 앱(삭제 중 포함)이 쓰는 Secret은 건드리지 않는다.
 
 #### 6.4.2 `destinations[].private` (hostname 없는 L4, `[U-9]`)
 

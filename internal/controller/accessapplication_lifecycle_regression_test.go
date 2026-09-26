@@ -235,7 +235,8 @@ func TestAccessApplicationDeletionWithdrawsProgrammedAndRetainsDeniedCleanup(t *
 	}
 	remote := newFakeAccessApplicationCloudflare()
 	remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))}})
-	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(application).WithObjects(application, account,
+	kube := accessApplicationTestClientBuilder(scheme).WithStatusSubresource(application).
+		WithObjects(application, account,
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
@@ -327,7 +328,8 @@ func newDeniedDeletionWorld(t *testing.T, application *v1alpha1.AccessApplicatio
 		}},
 	}
 	remote := newFakeAccessApplicationCloudflare()
-	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(application).WithObjects(application, account,
+	kube := accessApplicationTestClientBuilder(scheme).WithStatusSubresource(application).
+		WithObjects(application, account,
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: application.Namespace}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "flareway-system"}, Data: map[string][]byte{"token": []byte("test-token")}},

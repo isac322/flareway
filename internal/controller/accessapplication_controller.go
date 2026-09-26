@@ -60,6 +60,7 @@ const (
 	accessApplicationTargetIndex          = "flareway.accessApplication.target"
 	accessApplicationPolicyIndex          = "flareway.accessApplication.policy"
 	accessApplicationAccountIndex         = "flareway.accessApplication.account"
+	accessApplicationHandoffOwnerIndex    = "flareway.accessApplication.handoffOwner"
 	accessApplicationAUDNamespace         = "flareway-system"
 	accessApplicationRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
 	// accessApplicationRemoteAttemptAnnotation is stamped before the first
@@ -121,7 +122,13 @@ type AccessApplicationReconciler struct {
 func (r *AccessApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var application v1alpha1.AccessApplication
 	if err := r.Get(ctx, req.NamespacedName, &application); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.collectOrphanedHandoffs(ctx, req.NamespacedName, nil)
+	}
+	if err := r.collectOrphanedHandoffs(ctx, req.NamespacedName, &application); err != nil {
+		return ctrl.Result{}, err
 	}
 	if !application.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, &application)
@@ -1156,6 +1163,151 @@ func (r *AccessApplicationReconciler) deleteAUDSecrets(ctx context.Context, appl
 	return nil
 }
 
+// accessHandoffOwner identifies the AccessApplication incarnation that an
+// operator-namespace handoff Secret (an AUD handoff or a private-tunnel ledger)
+// was written for. AUD handoffs record exactly one owner key. Ledgers only
+// carry the ambiguous "namespace--name" label, so every split of it is a
+// candidate owner key.
+type accessHandoffOwner struct {
+	uid        types.UID
+	candidates []types.NamespacedName
+}
+
+func accessHandoffOwnerOf(secret *corev1.Secret, operatorNamespace string) (accessHandoffOwner, bool) {
+	if secret == nil || secret.Namespace != operatorNamespace {
+		return accessHandoffOwner{}, false
+	}
+	if label, found := secret.Labels[v1alpha1.AccessApplicationAUDSecretLabel]; found {
+		uid := types.UID(secret.Data[v1alpha1.AccessApplicationUIDSecretKey])
+		namespace, name, split := strings.Cut(string(secret.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey]), "/")
+		if uid == "" || !split || namespace == "" || name == "" || strings.Contains(name, "/") ||
+			!strings.HasPrefix(secret.Name, "aud-"+string(uid)+"-") {
+			return accessHandoffOwner{}, false
+		}
+		key := types.NamespacedName{Namespace: namespace, Name: name}
+		if label != audIdentityLabel(key, uid) && label != namespace+"--"+name {
+			return accessHandoffOwner{}, false
+		}
+		return accessHandoffOwner{uid: uid, candidates: []types.NamespacedName{key}}, true
+	}
+	if label, found := secret.Labels[accessApplicationPrivateTunnelsLabel]; found {
+		uid, trimmed := strings.CutPrefix(secret.Name, privateTunnelLedgerSecretName(""))
+		candidates := privateTunnelLedgerOwnerCandidates(label)
+		if !trimmed || uid == "" || len(candidates) == 0 {
+			return accessHandoffOwner{}, false
+		}
+		return accessHandoffOwner{uid: types.UID(uid), candidates: candidates}, true
+	}
+	return accessHandoffOwner{}, false
+}
+
+// privateTunnelLedgerOwnerCandidates returns every namespace/name pair whose
+// ledger label equals label.
+func privateTunnelLedgerOwnerCandidates(label string) []types.NamespacedName {
+	var candidates []types.NamespacedName
+	for offset := 0; offset < len(label); {
+		index := strings.Index(label[offset:], "--")
+		if index < 0 {
+			break
+		}
+		split := offset + index
+		if split > 0 && split+2 < len(label) {
+			candidates = append(candidates, types.NamespacedName{Namespace: label[:split], Name: label[split+2:]})
+		}
+		offset = split + 1
+	}
+	return candidates
+}
+
+func accessHandoffOwnerIndexKeys(operatorNamespace string) client.IndexerFunc {
+	return func(object client.Object) []string {
+		secret, _ := object.(*corev1.Secret)
+		owner, found := accessHandoffOwnerOf(secret, operatorNamespace)
+		if !found {
+			return nil
+		}
+		keys := make([]string, len(owner.candidates))
+		for index, candidate := range owner.candidates {
+			keys[index] = candidate.String()
+		}
+		return keys
+	}
+}
+
+// collectOrphanedHandoffs deletes the operator-namespace handoff Secrets
+// recorded for key whose AccessApplication incarnation no longer exists. They
+// cannot carry cross-namespace ownerReferences, and a stripped finalizer skips
+// reconcileDelete, so nothing else ever removes them. Secrets of a live object
+// with the same UID, including one being deleted, are left to that object.
+func (r *AccessApplicationReconciler) collectOrphanedHandoffs(ctx context.Context, key types.NamespacedName, live *v1alpha1.AccessApplication) error {
+	var secrets corev1.SecretList
+	if err := r.List(ctx, &secrets,
+		client.InNamespace(r.operatorNamespace()),
+		client.MatchingFields{accessApplicationHandoffOwnerIndex: key.String()},
+	); err != nil {
+		return fmt.Errorf("list Access handoff Secrets for %s: %w", key, err)
+	}
+	if len(secrets.Items) == 0 {
+		return nil
+	}
+	liveUIDs := make(map[types.NamespacedName]types.UID, 1)
+	if live != nil {
+		liveUIDs[key] = live.UID
+	}
+	for index := range secrets.Items {
+		secret := &secrets.Items[index]
+		owner, found := accessHandoffOwnerOf(secret, r.operatorNamespace())
+		if !found {
+			continue
+		}
+		if uid, known := liveUIDs[key]; known && uid == owner.uid {
+			continue
+		}
+		orphaned := true
+		for _, candidate := range owner.candidates {
+			uid, err := r.authoritativeApplicationUID(ctx, candidate, liveUIDs)
+			if err != nil {
+				return err
+			}
+			if uid == owner.uid {
+				orphaned = false
+				break
+			}
+		}
+		if !orphaned {
+			continue
+		}
+		uid, resourceVersion := secret.UID, secret.ResourceVersion
+		if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete orphaned Access handoff Secret %s: %w", secret.Name, err)
+		}
+	}
+	return nil
+}
+
+// authoritativeApplicationUID returns the UID of the AccessApplication at key,
+// or "" when it does not exist. Lookups bypass the cache so a lagging informer
+// can never make a live application look absent.
+func (r *AccessApplicationReconciler) authoritativeApplicationUID(ctx context.Context, key types.NamespacedName, known map[types.NamespacedName]types.UID) (types.UID, error) {
+	if uid, found := known[key]; found {
+		return uid, nil
+	}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	var application v1alpha1.AccessApplication
+	if err := reader.Get(ctx, key, &application); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("confirm AccessApplication %s before handoff cleanup: %w", key, err)
+		}
+		known[key] = ""
+		return "", nil
+	}
+	known[key] = application.UID
+	return application.UID, nil
+}
+
 type accessRevocationLatch struct {
 	Claims        []accessRevocationClaim `json:"claims"`
 	TokensRevoked bool                    `json:"tokensRevoked,omitempty"`
@@ -1901,6 +2053,9 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index AccessApplication accountRef: %w", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Secret{}, accessApplicationHandoffOwnerIndex, accessHandoffOwnerIndexKeys(r.operatorNamespace())); err != nil {
+		return fmt.Errorf("index Access handoff Secret owners: %w", err)
+	}
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.AccessApplication{}, builder.WithPredicates(desiredStateChangedPredicate)).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.mapTargetToApplications)).
@@ -1916,7 +2071,7 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.CloudflareTunnel{}, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToApplications)).
 		Watches(&v1alpha1.CloudflareAccount{}, handler.EnqueueRequestsFromMapFunc(r.mapAccountToApplications)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToApplications)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapAUDSecretToApplication)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapHandoffSecretToApplications)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
 	if r.SweepEvents != nil {
 		b = b.WatchesRawSource(source.Channel(r.SweepEvents, &handler.EnqueueRequestForObject{}))
@@ -2167,16 +2322,20 @@ func (r *AccessApplicationReconciler) mapNamespaceToApplications(ctx context.Con
 	return accessApplicationRequests(applications.Items)
 }
 
-func (r *AccessApplicationReconciler) mapAUDSecretToApplication(ctx context.Context, object client.Object) []reconcile.Request {
-	secret, ok := object.(*corev1.Secret)
-	if !ok {
+// mapHandoffSecretToApplications enqueues every AccessApplication key a
+// handoff Secret was recorded for, whether or not that application still
+// exists, so that Reconcile can collect Secrets left by a vanished incarnation.
+func (r *AccessApplicationReconciler) mapHandoffSecretToApplications(_ context.Context, object client.Object) []reconcile.Request {
+	secret, _ := object.(*corev1.Secret)
+	owner, found := accessHandoffOwnerOf(secret, r.operatorNamespace())
+	if !found {
 		return nil
 	}
-	_, application, trusted := liveAUDSecretBinding(ctx, r.Client, r.operatorNamespace(), secret)
-	if !trusted {
-		return nil
+	requests := make([]reconcile.Request, len(owner.candidates))
+	for index, candidate := range owner.candidates {
+		requests[index] = reconcile.Request{NamespacedName: candidate}
 	}
-	return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(application)}}
+	return requests
 }
 
 func accessApplicationRequests(applications []v1alpha1.AccessApplication) []reconcile.Request {
