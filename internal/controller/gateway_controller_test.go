@@ -1399,7 +1399,6 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 			secret := genuine.DeepCopy()
 			test.mutate(secret)
 			gomega.Expect(reconciler.mapSecretToGateways(context.Background(), secret)).To(gomega.BeEmpty())
-			gomega.Expect(applicationReconciler.mapAUDSecretToApplication(context.Background(), secret)).To(gomega.BeEmpty())
 			gomega.Expect(reconciler.latchAUDRevocation(context.Background(), secret)).To(gomega.Succeed())
 			gomega.Expect(persistedLatches()).To(gomega.BeEmpty())
 		}
@@ -1407,7 +1406,7 @@ var _ = ginkgo.Describe("AUD handoff identity", func() {
 		gomega.Expect(reconciler.mapSecretToGateways(context.Background(), &genuine)).To(gomega.ConsistOf(
 			ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gateway)},
 		))
-		gomega.Expect(applicationReconciler.mapAUDSecretToApplication(context.Background(), &genuine)).To(gomega.ConsistOf(
+		gomega.Expect(applicationReconciler.mapHandoffSecretToApplications(context.Background(), &genuine)).To(gomega.ConsistOf(
 			ctrl.Request{NamespacedName: client.ObjectKeyFromObject(application)},
 		))
 		gomega.Expect(reconciler.latchAUDRevocation(context.Background(), &genuine)).To(gomega.Succeed())

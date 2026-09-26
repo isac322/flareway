@@ -1114,18 +1114,44 @@ var _ = ginkgo.Describe("AccessApplication reconciler", ginkgo.Ordered, func() {
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{
 			Namespace: accessApplicationAUDNamespace, Name: accessAUDSecretName(&application, fixture.gatewayKey),
 		}, &handoff)).To(gomega.Succeed())
-		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, &handoff)).To(gomega.Equal([]reconcile.Request{expected}))
+		gomega.Expect(reconciler.mapHandoffSecretToApplications(testContext, &handoff)).To(gomega.Equal([]reconcile.Request{expected}))
 
 		foreign := handoff.DeepCopy()
 		foreign.Name = "aud-foreign"
 		foreign.Data[v1alpha1.AccessApplicationNamespacedNameSecretKey] = []byte("other/foreign")
-		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, foreign)).To(gomega.BeEmpty())
-		gomega.Expect(reconciler.mapAUDSecretToApplication(testContext, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		gomega.Expect(reconciler.mapHandoffSecretToApplications(testContext, foreign)).To(gomega.BeEmpty())
+		gomega.Expect(reconciler.mapHandoffSecretToApplications(testContext, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Namespace: accessApplicationAUDNamespace, Name: "unrelated",
 		}})).To(gomega.BeEmpty())
 
 		gomega.Expect(reconciler.mapNamespaceToApplications(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fixture.namespace}})).To(gomega.Equal([]reconcile.Request{expected}))
 		gomega.Expect(reconciler.mapNamespaceToApplications(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system"}})).To(gomega.BeEmpty())
+	})
+
+	ginkgo.It("garbage-collects a leaked AUD handoff whose application no longer exists", func() {
+		fixture := newAccessFixture("orphan-aud", false, false)
+		fixture.create()
+		liveKey := waitForAUDHandoff(fixture)
+		leaked := createLeakedAUDSecret(fixture, types.NamespacedName{Namespace: fixture.namespace, Name: "gone"}, "gone-uid")
+
+		gomega.Eventually(func() error {
+			return testClient.Get(testContext, leaked, &corev1.Secret{})
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Satisfy(apierrors.IsNotFound))
+		gomega.Expect(testClient.Get(testContext, liveKey, &corev1.Secret{})).To(gomega.Succeed())
+	})
+
+	ginkgo.It("garbage-collects a leaked AUD handoff left by a previous incarnation of a live application", func() {
+		fixture := newAccessFixture("orphan-aud-recreate", false, false)
+		fixture.create()
+		liveKey := waitForAUDHandoff(fixture)
+		leaked := createLeakedAUDSecret(fixture, fixture.applicationKey, "previous-uid")
+
+		gomega.Eventually(func() error {
+			return testClient.Get(testContext, leaked, &corev1.Secret{})
+		}).WithTimeout(15 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Satisfy(apierrors.IsNotFound))
+		gomega.Consistently(func() error {
+			return testClient.Get(testContext, liveKey, &corev1.Secret{})
+		}).WithTimeout(2 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("revokes and retains the remote application when its AccessPolicy is deleted", func() {
@@ -1517,6 +1543,51 @@ func preparePrivateNetworkRouteAccess(fixture *accessFixture) (*v1alpha1.AccessA
 		g.Expect(findCondition(application.Status.Conditions, accessApplicationConditionProgrammed).Status).To(gomega.Equal(metav1.ConditionTrue))
 	}).WithTimeout(30 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	return application, route
+}
+
+// waitForAUDHandoff waits until the fixture's live application has published
+// its AUD handoff Secret and returns that Secret's key.
+func waitForAUDHandoff(fixture *accessFixture) types.NamespacedName {
+	var key types.NamespacedName
+	gomega.Eventually(func(g gomega.Gomega) {
+		var application v1alpha1.AccessApplication
+		g.Expect(testClient.Get(testContext, fixture.applicationKey, &application)).To(gomega.Succeed())
+		g.Expect(application.Status.ApplicationID).NotTo(gomega.BeEmpty())
+		key = accessAUDSecretKey(accessApplicationAUDNamespace, &application, fixture.gatewayKey)
+		var secret corev1.Secret
+		g.Expect(testClient.Get(testContext, key, &secret)).To(gomega.Succeed())
+		g.Expect(string(secret.Data[v1alpha1.AccessApplicationUIDSecretKey])).To(gomega.Equal(string(application.UID)))
+	}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	return key
+}
+
+// createLeakedAUDSecret writes the exact handoff Secret an application with
+// the given key and UID would have published for the fixture Gateway, as left
+// behind when that application disappeared without finalization.
+func createLeakedAUDSecret(fixture *accessFixture, applicationKey types.NamespacedName, uid types.UID) types.NamespacedName {
+	var gateway gatewayv1.Gateway
+	gomega.Expect(testClient.Get(testContext, fixture.gatewayKey, &gateway)).To(gomega.Succeed())
+	dead := &v1alpha1.AccessApplication{ObjectMeta: metav1.ObjectMeta{Namespace: applicationKey.Namespace, Name: applicationKey.Name, UID: uid}}
+	key := accessAUDSecretKey(accessApplicationAUDNamespace, dead, fixture.gatewayKey)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: map[string]string{
+			v1alpha1.AccessApplicationAUDSecretLabel:  applicationAUDIdentityLabel(dead),
+			v1alpha1.AccessApplicationGatewayAUDLabel: gatewayAUDIdentityLabel(&gateway),
+		}},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			v1alpha1.AccessApplicationAUDSecretKey:                   []byte("aud-dead"),
+			v1alpha1.AccessApplicationIDSecretKey:                    []byte("dead-application"),
+			v1alpha1.AccessApplicationNamespacedNameSecretKey:        []byte(applicationKey.String()),
+			v1alpha1.AccessApplicationUIDSecretKey:                   []byte(uid),
+			v1alpha1.AccessApplicationGatewayNamespacedNameSecretKey: []byte(fixture.gatewayKey.String()),
+			v1alpha1.AccessApplicationGatewayUIDSecretKey:            []byte(gateway.UID),
+			accessApplicationAUDReadyKey:                             []byte("true"),
+		},
+	}
+	gomega.Expect(testClient.Create(testContext, secret)).To(gomega.Succeed())
+	ginkgo.DeferCleanup(func() { _ = testClient.Delete(context.Background(), secret) })
+	return key
 }
 
 func programAccessFixture(fixture *accessFixture, application *v1alpha1.AccessApplication, version int64) {
