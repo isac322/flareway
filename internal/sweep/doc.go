@@ -62,6 +62,27 @@ limitations under the License.
 // records and no judgement, so a denied zone can never produce a false
 // missing verdict. Every other target keeps the strict contract above.
 //
+// # Content confirmation
+//
+// Identity checks (remote ID, name, ownership tags) cannot see a remote whose
+// content was edited out of band. When the Invalidator also implements
+// ContentConfirmer, every classify call hands each matched object whose
+// identity checks passed to ConfirmContent, together with the time the pass
+// started (contentCheck). The owning reconciler decides per object whether a
+// listing can confirm it by registering a content baseline after its own
+// verify: a listed object that matches the baseline counts as a fresh verify
+// and keeps the object from reading the remote itself; one that does not is
+// a DriftCaseMismatch like any other. Confirmations happen only inside
+// classify, which is only ever called with a complete listing, so a partial
+// or failed pass confirms nothing. The DNS target does not use classify and
+// confirms nothing.
+//
+// The AccessApplication target hands the confirmer an
+// AccessApplicationListing rather than the bare application: the whole
+// application listing (bypass children live there) and, when any application
+// references them, the identity provider and custom page listings, all taken
+// in the same pass. A failure listing any of them abandons the pass.
+//
 // # Orphans are observe-only
 //
 // Deleting a remote object is a destructive write. The sweep loop never

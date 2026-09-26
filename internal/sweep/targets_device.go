@@ -60,10 +60,11 @@ func sweepDeviceProfiles(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.DeviceProfile]{
-		kind:   "DeviceProfile",
-		idOf:   func(p flarecloudflare.DeviceProfile) string { return p.PolicyID },
-		listed: accountScopeListed,
-		nameOf: func(p flarecloudflare.DeviceProfile) string { return p.Name },
+		kind:    "DeviceProfile",
+		content: contentCheck[flarecloudflare.DeviceProfile](ctx, as),
+		idOf:    func(p flarecloudflare.DeviceProfile) string { return p.PolicyID },
+		listed:  accountScopeListed,
+		nameOf:  func(p flarecloudflare.DeviceProfile) string { return p.Name },
 	}), nil
 }
 
@@ -101,10 +102,11 @@ func sweepDevicePostureRules(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.DevicePostureRule]{
-		kind:   "DevicePostureRule",
-		idOf:   func(r flarecloudflare.DevicePostureRule) string { return r.ID },
-		listed: accountScopeListed,
-		nameOf: func(r flarecloudflare.DevicePostureRule) string { return r.Name },
+		kind:    "DevicePostureRule",
+		content: contentCheck[flarecloudflare.DevicePostureRule](ctx, as),
+		idOf:    func(r flarecloudflare.DevicePostureRule) string { return r.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(r flarecloudflare.DevicePostureRule) string { return r.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(r flarecloudflare.DevicePostureRule) string { return r.ID },
 			func(r flarecloudflare.DevicePostureRule) string { return r.Name }),
@@ -146,10 +148,11 @@ func sweepDevicePostureIntegrations(ctx context.Context, as *AccountSweeper) ([]
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.DevicePostureIntegration]{
-		kind:   "DevicePostureIntegration",
-		idOf:   func(i flarecloudflare.DevicePostureIntegration) string { return i.ID },
-		listed: accountScopeListed,
-		nameOf: func(i flarecloudflare.DevicePostureIntegration) string { return i.Name },
+		kind:    "DevicePostureIntegration",
+		content: contentCheck[flarecloudflare.DevicePostureIntegration](ctx, as),
+		idOf:    func(i flarecloudflare.DevicePostureIntegration) string { return i.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(i flarecloudflare.DevicePostureIntegration) string { return i.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(i flarecloudflare.DevicePostureIntegration) string { return i.ID },
 			func(i flarecloudflare.DevicePostureIntegration) string { return i.Name }),

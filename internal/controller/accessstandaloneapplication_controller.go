@@ -158,7 +158,22 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if err := r.patchStatus(ctx, object, remote, scope, true, secretRef, metav1.ConditionTrue, metav1.ConditionTrue, "Ready", "Standalone Access application is synchronized", object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if secretRef == nil {
+		// The sweep's application listing carries every field compared above,
+		// with each attached policy embedded; an attachment to a policy deleted
+		// out of band comes back without its decision and counts as changed.
+		// Referenced policies, identity providers, and custom pages are
+		// resolved before the gate on every pass. An application holding a
+		// one-time SaaS client Secret keeps its own verify, which is what
+		// notices that Secret going missing.
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			application, ok := listed.(flarecloudflare.AccessApplication)
+			return ok && application.ID == remote.ID && accessApplicationPoliciesEmbedded(application) &&
+				flarecloudflare.AccessApplicationMatchesInput(application, input)
+		}, remote))
+	}
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)

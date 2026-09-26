@@ -49,10 +49,10 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	bypasses []gatewayapi.AccessBypass,
 	ownerTag string,
 	clusterID string,
-) ([]v1alpha1.AccessBypassApplicationStatus, error) {
+) ([]v1alpha1.AccessBypassApplicationStatus, *bypassExpectation, error) {
 	declarations, err := declaredBypassChildren(application)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	observeOnly := effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	existing := make(map[string]v1alpha1.AccessBypassApplicationStatus, len(application.Status.BypassApplications))
@@ -65,14 +65,14 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			key := bypassStatusKey(bypass.Hostname, bypass.Path)
 			declared, found := declarations[key]
 			if !found || declared.ExternalRef == nil {
-				return nil, fmt.Errorf("validation BypassNotDeclared: ObserveOnly bypass %s%s requires a declared externalRef", bypass.Hostname, bypass.Path)
+				return nil, nil, fmt.Errorf("validation BypassNotDeclared: ObserveOnly bypass %s%s requires a declared externalRef", bypass.Hostname, bypass.Path)
 			}
 			child, err := remote.GetAccessApplication(ctx, scope, declared.ExternalRef.ApplicationID)
 			if err != nil {
-				return nil, fmt.Errorf("observe bypass Access application %s%s: %w", bypass.Hostname, bypass.Path, err)
+				return nil, nil, fmt.Errorf("observe bypass Access application %s%s: %w", bypass.Hostname, bypass.Path, err)
 			}
 			if err := verifyAccessApplicationExpectation(child, declared.Adoption.Expect); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			policyID := ""
 			if len(child.Policies) > 0 {
@@ -85,7 +85,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			})
 		}
 		sortBypassStatuses(result)
-		return result, nil
+		return result, nil, nil
 	}
 
 	parentName := accessApplicationRemoteName(application)
@@ -95,7 +95,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	signingKey, ownerTags, writeOwnerTag := r.accessOwnerTags(ctx, application, ownerTag)
 	ownedRemote, err := listOwnedBypassApplications(ctx, remote, scope, ownerTags, signingKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	needsDefaultPolicy := false
 	for _, bypass := range bypasses {
@@ -106,11 +106,12 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	if needsDefaultPolicy {
 		bypassPolicy, err := remote.EnsureBypassPolicy(ctx, "flareway/"+clusterID+"/bypass-everyone")
 		if err != nil {
-			return nil, fmt.Errorf("ensure account bypass policy: %w", err)
+			return nil, nil, fmt.Errorf("ensure account bypass policy: %w", err)
 		}
 		defaultPolicyID = bypassPolicy.ID
 	}
 
+	expectation := &bypassExpectation{ownerTags: ownerTags, signingKey: signingKey}
 	falseValue := false
 	result := make([]v1alpha1.AccessBypassApplicationStatus, 0, len(bypasses))
 	desiredKeys := make(map[string]struct{}, len(bypasses))
@@ -138,7 +139,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		if declaredFound && declared.PolicyRef != nil {
 			policyID, err = r.resolveBypassPolicyReference(ctx, application, application.Spec.AccountRef.Name, remote, *declared.PolicyRef)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		uri := strings.TrimSuffix(strings.ToLower(bypass.Hostname), "/") + bypass.Path
@@ -163,11 +164,11 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		previous := existing[key]
 		if declaredFound && declared.ExternalRef != nil {
 			if declared.Adoption.Mode != v1alpha1.AdoptionModeAdoptByID {
-				return nil, fmt.Errorf("managed bypass %s%s externalRef requires adoption.mode AdoptById", bypass.Hostname, bypass.Path)
+				return nil, nil, fmt.Errorf("managed bypass %s%s externalRef requires adoption.mode AdoptById", bypass.Hostname, bypass.Path)
 			}
 			child, err = remote.GetAccessApplication(ctx, scope, declared.ExternalRef.ApplicationID)
 			if err != nil {
-				return nil, fmt.Errorf("get adopted bypass Access application %s%s: %w", bypass.Hostname, bypass.Path, err)
+				return nil, nil, fmt.Errorf("get adopted bypass Access application %s%s: %w", bypass.Hostname, bypass.Path, err)
 			}
 			managedRecovery := false
 			if previous.ApplicationID == declared.ExternalRef.ApplicationID &&
@@ -175,7 +176,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 				previous.Name != "" {
 				previousMarkers := accessBypassMarkersForOwners(signingKey, ownerTags, previous.Name)
 				if !ownedBypassApplication(child, ownerTags, previousMarkers, previous.Name) {
-					return nil, fmt.Errorf("ownership conflict: adopted bypass Access application %q is not owned by this resource", previous.ApplicationID)
+					return nil, nil, fmt.Errorf("ownership conflict: adopted bypass Access application %q is not owned by this resource", previous.ApplicationID)
 				}
 				managedRecovery = true
 			} else if previous.ApplicationID == "" && ownedBypassApplication(child, ownerTags, bypassMarkers, childName) {
@@ -183,7 +184,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			}
 			if !managedRecovery {
 				if err := verifyAccessApplicationExpectation(child, declared.Adoption.Expect); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			}
 			origin = v1alpha1.AccessBypassApplicationOriginAdopted
@@ -194,7 +195,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 				child, err = remote.GetAccessApplication(ctx, scope, previous.ApplicationID)
 				if err == nil {
 					if !ownedBypassApplication(child, ownerTags, bypassMarkers, childName) {
-						return nil, fmt.Errorf("ownership conflict: bypass Access application %q is not owned by this resource", previous.ApplicationID)
+						return nil, nil, fmt.Errorf("ownership conflict: bypass Access application %q is not owned by this resource", previous.ApplicationID)
 					}
 					origin = previous.Origin
 					if origin == "" {
@@ -202,7 +203,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 					}
 					selected = true
 				} else if !isRemoteNotFound(err) {
-					return nil, err
+					return nil, nil, err
 				}
 			}
 		}
@@ -213,7 +214,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 					continue
 				}
 				if recovered.Name != childName {
-					return nil, fmt.Errorf("ownership conflict: bypass tag %q belongs to Access application name %q, want %q", marker, recovered.Name, childName)
+					return nil, nil, fmt.Errorf("ownership conflict: bypass tag %q belongs to Access application name %q, want %q", marker, recovered.Name, childName)
 				}
 				child = recovered
 				origin = v1alpha1.AccessBypassApplicationOriginRecovered
@@ -224,13 +225,13 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		if selected {
 			if !accessApplicationMatchesInput(child, input) {
 				if err := ensureAccessTags(ctx, remote, input.Tags...); err != nil {
-					return nil, fmt.Errorf("ensure bypass Access tags for %s%s: %w", bypass.Hostname, bypass.Path, err)
+					return nil, nil, fmt.Errorf("ensure bypass Access tags for %s%s: %w", bypass.Hostname, bypass.Path, err)
 				}
 				child, err = remote.UpdateAccessApplication(ctx, scope, child.ID, input)
 			}
 		} else {
 			if err := ensureAccessTags(ctx, remote, input.Tags...); err != nil {
-				return nil, fmt.Errorf("ensure bypass Access tags for %s%s: %w", bypass.Hostname, bypass.Path, err)
+				return nil, nil, fmt.Errorf("ensure bypass Access tags for %s%s: %w", bypass.Hostname, bypass.Path, err)
 			}
 			var created flarecloudflare.AccessApplicationCreateResult
 			created, err = remote.CreateAccessApplication(ctx, scope, input)
@@ -253,7 +254,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			}
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reconcile bypass Access application for %s%s: %w", bypass.Hostname, bypass.Path, err)
+			return nil, nil, fmt.Errorf("reconcile bypass Access application for %s%s: %w", bypass.Hostname, bypass.Path, err)
 		}
 		status := v1alpha1.AccessBypassApplicationStatus{
 			Hostname: bypass.Hostname, Path: bypass.Path, ApplicationID: child.ID,
@@ -261,13 +262,15 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 		}
 		if !reflect.DeepEqual(existing[key], status) {
 			if err := r.persistChildID(ctx, application, status); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			upsertLocalBypassStatus(application, status)
 			existing[key] = status
 		}
 		result = append(result, status)
+		expectation.children = append(expectation.children, bypassChildExpectation{id: child.ID, input: input})
 	}
+	expectation.desiredTags = desiredTags
 
 	prune := make(map[string]v1alpha1.AccessBypassApplicationStatus)
 	for _, status := range application.Status.BypassApplications {
@@ -295,7 +298,7 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("get obsolete bypass Access application %s: %w", id, err)
+			return nil, nil, fmt.Errorf("get obsolete bypass Access application %s: %w", id, err)
 		}
 		childName := status.Name
 		if childName == "" && status.Hostname != "" {
@@ -310,11 +313,11 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 			input.Tags = removeAccessTags(input.Tags, append(append([]string{accessManagedTag}, ownerTags...), pruneMarkers...)...)
 			if !accessApplicationMatchesInput(child, input) {
 				if _, err := remote.UpdateAccessApplication(ctx, scope, child.ID, input); err != nil {
-					return nil, fmt.Errorf("orphan bypass Access application %s: %w", id, err)
+					return nil, nil, fmt.Errorf("orphan bypass Access application %s: %w", id, err)
 				}
 			}
 		} else if err := remote.DeleteAccessApplication(ctx, scope, id); err != nil && !isRemoteNotFound(err) {
-			return nil, fmt.Errorf("delete obsolete bypass Access application %s: %w", id, err)
+			return nil, nil, fmt.Errorf("delete obsolete bypass Access application %s: %w", id, err)
 		}
 		for _, marker := range pruneMarkers {
 			deleteTags[marker] = struct{}{}
@@ -322,11 +325,57 @@ func (r *AccessApplicationReconciler) reconcileBypassApplications(
 	}
 	for _, tagName := range sortedStringKeys(deleteTags) {
 		if err := remote.DeleteAccessTag(ctx, tagName); err != nil && !isRemoteNotFound(err) {
-			return nil, fmt.Errorf("delete obsolete bypass Access tag %q: %w", tagName, err)
+			return nil, nil, fmt.Errorf("delete obsolete bypass Access tag %q: %w", tagName, err)
 		}
 	}
 	sortBypassStatuses(result)
-	return result, nil
+	return result, expectation, nil
+}
+
+// bypassExpectation is what a converged pass established about an
+// application's bypass children, in a form a drift sweep's application
+// listing can check: every desired child exists with its desired content, and
+// no other application carries this owner's bypass marker (the pass would
+// have pruned it).
+type bypassExpectation struct {
+	children    []bypassChildExpectation
+	ownerTags   []string
+	signingKey  []byte
+	desiredTags map[string]struct{}
+}
+
+type bypassChildExpectation struct {
+	id    string
+	input flarecloudflare.AccessApplicationInput
+}
+
+// matches reports whether the listed applications still satisfy the
+// expectation. A nil expectation (ObserveOnly) never matches.
+func (expectation *bypassExpectation) matches(listed map[string]flarecloudflare.AccessApplication) bool {
+	if expectation == nil || listed == nil {
+		return false
+	}
+	ids := make(map[string]struct{}, len(expectation.children))
+	for _, child := range expectation.children {
+		remote, found := listed[child.id]
+		if !found || !accessApplicationPoliciesEmbedded(remote) || !accessApplicationMatchesInput(remote, child.input) {
+			return false
+		}
+		ids[child.id] = struct{}{}
+	}
+	for _, application := range listed {
+		tagName, owned := ownedBypassApplicationTag(application, expectation.ownerTags, expectation.signingKey)
+		if !owned {
+			continue
+		}
+		if _, desired := expectation.desiredTags[tagName]; !desired {
+			return false
+		}
+		if _, known := ids[application.ID]; !known {
+			return false
+		}
+	}
+	return true
 }
 
 func listOwnedBypassApplications(ctx context.Context, remote AccessApplicationCloudflareClient, scope flarecloudflare.AccessScope, ownerTags []string, key []byte) (map[string]flarecloudflare.AccessApplication, error) {

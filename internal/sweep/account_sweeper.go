@@ -286,7 +286,9 @@ func (as *AccountSweeper) runTarget(ctx context.Context, target TargetDescriptor
 // against completed scopes are safe, so they are returned together with the
 // aggregate error.
 func (as *AccountSweeper) RunTargetOnce(ctx context.Context, target TargetDescriptor) ([]DriftItem, string, error) {
-	items, err := target.SweepFunc(ctx, as)
+	// Content confirmations are stamped with the time the pass started: a
+	// listing can only prove what the remote held at some point after that.
+	items, err := target.SweepFunc(context.WithValue(ctx, passStartKey{}, time.Now()), as)
 	var scoped *scopedListingError
 	switch {
 	case err != nil && errors.Is(err, context.Canceled):
@@ -337,6 +339,40 @@ func (as *AccountSweeper) handleDriftResults(_ context.Context, items []DriftIte
 			// destructive write that belongs to the owning reconciler's
 			// teardown path after a T0 fresh read, never to this loop.
 		}
+	}
+}
+
+// passStartKey carries the start time of the current pass in its context.
+type passStartKey struct{}
+
+// contentCheck returns the classify hook that checks each listed object whose
+// identity checks passed against the desired content its reconciler last
+// verified. A match counts as a fresh verify of the object, dated at the start
+// of this pass; a mismatch becomes a DriftCaseMismatch item. It returns nil,
+// and the kind keeps identity-only checks, when the invalidator cannot confirm
+// content or the pass start is unknown.
+//
+// Only kinds whose listed objects carry every field their reconciler
+// compares may use it; the reconciler decides per object by registering a
+// baseline or not.
+func contentCheck[R any](ctx context.Context, as *AccountSweeper) func(localRef, R) bool {
+	return contentCheckWith(ctx, as, func(remote R) any { return remote })
+}
+
+// contentCheckWith is contentCheck for kinds whose content check needs more
+// than the listed object itself; observe builds what the reconciler's matcher
+// receives, from listings taken in the same pass.
+func contentCheckWith[R any](ctx context.Context, as *AccountSweeper, observe func(R) any) func(localRef, R) bool {
+	confirmer, ok := as.invalidator.(ContentConfirmer)
+	if !ok {
+		return nil
+	}
+	start, ok := ctx.Value(passStartKey{}).(time.Time)
+	if !ok || start.IsZero() {
+		return nil
+	}
+	return func(ref localRef, remote R) bool {
+		return confirmer.ConfirmContent(ref.kind, ref.key, observe(remote), start)
 	}
 }
 

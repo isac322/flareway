@@ -80,10 +80,11 @@ func sweepCloudflareTunnels(ctx context.Context, as *AccountSweeper) ([]DriftIte
 	}
 	generatedPrefix := clusterID + "-"
 	return classify(refs, live, classifyOptions[flarecloudflare.Tunnel]{
-		kind:   "CloudflareTunnel",
-		idOf:   func(t flarecloudflare.Tunnel) string { return t.ID },
-		listed: accountScopeListed,
-		nameOf: func(t flarecloudflare.Tunnel) string { return t.Name },
+		kind:    "CloudflareTunnel",
+		content: contentCheck[flarecloudflare.Tunnel](ctx, as),
+		idOf:    func(t flarecloudflare.Tunnel) string { return t.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(t flarecloudflare.Tunnel) string { return t.Name },
 		orphan: func(remote flarecloudflare.Tunnel, _ map[string]bool) (types.NamespacedName, bool) {
 			if !strings.HasPrefix(remote.Name, generatedPrefix) || expectedNames[remote.Name] {
 				return types.NamespacedName{}, false
@@ -130,9 +131,10 @@ func sweepWARPConnectors(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 		}
 	}
 	return classify(refs, live, classifyOptions[flarecloudflare.WARPConnector]{
-		kind:   "WARPConnector",
-		idOf:   func(c flarecloudflare.WARPConnector) string { return c.ID },
-		listed: accountScopeListed,
-		nameOf: func(c flarecloudflare.WARPConnector) string { return c.Name },
+		kind:    "WARPConnector",
+		content: contentCheck[flarecloudflare.WARPConnector](ctx, as),
+		idOf:    func(c flarecloudflare.WARPConnector) string { return c.ID },
+		listed:  accountScopeListed,
+		nameOf:  func(c flarecloudflare.WARPConnector) string { return c.Name },
 	}), nil
 }

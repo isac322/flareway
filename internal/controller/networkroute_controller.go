@@ -164,7 +164,20 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := r.patchStatusWithIPLookup(ctx, object, remote, lookup, true, true, metav1.ConditionTrue, "Ready", "Network route is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if object.Spec.IPLookup == nil {
+		// ListNetworkRoutes returns every field this pass compared. An
+		// ipLookup route also reads LookupNetworkRoute, whose answer the
+		// listed route cannot show, so it keeps its own per-TTL verify.
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			route, ok := listed.(flarecloudflare.NetworkRoute)
+			return ok && route.ID == remote.ID && !route.Deleted &&
+				privateCommentOwnedBy(route.Comment, input.Comment) &&
+				validatePrivateTunnelType(input.TunnelType, route.TunnelType, "network route", route.ID) == "" &&
+				!networkRouteNeedsUpdate(input, route)
+		}, remote))
+	}
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "NetworkRoute", request.NamespacedName)

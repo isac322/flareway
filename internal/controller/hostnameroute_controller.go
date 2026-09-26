@@ -150,7 +150,17 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 	if err := r.patchStatus(ctx, object, remote, hostname, true, true, metav1.ConditionTrue, "Ready", "Hostname route is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	// ListHostnameRoutes returns every field this pass compared, so the
+	// sweep's listing can stand in for this pass's own read.
+	stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+		route, ok := listed.(flarecloudflare.HostnameRoute)
+		return ok && route.ID == remote.ID && !route.Deleted &&
+			privateCommentOwnedBy(route.Comment, input.Comment) &&
+			validatePrivateTunnelType(input.TunnelType, route.TunnelType, "hostname route", route.ID) == "" &&
+			!hostnameRouteNeedsUpdate(input, route)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "HostnameRoute", request.NamespacedName)

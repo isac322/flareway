@@ -46,7 +46,7 @@ func TestAdoptedBypassExpectationIsNotReplayed(t *testing.T) {
 	reconciler := &AccessApplicationReconciler{Client: kube, Scheme: scheme}
 	bypasses := []gatewayapi.AccessBypass{{Hostname: hostname, Path: path}}
 
-	children, err := reconciler.reconcileBypassApplications(
+	children, _, err := reconciler.reconcileBypassApplications(
 		context.Background(), remote, flarecloudflare.AccessScope{}, application, bypasses, ownerTag, "cluster",
 	)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestAdoptedBypassExpectationIsNotReplayed(t *testing.T) {
 		t.Fatalf("updates after adoption = %d, want 1", updates)
 	}
 
-	children, err = reconciler.reconcileBypassApplications(
+	children, _, err = reconciler.reconcileBypassApplications(
 		context.Background(), remote, flarecloudflare.AccessScope{}, application, bypasses, ownerTag, "cluster",
 	)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestAdoptedBypassExpectationIsNotReplayed(t *testing.T) {
 	}
 
 	application.Status.BypassApplications = nil
-	children, err = reconciler.reconcileBypassApplications(
+	children, _, err = reconciler.reconcileBypassApplications(
 		context.Background(), remote, flarecloudflare.AccessScope{}, application, bypasses, ownerTag, "cluster",
 	)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestAdoptedBypassExternalRefChangeRechecksExpectation(t *testing.T) {
 		Origin: v1alpha1.AccessBypassApplicationOriginAdopted,
 	}}
 
-	_, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+	_, _, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 		context.Background(), remote, flarecloudflare.AccessScope{}, application,
 		[]gatewayapi.AccessBypass{{Hostname: hostname, Path: path}}, ownerTag, "cluster",
 	)
@@ -144,7 +144,7 @@ func TestAdoptedBypassManagedRecoveryRequiresOwnershipTags(t *testing.T) {
 		Origin: v1alpha1.AccessBypassApplicationOriginAdopted,
 	}}
 
-	_, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
+	_, _, err := (&AccessApplicationReconciler{}).reconcileBypassApplications(
 		context.Background(), remote, flarecloudflare.AccessScope{}, application,
 		[]gatewayapi.AccessBypass{{Hostname: hostname, Path: path}}, ownerTag, "cluster",
 	)

@@ -160,10 +160,22 @@ func evaluateGateWithHash(
 	}
 
 	gate := policy.Evaluate(grade, appliedHash, desiredHash, applied, now, invalidated)
+	// A sweep listing that confirmed the content of this exact desired hash
+	// counts as a verify with a longer window (two grade periods), so that a
+	// healthy sweep keeps the object from reading the remote itself. When
+	// both are valid, the later expiry wins so the object wakes no earlier
+	// than it has to. Invalidation and hash mismatches close it the same way.
+	if confirmed, ok := latch.ConfirmedAt(kind, key, desiredHash); ok {
+		swept := policy.EvaluateSweepConfirmed(grade, appliedHash, desiredHash, confirmed, now, invalidated)
+		if swept.Open && (!gate.Open || swept.Requeue > gate.Requeue) {
+			gate = swept
+		}
+	}
 	// A closed gate sends this pass to the remote. Until it converges and
 	// records again, nothing verified earlier may re-open the gate: a desired
-	// state that changes and then changes back must not find the old verify
-	// and skip the pass that brings status back in line.
+	// state that changes and then changes back must not find an old verify
+	// or a sweep confirmation the sweep kept renewing, and skip the pass that
+	// brings status back in line.
 	if !gate.Open && gate.Decision != freshness.DecisionNotGated {
 		latch.Forget(kind, key)
 	}
@@ -235,11 +247,41 @@ func convergedRequeue(policy freshness.Policy, grade freshness.Grade, fallback t
 type gateStamp struct {
 	Hash string
 	At   metav1.Time
+	// Content, when set, lets the drift sweep confirm this desired state from
+	// its listing (freshness.Latch.SetBaseline). Set it only when the listed
+	// remote object carries everything this pass verified; leave it nil and
+	// the object keeps its own per-TTL verify.
+	Content freshness.ContentMatcher
 }
 
 // newGateStamp builds the stamp for a pass that just converged.
 func newGateStamp(hash string, at time.Time) gateStamp {
 	return gateStamp{Hash: hash, At: metav1.NewTime(at)}
+}
+
+// withContent returns the stamp with a content matcher for the sweep.
+func (stamp gateStamp) withContent(matches freshness.ContentMatcher) gateStamp {
+	stamp.Content = matches
+	return stamp
+}
+
+// recordGateVerification records a converged pass in the latch: the verify
+// time, and the content baseline the sweep confirms against. It runs only
+// after the pass has persisted whatever status it had to.
+func recordGateVerification(latch *freshness.Latch, kind string, key types.NamespacedName, stamp gateStamp) {
+	latch.MarkVerified(kind, key, stamp.Hash, stamp.At.Time)
+	latch.SetBaseline(kind, key, stamp.Hash, stamp.Content)
+}
+
+// contentBaseline returns matches only when the remote object this pass just
+// verified satisfies it. A matcher that rejects the very object the reconciler
+// accepted as converged would make the sweep report drift on every pass, so
+// such an object keeps its own per-TTL verify instead.
+func contentBaseline(matches freshness.ContentMatcher, verified any) freshness.ContentMatcher {
+	if matches == nil || !matches(verified) {
+		return nil
+	}
+	return matches
 }
 
 // nextGateStamp decides what status must hold after a converged pass.
@@ -309,7 +351,7 @@ func persistGateStamp(
 			return fmt.Errorf("persist freshness gate stamp: %w", err)
 		}
 	}
-	latch.MarkVerified(kind, key, stamp.Hash, stamp.At.Time)
+	recordGateVerification(latch, kind, key, stamp)
 	return nil
 }
 

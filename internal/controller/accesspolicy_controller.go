@@ -241,7 +241,13 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := r.patchAccessPolicyStatus(ctx, object, &remote, owned, nil, metav1.ConditionTrue, "Ready", "Access policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	// The sweep's policy listing carries every field AccessPolicyMatchesInput
+	// compares; rule references are resolved before the gate on every pass.
+	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
+		policy, ok := listed.(flarecloudflare.AccessPolicy)
+		return ok && policy.ID == remote.ID && flarecloudflare.AccessPolicyMatchesInput(policy, input)
+	}, remote))
+	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}
 	clearGate(r.Invalidator, "AccessPolicy", request.NamespacedName)

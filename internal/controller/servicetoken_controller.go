@@ -318,6 +318,10 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is synchronized", update); err != nil {
 		return ctrl.Result{}, err
 	}
+	// No content baseline: this verify also reads the credential Secret
+	// (missing Secret, previous-credential expiry) and refreshes on expiry,
+	// none of which the sweep's token listing shows. A sweep confirmation
+	// would defer that work for as long as the sweep stays healthy.
 	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
 		return ctrl.Result{}, err
 	}

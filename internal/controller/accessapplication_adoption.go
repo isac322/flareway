@@ -69,16 +69,8 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 	if input.Type == flarecloudflare.AccessApplicationTypeProxyEndpoint {
 		return r.reconcileProxyEndpointApplication(ctx, remote, scope, application, input)
 	}
-	// D13: writes carry exactly one owner marker — the HMAC tag when the
-	// cluster ownership key is available, the legacy plaintext tag otherwise.
-	// Reads still accept either form, so legacy-marked remotes are recognized
-	// and upgraded to the signed marker on the next write.
-	_, ownerTags, writeTag := r.accessOwnerTags(ctx, application, ownerTag)
-	if writeTag != ownerTag {
-		input.Tags = append(removeAccessTags(input.Tags, ownerTag), writeTag)
-		slices.Sort(input.Tags)
-		input.Tags = slices.Compact(input.Tags)
-	}
+	_, ownerTags, _ := r.accessOwnerTags(ctx, application, ownerTag)
+	input = r.writtenApplicationInput(ctx, application, input, ownerTag)
 	if application.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
 		if application.Spec.ExternalRef == nil {
 			return flarecloudflare.AccessApplication{}, errors.New("adoption mode AdoptById for AccessApplication requires externalRef")
@@ -152,6 +144,23 @@ func (r *AccessApplicationReconciler) reconcileRemoteApplication(
 		return recovered, nil
 	}
 	return flarecloudflare.AccessApplication{}, createErr
+}
+
+// writtenApplicationInput is the input reconcileRemoteApplication compares
+// and writes for a Managed application.
+//
+// D13: writes carry exactly one owner marker — the HMAC tag when the cluster
+// ownership key is available, the legacy plaintext tag otherwise. Reads still
+// accept either form, so legacy-marked remotes are recognized and upgraded to
+// the signed marker on the next write.
+func (r *AccessApplicationReconciler) writtenApplicationInput(ctx context.Context, application *v1alpha1.AccessApplication, input flarecloudflare.AccessApplicationInput, ownerTag string) flarecloudflare.AccessApplicationInput {
+	_, _, writeTag := r.accessOwnerTags(ctx, application, ownerTag)
+	if writeTag != ownerTag {
+		input.Tags = append(removeAccessTags(input.Tags, ownerTag), writeTag)
+		slices.Sort(input.Tags)
+		input.Tags = slices.Compact(input.Tags)
+	}
+	return input
 }
 
 func verifyAccessApplicationExpectation(observed flarecloudflare.AccessApplication, expected v1alpha1.AdoptionExpect) error {
