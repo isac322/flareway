@@ -1063,6 +1063,41 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElements("GetTunnel", "GetTunnelToken"))
 	})
 
+	ginkgo.It("reports a namespace grant denial as RefNotPermitted even when a hostname has no verified zone", func() {
+		fixture := newTunnelFixture("ungranted-unknown-zone", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeManaged)
+		fixture.ungranted = true
+		fixture.hostname = "app.unverified.test"
+		fixture.create()
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var tunnel v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			accepted := findCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(accepted.Reason).To(gomega.Equal(authz.ReasonRefNotPermitted))
+			g.Expect(accepted.Message).To(gomega.ContainSubstring("is not granted"))
+			g.Expect(tunnel.Status.TunnelID).To(gomega.BeEmpty())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElements("CreateTunnel", "GetTunnelToken"))
+	})
+
+	ginkgo.It("still reports a granted hostname without a verified zone as Invalid", func() {
+		fixture := newTunnelFixture("granted-unknown-zone", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeManaged)
+		fixture.hostname = "app.unverified.test"
+		fixture.create()
+
+		gomega.Eventually(func(g gomega.Gomega) {
+			var tunnel v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			accepted := findCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(accepted.Reason).To(gomega.Equal("Invalid"))
+			g.Expect(accepted.Message).To(gomega.ContainSubstring("zone not found"))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("removes a user-supplied teardown annotation from an active Tunnel", func() {
 		fixture := newTunnelFixture("active-teardown-annotation", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
 		fixture.tunnel.Annotations = map[string]string{v1alpha1.CloudflareTunnelTeardownAnnotation: "true"}
@@ -2109,6 +2144,8 @@ type tunnelFixture struct {
 	hostname     string
 	tunnel       *v1alpha1.CloudflareTunnel
 	beforeTunnel []client.Object
+	// ungranted labels the namespace so no account grant selects it.
+	ungranted bool
 }
 
 func newTunnelFixture(prefix string, management v1alpha1.ManagementPolicy, dnsMode v1alpha1.DNSMode) *tunnelFixture {
@@ -2138,8 +2175,12 @@ func newTunnelFixture(prefix string, management v1alpha1.ManagementPolicy, dnsMo
 
 func (f *tunnelFixture) create() {
 	ginkgo.By("creating the namespace, credential, verified account, Gateway, and Tunnel")
+	tenantLabel := f.namespace
+	if f.ungranted {
+		tenantLabel = "ungranted"
+	}
 	gomega.Expect(testClient.Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-		Name: f.namespace, Labels: map[string]string{"flareway.bhyoo.com/tenant": f.namespace},
+		Name: f.namespace, Labels: map[string]string{"flareway.bhyoo.com/tenant": tenantLabel},
 	}})).To(gomega.Succeed())
 	ginkgo.DeferCleanup(forceDeleteTunnelNamespace, f.namespace)
 	gomega.Expect(testClient.Create(testContext, &corev1.Secret{

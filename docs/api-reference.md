@@ -374,6 +374,10 @@ Dataplane pod placement is not a tunnel override. It is configured at class leve
 
 Gateway ownership is sticky and bound to both `status.gatewayRef.name` and `status.gatewayUid`. A later Gateway cannot preempt the live owner. Flareway drains the previous owner’s connector before admitting a successor. `ObserveOnly` Tunnels never issue connector tokens or create connector Secrets, and a non-empty `status.deletedAt` blocks Gateway publication, addresses, private routing, and configuration writes while cleanup drains the data plane.
 
+While a Gateway cannot program its Tunnel (not yet owned, owned by another Gateway, draining, `ObserveOnly`, remotely deleted, waiting for connector credentials, or rejected by the Tunnel controller), the Gateway still reports `Accepted`, `status.listeners`, and HTTPRoute `status.parents` for its current generation. `Programmed=False` names the blocking state; when the Tunnel's own `Accepted=False` condition is current, the message carries its reason and message. Listener grant checks run against the Tunnel's `CloudflareAccount`, so a namespace or hostname that is not granted shows up as listener `Accepted=False`. Nothing is published or written to the Tunnel in this state.
+
+The Tunnel controller and the `AccessApplication` controller check the namespace grant before they resolve zones or targets, so a namespace that no grant selects reports `Accepted=False/RefNotPermitted`.
+
 ### Direct mode
 
 `Direct` is an explicit whole-object alternative. It cannot be combined with Gateway-owned `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, or `listeners`.
