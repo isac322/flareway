@@ -43,7 +43,12 @@ Procedure:
    constructs its client directly (`cloudflareClient`) and is gated by
    `managementPolicy != ObserveOnly` plus `status.ownershipVerified` instead of
    a fresh grant evaluation. Keep that exception confined to tunnel teardown —
-   never extend it to provisioning or to other resources.
+   never extend it to provisioning or to other resources. Skipping the remote
+   step because nothing remote can exist is not a bypass: AccessApplication
+   deletion builds no client at all when it has no remote evidence (no
+   `flareway.bhyoo.com/access-remote-attempt` annotation, which is stamped
+   before the first Cloudflare write, and no status application ID, bypass
+   children, or `ownershipVerified`). With any evidence it stays grant-gated.
 
 Verification:
 
