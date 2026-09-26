@@ -159,6 +159,8 @@ scopedListingError { failures []error }                      // 비공개, 각 �
 | E. 공개 API/map 확장으로 부분 결과 표현 | 기각 | `SweepFunc` 시그니처 유지 + 비공개 typed 오류로 충분. 공개 표면 확장 불필요 |
 | **채택: typed scoped partial(§5)** | 채택 | zone 격리 + 안전 items 보존 + 진단 보존 + fail-closed 유지를 최소 표면 변경으로 달성 |
 
+**후속(issue #114):** 대안 A와 "전체 계정 열거" 사이의 합집합, 즉 grant가 지정한 zone ∪ 판정 대상 tunnel의 checkpoint zone은 여기서 검토되지 않았다. 최소 권한 토큰에서는 grant 밖 zone이 매 pass 403을 내어 DNS 스윕이 영구 `partial`이 되었다. #114에서 스캔 대상을 이 합집합(`"*"` grant는 전체 계정)으로 좁혔다. grant 취소 zone은 checkpoint가 남아 있는 동안 계속 스캔되므로 대안 A의 기각 사유(cleanup 의무 추적 소실)는 적용되지 않는다. Flareway는 grant 밖 zone에 레코드를 쓰지 않으므로(`authorizeBindings`) orphan 발견 범위도 사실상 같다. 남는 간극은 checkpoint가 기록되기 전에 grant가 취소된 레코드뿐이며, orphan은 관측 전용이다.
+
 ---
 
 ## 7. 토론 정정 기록 `[C]`

@@ -63,6 +63,11 @@ const (
 	accessApplicationHandoffOwnerIndex    = "flareway.accessApplication.handoffOwner"
 	accessApplicationAUDNamespace         = "flareway-system"
 	accessApplicationRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
+	// accessApplicationRemoteAttemptAnnotation is stamped before the first
+	// Cloudflare write for a Managed application. With status evidence it tells
+	// deletion whether a remote object may exist even if status never recorded
+	// it; without either, deletion has nothing remote to clean up.
+	accessApplicationRemoteAttemptAnnotation = "flareway.bhyoo.com/access-remote-attempt"
 	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
 	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
 	accessApplicationPrivateTunnelsKey    = "tunnels"
@@ -261,6 +266,9 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
 		desiredHash = decision.DesiredHash
+		if err := r.markRemoteAttempt(ctx, application); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	observed, err := r.reconcileRemoteApplication(ctx, remote, resolved.scope, application, input, ownerTag)
 	if err != nil {
@@ -1652,13 +1660,15 @@ func (r *AccessApplicationReconciler) reconcileDelete(ctx context.Context, appli
 		}
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
-	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
-		return r.finishDeleteError(ctx, application, err)
-	}
-	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
-		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
-		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
+	if accessApplicationHasRemoteEvidence(application) {
+		if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
 			return r.finishDeleteError(ctx, application, err)
+		}
+		if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
+			effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
+			if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
+				return r.finishDeleteError(ctx, application, err)
+			}
 		}
 	}
 	if err := r.deletePrivateTunnelLedger(ctx, application); err != nil {
@@ -1678,6 +1688,33 @@ func (r *AccessApplicationReconciler) finishDeleteError(ctx context.Context, app
 	setApplicationStatusCondition(&status, application, accessApplicationConditionCleanupBlocked, metav1.ConditionTrue, "RemoteError", cause.Error(), now)
 	setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "CleanupBlocked", "Access application deletion is blocked", now)
 	return ctrl.Result{}, errors.Join(cause, r.patchStatus(ctx, application, status))
+}
+
+// accessApplicationHasRemoteEvidence reports whether a Cloudflare object may
+// exist for the application. Without it the controller never wrote to
+// Cloudflare, so deletion needs no remote cleanup and must not run the
+// grant-gated client, which would block namespaces that were never granted.
+func accessApplicationHasRemoteEvidence(application *v1alpha1.AccessApplication) bool {
+	_, attempted := application.Annotations[accessApplicationRemoteAttemptAnnotation]
+	return attempted ||
+		application.Status.ApplicationID != "" ||
+		len(application.Status.BypassApplications) > 0 ||
+		application.Status.OwnershipVerified
+}
+
+func (r *AccessApplicationReconciler) markRemoteAttempt(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	if _, attempted := application.Annotations[accessApplicationRemoteAttemptAnnotation]; attempted {
+		return nil
+	}
+	before := application.DeepCopy()
+	if application.Annotations == nil {
+		application.Annotations = make(map[string]string)
+	}
+	application.Annotations[accessApplicationRemoteAttemptAnnotation] = "true"
+	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("record Access remote attempt: %w", err)
+	}
+	return nil
 }
 
 func accessStatusHostnames(destinations []v1alpha1.AccessApplicationDestinationStatus) []string {
