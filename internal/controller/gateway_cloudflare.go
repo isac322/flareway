@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -41,6 +42,7 @@ import (
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/authz"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/freshness"
@@ -248,18 +250,33 @@ func retainedAccessHostnames(tunnel *v1alpha1.CloudflareTunnel, application *v1a
 	return slices.Compact(hostnames)
 }
 
+// tunnelProgrammingBlock explains why the resolved CloudflareTunnel cannot be
+// programmed by this Gateway yet. It never affects admission: the Gateway is
+// still translated so Accepted, listener, and route status stay current, but
+// nothing is published or written on the tunnel's behalf.
+type tunnelProgrammingBlock struct {
+	// message is the Programmed=False message.
+	message string
+	// retractDataplane scales the Gateway's own dataplane to zero. Only a
+	// verified owner waiting on connector credentials keeps it running.
+	retractDataplane bool
+	// terminal stops polling: the block only clears after a spec or grant
+	// change, which the CloudflareTunnel and CloudflareAccount watches observe.
+	terminal bool
+}
+
 func (r *GatewayReconciler) resolveCloudflareContext(
 	ctx context.Context,
 	gateway *gatewayv1.Gateway,
 	cfg *v1alpha1.GatewayClassConfig,
-) (*v1alpha1.CloudflareTunnel, *v1alpha1.CloudflareAccount, *v1alpha1.GatewayClassConfig, bool, error) {
+) (*v1alpha1.CloudflareTunnel, *v1alpha1.CloudflareAccount, *v1alpha1.GatewayClassConfig, *tunnelProgrammingBlock, error) {
 	if cfg.Spec.ConformanceMode {
-		return nil, nil, cfg, false, nil
+		return nil, nil, cfg, nil, nil
 	}
 
 	tunnelName, explicit, supported := referencedTunnelName(gateway)
 	if !supported {
-		return nil, nil, cfg, false, nil
+		return nil, nil, cfg, nil, nil
 	}
 	if tunnelName == "" {
 		tunnelName = gateway.Name
@@ -268,13 +285,13 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 	var tunnel v1alpha1.CloudflareTunnel
 	if err := r.Get(ctx, key, &tunnel); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, nil, cfg, false, fmt.Errorf("get CloudflareTunnel %s: %w", key, err)
+			return nil, nil, cfg, nil, fmt.Errorf("get CloudflareTunnel %s: %w", key, err)
 		}
 		if explicit {
-			return nil, nil, cfg, false, &missingExplicitTunnelError{key: key}
+			return nil, nil, cfg, nil, &missingExplicitTunnelError{key: key}
 		}
 		if cfg.Spec.AccountRef == nil || cfg.Spec.AccountRef.Name == "" {
-			return nil, nil, cfg, false, errors.New("the GatewayClassConfig accountRef is required in Cloudflare mode")
+			return nil, nil, cfg, nil, errors.New("the GatewayClassConfig accountRef is required in Cloudflare mode")
 		}
 		tunnel = v1alpha1.CloudflareTunnel{
 			TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.GroupVersion.String(), Kind: "CloudflareTunnel"},
@@ -290,75 +307,35 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 			},
 		}
 		if err := controllerutil.SetControllerReference(gateway, &tunnel, r.Scheme); err != nil {
-			return nil, nil, cfg, false, fmt.Errorf("set Gateway owner on default CloudflareTunnel: %w", err)
+			return nil, nil, cfg, nil, fmt.Errorf("set Gateway owner on default CloudflareTunnel: %w", err)
 		}
-		if err := r.Create(ctx, &tunnel); err != nil && !apierrors.IsAlreadyExists(err) {
-			return nil, nil, cfg, false, fmt.Errorf("create default CloudflareTunnel %s: %w", key, err)
+		if err := r.Create(ctx, &tunnel); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, nil, cfg, nil, fmt.Errorf("create default CloudflareTunnel %s: %w", key, err)
+			}
+			if err := r.directReader().Get(ctx, key, &tunnel); err != nil {
+				return nil, nil, cfg, nil, fmt.Errorf("get existing default CloudflareTunnel %s: %w", key, err)
+			}
 		}
-		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), true, nil
+		// A just-created tunnel has no ownership checkpoint, so it resolves to
+		// a programming block below and the Gateway is still translated.
 	}
+	var block *tunnelProgrammingBlock
 	if tunnelConfigurationMode(&tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway {
 		selected, _, waitingForDrain, err := selectLiveTunnelGateway(ctx, r.Client, &tunnel)
 		if err != nil {
-			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
+			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), nil, err
 		}
-		authorized := sameGatewayIdentity(gateway, selected) && tunnelGatewayStatusIdentityMatches(&tunnel, gateway)
-		if !authorized || tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
-			tunnel.Status.DeletedAt != nil || !tunnel.Status.OwnershipVerified ||
-			tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil {
-			message := fmt.Sprintf("Waiting for exact UID-bound ownership of CloudflareTunnel %s", key)
-			retractDataplane := true
-			switch {
-			case tunnel.Status.DeletedAt != nil:
-				message = fmt.Sprintf("CloudflareTunnel %s is remotely deleted and draining its connector dataplane", key)
-			case waitingForDrain:
-				message = fmt.Sprintf("CloudflareTunnel %s is draining its prior Gateway UID dataplane", key)
-			case selected != nil && !sameGatewayIdentity(gateway, selected):
-				message = fmt.Sprintf("CloudflareTunnel %s is owned by Gateway %s/%s UID %s", key, selected.Namespace, selected.Name, selected.UID)
-			case tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly:
-				message = fmt.Sprintf("CloudflareTunnel %s is ObserveOnly and cannot authorize a connector dataplane", key)
-			case authorized && !tunnel.Status.OwnershipVerified:
-				message = fmt.Sprintf("CloudflareTunnel %s has not verified remote ownership", key)
-			case authorized && (tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil):
-				message = fmt.Sprintf("CloudflareTunnel %s is waiting for verified connector credentials", key)
-				// A verified owner waiting on connector credentials is a
-				// recoverable convergence gap, not dependency loss: the
-				// published snapshot is still retracted and the Gateway stays
-				// unprogrammed, but the owned dataplane keeps running so a
-				// stale or in-flight credential write cannot drop live traffic.
-				retractDataplane = false
-			}
-			r.clearSnapshot(client.ObjectKeyFromObject(gateway))
-			if retractDataplane {
-				if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
-					return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
-				}
-			}
-			var current gatewayv1.Gateway
-			if err := r.Get(ctx, client.ObjectKeyFromObject(gateway), &current); err != nil {
-				if apierrors.IsNotFound(err) {
-					return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), true, nil
-				}
-				return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
-			}
-			if !sameGatewayIdentity(gateway, &current) {
-				return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), true, nil
-			}
-			status := current.DeepCopy().Status
-			r.prepareGatewayStatus(&status, &current)
-			status.Addresses = nil
-			r.setCloudflareProgrammedStatus(&status, &current, false, message)
-			if err := r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(&current), status); err != nil {
-				return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, err
-			}
-			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), true, nil
-		}
+		block = gatewayTunnelProgrammingBlock(gateway, &tunnel, selected, waitingForDrain)
 	}
 
 	var account v1alpha1.CloudflareAccount
 	if tunnel.Spec.AccountRef.Name == "" {
-		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, errors.New("the CloudflareTunnel accountRef is empty")
+		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), block, errors.New("the CloudflareTunnel accountRef is empty")
 	}
+	// Reading the account is a cache read with no credential or remote access;
+	// the translator needs its grants to report listener authorization even
+	// while the tunnel is blocked.
 	if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account); err != nil {
 		if apierrors.IsNotFound(err) {
 			// A missing CloudflareAccount is dependency loss, not a hard
@@ -366,11 +343,81 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 			// account is absent. The typed error lets Reconcile stop polling;
 			// the CloudflareAccount watch re-enqueues the Gateway when the
 			// account is recreated.
-			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, &missingCloudflareAccountError{name: tunnel.Spec.AccountRef.Name}
+			return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), block, &missingCloudflareAccountError{name: tunnel.Spec.AccountRef.Name}
 		}
-		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), false, fmt.Errorf("get CloudflareAccount %q: %w", tunnel.Spec.AccountRef.Name, err)
+		return &tunnel, nil, effectiveGatewayConfig(cfg, &tunnel), block, fmt.Errorf("get CloudflareAccount %q: %w", tunnel.Spec.AccountRef.Name, err)
 	}
-	return &tunnel, &account, effectiveGatewayConfig(cfg, &tunnel), false, nil
+	return &tunnel, &account, effectiveGatewayConfig(cfg, &tunnel), block, nil
+}
+
+// gatewayTunnelProgrammingBlock returns nil only when this exact Gateway UID
+// owns the Gateway-mode tunnel and the tunnel holds verified connector
+// credentials.
+func gatewayTunnelProgrammingBlock(
+	gateway *gatewayv1.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	selected *gatewayv1.Gateway,
+	waitingForDrain bool,
+) *tunnelProgrammingBlock {
+	key := client.ObjectKeyFromObject(tunnel)
+	authorized := sameGatewayIdentity(gateway, selected) && tunnelGatewayStatusIdentityMatches(tunnel, gateway)
+	observeOnly := tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly
+	credentialsMissing := tunnel.Status.TunnelID == "" || tunnel.Status.ConnectorTokenSecretRef == nil
+	if authorized && !observeOnly && tunnel.Status.DeletedAt == nil && tunnel.Status.OwnershipVerified && !credentialsMissing {
+		return nil
+	}
+	block := &tunnelProgrammingBlock{
+		message:          fmt.Sprintf("Waiting for exact UID-bound ownership of CloudflareTunnel %s", key),
+		retractDataplane: true,
+	}
+	switch {
+	case tunnel.Status.DeletedAt != nil:
+		block.message = fmt.Sprintf("CloudflareTunnel %s is remotely deleted and draining its connector dataplane", key)
+	case waitingForDrain:
+		block.message = fmt.Sprintf("CloudflareTunnel %s is draining its prior Gateway UID dataplane", key)
+	case selected != nil && !sameGatewayIdentity(gateway, selected):
+		block.message = fmt.Sprintf("CloudflareTunnel %s is owned by Gateway %s/%s UID %s", key, selected.Namespace, selected.Name, selected.UID)
+	case observeOnly:
+		block.message = fmt.Sprintf("CloudflareTunnel %s is ObserveOnly and cannot authorize a connector dataplane", key)
+		block.terminal = true
+	default:
+		if rejection := currentTunnelRejection(tunnel, gateway); rejection != nil {
+			block.message = fmt.Sprintf("CloudflareTunnel %s is not accepted: %s: %s", key, rejection.Reason, rejection.Message)
+			block.terminal = terminalTunnelRejectionReasons.Has(rejection.Reason)
+		} else if authorized && !tunnel.Status.OwnershipVerified {
+			block.message = fmt.Sprintf("CloudflareTunnel %s has not verified remote ownership", key)
+		} else if authorized && credentialsMissing {
+			block.message = fmt.Sprintf("CloudflareTunnel %s is waiting for verified connector credentials", key)
+		}
+		if authorized && tunnel.Status.OwnershipVerified && credentialsMissing {
+			// A verified owner waiting on connector credentials is a
+			// recoverable convergence gap, not dependency loss: the
+			// published snapshot is still retracted and the Gateway stays
+			// unprogrammed, but the owned dataplane keeps running so a
+			// stale or in-flight credential write cannot drop live traffic.
+			block.retractDataplane = false
+		}
+	}
+	return block
+}
+
+// terminalTunnelRejectionReasons are tunnel Accepted=False verdicts that only
+// a spec, grant, or account change can clear. The tunnel controller does not
+// requeue them either.
+var terminalTunnelRejectionReasons = sets.New(authz.ReasonRefNotPermitted, authz.ReasonUnsupportedValue, "Invalid")
+
+// currentTunnelRejection returns the tunnel's Accepted=False condition when it
+// describes the tunnel's current spec and this exact Gateway. The Gateway
+// controller only reads it to explain Programmed=False.
+func currentTunnelRejection(tunnel *v1alpha1.CloudflareTunnel, gateway *gatewayv1.Gateway) *metav1.Condition {
+	if !tunnelGatewayStatusIdentityMatches(tunnel, gateway) {
+		return nil
+	}
+	accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.ObservedGeneration != tunnel.Generation {
+		return nil
+	}
+	return accepted
 }
 
 // missingExplicitTunnelError reports that a Gateway explicitly referenced a

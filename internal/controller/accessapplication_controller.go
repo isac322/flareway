@@ -457,6 +457,19 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			compilation: rejectedCompilation("RefNotPermitted", fmt.Sprintf("CloudflareAccount %q is not accepted with valid credentials", account.Name)),
 		}, nil
 	}
+	// The namespace grant is checked before targets are compiled so a denied
+	// tenant sees the denial, not a TargetNotFound derived from listeners the
+	// same denial rejected.
+	var namespace corev1.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Name: application.Namespace}, &namespace); err != nil {
+		return accessApplicationContext{}, fmt.Errorf("get AccessApplication namespace %q: %w", application.Namespace, err)
+	}
+	if decision := authz.Evaluate(&account, &namespace, authz.Request{}); !decision.Allowed {
+		return accessApplicationContext{
+			account:     &account,
+			compilation: rejectedCompilation(decision.Reason, decision.Message),
+		}, nil
+	}
 	scope, err := accessApplicationScope(application, &account)
 	if err != nil {
 		return accessApplicationContext{

@@ -222,7 +222,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if rejected {
 		return ctrl.Result{}, nil
 	}
-	tunnel, account, effectiveConfig, created, err := r.resolveCloudflareContext(ctx, &gateway, cfg)
+	tunnel, account, effectiveConfig, block, err := r.resolveCloudflareContext(ctx, &gateway, cfg)
 	accountMissing := false
 	if err != nil {
 		var missingTunnel *missingExplicitTunnelError
@@ -254,9 +254,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{}, nil
 	}
-	if created {
-		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
-	}
 	cfg = effectiveConfig
 	inputs, routes, err := r.collectInputs(ctx, &gateway, &gatewayClass, cfg)
 	if err != nil {
@@ -264,13 +261,22 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	inputs.CloudflareTunnel = tunnel
 	inputs.CloudflareAccount = account
-	if err := r.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
-		return ctrl.Result{}, err
+	// A blocked tunnel is never written on this Gateway's behalf: latch
+	// release/prune persists into tunnel status and nothing is published.
+	if block == nil {
+		if err := r.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	compiled, statuses := gatewayapi.Translate(inputs)
 	if compiled == nil {
 		return ctrl.Result{}, errors.New("gateway API translator returned a nil Gateway")
+	}
+	if block != nil {
+		// A blocked tunnel never yields Cloudflare programming state, even
+		// when its status still names this Gateway as a verified owner.
+		compiled.Cloudflare = nil
 	}
 	retainAccessRevocationDomains(compiled, tunnel, inputs.AccessApplications)
 	compiled, _, err = accessBlockFirstGateway(compiled, tunnel)
@@ -278,7 +284,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("prepare Access block-first transition: %w", err)
 	}
 	privateState := privatePrerequisiteResult{}
-	if !compiled.ConformanceMode {
+	if !compiled.ConformanceMode && block == nil {
 		privateState, err = r.reconcilePrivatePrerequisites(ctx, compiled, tunnel, account, privateInputsView(
 			inputs.Namespaces, inputs.VirtualNetworks, inputs.NetworkRoutes, inputs.HostnameRoutes, inputs.AccessApplications,
 		))
@@ -294,6 +300,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// including conformance mode — and record the rejection without
 		// publishing a new snapshot. AUD revocation latches and owned child
 		// resources are deliberately retained.
+		programmedReason := gatewayv1.GatewayReasonInvalid
+		programmedMessage := "Gateway configuration is invalid"
+		if block != nil {
+			// Admission already carries the config verdict; Programmed names
+			// the tunnel state the Gateway is actually waiting on.
+			programmedReason = gatewayv1.GatewayReasonPending
+			programmedMessage += "; " + block.message
+		}
 		r.clearSnapshot(req.NamespacedName)
 		statuses.Gateway.Addresses = nil
 		now := metav1.Now()
@@ -304,8 +318,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: gateway.Generation,
-			Reason:             string(gatewayv1.GatewayReasonInvalid),
-			Message:            "Gateway configuration is invalid",
+			Reason:             string(programmedReason),
+			Message:            programmedMessage,
 			LastTransitionTime: now,
 		})
 		for index := range statuses.Gateway.Listeners {
@@ -330,7 +344,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
+		if block != nil && !block.terminal {
+			return ctrl.Result{RequeueAfter: programmedRequeue}, nil
+		}
 		return ctrl.Result{}, nil
+	}
+	if !compiled.ConformanceMode && block != nil {
+		// The tunnel cannot be programmed by this Gateway, but admission,
+		// listener, and route status are already translated and still owed.
+		if err := r.reportCloudflareUnprogrammed(ctx, req.NamespacedName, &gateway, routes, inputs.BackendTLSPolicies, &statuses, block.message, block.retractDataplane); err != nil {
+			return ctrl.Result{}, err
+		}
+		if block.terminal {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
 	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
@@ -350,19 +378,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if !compiled.ConformanceMode && (tunnel == nil || account == nil || compiled.Cloudflare == nil) {
-		r.clearSnapshot(req.NamespacedName)
-		statuses.Gateway.Addresses = nil
-		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, "CloudflareTunnel and CloudflareAccount are required")
-		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, req.NamespacedName); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
+		if err := r.reportCloudflareUnprogrammed(ctx, req.NamespacedName, &gateway, routes, inputs.BackendTLSPolicies, &statuses, "CloudflareTunnel and CloudflareAccount are required", true); err != nil {
 			return ctrl.Result{}, err
 		}
 		if accountMissing {
@@ -1296,6 +1312,37 @@ func (r *GatewayReconciler) deploymentAvailable(ctx context.Context, gateway *ir
 		}
 	}
 	return false, nil
+}
+
+// reportCloudflareUnprogrammed records a translated Gateway that cannot be
+// programmed in Cloudflare mode: it withdraws the published snapshot and
+// addresses, optionally retracts the Gateway's own dataplane, and still
+// patches the translated Gateway, HTTPRoute, and BackendTLSPolicy status.
+func (r *GatewayReconciler) reportCloudflareUnprogrammed(
+	ctx context.Context,
+	key types.NamespacedName,
+	gateway *gatewayv1.Gateway,
+	routes []gatewayv1.HTTPRoute,
+	policies []gatewayv1.BackendTLSPolicy,
+	statuses *gatewayapi.Statuses,
+	message string,
+	retractDataplane bool,
+) error {
+	r.clearSnapshot(key)
+	statuses.Gateway.Addresses = nil
+	r.setCloudflareProgrammedStatus(&statuses.Gateway, gateway, false, message)
+	if retractDataplane {
+		if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+			return err
+		}
+	}
+	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
+		return err
+	}
+	if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, key); err != nil {
+		return err
+	}
+	return r.patchBackendTLSPolicyStatuses(ctx, policies, statuses.BackendTLSPolicies, key)
 }
 
 func (r *GatewayReconciler) handleSnapshotBuildFailure(

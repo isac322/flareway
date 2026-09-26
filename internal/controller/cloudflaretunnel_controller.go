@@ -328,6 +328,16 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Namespace}, namespace); err != nil {
 		return ctrl.Result{}, fmt.Errorf("get Tunnel namespace: %w", err)
 	}
+	// The namespace grant gates everything else: a denied tenant is told it
+	// is not granted before any spec problem, and learns nothing about the
+	// account's verified zones.
+	if decision := authz.Evaluate(&account, namespace, authz.Request{PlatformObject: mode == v1alpha1.CloudflareTunnelConfigurationModeDirect}); !decision.Allowed {
+		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionAccepted, metav1.ConditionFalse, decision.Reason, decision.Message, tunnel.Generation, now))
+		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "Pending", decision.Message, tunnel.Generation, now))
+		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Pending", decision.Message, tunnel.Generation, now))
+		status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
+		return ctrl.Result{}, r.patchOwnedStatus(ctx, tunnel, status, clearIntent)
+	}
 	var publicHosts []publicHostname
 	var allBindings []listenerBinding
 	var bindingErr error
