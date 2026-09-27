@@ -400,12 +400,16 @@ func (s *managerLifecycleSink) Info(_ int, msg string, _ ...any) {
 	case msg == "Reconciling":
 		s.trace.invoked(s.controllerName(), id)
 	case msg == "Reconcile successful":
-		s.trace.ended(id, managerResultSuccess)
-	case strings.HasPrefix(msg, "Reconcile done, requeueing after"):
-		s.trace.ended(id, managerResultRequeueAfter)
+		s.trace.ended(id, managerResultSuccess, 0)
+	case strings.HasPrefix(msg, "Reconcile done, requeueing after "):
+		// The pending timer's duration is the verdict's expiry; a duration
+		// that fails to parse records zero, which the verdict fails closed on.
+		after, _ := time.ParseDuration(strings.TrimPrefix(msg, "Reconcile done, requeueing after "))
+		s.trace.ended(id, managerResultRequeueAfter, after)
 	case msg == "Reconcile done, requeueing":
-		s.trace.ended(id, managerResultRateLimited)
+		s.trace.ended(id, managerResultRateLimited, 0)
 	}
+
 }
 
 // Error implements logr.LogSink.
@@ -414,7 +418,7 @@ func (s *managerLifecycleSink) Error(_ error, msg string, _ ...any) {
 		return
 	}
 	if id := s.reconcileID(); id != "" {
-		s.trace.ended(id, managerResultRateLimited)
+		s.trace.ended(id, managerResultRateLimited, 0)
 	}
 }
 
@@ -486,8 +490,11 @@ type managerReconcileEntry struct {
 	EndedAt    time.Time
 	ResultSeen bool
 	Result     string
-	Reads      []managerTracedObject
-	Writes     []managerTracedWrite
+	// RequeueAfter is the timer duration the reconcile returned, parsed from
+	// "Reconcile done, requeueing after <d>"; zero when absent or unparsed.
+	RequeueAfter time.Duration
+	Reads        []managerTracedObject
+	Writes       []managerTracedWrite
 }
 
 // beginAt is the reconcile's invocation, or its first client call when the
@@ -565,9 +572,21 @@ func (tr *managerTrace) entryFor(controllerName string, id types.UID) *managerRe
 // armGate holds the next reconcile invocations of controllerName at the
 // "Reconciling" lifecycle line until release runs. The caller must run
 // release exactly once, on every path, after the controlled write returned.
-func (tr *managerTrace) armGate(controllerName string) (release func()) {
+// Arming while a gate is already armed is a test bug: it would orphan the
+// earlier blocked worker, so it fails the test after freeing that worker.
+func (tr *managerTrace) armGate(t *testing.T, controllerName string) (release func()) {
+	t.Helper()
 	releaseCh := make(chan struct{})
 	tr.mu.Lock()
+	if tr.gateRelease != nil {
+		orphaned := tr.gateRelease
+		tr.gateController = ""
+		tr.gateRelease = nil
+		tr.mu.Unlock()
+		close(orphaned)
+		t.Fatalf("armGate(%q): a gate is already armed; the earlier worker was orphaned", controllerName)
+		return func() {}
+	}
 	tr.gateController = controllerName
 	tr.gateRelease = releaseCh
 	tr.mu.Unlock()
@@ -620,8 +639,9 @@ func (tr *managerTrace) invoked(controllerName string, id types.UID) {
 	entry.InvokedAt = invokedAt
 }
 
-// ended records the reconcile's result lifecycle line.
-func (tr *managerTrace) ended(id types.UID, result string) {
+// ended records the reconcile's result lifecycle line. after carries the
+// RequeueAfter duration for managerResultRequeueAfter results.
+func (tr *managerTrace) ended(id types.UID, result string, after time.Duration) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	entry := tr.byID[id]
@@ -631,6 +651,9 @@ func (tr *managerTrace) ended(id types.UID, result string) {
 	entry.ResultSeen = true
 	entry.Result = result
 	entry.EndedAt = time.Now()
+	if result == managerResultRequeueAfter {
+		entry.RequeueAfter = after
+	}
 }
 
 func (tr *managerTrace) record(ctx context.Context, controllerName string, start, end time.Time, reads []managerTracedObject, write *managerTracedWrite) {
@@ -931,22 +954,29 @@ type managerWakeup struct {
 // The pending expiry comes from the last reconcile invoked at or before the
 // write began and its synchronously recorded result (entry.Result). A
 // RequeueAfter armed by it cannot dispatch before that reconcile's recorded
-// end plus interval, because controller-runtime arms the timer after
-// Reconcile returns; that bound is the deadline even when it already elapsed,
-// since an elapsed lower bound does not prove the timer fired. A result
-// without a timer (success) leaves the event as the only wakeup: the deadline
-// stays informational and a qualifying consumer passes on causality alone.
-// An error or requeue result arms a rate-limited retry that can dispatch at
-// any time, so no wakeup is attributable to the stimulus; a missing result
-// makes the pending window unknowable. Both return undecided terminal
-// verdicts (Decided=false, Detail set) rather than a fabricated deadline.
+// end plus the RequeueAfter it actually returned (entry.RequeueAfter),
+// because controller-runtime arms the timer after Reconcile returns; that
+// bound is the deadline even when it already elapsed, since an elapsed lower
+// bound does not prove the timer fired. A requeue_after result without a
+// recorded duration makes the window unknowable. A result without a timer
+// (success) leaves the event as the only wakeup: the deadline (CommitUB plus
+// interval) stays informational and a qualifying consumer passes on
+// causality alone. An error or requeue result arms a rate-limited retry that
+// can dispatch at any time, so no wakeup is attributable to the stimulus; a
+// missing result makes the pending window unknowable. These return undecided
+// terminal verdicts (Decided=false, Detail set) rather than a fabricated
+// deadline.
 //
-// Admission requires invocation at or after CommitUB: only an invocation
-// provably after the commit satisfies "event commit < reconcile start". An
-// entry invoked inside the write call that later reads the new revision is
-// ambiguous - it proves no causality - but it is not a miss either, so it is
-// skipped. Completion times play no part: the timer is consumed by the
-// event's enqueue, so a slow consuming reconcile cannot miss it.
+// Admission requires a recorded "Reconciling" invocation at or after
+// CommitUB: only an invocation provably after the commit satisfies "event
+// commit < reconcile start". A consumer without a recorded invocation (the
+// lifecycle line renamed or re-leveled, which also disarms the write-time
+// gate) cannot prove that order and is terminal-undecided, never admitted on
+// its first client call. An entry invoked inside the write call that later
+// reads the new revision is ambiguous - it proves no causality - but it is
+// not a miss either, so it is skipped. Completion times play no part: the
+// timer is consumed by the event's enqueue, so a slow consuming reconcile
+// cannot miss it.
 func managerWakeupVerdict(entries []managerReconcileEntry, stim managerStimulus, interval time.Duration) managerWakeup {
 	deadline := stim.CommitUB.Add(interval)
 	timer := false
@@ -971,9 +1001,12 @@ func managerWakeupVerdict(entries []managerReconcileEntry, stim managerStimulus,
 		case previous.Result == managerResultRateLimited:
 			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
 				"reconcile %s dispatched before the stimulus returned a rate-limited retry, which can dispatch at any time", previous.ID)}
+		case previous.RequeueAfter <= 0:
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"reconcile %s dispatched before the stimulus returned %q without a recorded RequeueAfter, so the pending expiry is unknown", previous.ID, previous.Result)}
 		default:
 			timer = true
-			deadline = previous.endAt().Add(interval)
+			deadline = previous.endAt().Add(previous.RequeueAfter)
 		}
 		break
 	}
@@ -984,6 +1017,12 @@ func managerWakeupVerdict(entries []managerReconcileEntry, stim managerStimulus,
 	ambiguous := false
 	for index := range entries {
 		entry := &entries[index]
+		if entry.consumed(stim) && entry.InvokedAt.IsZero() {
+			// Without the lifecycle line neither the invocation order nor
+			// the write-time gate holds; fail closed.
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"reconcile %s read the revision but has no recorded invocation, so commit < start is unprovable", entry.ID)}
+		}
 		admitted := !entry.beginAt().Before(stim.CommitUB)
 		if entry.consumed(stim) {
 			if admitted {
@@ -2192,7 +2231,7 @@ func (h *managerHarness) applyTunnelDNSRecords(t *testing.T, key types.Namespace
 	}
 	// Hold Gateway invocations at their synchronous start until the apply
 	// returns, so the consuming reconcile provably begins after the commit.
-	release := h.trace.armGate("gateway")
+	release := h.trace.armGate(t, "gateway")
 	defer release()
 	start := time.Now()
 	if err := h.direct.Status().Apply(h.ctx, client.ApplyConfigurationFromUnstructured(tunnel), client.FieldOwner(managerDNSStimulusManager), client.ForceOwnership); err != nil {
@@ -3125,7 +3164,7 @@ func TestQA92_39_PodProbeFailureWakeup(t *testing.T) {
 	pod.Annotations["qa92.probe"] = "down"
 	// Hold Gateway invocations at their synchronous start until the write
 	// returns, so the consuming reconcile provably begins after the commit.
-	release := h.trace.armGate("gateway")
+	release := h.trace.armGate(t, "gateway")
 	defer release()
 	failureStart := time.Now()
 	if err := h.direct.Update(h.ctx, &pod); err != nil {
@@ -3158,7 +3197,7 @@ func TestQA92_39_PodProbeFailureWakeup(t *testing.T) {
 	pod.Annotations["qa92.probe"] = "up"
 	// Same write-time gate as the failure poke: the consumer provably
 	// begins after the commit.
-	release = h.trace.armGate("gateway")
+	release = h.trace.armGate(t, "gateway")
 	defer release()
 	recoverStart := time.Now()
 	if err := h.direct.Update(h.ctx, &pod); err != nil {
@@ -3240,7 +3279,7 @@ func TestQA92_41_SweepEventWakeup(t *testing.T) {
 	h.remote.setConfigVersion(tunnel.Status.TunnelID, tunnel.Status.ConfigVersion.Applied+7)
 	// Hold Gateway invocations until the send completes so the consumer
 	// provably begins after the stimulus.
-	release := h.trace.armGate("gateway")
+	release := h.trace.armGate(t, "gateway")
 	defer release()
 	eventAt := time.Now()
 	h.sweep <- event.GenericEvent{Object: tunnel}
@@ -3291,7 +3330,7 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 	// missing-account path) → tuple-complete status event → gateway reconcile.
 	// Hold tunnel invocations until the create returns so the consuming
 	// reconcile provably begins after the commit.
-	release := h.trace.armGate("cloudflaretunnel")
+	release := h.trace.armGate(t, "cloudflaretunnel")
 	defer release()
 	eventAt := time.Now()
 	f.account = h.createAccount(t, f)
@@ -3341,7 +3380,7 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 	account.Annotations["qa92.rotation"] = "1"
 	// Hold Gateway invocations until the update returns so the consuming
 	// reconcile provably begins after the commit.
-	release = h.trace.armGate("gateway")
+	release = h.trace.armGate(t, "gateway")
 	defer release()
 	touchStart := time.Now()
 	if err := h.direct.Update(h.ctx, &account); err != nil {
@@ -3502,13 +3541,28 @@ func TestManagerWakeupVerdict(t *testing.T) {
 	stim := managerStimulus{What: "stimulus", Kind: "CloudflareTunnel", Key: key, RV: 10, CommitLB: at(1000), CommitUB: at(1010)}
 	// reconcile builds an entry: invoked at invokedMs, last client call and
 	// recorded end at lastMs, and it read the tunnel at revision rv at readMs.
-	// result is the recorded lifecycle result ("" means not seen yet).
+	// result is the recorded lifecycle result ("" means not seen yet); a
+	// requeue_after result records interval as its RequeueAfter.
 	reconcile := func(invokedMs, lastMs, readMs int, rv int64, direct bool, result string) managerReconcileEntry {
-		return managerReconcileEntry{
+		entry := managerReconcileEntry{
 			Controller: "gateway", InvokedAt: at(invokedMs), Start: at(invokedMs + 1), Last: at(lastMs),
 			EndedAt: at(lastMs), ResultSeen: result != "", Result: result,
 			Reads: []managerTracedObject{{Kind: "CloudflareTunnel", Key: key, RV: rv, At: at(readMs), Direct: direct}},
 		}
+		if result == managerResultRequeueAfter {
+			entry.RequeueAfter = interval
+		}
+		return entry
+	}
+	// requeueAfter overrides the RequeueAfter the entry recorded.
+	requeueAfter := func(entry managerReconcileEntry, after time.Duration) managerReconcileEntry {
+		entry.RequeueAfter = after
+		return entry
+	}
+	// uninvoked drops the "Reconciling" record, leaving only client calls.
+	uninvoked := func(entry managerReconcileEntry) managerReconcileEntry {
+		entry.InvokedAt = time.Time{}
+		return entry
 	}
 	tests := []struct {
 		name     string
@@ -3600,6 +3654,28 @@ func TestManagerWakeupVerdict(t *testing.T) {
 		name:    "an admitted consumer after ambiguity passes",
 		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1005, 1200, 1050, 10, false, managerResultRequeueAfter), reconcile(1500, 1600, 1520, 10, false, managerResultRequeueAfter)},
 		decided: true, pass: true, consumer: at(1500),
+	}, {
+		// The predecessor returned RequeueAfter 1s, not the caller's 2s
+		// interval: its timer expires at 200+1000ms, so a consumer invoked
+		// at 1300 missed the pending expiry even though end+interval would
+		// have admitted it.
+		name:    "a shorter recorded RequeueAfter bounds the wakeup",
+		entries: []managerReconcileEntry{requeueAfter(reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), time.Second), reconcile(1300, 1400, 1310, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		// A requeue_after result whose duration was not recorded leaves the
+		// pending expiry unknown; no fallback to the caller's interval.
+		name:     "a requeue_after predecessor without a recorded duration is undecided",
+		entries:  []managerReconcileEntry{requeueAfter(reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), 0), reconcile(1015, 1100, 1020, 10, false, managerResultRequeueAfter)},
+		terminal: true,
+	}, {
+		// No "Reconciling" record (the line renamed or re-leveled, which
+		// also disarms the write-time gate): the consumer's first client
+		// call after the commit cannot prove it was invoked after it, so
+		// the verdict fails closed instead of admitting it.
+		name:     "a consumer without a recorded invocation fails closed",
+		entries:  []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), uninvoked(reconcile(1015, 1200, 1050, 10, false, managerResultRequeueAfter))},
+		terminal: true,
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
