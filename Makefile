@@ -109,7 +109,7 @@ test-envtest: setup-envtest ## Run controller tests with envtest.
 .PHONY: test-exploratory-compile
 test-exploratory-compile: ## Vet the tagged harness and run its deterministic tests (artifact safety, oracle predicates).
 	go vet -tags exploratory ./test/exploratory
-	go test -race -tags exploratory -run '^(TestTrace|TestAccountLoss)' ./test/exploratory
+	go test -race -tags exploratory -run '^(TestTrace|TestAccountLoss|TestG1Attribution)' ./test/exploratory
 
 .PHONY: test-exploratory
 test-exploratory: setup-envtest ## Run bounded state-machine exploration against an isolated envtest control plane.
