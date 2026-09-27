@@ -20,6 +20,7 @@ package exploratory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -133,10 +134,16 @@ type gatewayMachine struct {
 	podCreated         bool
 	remoteConnector    bool
 
-	// accountUnverifiedMark and tunnelUnauthorizedMark bound the journal
-	// windows used by the G1 invariant. writerBoundary bounds the G4 window.
+	// accountUnverifiedMark bounds the account-unverified G1 window.
+	// tunnelUnauthorizedMark bounds the window for unattributable calls, and
+	// tunnelOwnerMarks the per-tunnel windows: a call attributed to owner X is
+	// judged only when journaled at or after tunnelOwnerMarks[X]. The denial
+	// and account-loss waiters drain every live tunnel before the marks move
+	// so post-mark calls are never authorized-era stragglers. writerBoundary
+	// bounds the G4 window.
 	accountUnverifiedMark  int
 	tunnelUnauthorizedMark int
+	tunnelOwnerMarks       map[string]int
 	grantDeniedMark        int
 	writerBoundary         int
 	writerBoundarySettled  bool
@@ -165,6 +172,8 @@ func newGatewayMachine(t *testing.T, h *explorationHarness, recorder *traceRecor
 		backend:   "backend-" + suffix,
 		hostname:  "app.expl" + suffix + ".example.com",
 		altHost:   "alt.expl" + suffix + ".example.com",
+
+		tunnelOwnerMarks: make(map[string]int),
 	}
 }
 
@@ -255,7 +264,7 @@ func (m *gatewayMachine) UpdateAccount(rt *rapid.T) {
 	if m.accountDenied {
 		m.waitForGrantDenialObserved(rt)
 		m.grantDeniedMark = len(m.h.stub.Journal())
-		m.tunnelUnauthorizedMark = m.grantDeniedMark
+		m.resetG1Marks()
 	}
 	m.record(rt, "UpdateAccount", map[bool]string{true: "denied", false: "allowed"}[m.accountDenied])
 }
@@ -280,7 +289,7 @@ func (m *gatewayMachine) DeleteAccount(rt *rapid.T) {
 	m.waitForAccountLossObserved(rt)
 	m.waitForStable(rt)
 	m.accountUnverifiedMark = len(m.h.stub.Journal())
-	m.tunnelUnauthorizedMark = m.accountUnverifiedMark
+	m.resetG1Marks()
 	m.record(rt, "DeleteAccount", "deleted")
 }
 
@@ -382,7 +391,7 @@ func (m *gatewayMachine) CreateTunnel(rt *rapid.T) {
 	if !apierrors.IsNotFound(err) {
 		must2(rt, err, "check existing CloudflareTunnel")
 	}
-	m.tunnelUnauthorizedMark = len(m.h.stub.Journal())
+	m.tunnelOwnerMarks[m.tunnel] = len(m.h.stub.Journal())
 	must2(rt, m.h.client.Create(context.Background(), &v1alpha1.CloudflareTunnel{
 		ObjectMeta: metav1.ObjectMeta{Namespace: m.namespace, Name: m.tunnel},
 		Spec: v1alpha1.CloudflareTunnelSpec{
@@ -491,7 +500,7 @@ func (m *gatewayMachine) CreateGateway(rt *rapid.T) {
 		}
 		m.gatewayRefExplicit = true
 	}
-	m.tunnelUnauthorizedMark = len(m.h.stub.Journal())
+	m.tunnelOwnerMarks[m.gateway] = len(m.h.stub.Journal())
 	must2(rt, m.h.client.Create(context.Background(), gateway), "create Gateway")
 	m.gatewayCreated = true
 	m.writerBoundary = len(m.h.stub.Journal())
@@ -781,79 +790,66 @@ func (m *gatewayMachine) waitForStable(rt *rapid.T) {
 }
 
 // waitForGrantDenialObserved keeps revocation on the warm account-watch path
-// and waits until a bound tunnel with hostname work reports the new denial.
+// and waits until every live tunnel in the iteration namespace reports the
+// new denial. Every tunnel is covered, not just the bound one: a sibling's
+// reconcile may hold a stale account snapshot and emit authorized-era calls
+// until it observes the denial, and the per-owner G1 watermarks only move
+// after this drain so those stragglers are never scanned as violations.
 func (m *gatewayMachine) waitForGrantDenialObserved(rt *rapid.T) {
 	rt.Helper()
-	name := m.boundTunnelName()
-	if name == "" {
-		return
-	}
-	ctx := context.Background()
-	var current v1alpha1.CloudflareTunnel
-	if err := m.h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.namespace, Name: name}, &current); err != nil {
-		if apierrors.IsNotFound(err) {
-			return
-		}
-		must2(rt, err, "get tunnel before grant denial")
-	}
-	if current.DeletionTimestamp != nil {
-		return
-	}
-	hasBinding := m.gatewayCreated
-	if current.Spec.Configuration.Mode == v1alpha1.CloudflareTunnelConfigurationModeDirect &&
-		current.Spec.Configuration.Direct != nil {
-		for _, ingress := range current.Spec.Configuration.Direct.Ingress {
-			if ingress.Hostname == m.hostname || ingress.Hostname == m.altHost {
-				hasBinding = true
-			}
-		}
-	}
-	if !hasBinding {
-		return
-	}
 	denial := func(ctx context.Context, h *explorationHarness) (string, error) {
-		var tunnel v1alpha1.CloudflareTunnel
-		err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.namespace, Name: name}, &tunnel)
-		if apierrors.IsNotFound(err) {
-			return "absent", nil
-		}
-		if err != nil {
+		var tunnels v1alpha1.CloudflareTunnelList
+		if err := h.apiReader.List(ctx, &tunnels, client.InNamespace(m.namespace)); err != nil {
 			return "", err
 		}
-		accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
-		cleanupReason := accepted != nil && (accepted.Reason == "WaitingForDrain" ||
-			accepted.Reason == "WaitingForOwnerDrain" || accepted.Reason == "TargetNotFound")
-		if accepted == nil || accepted.Status != metav1.ConditionFalse ||
-			!cleanupReason && !strings.Contains(strings.ToLower(accepted.Message), "not granted") {
-			return "", fmt.Errorf("CloudflareTunnel %s has not observed hostname grant denial", name)
+		var fingerprint strings.Builder
+		for i := range tunnels.Items {
+			tunnel := &tunnels.Items[i]
+			if tunnel.DeletionTimestamp != nil {
+				// A terminating tunnel runs ownership-verified cleanup and
+				// never re-evaluates authorization, so it cannot drain
+				// unauthorized-era calls.
+				continue
+			}
+			accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+			cleanupReason := accepted != nil && (accepted.Reason == "WaitingForDrain" ||
+				accepted.Reason == "WaitingForOwnerDrain" || accepted.Reason == "TargetNotFound")
+			if accepted == nil || accepted.Status != metav1.ConditionFalse ||
+				!cleanupReason && !strings.Contains(strings.ToLower(accepted.Message), "not granted") {
+				return "", fmt.Errorf("CloudflareTunnel %s has not observed hostname grant denial", tunnel.Name)
+			}
+			fmt.Fprintf(&fingerprint, "%s=%s;", tunnel.Name, tunnel.ResourceVersion)
 		}
-		return tunnel.ResourceVersion, nil
+		return fingerprint.String(), nil
 	}
-	if err := m.h.waitStable(ctx, denial); err != nil {
+	if err := m.h.waitStable(context.Background(), denial); err != nil {
 		rt.Fatalf("wait for grant denial: %v", err)
 	}
 }
 
-// waitForAccountLossObserved waits until the bound tunnel reports the deleted
-// account, or is gone.
+// waitForAccountLossObserved waits until every live tunnel in the iteration
+// namespace reports the deleted account, or is gone. Like the grant-denial
+// drain it covers siblings too, so no tunnel can journal authorized-era calls
+// after the account-loss watermark moves.
 func (m *gatewayMachine) waitForAccountLossObserved(rt *rapid.T) {
 	rt.Helper()
-	name := m.boundTunnelName()
-	if name == "" {
-		return
-	}
-	denial := func(ctx context.Context, h *explorationHarness) (string, error) {
-		var tunnel v1alpha1.CloudflareTunnel
-		err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.namespace, Name: name}, &tunnel)
-		if apierrors.IsNotFound(err) {
-			return tunnelObservedAccountLoss(nil)
-		}
-		if err != nil {
+	loss := func(ctx context.Context, h *explorationHarness) (string, error) {
+		var tunnels v1alpha1.CloudflareTunnelList
+		if err := h.apiReader.List(ctx, &tunnels, client.InNamespace(m.namespace)); err != nil {
 			return "", err
 		}
-		return tunnelObservedAccountLoss(&tunnel)
+		var fingerprint strings.Builder
+		for i := range tunnels.Items {
+			tunnel := &tunnels.Items[i]
+			freshness, err := tunnelObservedAccountLoss(tunnel)
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(&fingerprint, "%s=%s;", tunnel.Name, freshness)
+		}
+		return fingerprint.String(), nil
 	}
-	if err := m.h.waitStable(context.Background(), denial); err != nil {
+	if err := m.h.waitStable(context.Background(), loss); err != nil {
 		rt.Fatalf("wait for account loss: %v", err)
 	}
 }
@@ -925,36 +921,15 @@ func (m *gatewayMachine) checkJournalOrder(rt *rapid.T) {
 
 // checkAuthorizedMutation is the G1 invariant: while the account is
 // unverified or a live tunnel has an authorization failure, no new remote
-// object may be provisioned. Ownership-verified cleanup and withdrawal remain
+// object may be provisioned. Each journaled call is evaluated against the
+// tunnel that owns it — the bound tunnel is not the only caller — so an
+// authorized sibling's calls are not blamed on a bound tunnel that has not
+// reconciled yet, and an unauthorized non-bound tunnel cannot hide behind an
+// accepted bound tunnel. Ownership-verified cleanup and withdrawal remain
 // permitted by G1.
 func (m *gatewayMachine) checkAuthorizedMutation(rt *rapid.T) {
 	journal := m.h.stub.Journal()
-	provisions := func(call cfstub.Call) bool {
-		path := strings.SplitN(call.Path, "?", 2)[0]
-		tunnelCollection := "/accounts/" + m.accountID + "/cfd_tunnel"
-		if call.Method == http.MethodPost && path == tunnelCollection {
-			return true
-		}
-		if call.Method == http.MethodPost && strings.HasSuffix(path, "/management") ||
-			call.Method == http.MethodGet && strings.HasSuffix(path, "/token") {
-			return true
-		}
-		if call.Method == http.MethodPatch && strings.HasPrefix(path, tunnelCollection+"/") &&
-			!strings.Contains(path, "/configurations") {
-			return true
-		}
-		if strings.Contains(path, "/dns_records") || strings.Contains(path, "/configurations") {
-			// Creating a DNS record is provisioning. Updates to an already-owned
-			// DNS record or tunnel configuration may complete after revocation
-			// when the reconcile already passed the gate.
-			return call.Method == http.MethodPost &&
-				(strings.Contains(call.Body, m.hostname) || strings.Contains(call.Body, m.altHost))
-		}
-		if call.Method != http.MethodPost && call.Method != http.MethodPut && call.Method != http.MethodPatch {
-			return false
-		}
-		return strings.Contains(call.Body, m.hostname) || strings.Contains(call.Body, m.altHost)
-	}
+	attribution := m.g1Attribution(rt)
 
 	if m.accountCreated {
 		var account v1alpha1.CloudflareAccount
@@ -963,7 +938,7 @@ func (m *gatewayMachine) checkAuthorizedMutation(rt *rapid.T) {
 				meta.IsStatusConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid)
 			if !verified {
 				for _, call := range journal[m.accountUnverifiedMark:] {
-					if provisions(call) {
+					if attribution.provisioning(call) {
 						rt.Fatalf("G1: remote provisioning %s %s while account %s unverified", call.Method, call.Path, m.account)
 					}
 				}
@@ -974,33 +949,20 @@ func (m *gatewayMachine) checkAuthorizedMutation(rt *rapid.T) {
 		m.accountUnverifiedMark = len(journal)
 	}
 
-	name := m.boundTunnelName()
-	if name == "" {
-		m.tunnelUnauthorizedMark = len(journal)
-		return
-	}
-	var tunnel v1alpha1.CloudflareTunnel
-	err := m.h.apiReader.Get(context.Background(), types.NamespacedName{Namespace: m.namespace, Name: name}, &tunnel)
-	if apierrors.IsNotFound(err) {
-		m.tunnelUnauthorizedMark = len(journal)
-		return
-	}
-	must2(rt, err, "get bound CloudflareTunnel")
-	if tunnel.DeletionTimestamp != nil {
-		m.tunnelUnauthorizedMark = len(journal)
-		return
-	}
-	accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
-	cleanupReason := accepted != nil && (accepted.Reason == "WaitingForDrain" ||
-		accepted.Reason == "WaitingForOwnerDrain" || accepted.Reason == "TargetNotFound")
-	if accepted == nil || accepted.Status != metav1.ConditionTrue && !cleanupReason {
-		for _, call := range journal[m.tunnelUnauthorizedMark:] {
-			if provisions(call) {
-				rt.Fatalf("G1: remote provisioning %s %s while CloudflareTunnel %s is unauthorized", call.Method, call.Path, name)
-			}
-		}
+	call, blamed, violated := attribution.unauthorizedProvisioning(
+		journal, m.tunnelOwnerMarks, m.tunnelUnauthorizedMark)
+	if violated {
+		rt.Fatalf("G1: remote provisioning %s %s while CloudflareTunnel %s is unauthorized", call.Method, call.Path, blamed)
 	}
 	m.tunnelUnauthorizedMark = len(journal)
+	for name := range attribution.tunnels {
+		m.tunnelOwnerMarks[name] = len(journal)
+	}
+	for name := range m.tunnelOwnerMarks {
+		if _, live := attribution.tunnels[name]; !live {
+			m.tunnelOwnerMarks[name] = len(journal)
+		}
+	}
 }
 
 // checkSingleWriter is the G4 invariant: configuration writes after a stable
@@ -1022,11 +984,10 @@ func (m *gatewayMachine) checkSingleWriter(rt *rapid.T) {
 		return
 	}
 	journal := m.h.stub.Journal()
+	attribution := m.g1Attribution(rt)
 	writes := 0
 	for _, call := range journal[m.writerBoundary:] {
-		if call.Method == http.MethodPut &&
-			strings.HasSuffix(call.Path, "/configurations") &&
-			strings.HasPrefix(call.Path, "/accounts/"+m.accountID+"/cfd_tunnel/") {
+		if attribution.boundConfigWrite(call) {
 			writes++
 		}
 	}
@@ -1042,6 +1003,269 @@ func (m *gatewayMachine) checkSingleWriter(rt *rapid.T) {
 	}
 	m.writerBoundary = len(journal)
 	m.writerBoundarySettled = true
+}
+
+// --- G1 journal attribution -------------------------------------------------
+
+// g1Attribution maps journaled Cloudflare calls to the CloudflareTunnel that
+// owns them. The bound tunnel is not the only caller: an explicit sibling
+// keeps reconciling while a Gateway binds an implicit tunnel, so the G1 check
+// must evaluate each call against the authorization of the tunnel the call
+// actually belongs to.
+type g1Attribution struct {
+	namespace string
+	gateway   string
+	bound     string
+	accountID string
+	hostnames []string
+
+	// tunnels indexes the live CloudflareTunnels by name; remote maps a
+	// remote tunnel ID to its owner's name; candidates are the names a remote
+	// tunnel name may end in ("-<namespace>-<name>").
+	tunnels    map[string]*v1alpha1.CloudflareTunnel
+	remote     map[string]string
+	candidates []string
+}
+
+// newG1Attribution builds the call→owner maps. Live tunnels bind their
+// recorded status.tunnelId; stub remote names cover the window between a
+// remote create and its status commit, and remotes whose owner object is
+// already gone (a soft-deleted remote still resolves to its owner name).
+func newG1Attribution(
+	namespace, gateway, bound, accountID string,
+	hostnames []string,
+	tunnels []v1alpha1.CloudflareTunnel,
+	remotes []cfstub.Tunnel,
+) *g1Attribution {
+	a := &g1Attribution{
+		namespace: namespace,
+		gateway:   gateway,
+		bound:     bound,
+		accountID: accountID,
+		hostnames: hostnames,
+		tunnels:   make(map[string]*v1alpha1.CloudflareTunnel, len(tunnels)),
+		remote:    make(map[string]string),
+	}
+	for i := range tunnels {
+		tunnel := &tunnels[i]
+		a.tunnels[tunnel.Name] = tunnel
+	}
+	a.candidates = make([]string, 0, len(tunnels)+2)
+	for name := range a.tunnels {
+		a.candidates = append(a.candidates, name)
+	}
+	for _, known := range []string{gateway, bound} {
+		if known != "" && !slices.Contains(a.candidates, known) {
+			a.candidates = append(a.candidates, known)
+		}
+	}
+	for i := range remotes {
+		if owner := a.matchRemoteName(remotes[i].Name); owner != "" {
+			a.remote[remotes[i].ID] = owner
+		}
+	}
+	for name, tunnel := range a.tunnels {
+		if tunnel.Status.TunnelID != "" {
+			a.remote[tunnel.Status.TunnelID] = name
+		}
+	}
+	return a
+}
+
+// matchRemoteName resolves a remote tunnel name of the form
+// "<clusterID>-<namespace>-<name>" to the owning CloudflareTunnel name. The
+// cluster ID contains dashes itself, so matching is by suffix only.
+func (a *g1Attribution) matchRemoteName(remoteName string) string {
+	for _, name := range a.candidates {
+		if strings.HasSuffix(remoteName, "-"+a.namespace+"-"+name) {
+			return name
+		}
+	}
+	return ""
+}
+
+// callOwner returns the name of the CloudflareTunnel that owns the call; an
+// empty owner means the call could not be attributed. Tunnel-scoped paths
+// resolve by remote ID, the create POST by the remote name in its body, and
+// DNS writes by their tunnel CNAME target or ownership comment. Bare hostnames
+// never attribute: the Gateway listener and a Direct ingress may share them.
+func (a *g1Attribution) callOwner(call cfstub.Call) (string, bool) {
+	path := callPath(call)
+	tunnelCollection := "/accounts/" + a.accountID + "/cfd_tunnel"
+	if rest, ok := strings.CutPrefix(path, tunnelCollection+"/"); ok {
+		id, _, _ := strings.Cut(rest, "/")
+		owner, attributed := a.remote[id]
+		return owner, attributed
+	}
+	var body struct {
+		Name    string `json:"name"`
+		Comment string `json:"comment"`
+		Content string `json:"content"`
+	}
+	_ = json.Unmarshal([]byte(call.Body), &body)
+	if call.Method == http.MethodPost && path == tunnelCollection {
+		if owner := a.matchRemoteName(body.Name); owner != "" {
+			return owner, true
+		}
+		return "", false
+	}
+	if id, isTarget := strings.CutSuffix(body.Content, ".cfargotunnel.com"); isTarget {
+		if owner, attributed := a.remote[id]; attributed {
+			return owner, true
+		}
+	}
+	if identity, isOwnerComment := strings.CutPrefix(body.Comment, "flareway "); isOwnerComment {
+		identity, _, _ = strings.Cut(identity, " ")
+		parts := strings.Split(identity, "/")
+		if len(parts) == 3 && parts[1] == a.namespace {
+			owner := parts[2]
+			if a.gateway != "" && owner == a.gateway {
+				owner = a.bound
+			}
+			if owner != "" && slices.Contains(a.candidates, owner) {
+				return owner, true
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// callPath strips the query string from a journaled call path.
+func callPath(call cfstub.Call) string {
+	path, _, _ := strings.Cut(call.Path, "?")
+	return path
+}
+
+// provisioning reports whether the call creates remote objects or fetches
+// credentials. Updates to already-owned remote state may legitimately
+// complete after revocation when the reconcile already passed the
+// authorization gate, so they are excluded; creation and credential fetches
+// may not.
+func (a *g1Attribution) provisioning(call cfstub.Call) bool {
+	path := callPath(call)
+	tunnelCollection := "/accounts/" + a.accountID + "/cfd_tunnel"
+	if call.Method == http.MethodPost && path == tunnelCollection {
+		return true
+	}
+	if call.Method == http.MethodPost && strings.HasSuffix(path, "/management") ||
+		call.Method == http.MethodGet && strings.HasSuffix(path, "/token") {
+		return true
+	}
+	if call.Method == http.MethodPatch && strings.HasPrefix(path, tunnelCollection+"/") &&
+		!strings.Contains(path, "/configurations") {
+		return true
+	}
+	if strings.Contains(path, "/dns_records") || strings.Contains(path, "/configurations") {
+		return call.Method == http.MethodPost && a.bodyHasHostname(call)
+	}
+	if call.Method != http.MethodPost && call.Method != http.MethodPut && call.Method != http.MethodPatch {
+		return false
+	}
+	return a.bodyHasHostname(call)
+}
+
+func (a *g1Attribution) bodyHasHostname(call cfstub.Call) bool {
+	for _, hostname := range a.hostnames {
+		if strings.Contains(call.Body, hostname) {
+			return true
+		}
+	}
+	return false
+}
+
+// boundConfigWrite reports whether the call is a configuration write that
+// targets the bound tunnel's remote.
+func (a *g1Attribution) boundConfigWrite(call cfstub.Call) bool {
+	if call.Method != http.MethodPut || !strings.HasSuffix(callPath(call), "/configurations") {
+		return false
+	}
+	owner, attributed := a.callOwner(call)
+	return attributed && owner == a.bound
+}
+
+// g1TunnelProvisioningPermitted reports whether the owning tunnel may emit
+// provisioning calls at the stable point. Tunnels whose owner object is gone
+// or terminating are running ownership-verified cleanup, which G1 permits;
+// Accepted=False teardown reasons mark the same drain.
+func g1TunnelProvisioningPermitted(tunnel *v1alpha1.CloudflareTunnel) bool {
+	if tunnel == nil || tunnel.DeletionTimestamp != nil {
+		return true
+	}
+	accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+	cleanupReason := accepted != nil && (accepted.Reason == "WaitingForDrain" ||
+		accepted.Reason == "WaitingForOwnerDrain" || accepted.Reason == "TargetNotFound")
+	return cleanupReason || accepted != nil && accepted.Status == metav1.ConditionTrue
+}
+
+// unauthorizedProvisioning scans the journal window for a provisioning call
+// that fails G1. A call attributed to an owner fails when the owner is live
+// and unauthorized and the call was journaled at or after the owner's
+// watermark. An unattributable call fails closed when any live tunnel is
+// unauthorized. It returns the offending call and the tunnel it is blamed on
+// (the owning tunnel, or the first unauthorized live tunnel when the call
+// cannot be attributed).
+func (a *g1Attribution) unauthorizedProvisioning(
+	journal []cfstub.Call,
+	ownerMarks map[string]int,
+	sharedMark int,
+) (cfstub.Call, string, bool) {
+	for index, call := range journal {
+		if !a.provisioning(call) {
+			continue
+		}
+		owner, attributed := a.callOwner(call)
+		if !attributed {
+			if index >= sharedMark {
+				if culprit := a.firstUnauthorizedLive(); culprit != "" {
+					return call, culprit, true
+				}
+			}
+			continue
+		}
+		if index >= ownerMarks[owner] && !g1TunnelProvisioningPermitted(a.tunnels[owner]) {
+			return call, owner, true
+		}
+	}
+	return cfstub.Call{}, "", false
+}
+
+// firstUnauthorizedLive returns the name of a live tunnel that is not allowed
+// to provision, or "" when every live tunnel is authorized or draining.
+func (a *g1Attribution) firstUnauthorizedLive() string {
+	names := make([]string, 0, len(a.tunnels))
+	for name := range a.tunnels {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if !g1TunnelProvisioningPermitted(a.tunnels[name]) {
+			return name
+		}
+	}
+	return ""
+}
+
+// g1Attribution snapshots the live tunnels and remote names the checks need.
+func (m *gatewayMachine) g1Attribution(rt *rapid.T) *g1Attribution {
+	rt.Helper()
+	ctx := context.Background()
+	var tunnels v1alpha1.CloudflareTunnelList
+	must2(rt, m.h.apiReader.List(ctx, &tunnels, client.InNamespace(m.namespace)), "list CloudflareTunnels for G1 attribution")
+	return newG1Attribution(
+		m.namespace, m.gateway, m.boundTunnelName(), m.accountID,
+		[]string{m.hostname, m.altHost}, tunnels.Items, m.h.stub.State.Tunnels(m.accountID))
+}
+
+// resetG1Marks drops every journal watermark after a drain: calls journaled
+// before this point were made by tunnels that were authorized or already
+// observed unauthorized, so they must not be re-scanned.
+func (m *gatewayMachine) resetG1Marks() {
+	mark := len(m.h.stub.Journal())
+	m.tunnelUnauthorizedMark = mark
+	for name := range m.tunnelOwnerMarks {
+		m.tunnelOwnerMarks[name] = mark
+	}
 }
 
 func (m *gatewayMachine) currentWriterReady(rt *rapid.T, tunnel *v1alpha1.CloudflareTunnel) (bool, string) {
