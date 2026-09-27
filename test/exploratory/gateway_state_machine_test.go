@@ -44,6 +44,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
@@ -1017,6 +1018,7 @@ type g1Attribution struct {
 	gateway   string
 	bound     string
 	accountID string
+	clusterID string
 	hostnames []string
 
 	// tunnels indexes the live CloudflareTunnels by name; remote maps a
@@ -1027,12 +1029,11 @@ type g1Attribution struct {
 	candidates []string
 }
 
-// newG1Attribution builds the call→owner maps. Live tunnels bind their
-// recorded status.tunnelId; stub remote names cover the window between a
-// remote create and its status commit, and remotes whose owner object is
-// already gone (a soft-deleted remote still resolves to its owner name).
+// remote create and its status commit. A soft-deleted remote resolves only
+// when its recorded name still ends in a candidate tunnel name, so tombstones
+// never attribute calls to foreign owners.
 func newG1Attribution(
-	namespace, gateway, bound, accountID string,
+	namespace, gateway, bound, accountID, clusterID string,
 	hostnames []string,
 	tunnels []v1alpha1.CloudflareTunnel,
 	remotes []cfstub.Tunnel,
@@ -1042,6 +1043,7 @@ func newG1Attribution(
 		gateway:   gateway,
 		bound:     bound,
 		accountID: accountID,
+		clusterID: clusterID,
 		hostnames: hostnames,
 		tunnels:   make(map[string]*v1alpha1.CloudflareTunnel, len(tunnels)),
 		remote:    make(map[string]string),
@@ -1087,8 +1089,9 @@ func (a *g1Attribution) matchRemoteName(remoteName string) string {
 // callOwner returns the name of the CloudflareTunnel that owns the call; an
 // empty owner means the call could not be attributed. Tunnel-scoped paths
 // resolve by remote ID, the create POST by the remote name in its body, and
-// DNS writes by their tunnel CNAME target or ownership comment. Bare hostnames
-// never attribute: the Gateway listener and a Direct ingress may share them.
+// DNS writes by their tunnel CNAME target or an ownership comment that names
+// this cluster and namespace. Bare hostnames never attribute: the Gateway
+// listener and a Direct ingress may share them.
 func (a *g1Attribution) callOwner(call cfstub.Call) (string, bool) {
 	path := callPath(call)
 	tunnelCollection := "/accounts/" + a.accountID + "/cfd_tunnel"
@@ -1117,7 +1120,7 @@ func (a *g1Attribution) callOwner(call cfstub.Call) (string, bool) {
 	if identity, isOwnerComment := strings.CutPrefix(body.Comment, "flareway "); isOwnerComment {
 		identity, _, _ = strings.Cut(identity, " ")
 		parts := strings.Split(identity, "/")
-		if len(parts) == 3 && parts[1] == a.namespace {
+		if len(parts) == 3 && parts[0] == a.clusterID && parts[1] == a.namespace {
 			owner := parts[2]
 			if a.gateway != "" && owner == a.gateway {
 				owner = a.bound
@@ -1246,14 +1249,17 @@ func (a *g1Attribution) firstUnauthorizedLive() string {
 	return ""
 }
 
-// g1Attribution snapshots the live tunnels and remote names the checks need.
+// g1Attribution snapshots the live tunnels, remote names, and cluster ID the
+// checks need.
 func (m *gatewayMachine) g1Attribution(rt *rapid.T) *g1Attribution {
 	rt.Helper()
 	ctx := context.Background()
 	var tunnels v1alpha1.CloudflareTunnelList
 	must2(rt, m.h.apiReader.List(ctx, &tunnels, client.InNamespace(m.namespace)), "list CloudflareTunnels for G1 attribution")
+	clusterID, err := flarecloudflare.ClusterID(ctx, m.h.client)
+	must2(rt, err, "read cluster ID for G1 attribution")
 	return newG1Attribution(
-		m.namespace, m.gateway, m.boundTunnelName(), m.accountID,
+		m.namespace, m.gateway, m.boundTunnelName(), m.accountID, clusterID,
 		[]string{m.hostname, m.altHost}, tunnels.Items, m.h.stub.State.Tunnels(m.accountID))
 }
 

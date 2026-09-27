@@ -49,7 +49,7 @@ func g1MachineFixture() *g1Fixture {
 	return &g1Fixture{
 		namespace: "expl-gw-1",
 		accountID: "00000000000000000000000000001001",
-		clusterID: "50532932-3b50-42de-939b-cbea89185481",
+		clusterID: "00000000-0000-4000-8000-000000000128",
 		gateway:   "gw-1",
 		tunnel:    "tun-1",
 		bound:     "gw-1",
@@ -58,7 +58,7 @@ func g1MachineFixture() *g1Fixture {
 }
 
 func (f *g1Fixture) attribution() *g1Attribution {
-	return newG1Attribution(f.namespace, f.gateway, f.bound, f.accountID, f.hostnames, f.tunnels, f.remotes)
+	return newG1Attribution(f.namespace, f.gateway, f.bound, f.accountID, f.clusterID, f.hostnames, f.tunnels, f.remotes)
 }
 
 // liveTunnel adds a live CloudflareTunnel carrying the given Accepted
@@ -302,6 +302,17 @@ func TestG1Attribution(t *testing.T) {
 				wantOK: false,
 			},
 			{
+				// Same namespace and a live owner name, but another cluster's
+				// marker: only this cluster's comments attribute.
+				name:    "DNS create with a foreign cluster ID is unattributable",
+				prepare: func(f *g1Fixture) { f.liveTunnel("tun-1", "", nil) },
+				call: func(f *g1Fixture) cfstub.Call {
+					return cfstub.Call{Method: http.MethodPost, Path: "/zones/zone-1/dns_records",
+						Body: fmt.Sprintf(`{"comment":"flareway 00000000-0000-4000-8000-00000000f00d/%s/tun-1","name":"app.expl1.example.com"}`, f.namespace)}
+				},
+				wantOK: false,
+			},
+			{
 				name:    "PATCH rename resolves by path id not body name",
 				prepare: func(f *g1Fixture) { f.liveTunnel("tun-1", "id-tun", g1Accepted("Accepted")) },
 				call: func(f *g1Fixture) cfstub.Call {
@@ -472,13 +483,29 @@ func TestG1Attribution(t *testing.T) {
 				t.Fatalf("deleting owner's calls must be allowed; violated on %s %s blamed %q", call.Method, call.Path, blamed)
 			}
 
-			// Gone owner: the remote resolves to a name with no live CR.
+			// Gone owner still named by the binding: the tombstoned remote
+			// resolves to a candidate with no live CR, i.e. cleanup. The shared
+			// mark is 0 so only tombstone resolution can excuse the call.
 			f2 := g1MachineFixture()
-			f2.liveTunnel("gw-1", "", nil)
+			f2.bound = "tun-1"
+			f2.liveTunnel("gw-1", "", nil) // unauthorized live tunnel
 			f2.tombstonedRemote("id-old", "tun-1")
 			journal = []cfstub.Call{f2.tokenGet("id-old")}
-			if call, blamed, violated := f2.g1Check(t, journal, nil, len(journal)); violated {
-				t.Fatalf("gone owner's calls must be allowed; violated on %s %s blamed %q", call.Method, call.Path, blamed)
+			if call, blamed, violated := f2.g1Check(t, journal, nil, 0); violated {
+				t.Fatalf("gone candidate owner's calls must be allowed; violated on %s %s blamed %q", call.Method, call.Path, blamed)
+			}
+		})
+
+		t.Run("tombstone of a non-candidate owner fails closed", func(t *testing.T) {
+			// Tombstones resolve only for candidate names. A remote whose name
+			// matches no live, gateway, or bound tunnel is unattributable, so
+			// it fails while a live tunnel is unauthorized.
+			f := g1MachineFixture()
+			f.liveTunnel("gw-1", "", nil)
+			f.tombstonedRemote("id-ghost", "ghost-1")
+			journal := []cfstub.Call{f.tokenGet("id-ghost")}
+			if _, blamed, violated := f.g1Check(t, journal, nil, 0); !violated || blamed != "gw-1" {
+				t.Fatalf("non-candidate tombstone must fail closed blamed gw-1; violated=%v blamed=%q", violated, blamed)
 			}
 		})
 
