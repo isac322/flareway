@@ -36,8 +36,8 @@ write a focused unit or envtest case.
 
 ## Commands
 
-Compile and race-test the deterministic trace helpers (this is the PR CI
-gate):
+Compile the harness and race-test its deterministic tests, the trace helpers
+and the oracle predicates (this is the PR CI gate):
 
 ```sh
 make test-exploratory-compile

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -833,6 +834,8 @@ func (m *gatewayMachine) waitForGrantDenialObserved(rt *rapid.T) {
 	}
 }
 
+// waitForAccountLossObserved waits until the bound tunnel reports the deleted
+// account, or is gone.
 func (m *gatewayMachine) waitForAccountLossObserved(rt *rapid.T) {
 	rt.Helper()
 	name := m.boundTunnelName()
@@ -843,20 +846,45 @@ func (m *gatewayMachine) waitForAccountLossObserved(rt *rapid.T) {
 		var tunnel v1alpha1.CloudflareTunnel
 		err := h.apiReader.Get(ctx, types.NamespacedName{Namespace: m.namespace, Name: name}, &tunnel)
 		if apierrors.IsNotFound(err) {
-			return "absent", nil
+			return tunnelObservedAccountLoss(nil)
 		}
 		if err != nil {
 			return "", err
 		}
-		accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
-		if accepted == nil || accepted.Status != metav1.ConditionFalse {
-			return "", fmt.Errorf("CloudflareTunnel %s has not observed account loss", name)
-		}
-		return tunnel.ResourceVersion, nil
+		return tunnelObservedAccountLoss(&tunnel)
 	}
 	if err := m.h.waitStable(context.Background(), denial); err != nil {
 		rt.Fatalf("wait for account loss: %v", err)
 	}
+}
+
+// tunnelObservedAccountLoss is the account-loss expectation for the bound
+// tunnel; nil means the tunnel is gone, which is success. A live tunnel reports
+// account loss as Accepted=False. A terminating tunnel's delete path never
+// authors Accepted: without the account it fails closed, keeps the finalizer,
+// and reports CleanupBlocked=True at the current generation. That retained
+// shape is the observation, whatever the reason, because a block before the
+// account read (WaitingForBlock) also keeps teardown from proceeding without
+// the account.
+func tunnelObservedAccountLoss(tunnel *v1alpha1.CloudflareTunnel) (string, error) {
+	if tunnel == nil {
+		return "absent", nil
+	}
+	if tunnel.DeletionTimestamp != nil {
+		if !slices.Contains(tunnel.Finalizers, v1alpha1.CloudflareTunnelFinalizer) {
+			return "", fmt.Errorf("deleting CloudflareTunnel %s released finalizer %s but is still present", tunnel.Name, v1alpha1.CloudflareTunnelFinalizer)
+		}
+		blocked := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionCleanupBlocked)
+		if blocked == nil || blocked.Status != metav1.ConditionTrue || blocked.ObservedGeneration != tunnel.Generation {
+			return "", fmt.Errorf("deleting CloudflareTunnel %s has not reported blocked cleanup at generation %d", tunnel.Name, tunnel.Generation)
+		}
+		return tunnel.ResourceVersion, nil
+	}
+	accepted := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse {
+		return "", fmt.Errorf("CloudflareTunnel %s has not observed account loss", tunnel.Name)
+	}
+	return tunnel.ResourceVersion, nil
 }
 
 // --- invariants ------------------------------------------------------------

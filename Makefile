@@ -107,9 +107,9 @@ test-envtest: setup-envtest ## Run controller tests with envtest.
 	KUBEBUILDER_ASSETS="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test -timeout=30m ./internal/controller/...
 
 .PHONY: test-exploratory-compile
-test-exploratory-compile: ## Vet the tagged harness and run its deterministic artifact-safety tests.
+test-exploratory-compile: ## Vet the tagged harness and run its deterministic tests (artifact safety, oracle predicates).
 	go vet -tags exploratory ./test/exploratory
-	go test -race -tags exploratory -run '^TestTrace' ./test/exploratory
+	go test -race -tags exploratory -run '^(TestTrace|TestAccountLoss)' ./test/exploratory
 
 .PHONY: test-exploratory
 test-exploratory: setup-envtest ## Run bounded state-machine exploration against an isolated envtest control plane.
