@@ -1,0 +1,15 @@
+---
+import config from 'virtual:starlight/user-config';
+import DefaultPagination from '@astrojs/starlight/components/Pagination.astro';
+import { paginationForTab, sidebarForPath } from '../../data/nav';
+
+// Previous/next stay inside the active tab instead of crossing into another section.
+const route = Astro.locals.starlightRoute;
+route.pagination = paginationForTab(
+	sidebarForPath(route.sidebar, Astro.url.pathname),
+	config.pagination,
+	route.entry.data,
+);
+---
+
+<DefaultPagination />

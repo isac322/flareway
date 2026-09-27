@@ -1,0 +1,28 @@
+/*
+ * Docs layout adjustments. Neutral on purpose: brand theming lands later.
+ *
+ * The header gains a second row for the site-wide tabs (Header.astro), so
+ * --sl-nav-height grows by the tab row. Starlight derives the sidebar, content
+ * offset, and scroll padding from --sl-nav-height, so they follow automatically.
+ */
+:root {
+	--fw-bar-height: 3.5rem;
+	--fw-tabs-height: 2.75rem;
+	--sl-nav-height: calc(var(--fw-bar-height) + var(--fw-tabs-height));
+}
+
+@media (min-width: 50rem) {
+	:root {
+		--fw-bar-height: 4rem;
+	}
+}
+
+/* Tabs sit flush on the header's bottom border. */
+header.header {
+	padding-bottom: 0;
+}
+
+/* Keep the mobile menu button centred on the top row, not the whole header. */
+starlight-menu-button button {
+	top: calc((var(--fw-bar-height) - var(--sl-menu-button-size)) / 2);
+}

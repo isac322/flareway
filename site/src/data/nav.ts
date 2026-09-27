@@ -1,0 +1,126 @@
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+/**
+ * Site-wide top tabs. Single source of truth: the Starlight sidebar config, the
+ * docs header tabs, the per-tab sidebar filter, and per-tab pagination all
+ * derive from this list.
+ */
+export interface NavTab {
+	/** Visible tab label; also the sidebar label for the tab's section. */
+	label: string;
+	/** Where the tab links to (the section's landing page). */
+	href: string;
+	/** URL path prefix owned by this tab. The longest matching prefix wins. */
+	match: string;
+	/**
+	 * Sidebar shape for the section. `link` renders the tab's page as a single
+	 * entry; `group` autogenerates entries from a content directory ordered by
+	 * each page's `sidebar.order` frontmatter.
+	 */
+	sidebar: { kind: 'link' } | { kind: 'group'; directory: string };
+}
+
+export const tabs: readonly NavTab[] = [
+	{ label: 'Overview', href: '/docs/', match: '/docs/', sidebar: { kind: 'link' } },
+	{
+		label: 'Operations',
+		href: '/docs/operations/install/',
+		match: '/docs/operations/',
+		sidebar: { kind: 'group', directory: 'docs/operations' },
+	},
+	{
+		label: 'Reference',
+		href: '/docs/reference/api/',
+		match: '/docs/reference/',
+		sidebar: { kind: 'group', directory: 'docs/reference' },
+	},
+	{
+		label: 'Architecture',
+		href: '/docs/architecture/',
+		match: '/docs/architecture/',
+		sidebar: { kind: 'link' },
+	},
+	{
+		label: 'Conformance',
+		href: '/docs/conformance/gateway-api-v1-6-2/',
+		match: '/docs/conformance/',
+		sidebar: { kind: 'link' },
+	},
+	{
+		label: 'Project',
+		href: '/docs/project/contributing/',
+		match: '/docs/project/',
+		sidebar: { kind: 'group', directory: 'docs/project' },
+	},
+];
+
+/** Starlight `sidebar` config generated from the tabs, one top-level entry per tab. */
+export const starlightSidebar = tabs.map((tab) =>
+	tab.sidebar.kind === 'link'
+		? { label: tab.label, link: tab.href }
+		: { label: tab.label, items: [{ autogenerate: { directory: tab.sidebar.directory } }] },
+);
+
+/** The tab owning `pathname` (longest `match` prefix), or `undefined` outside all tabs. */
+export function activeTab(pathname: string): NavTab | undefined {
+	const path = pathname.endsWith('/') ? pathname : `${pathname}/`;
+	let best: NavTab | undefined;
+	for (const tab of tabs) {
+		if (path.startsWith(tab.match) && (!best || tab.match.length > best.match.length)) best = tab;
+	}
+	return best;
+}
+
+type SidebarEntry = StarlightRouteData['sidebar'][number];
+type SidebarLink = Extract<SidebarEntry, { type: 'link' }>;
+
+function flatten(entries: readonly SidebarEntry[]): SidebarLink[] {
+	return entries.flatMap((entry) => (entry.type === 'group' ? flatten(entry.entries) : [entry]));
+}
+
+/**
+ * Keep only the top-level sidebar entries belonging to the tab that owns
+ * `pathname`. Outside every tab the sidebar is returned unchanged.
+ */
+export function sidebarForPath(sidebar: SidebarEntry[], pathname: string): SidebarEntry[] {
+	const current = activeTab(pathname);
+	if (!current) return sidebar;
+	return sidebar.filter((entry) => {
+		const first = flatten([entry])[0];
+		return first !== undefined && activeTab(first.href) === current;
+	});
+}
+
+type PrevNextConfig = StarlightRouteData['entry']['data']['prev'];
+
+/** Mirrors Starlight's prev/next frontmatter semantics on a tab-scoped sidebar. */
+function applyPrevNext(
+	link: SidebarLink | undefined,
+	paginationEnabled: boolean,
+	config: PrevNextConfig,
+): SidebarLink | undefined {
+	if (config === false) return undefined;
+	if (config === true) return link;
+	if (typeof config === 'string' && link) return { ...link, label: config };
+	if (typeof config === 'object' && config !== null) {
+		if (link) return { ...link, label: config.label ?? link.label, href: config.link ?? link.href, attrs: {} };
+		if (config.link && config.label) {
+			return { type: 'link', label: config.label, href: config.link, isCurrent: false, badge: undefined, attrs: {} };
+		}
+	}
+	return paginationEnabled ? link : undefined;
+}
+
+/** Previous/next links computed within the current tab only. */
+export function paginationForTab(
+	tabSidebar: SidebarEntry[],
+	paginationEnabled: boolean,
+	data: { prev?: PrevNextConfig; next?: PrevNextConfig },
+): { prev: SidebarLink | undefined; next: SidebarLink | undefined } {
+	const links = flatten(tabSidebar);
+	const index = links.findIndex((link) => link.isCurrent);
+	return {
+		prev: applyPrevNext(index > 0 ? links[index - 1] : undefined, paginationEnabled, data.prev),
+		next: applyPrevNext(index > -1 ? links[index + 1] : undefined, paginationEnabled, data.next),
+	};
+}
