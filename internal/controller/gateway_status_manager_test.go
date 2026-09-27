@@ -22,8 +22,9 @@ limitations under the License.
 // the real GatewayReconciler and CloudflareTunnelReconciler wired through
 // SetupWithManager, a stateful fake Cloudflare API shared by both writers, a
 // dynamic-client watch recorder that captures the full persisted status
-// sequence, and a workqueue/metrics sampler that timestamps queue adds and
-// reconcile completions. The file intentionally depends only on production
+// sequence, tracing reconciler clients that attribute every client call to
+// its reconcile ID, and a log sink that records each reconcile's synchronous
+// invocation and result lines. The file intentionally depends only on production
 // symbols so it compiles unchanged against the pre-fix baseline (dd322e3) and
 // the post-fix tree: the GatewayReconciler APIReader field, which does not
 // exist on the baseline, is injected through reflection when present.
@@ -43,7 +44,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,7 +55,7 @@ import (
 
 	"github.com/cloudflare/cloudflare-go/v7/zero_trust"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
-	dto "github.com/prometheus/client_model/go"
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -70,9 +73,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -281,7 +284,6 @@ func managerTunnelOf(event managerWatchEvent) (*v1alpha1.CloudflareTunnel, error
 	return &tunnel, nil
 }
 
-
 // managerConditionIndex maps condition type to status for one object.
 func managerConditionIndex(conditions []metav1.Condition) map[string]metav1.Condition {
 	out := make(map[string]metav1.Condition, len(conditions))
@@ -324,162 +326,108 @@ func managerConditionSummary(tunnel *v1alpha1.CloudflareTunnel) string {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics sampler: timestamps queue adds and reconcile completions
+// Metrics sampler: timestamps reconcile completions and their results
 // ---------------------------------------------------------------------------
 
-type managerMetricSample struct {
-	At         time.Time
-	Adds       float64
-	Reconciles float64
-	WorkSum    float64
+// Reconcile results as controller_runtime_reconcile_total labels them.
+// managerResult* mirror controller-runtime's reconcile_total result labels.
+// managerResultRateLimited covers "error" and "requeue", both rate-limited.
+const (
+	managerResultRequeueAfter = "requeue_after"
+	managerResultSuccess      = "success"
+	managerResultRateLimited  = "rate_limited"
+)
+
+// ---------------------------------------------------------------------------
+// Lifecycle sink: per-reconcile invocation and result through the manager log
+// ---------------------------------------------------------------------------
+
+// managerLifecycleSink observes controller-runtime's per-reconcile lifecycle
+// log lines, which the reconcile handler emits synchronously on the reconcile
+// goroutine at V(5) through the LogConstructor logger: "Reconciling" right
+// before invoking Reconcile, "Reconcile done, requeueing after <d>" or
+// "Reconcile done, requeueing" or "Reconcile successful" after it returns, and
+// "Reconciler error" on failure. That makes each reconcile's invocation and
+// result exact: aggregate metric sampling cannot preserve completion order
+// when one interval mixes result labels.
+//
+// Enabled reports true through level 5 so the lifecycle lines reach the sink;
+// every non-lifecycle message is discarded, matching the previous behavior
+// where the test manager's logs went nowhere.
+type managerLifecycleSink struct {
+	trace  *managerTrace
+	values []any
 }
 
-// managerMetricsSampler polls the controller-runtime registry so queue adds
-// and reconcile completions carry wall-clock times. Sampling granularity is a
-// few milliseconds, far below the 2s periodic requeue the liveness contract
-// distinguishes against.
-type managerMetricsSampler struct {
-	mu      sync.Mutex
-	samples map[string][]managerMetricSample
-	done    chan struct{}
-	wg      sync.WaitGroup
-}
+// Init implements logr.LogSink.
+func (s *managerLifecycleSink) Init(logr.RuntimeInfo) {}
 
-func newManagerMetricsSampler() *managerMetricsSampler {
-	sampler := &managerMetricsSampler{
-		samples: map[string][]managerMetricSample{},
-		done:    make(chan struct{}),
-	}
-	sampler.wg.Add(1)
-	go sampler.run()
-	return sampler
-}
+// Enabled implements logr.LogSink.
+func (s *managerLifecycleSink) Enabled(level int) bool { return level <= 5 }
 
-func (s *managerMetricsSampler) run() {
-	defer s.wg.Done()
-	ticker := time.NewTicker(3 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		s.collect()
-		select {
-		case <-s.done:
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (s *managerMetricsSampler) collect() {
-	families, err := controllermetrics.Registry.Gather()
-	if err != nil {
-		return
-	}
-	at := time.Now()
-	adds := map[string]float64{}
-	reconciles := map[string]float64{}
-	work := map[string]float64{}
-	for _, family := range families {
-		for _, metric := range family.GetMetric() {
-			name := metricLabel(metric, "name")
-			controller := metricLabel(metric, "controller")
-			switch family.GetName() {
-			case "workqueue_adds_total":
-				if name != "" {
-					adds[name] += metric.GetCounter().GetValue()
-				}
-			case "workqueue_work_duration_seconds":
-				if name != "" {
-					work[name] += metric.GetHistogram().GetSampleSum()
-				}
-			case "controller_runtime_reconcile_total":
-				if controller != "" {
-					reconciles[controller] += metric.GetCounter().GetValue()
-				}
+func (s *managerLifecycleSink) controllerName() string {
+	for i := 0; i+1 < len(s.values); i += 2 {
+		if key, ok := s.values[i].(string); ok && key == "controller" {
+			if name, ok := s.values[i+1].(string); ok {
+				return name
 			}
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, controller := range []string{"gateway", "cloudflaretunnel"} {
-		s.samples[controller] = append(s.samples[controller], managerMetricSample{
-			At:         at,
-			Adds:       adds[controller],
-			Reconciles: reconciles[controller],
-			WorkSum:    work[controller],
-		})
-	}
-}
-
-func metricLabel(metric *dto.Metric, label string) string {
-	for _, pair := range metric.GetLabel() {
-		if pair.GetName() == label {
-			return pair.GetValue()
 		}
 	}
 	return ""
 }
 
-func (s *managerMetricsSampler) close() {
-	close(s.done)
-	s.wg.Wait()
-}
-
-func (s *managerMetricsSampler) snapshot(controller string) []managerMetricSample {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]managerMetricSample(nil), s.samples[controller]...)
-}
-
-// countAt returns the counter value of the last sample at or before t.
-func (s *managerMetricsSampler) countAt(controller string, t time.Time, pick func(managerMetricSample) float64) float64 {
-	samples := s.snapshot(controller)
-	value := 0.0
-	for _, sample := range samples {
-		if sample.At.After(t) {
-			break
-		}
-		value = pick(sample)
-	}
-	return value
-}
-
-// firstIncreaseAfter returns the sampling time of the first counter increase
-// strictly after t, or the zero time when no increase was observed yet.
-func (s *managerMetricsSampler) firstIncreaseAfter(controller string, t time.Time, pick func(managerMetricSample) float64) time.Time {
-	samples := s.snapshot(controller)
-	base := s.countAt(controller, t, pick)
-	for _, sample := range samples {
-		if !sample.At.After(t) {
-			continue
-		}
-		if pick(sample) > base {
-			return sample.At
+func (s *managerLifecycleSink) reconcileID() types.UID {
+	for i := 0; i+1 < len(s.values); i += 2 {
+		if key, ok := s.values[i].(string); ok && key == "reconcileID" {
+			if id, ok := s.values[i+1].(types.UID); ok {
+				return id
+			}
+			if id, ok := s.values[i+1].(string); ok {
+				return types.UID(id)
+			}
 		}
 	}
-	return time.Time{}
+	return ""
 }
 
-// lastIncreaseBefore returns the sampling time of the most recent counter
-// increase at or before t.
-func (s *managerMetricsSampler) lastIncreaseBefore(controller string, t time.Time, pick func(managerMetricSample) float64) time.Time {
-	samples := s.snapshot(controller)
-	var last time.Time
-	previous := 0.0
-	for _, sample := range samples {
-		if sample.At.After(t) {
-			break
-		}
-		if pick(sample) > previous {
-			last = sample.At
-		}
-		previous = pick(sample)
+// Info implements logr.LogSink.
+func (s *managerLifecycleSink) Info(_ int, msg string, _ ...any) {
+	id := s.reconcileID()
+	if id == "" {
+		return
 	}
-	return last
+	switch {
+	case msg == "Reconciling":
+		s.trace.invoked(s.controllerName(), id)
+	case msg == "Reconcile successful":
+		s.trace.ended(id, managerResultSuccess)
+	case strings.HasPrefix(msg, "Reconcile done, requeueing after"):
+		s.trace.ended(id, managerResultRequeueAfter)
+	case msg == "Reconcile done, requeueing":
+		s.trace.ended(id, managerResultRateLimited)
+	}
 }
 
-func managerPickAdds(sample managerMetricSample) float64       { return sample.Adds }
-func managerPickReconciles(sample managerMetricSample) float64 { return sample.Reconciles }
-func managerPickWork(sample managerMetricSample) float64       { return sample.WorkSum }
+// Error implements logr.LogSink.
+func (s *managerLifecycleSink) Error(_ error, msg string, _ ...any) {
+	if msg != "Reconciler error" {
+		return
+	}
+	if id := s.reconcileID(); id != "" {
+		s.trace.ended(id, managerResultRateLimited)
+	}
+}
+
+// WithValues implements logr.LogSink.
+func (s *managerLifecycleSink) WithValues(kv ...any) logr.LogSink {
+	values := make([]any, 0, len(s.values)+len(kv))
+	values = append(values, s.values...)
+	values = append(values, kv...)
+	return &managerLifecycleSink{trace: s.trace, values: values}
+}
+
+// WithName implements logr.LogSink.
+func (s *managerLifecycleSink) WithName(string) logr.LogSink { return s }
 
 // ---------------------------------------------------------------------------
 // Reconcile-activity clocks
@@ -500,6 +448,583 @@ func (c *managerClock) now() time.Time {
 	return at
 }
 
+// ---------------------------------------------------------------------------
+// Reconcile tracer: per-reconcile start, reads, and writes
+// ---------------------------------------------------------------------------
+
+// managerTracedObject is one object revision a traced call observed.
+type managerTracedObject struct {
+	Kind string
+	Key  types.NamespacedName
+	RV   int64
+	At   time.Time
+	// Direct marks reads through the reconciler's APIReader. Those are
+	// diagnostic revalidations and write bases, not the reconcile's operative
+	// input, so they never prove consumption of a stimulus.
+	Direct bool
+}
+
+// managerTracedWrite is one successful traced write and the revision the API
+// server returned for it; the commit happened inside [Start, End].
+type managerTracedWrite struct {
+	managerTracedObject
+	Start time.Time
+	End   time.Time
+}
+
+// managerReconcileEntry is one reconcile, keyed by its controller-runtime
+// reconcile ID. InvokedAt is when the reconcile handler logged "Reconciling"
+// right before calling Reconcile; Start is when its first client call began.
+// EndedAt is the synchronous lifecycle timestamp for its result; Last is when
+// its latest client call returned. Result mirrors the reconcile_total label.
+type managerReconcileEntry struct {
+	Controller string
+	ID         types.UID
+	InvokedAt  time.Time
+	Start      time.Time
+	Last       time.Time
+	EndedAt    time.Time
+	ResultSeen bool
+	Result     string
+	Reads      []managerTracedObject
+	Writes     []managerTracedWrite
+}
+
+// beginAt is the reconcile's invocation, or its first client call when the
+// lifecycle line is absent.
+func (e *managerReconcileEntry) beginAt() time.Time {
+	if !e.InvokedAt.IsZero() {
+		return e.InvokedAt
+	}
+	return e.Start
+}
+
+// endAt is when the reconcile result was recorded, or its last client call.
+func (e *managerReconcileEntry) endAt() time.Time {
+	if !e.EndedAt.IsZero() {
+		return e.EndedAt
+	}
+	return e.Last
+}
+
+// consumed reports whether the reconcile read the stimulus object at or after
+// the stimulus revision through its cached client. APIReader revalidations
+// (Direct) do not count: the gate evaluated its own earlier read, so a
+// diagnostic hit does not prove the stimulus drove this pass.
+func (e *managerReconcileEntry) consumed(stim managerStimulus) bool {
+	for _, read := range e.Reads {
+		if !read.Direct && read.Kind == stim.Kind && read.Key == stim.Key && read.RV >= stim.RV {
+			return true
+		}
+	}
+	return false
+}
+
+// stimulusReadAt returns when the reconcile's first qualifying client read
+// observed the stimulus revision, and whether that happened.
+func (e *managerReconcileEntry) stimulusReadAt(stim managerStimulus) (time.Time, bool) {
+	for _, read := range e.Reads {
+		if !read.Direct && read.Kind == stim.Kind && read.Key == stim.Key && read.RV >= stim.RV {
+			return read.At, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// managerTrace attributes the reconcilers' client calls to reconciles through
+// controller.ReconcileIDFromContext. Calls outside a reconcile (watch map
+// functions, setup) carry no ID and are not recorded.
+type managerTrace struct {
+	mu      sync.Mutex
+	entries []*managerReconcileEntry
+	byID    map[types.UID]*managerReconcileEntry
+	// gate, when armed for a controller, holds reconcile invocations at the
+	// synchronous "Reconciling" lifecycle line - immediately before Reconcile
+	// runs - so a test-controlled write can commit before any new invocation
+	// starts. Invocations record their time at release, which is after the
+	// write returned, making "commit < invocation" provable instead of
+	// ambiguous. Only test-side writes arm it; recorder stimuli never do.
+	gateController string
+	gateRelease    chan struct{}
+}
+
+func newManagerTrace() *managerTrace {
+	return &managerTrace{byID: map[types.UID]*managerReconcileEntry{}}
+}
+
+func (tr *managerTrace) entryFor(controllerName string, id types.UID) *managerReconcileEntry {
+	entry := tr.byID[id]
+	if entry == nil {
+		entry = &managerReconcileEntry{Controller: controllerName, ID: id}
+		tr.byID[id] = entry
+		tr.entries = append(tr.entries, entry)
+	}
+	return entry
+}
+
+// armGate holds the next reconcile invocations of controllerName at the
+// "Reconciling" lifecycle line until release runs. The caller must run
+// release exactly once, on every path, after the controlled write returned.
+func (tr *managerTrace) armGate(controllerName string) (release func()) {
+	releaseCh := make(chan struct{})
+	tr.mu.Lock()
+	tr.gateController = controllerName
+	tr.gateRelease = releaseCh
+	tr.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			tr.mu.Lock()
+			armed := tr.gateRelease == releaseCh
+			if armed {
+				tr.gateController = ""
+				tr.gateRelease = nil
+			}
+			tr.mu.Unlock()
+			if armed {
+				close(releaseCh)
+			}
+		})
+	}
+}
+
+// releaseAllGates drops any armed gate; used on teardown so a blocked worker
+// can exit.
+func (tr *managerTrace) releaseAllGates() {
+	tr.mu.Lock()
+	release := tr.gateRelease
+	tr.gateController = ""
+	tr.gateRelease = nil
+	tr.mu.Unlock()
+	if release != nil {
+		close(release)
+	}
+}
+
+// invoked records the "Reconciling" lifecycle line. When a gate is armed for
+// this controller the invocation waits at the gate; its recorded time is the
+// release instant, which the gate caller guarantees is after the stimulus
+// write returned - the invocation provably follows the commit.
+func (tr *managerTrace) invoked(controllerName string, id types.UID) {
+	tr.mu.Lock()
+	gate := tr.gateRelease
+	gated := tr.gateController == controllerName && gate != nil
+	tr.mu.Unlock()
+	if gated {
+		<-gate
+	}
+	invokedAt := time.Now()
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	entry := tr.entryFor(controllerName, id)
+	entry.InvokedAt = invokedAt
+}
+
+// ended records the reconcile's result lifecycle line.
+func (tr *managerTrace) ended(id types.UID, result string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	entry := tr.byID[id]
+	if entry == nil {
+		return
+	}
+	entry.ResultSeen = true
+	entry.Result = result
+	entry.EndedAt = time.Now()
+}
+
+func (tr *managerTrace) record(ctx context.Context, controllerName string, start, end time.Time, reads []managerTracedObject, write *managerTracedWrite) {
+	id := controller.ReconcileIDFromContext(ctx)
+	if id == "" {
+		return
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	entry := tr.entryFor(controllerName, id)
+	if entry.Start.IsZero() {
+		entry.Start = start
+	}
+	if end.After(entry.Last) {
+		entry.Last = end
+	}
+	entry.Reads = append(entry.Reads, reads...)
+	if write != nil {
+		entry.Writes = append(entry.Writes, *write)
+	}
+}
+
+func (tr *managerTrace) get(ctx context.Context, controllerName string, reader client.Reader, key client.ObjectKey, obj client.Object, direct bool, opts ...client.GetOption) error {
+	start := time.Now()
+	err := reader.Get(ctx, key, obj, opts...)
+	var reads []managerTracedObject
+	if err == nil {
+		if read, ok := managerTracedObjectOf(obj); ok {
+			read.At = time.Now()
+			read.Direct = direct
+			reads = append(reads, read)
+		}
+	}
+	tr.record(ctx, controllerName, start, time.Now(), reads, nil)
+	return err
+}
+
+func (tr *managerTrace) list(ctx context.Context, controllerName string, reader client.Reader, list client.ObjectList, direct bool, opts ...client.ListOption) error {
+	start := time.Now()
+	err := reader.List(ctx, list, opts...)
+	var reads []managerTracedObject
+	if err == nil {
+		at := time.Now()
+		_ = meta.EachListItem(list, func(item runtime.Object) error {
+			if read, ok := managerTracedObjectOf(item); ok {
+				read.At = at
+				read.Direct = direct
+				reads = append(reads, read)
+			}
+			return nil
+		})
+	}
+	tr.record(ctx, controllerName, start, time.Now(), reads, nil)
+	return err
+}
+
+// recordWrite records a write call; obj holds the server response after a
+// successful call.
+func (tr *managerTrace) recordWrite(ctx context.Context, controllerName string, start time.Time, obj any, err error) {
+	end := time.Now()
+	var write *managerTracedWrite
+	if err == nil {
+		if written, ok := managerTracedObjectOf(obj); ok {
+			write = &managerTracedWrite{managerTracedObject: written, Start: start, End: end}
+		}
+	}
+	tr.record(ctx, controllerName, start, end, nil, write)
+}
+
+// snapshot returns copies of one controller's entries in dispatch order.
+func (tr *managerTrace) snapshot(controllerName string) []managerReconcileEntry {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	out := make([]managerReconcileEntry, 0, len(tr.entries))
+	for _, entry := range tr.entries {
+		if entry.Controller != controllerName {
+			continue
+		}
+		copied := *entry
+		copied.Reads = slices.Clone(entry.Reads)
+		copied.Writes = slices.Clone(entry.Writes)
+		out = append(out, copied)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].beginAt().Before(out[j].beginAt()) })
+	return out
+}
+
+// writeProducing returns the traced reconciler write whose response carried
+// revision rv for the object.
+func (tr *managerTrace) writeProducing(kind string, key types.NamespacedName, rv int64) (managerTracedWrite, bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for _, entry := range tr.entries {
+		for _, write := range entry.Writes {
+			if write.Kind == kind && write.Key == key && write.RV == rv {
+				return write, true
+			}
+		}
+	}
+	return managerTracedWrite{}, false
+}
+
+// countSince returns how many reconciles of the controller were invoked at or
+// after t.
+func (tr *managerTrace) countSince(controllerName string, t time.Time) int {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	count := 0
+	for _, entry := range tr.entries {
+		if entry.Controller == controllerName && !entry.beginAt().Before(t) {
+			count++
+		}
+	}
+	return count
+}
+
+// workSince sums the recorded end-to-invocation spans of the controller's
+// reconciles invoked at or after t.
+func (tr *managerTrace) workSince(controllerName string, t time.Time) time.Duration {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	var total time.Duration
+	for _, entry := range tr.entries {
+		if entry.Controller != controllerName || entry.beginAt().Before(t) || entry.endAt().IsZero() {
+			continue
+		}
+		total += entry.endAt().Sub(entry.beginAt())
+	}
+	return total
+}
+
+// managerTracedObjectOf reads kind, key, and resourceVersion from a typed
+// object, an unstructured object, or an unstructured apply configuration.
+func managerTracedObjectOf(obj any) (managerTracedObject, bool) {
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return managerTracedObject{}, false
+	}
+	rv, err := strconv.ParseInt(accessor.GetResourceVersion(), 10, 64)
+	if err != nil {
+		return managerTracedObject{}, false
+	}
+	return managerTracedObject{
+		Kind: managerKindOf(obj),
+		Key:  types.NamespacedName{Namespace: accessor.GetNamespace(), Name: accessor.GetName()},
+		RV:   rv,
+	}, true
+}
+
+// managerKindOf names the object kind without a scheme lookup: unstructured
+// objects carry it, typed objects are named by their Go type.
+func managerKindOf(obj any) string {
+	if named, ok := obj.(interface{ GetKind() string }); ok {
+		return named.GetKind()
+	}
+	typ := reflect.TypeOf(obj)
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	return typ.Name()
+}
+
+// managerTracingReader traces a reconciler's APIReader.
+type managerTracingReader struct {
+	client.Reader
+	trace      *managerTrace
+	controller string
+}
+
+func (r *managerTracingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return r.trace.get(ctx, r.controller, r.Reader, key, obj, true, opts...)
+}
+
+func (r *managerTracingReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return r.trace.list(ctx, r.controller, r.Reader, list, true, opts...)
+}
+
+// managerTracingClient traces a reconciler's Client: reads with the revisions
+// they returned, and writes with the revisions the API server returned.
+type managerTracingClient struct {
+	client.Client
+	trace      *managerTrace
+	controller string
+}
+
+func (c *managerTracingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.trace.get(ctx, c.controller, c.Client, key, obj, false, opts...)
+}
+
+func (c *managerTracingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return c.trace.list(ctx, c.controller, c.Client, list, false, opts...)
+}
+
+func (c *managerTracingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	start := time.Now()
+	err := c.Client.Create(ctx, obj, opts...)
+	c.trace.recordWrite(ctx, c.controller, start, obj, err)
+	return err
+}
+
+func (c *managerTracingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	start := time.Now()
+	err := c.Client.Update(ctx, obj, opts...)
+	c.trace.recordWrite(ctx, c.controller, start, obj, err)
+	return err
+}
+
+func (c *managerTracingClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	start := time.Now()
+	err := c.Client.Patch(ctx, obj, patch, opts...)
+	c.trace.recordWrite(ctx, c.controller, start, obj, err)
+	return err
+}
+
+func (c *managerTracingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	start := time.Now()
+	err := c.Client.Delete(ctx, obj, opts...)
+	c.trace.record(ctx, c.controller, start, time.Now(), nil, nil)
+	return err
+}
+
+func (c *managerTracingClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	start := time.Now()
+	err := c.Client.Apply(ctx, obj, opts...)
+	c.trace.recordWrite(ctx, c.controller, start, obj, err)
+	return err
+}
+
+func (c *managerTracingClient) Status() client.SubResourceWriter {
+	return &managerTracingStatus{SubResourceWriter: c.Client.Status(), trace: c.trace, controller: c.controller}
+}
+
+// managerTracingStatus traces status writes, including unstructured status
+// Apply calls whose response is decoded into the apply configuration.
+type managerTracingStatus struct {
+	client.SubResourceWriter
+	trace      *managerTrace
+	controller string
+}
+
+func (s *managerTracingStatus) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	start := time.Now()
+	err := s.SubResourceWriter.Update(ctx, obj, opts...)
+	s.trace.recordWrite(ctx, s.controller, start, obj, err)
+	return err
+}
+
+func (s *managerTracingStatus) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	start := time.Now()
+	err := s.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	s.trace.recordWrite(ctx, s.controller, start, obj, err)
+	return err
+}
+
+func (s *managerTracingStatus) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	start := time.Now()
+	err := s.SubResourceWriter.Apply(ctx, obj, opts...)
+	s.trace.recordWrite(ctx, s.controller, start, obj, err)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Wakeup oracle (QA §6)
+// ---------------------------------------------------------------------------
+
+// managerStimulus is the event whose watch wakeup an assertion proves: the
+// object revision it committed and bounds on the commit instant.
+type managerStimulus struct {
+	What     string
+	Kind     string
+	Key      types.NamespacedName
+	RV       int64
+	CommitLB time.Time // the write call began; the commit is not earlier
+	CommitUB time.Time // the write call returned; the commit is not later
+}
+
+func (s managerStimulus) String() string {
+	return fmt.Sprintf("%s (%s %s rv=%d, written %s-%s)", s.What, s.Kind, s.Key, s.RV,
+		s.CommitLB.Format("15:04:05.000"), s.CommitUB.Format("15:04:05.000"))
+}
+
+// managerWakeup is the oracle's verdict. Undecided verdicts wait for more
+// reconciles.
+type managerWakeup struct {
+	Decided  bool
+	Pass     bool
+	Consumer *managerReconcileEntry
+	Deadline time.Time
+	Detail   string
+}
+
+// managerWakeupVerdict judges the QA §6 causal chain for one stimulus over a
+// controller's reconciles in dispatch order: a reconcile invoked after the
+// stimulus commit that read the committed revision through its operative
+// (cached) client must have been invoked before the periodic expiry pending
+// at the stimulus.
+//
+// The pending expiry comes from the last reconcile invoked at or before the
+// write began and its synchronously recorded result (entry.Result). A
+// RequeueAfter armed by it cannot dispatch before that reconcile's recorded
+// end plus interval, because controller-runtime arms the timer after
+// Reconcile returns; that bound is the deadline even when it already elapsed,
+// since an elapsed lower bound does not prove the timer fired. A result
+// without a timer (success) leaves the event as the only wakeup: the deadline
+// stays informational and a qualifying consumer passes on causality alone.
+// An error or requeue result arms a rate-limited retry that can dispatch at
+// any time, so no wakeup is attributable to the stimulus; a missing result
+// makes the pending window unknowable. Both return undecided terminal
+// verdicts (Decided=false, Detail set) rather than a fabricated deadline.
+//
+// Admission requires invocation at or after CommitUB: only an invocation
+// provably after the commit satisfies "event commit < reconcile start". An
+// entry invoked inside the write call that later reads the new revision is
+// ambiguous - it proves no causality - but it is not a miss either, so it is
+// skipped. Completion times play no part: the timer is consumed by the
+// event's enqueue, so a slow consuming reconcile cannot miss it.
+func managerWakeupVerdict(entries []managerReconcileEntry, stim managerStimulus, interval time.Duration) managerWakeup {
+	deadline := stim.CommitUB.Add(interval)
+	timer := false
+	for index := len(entries) - 1; index >= 0; index-- {
+		previous := entries[index]
+		if previous.beginAt().After(stim.CommitLB) {
+			continue
+		}
+		switch {
+		case !previous.ResultSeen && index == len(entries)-1:
+			// The predecessor may still be running; its result decides
+			// whether a periodic timer is pending, so keep waiting.
+			return managerWakeup{Deadline: deadline}
+		case !previous.ResultSeen:
+			// Single-worker dispatch means a completed predecessor always
+			// carries a recorded result; its absence makes the pending
+			// window unknowable, not a deadline.
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"reconcile %s dispatched before the stimulus has no recorded result, so its pending queue state is unknown", previous.ID)}
+		case previous.Result == managerResultSuccess:
+			// No timer armed; the event is the only possible wakeup.
+		case previous.Result == managerResultRateLimited:
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"reconcile %s dispatched before the stimulus returned a rate-limited retry, which can dispatch at any time", previous.ID)}
+		default:
+			timer = true
+			deadline = previous.endAt().Add(interval)
+		}
+		break
+	}
+	// ambiguous marks a reconcile that read the stimulus revision before the
+	// deadline but was invoked inside (or before) the write call: it proves
+	// nothing about causality, yet it means the revision was consumed before
+	// expiry, so a miss can no longer be asserted.
+	ambiguous := false
+	for index := range entries {
+		entry := &entries[index]
+		admitted := !entry.beginAt().Before(stim.CommitUB)
+		if entry.consumed(stim) {
+			if admitted {
+				if !timer {
+					// No timer was pending; the event is the only wakeup.
+					return managerWakeup{Decided: true, Pass: true, Consumer: entry, Deadline: deadline}
+				}
+				if entry.beginAt().Before(deadline) {
+					return managerWakeup{Decided: true, Pass: true, Consumer: entry, Deadline: deadline}
+				}
+				return managerWakeup{Decided: true, Consumer: entry, Deadline: deadline, Detail: fmt.Sprintf(
+					"the first reconcile that read the revision (%s) was invoked at %s, not before the pending periodic expiry %s",
+					entry.ID, entry.beginAt().Format("15:04:05.000"), deadline.Format("15:04:05.000"))}
+			}
+			if at, ok := entry.stimulusReadAt(stim); ok && at.Before(deadline) {
+				ambiguous = true
+			}
+		}
+		if entry.beginAt().Before(deadline) {
+			// Still inside the pending window; later entries may consume.
+			continue
+		}
+		// A dispatch at or after the deadline exists; single-worker
+		// execution means every earlier reconcile already ran.
+		switch {
+		case timer && !ambiguous:
+			return managerWakeup{Decided: true, Deadline: deadline, Detail: fmt.Sprintf(
+				"no reconcile read the revision before the pending periodic expiry %s", deadline.Format("15:04:05.000"))}
+		case ambiguous:
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"a reconcile invoked inside the stimulus write read the revision before %s, so causality is unprovable", deadline.Format("15:04:05.000"))}
+		default:
+			return managerWakeup{Deadline: deadline, Detail: fmt.Sprintf(
+				"no admitted consumer by %s and no pending timer bounds the wait", deadline.Format("15:04:05.000"))}
+		}
+	}
+	// Ambiguity alone never ends the wait: a later reconcile may still prove
+	// the wakeup. Only a closed window (a dispatch at or after the deadline)
+	// makes an ambiguous verdict terminal.
+	return managerWakeup{Deadline: deadline}
+}
 
 // ---------------------------------------------------------------------------
 // Stateful fake Cloudflare API shared by both reconcilers
@@ -627,7 +1152,6 @@ func (f *managerRemote) configVersion(tunnelID string) int64 {
 	defer f.mu.Unlock()
 	return f.configs[tunnelID].Version
 }
-
 
 func (f *managerRemote) CreateTunnel(_ context.Context, name string) (flarecloudflare.Tunnel, error) {
 	f.mu.Lock()
@@ -867,6 +1391,14 @@ func (f *managerRemote) DeleteDNSRecord(_ context.Context, zoneID, recordID stri
 	return nil
 }
 
+// hasDNSRecord reports whether the fake remote holds the record.
+func (f *managerRemote) hasDNSRecord(zoneID, recordID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.dns[zoneID][recordID]
+	return ok
+}
+
 func managerDNSRecordFromInput(id string, input flarecloudflare.DNSRecordInput) flarecloudflare.DNSRecord {
 	record := flarecloudflare.DNSRecord{
 		ID: id, Name: input.Name, Type: "CNAME", Content: input.Content, Comment: input.Comment,
@@ -1052,7 +1584,6 @@ func (p *managerSnapshotPublisher) LastNACK(key string) (string, string, bool) {
 	return nack.version, nack.detail, ok
 }
 
-
 func (p *managerSnapshotPublisher) ack(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1079,7 +1610,7 @@ type managerHarness struct {
 	gatewayReconciler *GatewayReconciler
 	direct            client.Client
 	recorder          *managerWatchRecorder
-	metrics           *managerMetricsSampler
+	trace             *managerTrace
 	remote            *managerRemote
 	prober            *managerProber
 	snapshots         *managerSnapshotPublisher
@@ -1148,9 +1679,13 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 		t.Fatalf("add flareway scheme: %v", err)
 	}
 
+	trace := newManagerTrace()
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:  scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
+		// The lifecycle sink sees each reconcile's synchronous invocation and
+		// result lines; other manager log output is discarded as before.
+		Logger: logr.New(&managerLifecycleSink{trace: trace}),
 		// Every test in this package runs its own manager in the same process;
 		// controller-runtime's global name registry would otherwise reject the
 		// second "gateway"/"cloudflaretunnel" registration.
@@ -1187,7 +1722,7 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 		apiReader: mgr.GetAPIReader(),
 		direct:    direct,
 		recorder:  recorder,
-		metrics:   newManagerMetricsSampler(),
+		trace:     trace,
 		remote:    remote,
 		prober:    &managerProber{ready: true},
 		snapshots: newManagerSnapshotPublisher(),
@@ -1204,8 +1739,10 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	t.Cleanup(h.close)
 
+	// Both reconcilers run through tracing clients so every reconcile's start,
+	// reads, and writes are attributable to its reconcile ID.
 	gatewayReconciler := &GatewayReconciler{
-		Client:            mgr.GetClient(),
+		Client:            &managerTracingClient{Client: mgr.GetClient(), trace: h.trace, controller: "gateway"},
 		Scheme:            scheme,
 		Snapshots:         h.snapshots,
 		BuildSnapshot:     translator.Build,
@@ -1215,13 +1752,13 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 		Prober:            h.prober,
 		SweepEvents:       h.sweep,
 	}
-	managerSetAPIReader(gatewayReconciler, mgr.GetAPIReader())
+	managerSetAPIReader(gatewayReconciler, &managerTracingReader{Reader: mgr.GetAPIReader(), trace: h.trace, controller: "gateway"})
 	h.gatewayReconciler = gatewayReconciler
 	if err := gatewayReconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup GatewayReconciler: %v", err)
 	}
 	tunnelReconciler := &CloudflareTunnelReconciler{
-		Client:            mgr.GetClient(),
+		Client:            &managerTracingClient{Client: mgr.GetClient(), trace: h.trace, controller: "cloudflaretunnel"},
 		Scheme:            scheme,
 		OperatorNamespace: dataplane.DefaultOperatorNamespace,
 		Now:               h.tunClock.now,
@@ -1230,7 +1767,7 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 			return remote, nil
 		},
 	}
-	managerSetAPIReader(tunnelReconciler, mgr.GetAPIReader())
+	managerSetAPIReader(tunnelReconciler, &managerTracingReader{Reader: mgr.GetAPIReader(), trace: h.trace, controller: "cloudflaretunnel"})
 	if opts.configure != nil {
 		opts.configure(gatewayReconciler, tunnelReconciler)
 	}
@@ -1252,6 +1789,7 @@ func newManagerHarnessOpts(t *testing.T, opts managerHarnessOpts) *managerHarnes
 }
 
 func (h *managerHarness) close() {
+	h.trace.releaseAllGates()
 	h.cancel()
 	if h.started.Load() {
 		select {
@@ -1264,7 +1802,6 @@ func (h *managerHarness) close() {
 		h.t.Errorf("manager exited with error: %v", err)
 	}
 	h.recorder.close()
-	h.metrics.close()
 }
 
 // managerSetAPIReader injects the manager APIReader into the reconciler when
@@ -1624,6 +2161,46 @@ func (h *managerHarness) updateTunnelStatus(t *testing.T, key types.NamespacedNa
 	return committed
 }
 
+// managerDNSStimulusManager owns the status.dnsRecords entry QA-92-38 applies
+// as its stimulus. A dedicated server-side-apply manager can release the
+// entry; an Update-written one stays co-owned after the tunnel controller
+// writes the same key and values, and survives the controller's removal at
+// teardown.
+const managerDNSStimulusManager = "qa92-38-stimulus"
+
+// applyTunnelDNSRecords server-side-applies status.dnsRecords under
+// managerDNSStimulusManager and returns the write as a stimulus. Empty records
+// release every field the manager owns.
+func (h *managerHarness) applyTunnelDNSRecords(t *testing.T, key types.NamespacedName, records []v1alpha1.CloudflareTunnelDNSRecordStatus) managerStimulus {
+	t.Helper()
+	tunnel := &unstructured.Unstructured{}
+	tunnel.SetGroupVersionKind(v1alpha1.GroupVersion.WithKind("CloudflareTunnel"))
+	tunnel.SetNamespace(key.Namespace)
+	tunnel.SetName(key.Name)
+	if len(records) > 0 {
+		entries := make([]any, 0, len(records))
+		for index := range records {
+			entry, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&records[index])
+			if err != nil {
+				t.Fatalf("convert dnsRecords entry: %v", err)
+			}
+			entries = append(entries, entry)
+		}
+		if err := unstructured.SetNestedSlice(tunnel.Object, entries, "status", "dnsRecords"); err != nil {
+			t.Fatalf("set dnsRecords: %v", err)
+		}
+	}
+	// Hold Gateway invocations at their synchronous start until the apply
+	// returns, so the consuming reconcile provably begins after the commit.
+	release := h.trace.armGate("gateway")
+	defer release()
+	start := time.Now()
+	if err := h.direct.Status().Apply(h.ctx, client.ApplyConfigurationFromUnstructured(tunnel), client.FieldOwner(managerDNSStimulusManager), client.ForceOwnership); err != nil {
+		t.Fatalf("apply tunnel dnsRecords: %v", err)
+	}
+	return h.stimulusOf(t, "dnsRecords entry", tunnel, start, time.Now())
+}
+
 // deleteFixture removes the fixture objects and waits for the tunnel and
 // Gateway to disappear so the next test's manager starts from a clean cache.
 func (h *managerHarness) deleteFixture(t *testing.T, f *managerFixture) {
@@ -1798,29 +2375,79 @@ func (h *managerHarness) waitConverged(t *testing.T, f *managerFixture) {
 	f.tunnel = h.getTunnel(t, f.tunnelKey)
 }
 
-// assertEventDriven proves the QA §6 causal chain for one controller: a
-// reconcile completes after the event and before the earlier of (a) the next
-// periodic requeue deadline or (b) event+interval. For a quiescent controller
-// there is no pending timer, so (b) bounds the evidence. Error backoff is
-// excluded because the asserted paths return nil errors.
-func (h *managerHarness) assertEventDriven(t *testing.T, controller string, interval time.Duration, eventAt time.Time, what string) time.Time {
+// assertEventDriven proves the QA §6 causal chain for one stimulus: a
+// reconcile of the controller invoked after the stimulus commit that read
+// the committed revision through its operative client was invoked before
+// the periodic expiry pending at the stimulus (managerWakeupVerdict). The
+// verdict uses synchronous lifecycle records only; the 30s poll is a
+// harness bound, not an SLA. A verdict carrying Detail without Decided is
+// terminal-undecided: polling longer cannot resolve it.
+func (h *managerHarness) assertEventDriven(t *testing.T, controllerName string, interval time.Duration, stim managerStimulus) {
 	t.Helper()
-	deadline := eventAt.Add(interval)
-	if last := h.metrics.lastIncreaseBefore(controller, eventAt, managerPickReconciles); !last.IsZero() && last.Add(interval).After(eventAt) {
-		deadline = last.Add(interval)
+	timeout := time.Now().Add(30 * time.Second)
+	var verdict managerWakeup
+	for {
+		verdict = managerWakeupVerdict(h.trace.snapshot(controllerName), stim, interval)
+		if verdict.Decided || verdict.Detail != "" || time.Now().After(timeout) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	var doneAt time.Time
-	h.waitFor(t, 4*time.Second, controller+" reconcile after "+what, func() (bool, error) {
-		doneAt = h.metrics.firstIncreaseAfter(controller, eventAt, managerPickReconciles)
-		return !doneAt.IsZero(), nil
+	if !verdict.Pass {
+		h.dumpTrace(t, controllerName, stim)
+		detail := verdict.Detail
+		if !verdict.Decided && detail == "" {
+			detail = "no reconcile read the revision within the harness timeout"
+		}
+		t.Fatalf("%s: %s wakeup not proven: %s", stim, controllerName, detail)
+	}
+	t.Logf("%s: %s reconcile %s invoked %s, pending expiry %s", stim, controllerName, verdict.Consumer.ID,
+		verdict.Consumer.beginAt().Format("15:04:05.000"), verdict.Deadline.Format("15:04:05.000"))
+}
+
+// stimulusOf describes a write the test made; obj holds the server response.
+func (h *managerHarness) stimulusOf(t *testing.T, what string, obj client.Object, start, end time.Time) managerStimulus {
+	t.Helper()
+	written, ok := managerTracedObjectOf(obj)
+	if !ok {
+		t.Fatalf("%s: written %T carries no resourceVersion", what, obj)
+	}
+	return managerStimulus{What: what, Kind: written.Kind, Key: written.Key, RV: written.RV, CommitLB: start, CommitUB: end}
+}
+
+// tunnelEventStimulus correlates a recorded tunnel event with the traced
+// reconciler write whose response carried its revision.
+func (h *managerHarness) tunnelEventStimulus(t *testing.T, event managerWatchEvent, what string) managerStimulus {
+	t.Helper()
+	recorded, ok := managerTracedObjectOf(event.Obj)
+	if !ok {
+		t.Fatalf("%s: recorded event carries no resourceVersion", what)
+	}
+	var write managerTracedWrite
+	h.waitFor(t, 15*time.Second, "traced reconciler write of "+what, func() (bool, error) {
+		write, ok = h.trace.writeProducing(recorded.Kind, recorded.Key, recorded.RV)
+		return ok, nil
 	})
-	addAt := h.metrics.firstIncreaseAfter(controller, eventAt, managerPickAdds)
-	t.Logf("%s: event=%s add=%s reconcile-done=%s deadline=%s", what,
-		eventAt.Format("15:04:05.000"), addAt.Format("15:04:05.000"), doneAt.Format("15:04:05.000"), deadline.Format("15:04:05.000"))
-	if !doneAt.Before(deadline) {
-		t.Fatalf("%s: %s reconcile at %s did not precede periodic deadline %s", what, controller, doneAt, deadline)
+	return managerStimulus{What: what, Kind: recorded.Kind, Key: recorded.Key, RV: recorded.RV, CommitLB: write.Start, CommitUB: write.End}
+}
+
+// dumpTrace logs the controller's reconciles around a stimulus as failure
+// evidence.
+func (h *managerHarness) dumpTrace(t *testing.T, controllerName string, stim managerStimulus) {
+	t.Helper()
+	for index, entry := range h.trace.snapshot(controllerName) {
+		if entry.Last.Before(stim.CommitLB.Add(-5 * time.Second)) {
+			continue
+		}
+		read := int64(-1)
+		for _, object := range entry.Reads {
+			if object.Kind == stim.Kind && object.Key == stim.Key && object.RV > read {
+				read = object.RV
+			}
+		}
+		t.Logf("trace %s #%d %s invoked=%s end=%s result=%q stimulus-object-rv=%d", controllerName, index, entry.ID,
+			entry.beginAt().Format("15:04:05.000"), entry.endAt().Format("15:04:05.000"), entry.Result, read)
 	}
-	return doneAt
 }
 
 // waitQuiescent waits until a full window passes with no gateway reconcile
@@ -1833,10 +2460,10 @@ func (h *managerHarness) waitQuiescent(t *testing.T, f *managerFixture, window t
 	t.Helper()
 	h.waitFor(t, 30*time.Second, "quiescent window", func() (bool, error) {
 		start := time.Now()
-		base := h.metrics.countAt("gateway", start, managerPickReconciles)
+		base := h.trace.countSince("gateway", start)
 		deadline := start.Add(window)
 		for time.Now().Before(deadline) {
-			if h.metrics.countAt("gateway", time.Now(), managerPickReconciles) != base {
+			if h.trace.countSince("gateway", start) != base {
 				return false, nil
 			}
 			if len(h.recorder.modifiedAfter(managerTunnelGVR, f.tunnelKey, start)) != 0 {
@@ -1848,20 +2475,34 @@ func (h *managerHarness) waitQuiescent(t *testing.T, f *managerFixture, window t
 	})
 }
 
-// freshWindow waits for one more gateway reconcile completion and returns the
-// time just after it, giving the following stimulus a full periodic interval
-// of headroom so an event-caused reconcile is distinguishable from the timer.
-func (h *managerHarness) freshWindow(t *testing.T) time.Time {
+// freshWindow opens a stimulus window behind a no-event control period (QA §6
+// item 4): it waits for a gateway reconcile that started no earlier than its
+// predecessor's last client call plus programmedRequeue — no event dispatched
+// a reconcile for a full period — and returns once that reconcile completed,
+// so the timer it armed leaves the stimulus a full period of headroom.
+func (h *managerHarness) freshWindow(t *testing.T) {
 	t.Helper()
-	now := time.Now()
-	var doneAt time.Time
-	h.waitFor(t, 4*time.Second, "periodic reconcile boundary", func() (bool, error) {
-		doneAt = h.metrics.firstIncreaseAfter("gateway", now, managerPickReconciles)
-		return !doneAt.IsZero(), nil
+	since := time.Now()
+	var boundary types.UID
+	h.waitFor(t, 15*time.Second, "gateway reconcile after a quiet period", func() (bool, error) {
+		entries := h.trace.snapshot("gateway")
+		for index := 1; index < len(entries); index++ {
+			if entries[index].beginAt().After(since) && !entries[index].beginAt().Before(entries[index-1].endAt().Add(programmedRequeue)) {
+				boundary = entries[index].ID
+				return true, nil
+			}
+		}
+		return false, nil
 	})
-	return time.Now()
+	h.waitFor(t, 15*time.Second, "quiet-period reconcile completion", func() (bool, error) {
+		for _, entry := range h.trace.snapshot("gateway") {
+			if entry.ID == boundary {
+				return entry.ResultSeen, nil
+			}
+		}
+		return false, nil
+	})
 }
-
 
 // assertTunnelIntegrity checks every recorded tunnel revision for the QA-92-23
 // invariant: no torn Ready/ConfigApplied pair and no duplicate condition type.
@@ -1951,15 +2592,14 @@ func TestQA92_02_ConvergedTunnelStatusQuiescent(t *testing.T) {
 	start := time.Now()
 	tunnel := h.getTunnel(t, f.tunnelKey)
 	baseRV := tunnel.ResourceVersion
-	baseReconciles := h.metrics.countAt("gateway", start, managerPickReconciles)
 
 	window := 4 * time.Second
 	time.Sleep(window)
 
 	modified := h.recorder.modifiedAfter(managerTunnelGVR, f.tunnelKey, start)
 	current := h.getTunnel(t, f.tunnelKey)
-	reconciles := h.metrics.countAt("gateway", time.Now(), managerPickReconciles) - baseReconciles
-	t.Logf("QA-92-02 window=%s modified=%d rv %s->%s gateway-reconciles=%.0f",
+	reconciles := h.trace.countSince("gateway", start)
+	t.Logf("QA-92-02 window=%s modified=%d rv %s->%s gateway-reconciles=%d",
 		window, len(modified), baseRV, current.ResourceVersion, reconciles)
 	h.dumpTunnelSequence(t, f, start)
 	if len(modified) != 0 {
@@ -1969,7 +2609,7 @@ func TestQA92_02_ConvergedTunnelStatusQuiescent(t *testing.T) {
 		t.Fatalf("converged tunnel resourceVersion moved %s -> %s", baseRV, current.ResourceVersion)
 	}
 	if reconciles != 0 {
-		t.Fatalf("converged gateway self-triggered %.0f reconciles in %s", reconciles, window)
+		t.Fatalf("converged gateway self-triggered %d reconciles in %s", reconciles, window)
 	}
 	h.assertTunnelIntegrity(t, f)
 }
@@ -2238,6 +2878,7 @@ func TestQA92_35_TunnelIDStatusWakeup(t *testing.T) {
 	// The tunnel controller provisions the remote tunnel and records
 	// status.tunnelId; that status-only event must wake the Gateway, which
 	// then consumes the assigned ID (remote reads/writes against it).
+	var idEvent managerWatchEvent
 	var idEventAt time.Time
 	h.waitFor(t, 30*time.Second, "status.tunnelId write", func() (bool, error) {
 		for _, event := range h.recorder.events(managerTunnelGVR, &f.tunnelKey) {
@@ -2245,7 +2886,7 @@ func TestQA92_35_TunnelIDStatusWakeup(t *testing.T) {
 			if err != nil || tunnel.Status.TunnelID == "" {
 				continue
 			}
-			idEventAt = event.At
+			idEvent, idEventAt = event, event.At
 			return true, nil
 		}
 		return false, nil
@@ -2253,7 +2894,7 @@ func TestQA92_35_TunnelIDStatusWakeup(t *testing.T) {
 	if idEventAt.IsZero() {
 		t.Fatal("no tunnelId status event recorded")
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, idEventAt, "tunnelId assignment")
+	h.assertEventDriven(t, "gateway", programmedRequeue, h.tunnelEventStimulus(t, idEvent, "tunnelId assignment"))
 
 	// Before the tunnelId event the Gateway could not have written remote
 	// configuration for this tunnel; after the full tuple lands it must.
@@ -2288,6 +2929,7 @@ func TestQA92_36_ConnectorTokenWakeup(t *testing.T) {
 	// The tunnel controller captures the connector token (G6) and records
 	// status.connectorTokenSecretRef; that status-only event must wake the
 	// Gateway into dataplane verification.
+	var refEvent managerWatchEvent
 	var refEventAt time.Time
 	h.waitFor(t, 30*time.Second, "connectorTokenSecretRef write", func() (bool, error) {
 		for _, event := range h.recorder.events(managerTunnelGVR, &f.tunnelKey) {
@@ -2295,7 +2937,7 @@ func TestQA92_36_ConnectorTokenWakeup(t *testing.T) {
 			if err != nil || tunnel.Status.ConnectorTokenSecretRef == nil {
 				continue
 			}
-			refEventAt = event.At
+			refEvent, refEventAt = event, event.At
 			return true, nil
 		}
 		return false, nil
@@ -2303,7 +2945,7 @@ func TestQA92_36_ConnectorTokenWakeup(t *testing.T) {
 	if refEventAt.IsZero() {
 		t.Fatal("no connectorTokenSecretRef status event recorded")
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, refEventAt, "connectorTokenSecretRef capture")
+	h.assertEventDriven(t, "gateway", programmedRequeue, h.tunnelEventStimulus(t, refEvent, "connectorTokenSecretRef capture"))
 
 	// The Gateway must not write remote configuration before credentials are
 	// recorded, and must write once they are.
@@ -2352,6 +2994,7 @@ func TestQA92_37_OwnershipVerifiedWakeup(t *testing.T) {
 	})
 	defer h.deleteFixture(t, f)
 
+	var verifiedEvent managerWatchEvent
 	var verifiedEventAt time.Time
 	h.waitFor(t, 30*time.Second, "ownershipVerified write", func() (bool, error) {
 		for _, event := range h.recorder.events(managerTunnelGVR, &f.tunnelKey) {
@@ -2359,7 +3002,7 @@ func TestQA92_37_OwnershipVerifiedWakeup(t *testing.T) {
 			if err != nil || !tunnel.Status.OwnershipVerified {
 				continue
 			}
-			verifiedEventAt = event.At
+			verifiedEvent, verifiedEventAt = event, event.At
 			return true, nil
 		}
 		return false, nil
@@ -2367,7 +3010,7 @@ func TestQA92_37_OwnershipVerifiedWakeup(t *testing.T) {
 	if verifiedEventAt.IsZero() {
 		t.Fatal("no ownershipVerified status event recorded")
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, verifiedEventAt, "ownershipVerified")
+	h.assertEventDriven(t, "gateway", programmedRequeue, h.tunnelEventStimulus(t, verifiedEvent, "ownershipVerified"))
 
 	for _, call := range h.remote.callsSince(time.Time{}, "UpdateTunnelConfiguration") {
 		if call.At.Before(verifiedEventAt) {
@@ -2383,6 +3026,10 @@ func TestQA92_37_OwnershipVerifiedWakeup(t *testing.T) {
 // ---------------------------------------------------------------------------
 // QA-92-38: managed dnsRecords entries wake the DNS-gated Gateway
 // ---------------------------------------------------------------------------
+
+// managerInjectedDNSRecordID marks the status-only dnsRecords entry QA-92-38
+// writes as its stimulus; no remote record carries it.
+const managerInjectedDNSRecordID = "qa92-38-injected"
 
 func TestQA92_38_DNSRecordsWakeup(t *testing.T) {
 	h := newManagerHarness(t)
@@ -2419,37 +3066,34 @@ func TestQA92_38_DNSRecordsWakeup(t *testing.T) {
 		return programmed != nil && programmed.Status == metav1.ConditionFalse, nil
 	})
 
-	// Unblock DNS: the tunnel controller records the compiled hostname entry;
-	// that status-only event must wake the Gateway into Programmed=True.
-	injectAt := h.freshWindow(t)
+	// Stimulus: after a quiet period, apply the compiled hostname's
+	// dnsRecords entry while DNS creation still fails, so the test — not the
+	// tunnel controller's retry timer — fixes where the event lands in the
+	// Gateway's requeue period. The DNS-error path preserves the live entry
+	// (it never clears dnsRecords), and clearing the failure afterwards lets
+	// the tunnel controller replace it with the real record. Releasing the
+	// stimulus manager's fields leaves the entry to the tunnel controller.
+	h.freshWindow(t)
+	records := h.applyTunnelDNSRecords(t, f.tunnelKey, []v1alpha1.CloudflareTunnelDNSRecordStatus{{
+		Hostname: f.hostname, RecordID: managerInjectedDNSRecordID, ZoneID: "zone-1", State: dnsRecordStateReady,
+	}})
+	defer h.applyTunnelDNSRecords(t, f.tunnelKey, nil)
 	h.remote.clearFail("CreateCNAME")
-	var recordsEventAt time.Time
-	h.waitFor(t, 30*time.Second, "dnsRecords entry write", func() (bool, error) {
-		for _, event := range h.recorder.events(managerTunnelGVR, &f.tunnelKey) {
-			if event.At.Before(injectAt) {
-				continue
-			}
-			tunnel, err := managerTunnelOf(event)
-			if err != nil {
-				continue
-			}
-			for _, record := range tunnel.Status.DNSRecords {
-				if record.Hostname == f.hostname && record.State != dnsRecordStateConflict {
-					recordsEventAt = event.At
-					return true, nil
-				}
-			}
-		}
-		return false, nil
-	})
-	if recordsEventAt.IsZero() {
-		t.Fatal("no dnsRecords status event recorded")
-	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, recordsEventAt, "dnsRecords entry")
+	h.assertEventDriven(t, "gateway", programmedRequeue, records)
 	h.waitFor(t, 30*time.Second, "Programmed=True", func() (bool, error) {
 		gateway := h.getGateway(t, f.gatewayKey)
 		programmed := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 		return programmed != nil && programmed.Status == metav1.ConditionTrue, nil
+	})
+	// The injected entry must give way to the record the tunnel controller
+	// actually created; waitConverged alone would accept the injected one.
+	h.waitFor(t, 30*time.Second, "real dnsRecords entry", func() (bool, error) {
+		for _, record := range h.getTunnel(t, f.tunnelKey).Status.DNSRecords {
+			if record.Hostname == f.hostname && record.RecordID != managerInjectedDNSRecordID && h.remote.hasDNSRecord(record.ZoneID, record.RecordID) {
+				return true, nil
+			}
+		}
+		return false, nil
 	})
 	h.waitConverged(t, f)
 }
@@ -2471,7 +3115,6 @@ func TestQA92_39_PodProbeFailureWakeup(t *testing.T) {
 	// Flip the prober to not-ready and poke the Pod so the watch delivers the
 	// status-only wakeup the gate consumes.
 	h.prober.set(false, h.liveConfigVersionFn(f))
-	eventAt := time.Now()
 	var pod corev1.Pod
 	if err := h.direct.Get(h.ctx, types.NamespacedName{Namespace: f.namespace, Name: f.podName}, &pod); err != nil {
 		t.Fatalf("get pod: %v", err)
@@ -2480,10 +3123,17 @@ func TestQA92_39_PodProbeFailureWakeup(t *testing.T) {
 		pod.Annotations = map[string]string{}
 	}
 	pod.Annotations["qa92.probe"] = "down"
+	// Hold Gateway invocations at their synchronous start until the write
+	// returns, so the consuming reconcile provably begins after the commit.
+	release := h.trace.armGate("gateway")
+	defer release()
+	failureStart := time.Now()
 	if err := h.direct.Update(h.ctx, &pod); err != nil {
 		t.Fatalf("touch pod: %v", err)
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, eventAt, "pod probe failure")
+	stimulus := h.stimulusOf(t, "pod probe failure", &pod, failureStart, time.Now())
+	release()
+	h.assertEventDriven(t, "gateway", programmedRequeue, stimulus)
 
 	h.waitFor(t, 15*time.Second, "Programmed=False", func() (bool, error) {
 		gateway := h.getGateway(t, f.gatewayKey)
@@ -2497,17 +3147,26 @@ func TestQA92_39_PodProbeFailureWakeup(t *testing.T) {
 		return programmed != nil && programmed.Status == metav1.ConditionFalse, nil
 	})
 
-	// Recovery: probe healthy again, poke the Pod, Programmed returns.
+	// Recovery: the fail-closed Gateway requeues periodically, so the Pod
+	// poke follows a quiet period that leaves it a full period of headroom;
+	// probe healthy again, poke the Pod, Programmed returns.
+	h.freshWindow(t)
 	h.prober.set(true, h.liveConfigVersionFn(f))
-	recoverAt := time.Now()
 	if err := h.direct.Get(h.ctx, types.NamespacedName{Namespace: f.namespace, Name: f.podName}, &pod); err != nil {
 		t.Fatalf("get pod: %v", err)
 	}
 	pod.Annotations["qa92.probe"] = "up"
+	// Same write-time gate as the failure poke: the consumer provably
+	// begins after the commit.
+	release = h.trace.armGate("gateway")
+	defer release()
+	recoverStart := time.Now()
 	if err := h.direct.Update(h.ctx, &pod); err != nil {
 		t.Fatalf("touch pod: %v", err)
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, recoverAt, "pod probe recovery")
+	stimulus = h.stimulusOf(t, "pod probe recovery", &pod, recoverStart, time.Now())
+	release()
+	h.assertEventDriven(t, "gateway", programmedRequeue, stimulus)
 	h.waitFor(t, 15*time.Second, "Programmed=True after recovery", func() (bool, error) {
 		gateway := h.getGateway(t, f.gatewayKey)
 		programmed := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
@@ -2528,6 +3187,7 @@ func TestQA92_40_AdoptionTupleWakeup(t *testing.T) {
 	// ownershipVerified, connectorTokenSecretRef, gatewayRef/gatewayUid bound
 	// to the live Gateway UID, and deletedAt=nil. No remote configuration
 	// write may happen before the persisted tuple is complete.
+	var tupleEvent managerWatchEvent
 	var tupleEventAt time.Time
 	h.waitFor(t, 30*time.Second, "complete writer-guard tuple", func() (bool, error) {
 		gateway := h.getGateway(t, f.gatewayKey)
@@ -2537,7 +3197,7 @@ func TestQA92_40_AdoptionTupleWakeup(t *testing.T) {
 				continue
 			}
 			if managerTunnelTupleComplete(tunnel, gateway) {
-				tupleEventAt = event.At
+				tupleEvent, tupleEventAt = event, event.At
 				return true, nil
 			}
 		}
@@ -2551,7 +3211,7 @@ func TestQA92_40_AdoptionTupleWakeup(t *testing.T) {
 			t.Fatalf("remote config write at %s preceded complete tuple at %s", call.At, tupleEventAt)
 		}
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, tupleEventAt, "writer-guard tuple")
+	h.assertEventDriven(t, "gateway", programmedRequeue, h.tunnelEventStimulus(t, tupleEvent, "writer-guard tuple"))
 	h.waitConverged(t, f)
 	if len(h.remote.callsSince(tupleEventAt, "UpdateTunnelConfiguration")) == 0 {
 		t.Fatal("gateway never consumed the adoption tuple: no UpdateTunnelConfiguration call")
@@ -2574,13 +3234,19 @@ func TestQA92_41_SweepEventWakeup(t *testing.T) {
 	h.waitQuiescent(t, f, 1200*time.Millisecond)
 
 	// Drift the remote out of band, then deliver the sweep wakeup through the
-	// channel the real SetupWithManager wired.
+	// channel the real SetupWithManager wired. The event carries no new
+	// revision, so the reconcile it wakes consumes the current one.
 	tunnel := h.getTunnel(t, f.tunnelKey)
 	h.remote.setConfigVersion(tunnel.Status.TunnelID, tunnel.Status.ConfigVersion.Applied+7)
+	// Hold Gateway invocations until the send completes so the consumer
+	// provably begins after the stimulus.
+	release := h.trace.armGate("gateway")
+	defer release()
 	eventAt := time.Now()
 	h.sweep <- event.GenericEvent{Object: tunnel}
-
-	h.assertEventDriven(t, "gateway", programmedRequeue, eventAt, "sweep GenericEvent")
+	stimulus := h.stimulusOf(t, "sweep GenericEvent", tunnel, eventAt, time.Now())
+	release()
+	h.assertEventDriven(t, "gateway", programmedRequeue, stimulus)
 	h.waitFor(t, 15*time.Second, "DriftDetected=True with DriftHold", func() (bool, error) {
 		current := h.getTunnel(t, f.tunnelKey)
 		index := managerConditionIndex(current.Status.Conditions)
@@ -2623,9 +3289,16 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 	// account watch fired. The causal chain is: CloudflareAccount event →
 	// tunnel reconcile (the tunnel controller has no pending timer on the
 	// missing-account path) → tuple-complete status event → gateway reconcile.
+	// Hold tunnel invocations until the create returns so the consuming
+	// reconcile provably begins after the commit.
+	release := h.trace.armGate("cloudflaretunnel")
+	defer release()
 	eventAt := time.Now()
 	f.account = h.createAccount(t, f)
-	h.assertEventDriven(t, "cloudflaretunnel", tunnelRequeue, eventAt, "CloudflareAccount creation")
+	stimulus := h.stimulusOf(t, "CloudflareAccount creation", f.account, eventAt, time.Now())
+	release()
+	h.assertEventDriven(t, "cloudflaretunnel", tunnelRequeue, stimulus)
+	var tupleEvent managerWatchEvent
 	var tupleEventAt time.Time
 	h.waitFor(t, 30*time.Second, "complete writer-guard tuple", func() (bool, error) {
 		gateway := h.getGateway(t, f.gatewayKey)
@@ -2638,7 +3311,7 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 				continue
 			}
 			if managerTunnelTupleComplete(tunnel, gateway) {
-				tupleEventAt = event.At
+				tupleEvent, tupleEventAt = event, event.At
 				return true, nil
 			}
 		}
@@ -2647,25 +3320,17 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 	if tupleEventAt.IsZero() {
 		t.Fatal("no complete writer-guard tuple event recorded after account creation")
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, tupleEventAt, "tuple-complete status event")
+	h.assertEventDriven(t, "gateway", programmedRequeue, h.tunnelEventStimulus(t, tupleEvent, "tuple-complete status event"))
 
 	// The account-less fixture deferred dataplane wiring; now that the tunnel
 	// is provisioned the Deployment exists and the gate inputs can be armed.
 	h.ensureDataplane(t, f)
 
-	// Credential rotation: touching the account re-enqueues the Gateway; a
-	// broken credential Secret surfaces as a reconcile error, not silence.
+	// Account update: touching the CloudflareAccount re-enqueues the Gateway.
+	// Credentials stay valid here so the Secret→CloudflareTunnel→Gateway path
+	// cannot supply the wakeup instead of the account watch.
 	h.waitConverged(t, f)
 	h.waitQuiescent(t, f, 1200*time.Millisecond)
-	var secret corev1.Secret
-	if err := h.direct.Get(h.ctx, types.NamespacedName{Namespace: f.namespace, Name: f.secretName}, &secret); err != nil {
-		t.Fatalf("get credential secret: %v", err)
-	}
-	secret.Data["token"] = []byte("")
-	if err := h.direct.Update(h.ctx, &secret); err != nil {
-		t.Fatalf("break credential secret: %v", err)
-	}
-	rotateAt := time.Now()
 	var account v1alpha1.CloudflareAccount
 	if err := h.direct.Get(h.ctx, types.NamespacedName{Name: f.accountName}, &account); err != nil {
 		t.Fatalf("get account: %v", err)
@@ -2674,20 +3339,61 @@ func TestQA92_42_AccountMappingWakeup(t *testing.T) {
 		account.Annotations = map[string]string{}
 	}
 	account.Annotations["qa92.rotation"] = "1"
+	// Hold Gateway invocations until the update returns so the consuming
+	// reconcile provably begins after the commit.
+	release = h.trace.armGate("gateway")
+	defer release()
+	touchStart := time.Now()
 	if err := h.direct.Update(h.ctx, &account); err != nil {
 		t.Fatalf("touch account: %v", err)
 	}
-	h.assertEventDriven(t, "gateway", programmedRequeue, rotateAt, "account credential rotation")
+	stimulus = h.stimulusOf(t, "CloudflareAccount update", &account, touchStart, time.Now())
+	release()
+	h.assertEventDriven(t, "gateway", programmedRequeue, stimulus)
+
+	// Credential rotation: a broken credential Secret surfaces as a
+	// reconcile error, not silence.
+	var secret corev1.Secret
+	if err := h.direct.Get(h.ctx, types.NamespacedName{Namespace: f.namespace, Name: f.secretName}, &secret); err != nil {
+		t.Fatalf("get credential secret: %v", err)
+	}
+	secret.Data["token"] = []byte("")
+	if err := h.direct.Update(h.ctx, &secret); err != nil {
+		t.Fatalf("break credential secret: %v", err)
+	}
+	brokenRV, err := strconv.ParseInt(secret.ResourceVersion, 10, 64)
+	if err != nil {
+		t.Fatalf("broken secret resourceVersion %q: %v", secret.ResourceVersion, err)
+	}
+	rotateAt := time.Now()
+	account.Annotations["qa92.rotation"] = "2"
+	if err := h.direct.Update(h.ctx, &account); err != nil {
+		t.Fatalf("touch account: %v", err)
+	}
+	// A reconcile must surface the failure: it observed the broken Secret
+	// revision and returned an error (rate-limited result), not silence.
+	secretKey := types.NamespacedName{Namespace: f.namespace, Name: f.secretName}
 	h.waitFor(t, 15*time.Second, "credential failure surfaced", func() (bool, error) {
-		base := h.metrics.countAt("gateway", rotateAt, managerPickReconciles)
-		return h.metrics.countAt("gateway", time.Now(), managerPickReconciles) > base, nil
+		for _, controllerName := range []string{"gateway", "cloudflaretunnel"} {
+			for _, entry := range h.trace.snapshot(controllerName) {
+				if !entry.ResultSeen || entry.Result != managerResultRateLimited || entry.beginAt().Before(rotateAt) {
+					continue
+				}
+				for _, read := range entry.Reads {
+					if !read.Direct && read.Kind == "Secret" && read.Key == secretKey && read.RV == brokenRV {
+						return true, nil
+					}
+				}
+			}
+		}
+		return false, nil
 	})
 	// Restore credentials; the Gateway recovers through the same watch path.
 	secret.Data["token"] = []byte("qa92-token")
 	if err := h.direct.Update(h.ctx, &secret); err != nil {
 		t.Fatalf("restore credential secret: %v", err)
 	}
-	account.Annotations["qa92.rotation"] = "2"
+	account.Annotations["qa92.rotation"] = "3"
 	if err := h.direct.Update(h.ctx, &account); err != nil {
 		t.Fatalf("touch account: %v", err)
 	}
@@ -2724,10 +3430,10 @@ func TestQA92_43_ManagerChurnMeasurement(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	start := time.Now()
 	baseTunnel := h.getTunnel(t, f.tunnelKey)
-	baseGWReconciles := h.metrics.countAt("gateway", start, managerPickReconciles)
-	baseTunReconciles := h.metrics.countAt("cloudflaretunnel", start, managerPickReconciles)
-	baseGWWork := h.metrics.countAt("gateway", start, managerPickWork)
-	baseTunWork := h.metrics.countAt("cloudflaretunnel", start, managerPickWork)
+	baseGWReconciles := h.trace.countSince("gateway", time.Time{})
+	baseTunReconciles := h.trace.countSince("cloudflaretunnel", time.Time{})
+	baseGWWork := h.trace.workSince("gateway", time.Time{})
+	baseTunWork := h.trace.workSince("cloudflaretunnel", time.Time{})
 	baseCalls := len(h.remote.callsSince(time.Time{}, ""))
 
 	time.Sleep(managerQA92Window)
@@ -2738,10 +3444,10 @@ func TestQA92_43_ManagerChurnMeasurement(t *testing.T) {
 	measurement := managerQA92Measurement{
 		Suite:            "issue-92-manager",
 		WindowSeconds:    end.Sub(start).Seconds(),
-		GatewayReconcile: h.metrics.countAt("gateway", end, managerPickReconciles) - baseGWReconciles,
-		TunnelReconcile:  h.metrics.countAt("cloudflaretunnel", end, managerPickReconciles) - baseTunReconciles,
-		GatewayWorkSum:   h.metrics.countAt("gateway", end, managerPickWork) - baseGWWork,
-		TunnelWorkSum:    h.metrics.countAt("cloudflaretunnel", end, managerPickWork) - baseTunWork,
+		GatewayReconcile: float64(h.trace.countSince("gateway", time.Time{}) - baseGWReconciles),
+		TunnelReconcile:  float64(h.trace.countSince("cloudflaretunnel", time.Time{}) - baseTunReconciles),
+		GatewayWorkSum:   (h.trace.workSince("gateway", time.Time{}) - baseGWWork).Seconds(),
+		TunnelWorkSum:    (h.trace.workSince("cloudflaretunnel", time.Time{}) - baseTunWork).Seconds(),
 		TunnelModified:   len(modified),
 		RemoteCalls:      len(h.remote.callsSince(time.Time{}, "")) - baseCalls,
 		RemoteWrites:     len(h.remote.callsSince(start, "UpdateTunnelConfiguration")),
@@ -2783,4 +3489,130 @@ func rvDelta(before, after string) int {
 		return -1
 	}
 	return int(a - b)
+}
+
+// TestManagerWakeupVerdict pins the QA §6 wakeup oracle on synthetic traces.
+// It judges when the consuming reconcile started against the one periodic
+// expiry pending at the stimulus, never when a reconcile completed (#123).
+func TestManagerWakeupVerdict(t *testing.T) {
+	const interval = 2 * time.Second
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+	key := types.NamespacedName{Namespace: "qa", Name: "tunnel"}
+	stim := managerStimulus{What: "stimulus", Kind: "CloudflareTunnel", Key: key, RV: 10, CommitLB: at(1000), CommitUB: at(1010)}
+	// reconcile builds an entry: invoked at invokedMs, last client call and
+	// recorded end at lastMs, and it read the tunnel at revision rv at readMs.
+	// result is the recorded lifecycle result ("" means not seen yet).
+	reconcile := func(invokedMs, lastMs, readMs int, rv int64, direct bool, result string) managerReconcileEntry {
+		return managerReconcileEntry{
+			Controller: "gateway", InvokedAt: at(invokedMs), Start: at(invokedMs + 1), Last: at(lastMs),
+			EndedAt: at(lastMs), ResultSeen: result != "", Result: result,
+			Reads: []managerTracedObject{{Kind: "CloudflareTunnel", Key: key, RV: rv, At: at(readMs), Direct: direct}},
+		}
+	}
+	tests := []struct {
+		name     string
+		entries  []managerReconcileEntry
+		decided  bool
+		pass     bool
+		terminal bool // Detail set: polling cannot resolve the verdict
+		consumer time.Time
+	}{{
+		// #123: the woken reconcile was invoked right after the commit,
+		// before the pending expiry, and finished long after it.
+		name:    "invocation before the pending expiry passes regardless of completion",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1015, 2600, 1100, 10, false, managerResultRequeueAfter)},
+		decided: true, pass: true, consumer: at(1015),
+	}, {
+		name:    "a timer dispatch reading the revision fails",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(2200, 2400, 2210, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		// Invoked inside the stimulus write call: it read the revision
+		// before the deadline, so no miss can be asserted, but its start
+		// is not provably after the commit, so no pass either. The window
+		// has not closed, so the verdict keeps waiting.
+		name:    "a consumer invoked inside the write call is ambiguous",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1005, 1200, 1050, 10, false, managerResultRequeueAfter)},
+	}, {
+		// Invoked before the write began and read the old revision; the
+		// next reconcile missed the pending expiry.
+		name:    "a reconcile in flight at the write does not count",
+		entries: []managerReconcileEntry{reconcile(900, 1100, 905, 9, false, managerResultRequeueAfter), reconcile(3150, 3300, 3160, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		name:    "a stale read does not count",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1015, 1100, 1020, 9, false, managerResultRequeueAfter), reconcile(2250, 2300, 2260, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		// After a periodic dispatch the deadline stays the one pending at
+		// the stimulus; a newly armed timer does not extend it.
+		name:    "a re-dispatch after the pending expiry fails",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(2200, 2400, 2210, 10, false, managerResultRequeueAfter), reconcile(2410, 2500, 2420, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		// The predecessor's recorded end precedes its timer arm, so an
+		// elapsed lower bound never proves the timer already fired.
+		name:    "a timer armed late after its recorded end still bounds the wakeup",
+		entries: []managerReconcileEntry{reconcile(-1000, -990, -995, 9, false, managerResultRequeueAfter), reconcile(1100, 1200, 1110, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		name:    "no pending timer passes any admitted consumer",
+		entries: []managerReconcileEntry{reconcile(-500, -400, -490, 9, false, managerResultSuccess), reconcile(2900, 3000, 2910, 10, false, managerResultSuccess)},
+		decided: true, pass: true, consumer: at(2900),
+	}, {
+		// A rate-limited retry can dispatch at any time, so no wakeup is
+		// attributable to the stimulus.
+		name:     "an error backoff at the stimulus is unmeasurable",
+		entries:  []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRateLimited), reconcile(1015, 1200, 1020, 10, false, managerResultRateLimited)},
+		terminal: true,
+	}, {
+		// Single-worker order means a completed predecessor always has a
+		// recorded result; none seen means the pending window is unknown.
+		name:     "a predecessor without a recorded result is undecided",
+		entries:  []managerReconcileEntry{reconcile(-500, -400, -490, 9, false, ""), reconcile(2900, 3000, 2910, 10, false, managerResultRequeueAfter)},
+		terminal: true,
+	}, {
+		// An in-flight predecessor (the last entry has no result yet) can
+		// still arm a timer, so the verdict waits for its result.
+		name:    "an in-flight predecessor keeps waiting",
+		entries: []managerReconcileEntry{reconcile(900, 1100, 905, 9, false, "")},
+	}, {
+		name:    "an entry still before the deadline without the read stays undecided",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1015, 1020, 1017, 9, false, managerResultRequeueAfter)},
+	}, {
+		// A diagnostic APIReader read of the fresh revision does not prove
+		// the reconcile's operative view consumed the stimulus; the later
+		// consumer still missed the pending expiry.
+		name:    "a diagnostic direct read does not prove consumption",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1015, 1200, 1100, 9, false, managerResultRequeueAfter), reconcile(1015, 1200, 1150, 10, true, managerResultRequeueAfter), reconcile(2210, 2300, 2220, 10, false, managerResultRequeueAfter)},
+		decided: true,
+	}, {
+		// The ambiguous consumer plus a dispatch past the deadline: the
+		// revision was consumed before expiry, but no reconcile proves
+		// the event caused it, so the verdict is terminal-undecided.
+		name:     "ambiguity past the closed window is terminal",
+		entries:  []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1005, 1200, 1050, 10, false, managerResultRequeueAfter), reconcile(2300, 2400, 2310, 9, false, managerResultRequeueAfter)},
+		terminal: true,
+	}, {
+		// An ambiguous read before the deadline does not block a later
+		// proven consumer: the admitted entry still wins the pass.
+		name:    "an admitted consumer after ambiguity passes",
+		entries: []managerReconcileEntry{reconcile(0, 200, 10, 9, false, managerResultRequeueAfter), reconcile(1005, 1200, 1050, 10, false, managerResultRequeueAfter), reconcile(1500, 1600, 1520, 10, false, managerResultRequeueAfter)},
+		decided: true, pass: true, consumer: at(1500),
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verdict := managerWakeupVerdict(tt.entries, stim, interval)
+			if verdict.Decided != tt.decided || verdict.Pass != tt.pass {
+				t.Fatalf("verdict decided=%v pass=%v (%s), want decided=%v pass=%v", verdict.Decided, verdict.Pass, verdict.Detail, tt.decided, tt.pass)
+			}
+			if terminal := !verdict.Decided && verdict.Detail != ""; terminal != tt.terminal {
+				t.Fatalf("verdict terminal=%v (%s), want %v", terminal, verdict.Detail, tt.terminal)
+			}
+			if tt.pass && !verdict.Consumer.beginAt().Equal(tt.consumer) {
+				t.Fatalf("consumer invoked %s, want %s", verdict.Consumer.beginAt(), tt.consumer)
+			}
+		})
+	}
 }
