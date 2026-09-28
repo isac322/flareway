@@ -1,0 +1,198 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-28T00:00:00Z",
+  "title": "Design System: Flareway",
+  "extensions": {
+    "colorMeta": {
+      "chart-paper": { "role": "neutral", "displayName": "Chart Paper", "canonical": "#fffaf2", "tonalRamp": ["oklch(15% 0.008 80)", "oklch(25% 0.012 80)", "oklch(38% 0.012 80)", "oklch(52% 0.012 80)", "oklch(66% 0.012 80)", "oklch(78% 0.012 80)", "oklch(88% 0.012 80)", "oklch(95% 0.004 80)"] },
+      "ink-navy": { "role": "neutral", "displayName": "Navy Ink", "canonical": "#172b4d", "tonalRamp": ["oklch(15% 0.047 260)", "oklch(25% 0.068 260)", "oklch(38% 0.068 260)", "oklch(52% 0.068 260)", "oklch(66% 0.068 260)", "oklch(78% 0.068 260)", "oklch(88% 0.068 260)", "oklch(95% 0.024 260)"] },
+      "ink-muted": { "role": "neutral", "displayName": "Muted Ink", "canonical": "#52627a", "tonalRamp": ["oklch(15% 0.030 258)", "oklch(25% 0.043 258)", "oklch(38% 0.043 258)", "oklch(52% 0.043 258)", "oklch(66% 0.043 258)", "oklch(78% 0.043 258)", "oklch(88% 0.043 258)", "oklch(95% 0.015 258)"] },
+      "hairline": { "role": "neutral", "displayName": "Hairline", "canonical": "#e3daca", "tonalRamp": ["oklch(15% 0.017 82)", "oklch(25% 0.024 82)", "oklch(38% 0.024 82)", "oklch(52% 0.024 82)", "oklch(66% 0.024 82)", "oklch(78% 0.024 82)", "oklch(88% 0.024 82)", "oklch(95% 0.008 82)"] },
+      "hairline-soft": { "role": "neutral", "displayName": "Hairline Soft", "canonical": "#efe6d6", "tonalRamp": ["oklch(15% 0.016 82)", "oklch(25% 0.023 82)", "oklch(38% 0.023 82)", "oklch(52% 0.023 82)", "oklch(66% 0.023 82)", "oklch(78% 0.023 82)", "oklch(88% 0.023 82)", "oklch(95% 0.008 82)"] },
+      "panel": { "role": "neutral", "displayName": "Panel White", "canonical": "#ffffff", "tonalRamp": ["oklch(15% 0.000 90)", "oklch(25% 0.000 90)", "oklch(38% 0.000 90)", "oklch(52% 0.000 90)", "oklch(66% 0.000 90)", "oklch(78% 0.000 90)", "oklch(88% 0.000 90)", "oklch(95% 0.000 90)"] },
+      "land-tint": { "role": "neutral", "displayName": "Land Tint", "canonical": "#fdf6ec", "tonalRamp": ["oklch(15% 0.011 77)", "oklch(25% 0.015 77)", "oklch(38% 0.015 77)", "oklch(52% 0.015 77)", "oklch(66% 0.015 77)", "oklch(78% 0.015 77)", "oklch(88% 0.015 77)", "oklch(95% 0.005 77)"] },
+      "warm-tint": { "role": "neutral", "displayName": "Warm Tint", "canonical": "#fcebd9", "tonalRamp": ["oklch(15% 0.021 69)", "oklch(25% 0.030 69)", "oklch(38% 0.030 69)", "oklch(52% 0.030 69)", "oklch(66% 0.030 69)", "oklch(78% 0.030 69)", "oklch(88% 0.030 69)", "oklch(95% 0.011 69)"] },
+      "cool-tint": { "role": "neutral", "displayName": "Cool Tint", "canonical": "#eef2f8", "tonalRamp": ["oklch(15% 0.006 258)", "oklch(25% 0.009 258)", "oklch(38% 0.009 258)", "oklch(52% 0.009 258)", "oklch(66% 0.009 258)", "oklch(78% 0.009 258)", "oklch(88% 0.009 258)", "oklch(95% 0.003 258)"] },
+      "channel-orange": { "role": "primary", "displayName": "Channel Orange", "canonical": "#e77b35", "tonalRamp": ["oklch(15% 0.109 50)", "oklch(25% 0.156 50)", "oklch(38% 0.156 50)", "oklch(52% 0.156 50)", "oklch(66% 0.156 50)", "oklch(78% 0.156 50)", "oklch(88% 0.156 50)", "oklch(95% 0.055 50)"] },
+      "orange-ink": { "role": "secondary", "displayName": "Orange Ink", "canonical": "#b5541c", "tonalRamp": ["oklch(15% 0.099 46)", "oklch(25% 0.142 46)", "oklch(38% 0.142 46)", "oklch(52% 0.142 46)", "oklch(66% 0.142 46)", "oklch(78% 0.142 46)", "oklch(88% 0.142 46)", "oklch(95% 0.050 46)"] },
+      "ink-deep": { "role": "neutral", "displayName": "Ink Deep", "canonical": "#0f1f3a", "tonalRamp": ["oklch(15% 0.039 260)", "oklch(25% 0.056 260)", "oklch(38% 0.056 260)", "oklch(52% 0.056 260)", "oklch(66% 0.056 260)", "oklch(78% 0.056 260)", "oklch(88% 0.056 260)", "oklch(95% 0.020 260)"] },
+      "code-panel": { "role": "neutral", "displayName": "Code Panel Navy", "canonical": "#172b4d", "tonalRamp": ["oklch(15% 0.047 260)", "oklch(25% 0.068 260)", "oklch(38% 0.068 260)", "oklch(52% 0.068 260)", "oklch(66% 0.068 260)", "oklch(78% 0.068 260)", "oklch(88% 0.068 260)", "oklch(95% 0.024 260)"] },
+      "code-ink": { "role": "neutral", "displayName": "Code Ink", "canonical": "#e6edf3", "tonalRamp": ["oklch(15% 0.008 244)", "oklch(25% 0.011 244)", "oklch(38% 0.011 244)", "oklch(52% 0.011 244)", "oklch(66% 0.011 244)", "oklch(78% 0.011 244)", "oklch(88% 0.011 244)", "oklch(95% 0.004 244)"] },
+      "code-key": { "role": "neutral", "displayName": "Code Key", "canonical": "#f5d3b8", "tonalRamp": ["oklch(15% 0.037 61)", "oklch(25% 0.053 61)", "oklch(38% 0.053 61)", "oklch(52% 0.053 61)", "oklch(66% 0.053 61)", "oklch(78% 0.053 61)", "oklch(88% 0.053 61)", "oklch(95% 0.018 61)"] },
+      "code-dim": { "role": "neutral", "displayName": "Code Dim", "canonical": "#a9b5c8", "tonalRamp": ["oklch(15% 0.021 260)", "oklch(25% 0.030 260)", "oklch(38% 0.030 260)", "oklch(52% 0.030 260)", "oklch(66% 0.030 260)", "oklch(78% 0.030 260)", "oklch(88% 0.030 260)", "oklch(95% 0.011 260)"] },
+      "code-gutter": { "role": "neutral", "displayName": "Code Gutter", "canonical": "#7f8fa8", "tonalRamp": ["oklch(15% 0.029 259)", "oklch(25% 0.042 259)", "oklch(38% 0.042 259)", "oklch(52% 0.042 259)", "oklch(66% 0.042 259)", "oklch(78% 0.042 259)", "oklch(88% 0.042 259)", "oklch(95% 0.015 259)"] },
+      "code-highlight": { "role": "primary", "displayName": "Code Line Highlight", "canonical": "rgb(231 123 53 / 0.16)", "tonalRamp": ["rgb(231 123 53 / 0.05)", "rgb(231 123 53 / 0.08)", "rgb(231 123 53 / 0.11)", "rgb(231 123 53 / 0.16)", "rgb(231 123 53 / 0.22)", "rgb(231 123 53 / 0.30)", "rgb(231 123 53 / 0.40)", "rgb(231 123 53 / 0.52)"] },
+      "kind-glow": { "role": "secondary", "displayName": "Kind Glow", "canonical": "#f4b585", "tonalRamp": ["oklch(15% 0.068 58)", "oklch(25% 0.097 58)", "oklch(38% 0.097 58)", "oklch(52% 0.097 58)", "oklch(66% 0.097 58)", "oklch(78% 0.097 58)", "oklch(88% 0.097 58)", "oklch(95% 0.034 58)"] },
+      "night-paper": { "role": "neutral", "displayName": "Night Paper", "canonical": "#161b22", "tonalRamp": ["oklch(15% 0.011 257)", "oklch(25% 0.016 257)", "oklch(38% 0.016 257)", "oklch(52% 0.016 257)", "oklch(66% 0.016 257)", "oklch(78% 0.016 257)", "oklch(88% 0.016 257)", "oklch(95% 0.005 257)"] },
+      "night-ink": { "role": "neutral", "displayName": "Night Ink", "canonical": "#e6edf3", "tonalRamp": ["oklch(15% 0.008 244)", "oklch(25% 0.011 244)", "oklch(38% 0.011 244)", "oklch(52% 0.011 244)", "oklch(66% 0.011 244)", "oklch(78% 0.011 244)", "oklch(88% 0.011 244)", "oklch(95% 0.004 244)"] },
+      "night-muted": { "role": "neutral", "displayName": "Night Muted", "canonical": "#9aa7bc", "tonalRamp": ["oklch(15% 0.024 260)", "oklch(25% 0.034 260)", "oklch(38% 0.034 260)", "oklch(52% 0.034 260)", "oklch(66% 0.034 260)", "oklch(78% 0.034 260)", "oklch(88% 0.034 260)", "oklch(95% 0.012 260)"] },
+      "night-hairline": { "role": "neutral", "displayName": "Night Hairline", "canonical": "#2e3644", "tonalRamp": ["oklch(15% 0.019 262)", "oklch(25% 0.027 262)", "oklch(38% 0.027 262)", "oklch(52% 0.027 262)", "oklch(66% 0.027 262)", "oklch(78% 0.027 262)", "oklch(88% 0.027 262)", "oklch(95% 0.010 262)"] },
+      "night-hairline-soft": { "role": "neutral", "displayName": "Night Hairline Soft", "canonical": "#232a35", "tonalRamp": ["oklch(15% 0.016 259)", "oklch(25% 0.023 259)", "oklch(38% 0.023 259)", "oklch(52% 0.023 259)", "oklch(66% 0.023 259)", "oklch(78% 0.023 259)", "oklch(88% 0.023 259)", "oklch(95% 0.008 259)"] },
+      "night-panel": { "role": "neutral", "displayName": "Night Panel", "canonical": "#1c2129", "tonalRamp": ["oklch(15% 0.012 260)", "oklch(25% 0.017 260)", "oklch(38% 0.017 260)", "oklch(52% 0.017 260)", "oklch(66% 0.017 260)", "oklch(78% 0.017 260)", "oklch(88% 0.017 260)", "oklch(95% 0.006 260)"] },
+      "night-tint": { "role": "neutral", "displayName": "Night Tint", "canonical": "#1a1f2a", "tonalRamp": ["oklch(15% 0.016 266)", "oklch(25% 0.022 266)", "oklch(38% 0.022 266)", "oklch(52% 0.022 266)", "oklch(66% 0.022 266)", "oklch(78% 0.022 266)", "oklch(88% 0.022 266)", "oklch(95% 0.008 266)"] },
+      "night-warm": { "role": "neutral", "displayName": "Night Warm", "canonical": "#2a2118", "tonalRamp": ["oklch(15% 0.015 67)", "oklch(25% 0.021 67)", "oklch(38% 0.021 67)", "oklch(52% 0.021 67)", "oklch(66% 0.021 67)", "oklch(78% 0.021 67)", "oklch(88% 0.021 67)", "oklch(95% 0.007 67)"] },
+      "night-cool": { "role": "neutral", "displayName": "Night Cool", "canonical": "#1d222b", "tonalRamp": ["oklch(15% 0.013 262)", "oklch(25% 0.019 262)", "oklch(38% 0.019 262)", "oklch(52% 0.019 262)", "oklch(66% 0.019 262)", "oklch(78% 0.019 262)", "oklch(88% 0.019 262)", "oklch(95% 0.007 262)"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Hero H1 only; 15ch max, tight -0.03em tracking." },
+      "headline": { "displayName": "Headline", "purpose": "Section H2s; 18-22ch measures." },
+      "title": { "displayName": "Title", "purpose": "H3s, output rows, footer group heads." },
+      "body": { "displayName": "Body", "purpose": "Prose at 17px/1.6; docs hold a 70ch measure." },
+      "lede": { "displayName": "Lede", "purpose": "Section intros in muted ink, 46-58ch." },
+      "label": { "displayName": "Label", "purpose": "Tabs, buttons, captions; no uppercase, no letter-spacing." },
+      "label-sm": { "displayName": "Label Small", "purpose": "Header chrome pills (GitHub button, menu, search)." },
+      "mono-label": { "displayName": "Mono Label", "purpose": "Chips, figure ratios, code-adjacent labels." },
+      "mono-voice": { "displayName": "Mono Voice", "purpose": "Display-size JetBrains Mono for technical statements (the 'without Flareway' list)." },
+      "note": { "displayName": "Chart Note", "purpose": "Alegreya italic for chart annotations and plate captions only." },
+      "code": { "displayName": "Code", "purpose": "Code panels at 13.5px/1.62; ligatures off." }
+    },
+    "shadows": [
+      { "name": "panel-lift", "value": "0 1px 2px rgb(23 43 77 / 0.06), 0 12px 32px -12px rgb(23 43 77 / 0.18)", "purpose": "Light theme: the single ambient shadow, reserved for the navy code panel and the star CTA." },
+      { "name": "panel-lift-dark", "value": "0 1px 2px rgb(0 0 0 / 0.3), 0 16px 40px -16px rgb(0 0 0 / 0.6)", "purpose": "Dark theme counterpart; code panels drop it for a hairline border." },
+      { "name": "plate-frame", "value": "inset 0 0 0 4px #ffffff, inset 0 0 0 5px #e3daca", "purpose": "Not an elevation — the lockup cartouche's double-rule frame (ink border + inset hairline)." }
+    ],
+    "motion": [
+      { "name": "ease-standard", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Shared ease for hovers, leaf swings, the star icon tilt, and line draws (--fw-ease)." },
+      { "name": "ease-swing", "value": "cubic-bezier(0.4, 0, 0.12, 1)", "purpose": "The load-time door swing on the hero lockup (fw-swing, 0.8s)." },
+      { "name": "ease-draw", "value": "cubic-bezier(0.3, 0, 0.2, 1)", "purpose": "The channel drawing itself down the gutter (fw-spine, 1.7s)." },
+      { "name": "press", "value": "transform: translateY(1px)", "purpose": "Button :active state — a 1px press, no bounce." },
+      { "name": "hover-nudge", "value": "transform: translateX(3px)", "purpose": "Arrow and star affordances drift 3px / tilt 12-14deg on hover." },
+      { "name": "door-slant", "value": "skewY(18deg)", "purpose": "The door leaf's resting swing angle (--fw-door-slant); the whole doorway motif depends on it." }
+    ],
+    "breakpoints": [
+      { "name": "mobile", "value": "640px", "purpose": "Spine pins to the left edge; content insets to keep 20px clear; hero CTAs go full-width." },
+      { "name": "docs-sidebar", "value": "800px (50rem)", "purpose": "Starlight's own breakpoint: sidebar, larger docs type scale, taller header bar." },
+      { "name": "stacked", "value": "1060px", "purpose": "Two-way split grids stack; tabs become a horizontal scroller under the brand row." },
+      { "name": "compact-tabs", "value": "1180px", "purpose": "Tab padding and header gaps tighten." },
+      { "name": "wide-channel", "value": "1321px", "purpose": "The gutter channel widens from 12px to its full 22px." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Main CTA; carries the doorway notch with an orange leaf that swings open on hover.",
+      "html": "<a class=\"ds-btn-primary\" href=\"#\">Get started<svg class=\"ds-arrow\" viewBox=\"0 0 20 20\" width=\"18\" height=\"18\" aria-hidden=\"true\"><path d=\"M4 10h11m-4.5-4.5L15 10l-4.5 4.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></a>",
+      "css": ".ds-btn-primary{position:relative;display:inline-flex;align-items:center;gap:10px;min-height:48px;padding:0 22px 0 40px;border-radius:10px;background:var(--fw-btn-bg,#172b4d);color:var(--fw-btn-ink,#fffaf2);font:600 16px/1.2 var(--fw-font-sans,system-ui,sans-serif);text-decoration:none;transition:background-color .2s cubic-bezier(.16,1,.3,1),transform .2s cubic-bezier(.16,1,.3,1)}.ds-btn-primary::before{content:'';position:absolute;left:17px;bottom:0;width:10px;height:15px;background:var(--fw-bg,#fffaf2);border-radius:1px 1px 0 0}.ds-btn-primary::after{content:'';position:absolute;left:18px;bottom:-3px;width:6px;height:16px;background:var(--fw-accent,#e77b35);transform-origin:0 100%;transition:transform .35s cubic-bezier(.16,1,.3,1)}.ds-btn-primary:hover{background:var(--fw-btn-hover,#0f1f3a)}.ds-btn-primary:hover::after,.ds-btn-primary:focus-visible::after{transform:skewY(18deg) scaleX(.8)}.ds-btn-primary:active{transform:translateY(1px)}.ds-btn-primary .ds-arrow{transition:transform .3s cubic-bezier(.16,1,.3,1)}.ds-btn-primary:hover .ds-arrow{transform:translateX(3px)}.ds-btn-primary:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Ghost companion to the primary CTA — hairline-bordered panel that darkens on hover.",
+      "html": "<a class=\"ds-btn-secondary\" href=\"#\"><svg viewBox=\"0 0 16 16\" width=\"18\" height=\"18\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M8 0c4.42 0 8 3.58 8 8a8.01 8.01 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A8 8 0 0 1 0 8c0-4.42 3.58-8 8-8Z\"/></svg>GitHub</a>",
+      "css": ".ds-btn-secondary{display:inline-flex;align-items:center;gap:10px;min-height:48px;padding:0 22px;border:1px solid var(--fw-line,#e3daca);border-radius:10px;background:var(--fw-panel,#fff);color:var(--fw-ink,#172b4d);font:600 16px/1.2 var(--fw-font-sans,system-ui,sans-serif);text-decoration:none;transition:border-color .2s,transform .2s cubic-bezier(.16,1,.3,1)}.ds-btn-secondary:hover{border-color:var(--fw-ink-2,#52627a)}.ds-btn-secondary:active{transform:translateY(1px)}.ds-btn-secondary:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px}"
+    },
+    {
+      "name": "Tertiary Link",
+      "kind": "button",
+      "refersTo": "button-tertiary",
+      "description": "The quiet third action — muted ink underlined, the underline warming to orange on hover.",
+      "html": "<a class=\"ds-tertiary\" href=\"#\">Render the chart locally with <code>helm template</code></a>",
+      "css": ".ds-tertiary{display:inline-block;margin-top:18px;font-size:15px;color:var(--fw-ink-2,#52627a);font-family:var(--fw-font-sans,system-ui,sans-serif);text-decoration:underline;text-decoration-color:var(--fw-line,#e3daca);text-underline-offset:.22em;transition:text-decoration-color .2s,color .2s}.ds-tertiary code{font-family:var(--fw-font-mono,ui-monospace,monospace);font-size:.88em;color:var(--fw-ink,#172b4d)}.ds-tertiary:hover{color:var(--fw-ink,#172b4d);text-decoration-color:var(--fw-accent,#e77b35)}.ds-tertiary:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px;border-radius:4px}"
+    },
+    {
+      "name": "Star CTA",
+      "kind": "button",
+      "refersTo": "button-star",
+      "description": "The closing-room button — taller, shadowed, rotating orange star, live count behind a hairline.",
+      "html": "<a class=\"ds-btn-star\" href=\"#\"><svg class=\"ds-star-icon\" viewBox=\"0 0 16 16\" width=\"26\" height=\"26\" aria-hidden=\"true\"><path class=\"ds-star-shape\" d=\"M8 1.2l2.05 4.3 4.7.6-3.45 3.25.87 4.66L8 11.73 3.83 14l.87-4.66L1.25 6.1l4.7-.6z\"/></svg>Star on GitHub<span class=\"ds-num\">1.2k</span></a>",
+      "css": ".ds-btn-star{display:inline-flex;align-items:center;gap:14px;min-height:64px;padding:0 34px 0 28px;border-radius:12px;background:var(--fw-btn-bg,#172b4d);color:var(--fw-btn-ink,#fffaf2);font:600 19px/1.2 var(--fw-font-sans,system-ui,sans-serif);text-decoration:none;box-shadow:var(--fw-shadow,0 1px 2px rgb(23 43 77/.06),0 12px 32px -12px rgb(23 43 77/.18));transition:background-color .2s cubic-bezier(.16,1,.3,1)}.ds-btn-star:hover{background:var(--fw-btn-hover,#0f1f3a)}.ds-btn-star .ds-star-icon{transition:transform .35s cubic-bezier(.16,1,.3,1)}.ds-btn-star .ds-star-shape{fill:var(--fw-accent,#e77b35);stroke:var(--fw-accent-ink,#b5541c);stroke-width:1;stroke-linejoin:round}.ds-btn-star:hover .ds-star-icon,.ds-btn-star:focus-visible .ds-star-icon{transform:rotate(-14deg) scale(1.12)}.ds-btn-star .ds-num{padding-left:14px;border-left:1px solid rgb(255 250 242/.3);font-weight:500;font-variant-numeric:tabular-nums}.ds-btn-star:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px}"
+    },
+    {
+      "name": "Header Tabs",
+      "kind": "nav",
+      "refersTo": "nav-tab",
+      "description": "Site tabs on the sticky header rule; the current one wears the doorway notch and swung-open leaf.",
+      "html": "<nav class=\"ds-tabs\"><ul><li><a href=\"#\" aria-current=\"true\">Overview</a></li><li><a href=\"#\">Docs</a></li><li><a href=\"#\">API</a></li></ul></nav>",
+      "css": ".ds-tabs ul{display:flex;gap:2px;margin:0;padding:0;list-style:none;font:500 15px var(--fw-font-sans,system-ui,sans-serif)}.ds-tabs a{display:block;position:relative;padding:8px 12px;border-radius:8px;color:var(--fw-ink-2,#52627a);text-decoration:none;white-space:nowrap;transition:color .2s,background-color .2s}.ds-tabs a:hover{color:var(--fw-ink,#172b4d);background:var(--fw-tint,#fdf6ec)}.ds-tabs a[aria-current]{color:var(--fw-ink,#172b4d);font-weight:600}.ds-tabs a[aria-current]::after{content:'';position:absolute;left:50%;bottom:-14px;width:18px;height:11px;margin-left:-9px;background:var(--fw-bg,#fffaf2);border:1px solid var(--fw-ink-2,#52627a);border-bottom:0}.ds-tabs a[aria-current]::before{content:'';position:absolute;left:50%;bottom:-17px;width:5px;height:11px;margin-left:-7px;background:var(--fw-accent,#e77b35);transform:skewY(18deg);transform-origin:0 0;z-index:1}.ds-tabs a:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px}"
+    },
+    {
+      "name": "GitHub Button",
+      "kind": "nav",
+      "refersTo": "gh-button",
+      "description": "Header pill with mark, label, and a hairline-separated star affordance that tilts on hover.",
+      "html": "<a class=\"ds-gh\" href=\"#\"><svg class=\"ds-gh-mark\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M8 0c4.42 0 8 3.58 8 8a8.01 8.01 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A8 8 0 0 1 0 8c0-4.42 3.58-8 8-8Z\"/></svg><span>GitHub</span><span class=\"ds-gh-star\"><svg class=\"ds-gh-star-ico\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path class=\"ds-star-shape\" d=\"M8 1.2l2.05 4.3 4.7.6-3.45 3.25.87 4.66L8 11.73 3.83 14l.87-4.66L1.25 6.1l4.7-.6z\"/></svg>Star<span class=\"ds-num\">1.2k</span></span></a>",
+      "css": ".ds-gh{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 12px;border:1px solid var(--fw-line,#e3daca);border-radius:8px;background:var(--fw-panel,#fff);color:var(--fw-ink,#172b4d);font:500 14px var(--fw-font-sans,system-ui,sans-serif);text-decoration:none;white-space:nowrap;transition:border-color .2s,background-color .2s}.ds-gh:hover{border-color:var(--fw-ink-2,#52627a)}.ds-gh-mark{width:18px;height:18px;flex:none}.ds-gh-star{display:inline-flex;align-items:center;gap:6px;margin-left:2px;padding-left:10px;border-left:1px solid var(--fw-line,#e3daca);color:var(--fw-ink-2,#52627a)}.ds-gh-star-ico{width:14px;height:14px;flex:none;transition:transform .3s cubic-bezier(.16,1,.3,1)}.ds-gh-star-ico .ds-star-shape{fill:var(--fw-accent,#e77b35);stroke:var(--fw-accent-ink,#b5541c);stroke-width:1;stroke-linejoin:round}.ds-gh:hover .ds-gh-star-ico,.ds-gh:focus-visible .ds-gh-star-ico{transform:rotate(-12deg) scale(1.1)}.ds-gh .ds-num{color:var(--fw-ink,#172b4d);font-weight:600;font-variant-numeric:tabular-nums}.ds-gh:focus-visible{outline:2px solid var(--fw-ink,#172b4d);outline-offset:3px}"
+    },
+    {
+      "name": "Origin Chip",
+      "kind": "chip",
+      "refersTo": "chip-origin",
+      "description": "True pill in mono, hairline-bordered — used for Direct-mode origin kinds.",
+      "html": "<ul class=\"ds-origins\"><li>tcp</li><li>ssh</li><li>rdp</li><li>bastion</li></ul>",
+      "css": ".ds-origins{display:flex;flex-wrap:wrap;gap:8px;margin:0;padding:0;list-style:none}.ds-origins li{padding:4px 12px;border:1px solid var(--fw-line,#e3daca);border-radius:999px;font:500 13px var(--fw-font-mono,ui-monospace,monospace);color:var(--fw-ink,#172b4d);background:var(--fw-panel,#fff)}"
+    },
+    {
+      "name": "Figure Card",
+      "kind": "card",
+      "refersTo": "figure-card",
+      "description": "The framed evidence plate — white panel, hairline border, caption row with a mono figure ratio.",
+      "html": "<figure class=\"ds-figure\"><div class=\"ds-figure-body\"><svg viewBox=\"0 0 200 60\" width=\"100%\" aria-hidden=\"true\"><rect x=\"8\" y=\"10\" width=\"56\" height=\"40\" rx=\"6\" fill=\"none\" stroke=\"#52627a\" stroke-width=\"1.2\" stroke-dasharray=\"4 4\"/><line x1=\"64\" y1=\"30\" x2=\"130\" y2=\"30\" stroke=\"#e77b35\" stroke-width=\"9\" stroke-linecap=\"round\"/><rect x=\"130\" y=\"10\" width=\"62\" height=\"40\" rx=\"6\" fill=\"#eef2f8\" stroke=\"#e3daca\" stroke-width=\"1.2\"/></svg></div><figcaption><span>Gateway · Tunnel · data plane</span><span class=\"ds-ratio\">fig. 1 — 1:1:1</span></figcaption></figure>",
+      "css": ".ds-figure{margin:0;background:var(--fw-panel,#fff);border:1px solid var(--fw-line,#e3daca);border-radius:16px;padding:clamp(14px,1.8vw,24px);position:relative}.ds-figure svg{display:block;width:100%;height:auto}.ds-figure figcaption{display:flex;justify-content:space-between;gap:12px 24px;font:400 13px var(--fw-font-sans,system-ui,sans-serif);color:var(--fw-ink-2,#52627a);padding:12px 4px 0;border-top:1px solid var(--fw-line-soft,#efe6d6);margin-top:10px}.ds-figure .ds-ratio{font-family:var(--fw-font-mono,ui-monospace,monospace);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}"
+    },
+    {
+      "name": "Code Panel",
+      "kind": "custom",
+      "refersTo": "code-panel",
+      "description": "The navy well — mono 13.5/1.62, tabular gutter numbers, orange edge-bar on the highlighted line. Navy in both themes.",
+      "html": "<div class=\"ds-code\"><div class=\"ds-code-file\"><b>gateway.yaml</b><button class=\"ds-copy\" type=\"button\">copy</button></div><pre class=\"ds-code-pre\"><span class=\"ds-l\" data-n=\"1\"><span class=\"ds-k\">kind</span><span class=\"ds-p\">:</span> <span class=\"ds-n\">Gateway</span></span><span class=\"ds-l hl\" data-n=\"2\"><span class=\"ds-k\">metadata</span><span class=\"ds-p\">:</span></span><span class=\"ds-l\" data-n=\"3\">  <span class=\"ds-k\">name</span><span class=\"ds-p\">:</span> <span class=\"ds-v\">edge</span></span></pre></div>",
+      "css": ".ds-code{background:var(--fw-code-bg,#172b4d);color:var(--fw-code-ink,#e6edf3);border-radius:16px;overflow:hidden;box-shadow:var(--fw-shadow,0 1px 2px rgb(23 43 77/.06),0 12px 32px -12px rgb(23 43 77/.18));font:400 13.5px/1.62 var(--fw-font-mono,ui-monospace,monospace);font-variant-ligatures:none}.ds-code-file{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 18px;border-bottom:1px solid rgb(230 237 243/.1);font-size:12.5px;color:var(--fw-code-dim,#a9b5c8)}.ds-code-file b{color:var(--fw-code-ink,#e6edf3);font-weight:600}.ds-copy{font:500 12px var(--fw-font-sans,system-ui,sans-serif);color:var(--fw-code-dim,#a9b5c8);background:transparent;border:1px solid rgb(230 237 243/.18);border-radius:6px;padding:4px 9px;cursor:pointer;transition:color .2s,border-color .2s}.ds-copy:hover{color:var(--fw-code-ink,#e6edf3);border-color:rgb(230 237 243/.4)}.ds-code-pre{margin:0;padding:12px 0 14px;overflow-x:auto}.ds-code-pre .ds-l{display:block;padding:0 18px 0 0;position:relative}.ds-code-pre .ds-l::before{content:attr(data-n);display:inline-block;width:44px;padding-right:16px;text-align:right;color:var(--fw-code-gutter,#7f8fa8);user-select:none;font-variant-numeric:tabular-nums}.ds-code-pre .ds-l::after{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--fw-accent,#e77b35);transform:scaleY(0);transition:transform .25s cubic-bezier(.16,1,.3,1)}.ds-code-pre .ds-l.hl{background:var(--fw-code-hl,rgb(231 123 53/.16))}.ds-code-pre .ds-l.hl::after{transform:none}.ds-code .ds-k{color:var(--fw-code-key,#f5d3b8)}.ds-code .ds-v{color:var(--fw-code-ink,#e6edf3)}.ds-code .ds-p{color:var(--fw-code-dim,#a9b5c8)}.ds-code .ds-n{color:var(--fw-landing-code-kind,#f4b585)}"
+    },
+    {
+      "name": "Doorway Divider",
+      "kind": "custom",
+      "refersTo": "figure-card",
+      "description": "The section rule the channel passes through — hairline broken by jamb ticks with the orange leaf swung across the gap.",
+      "html": "<div class=\"ds-doorway\" aria-hidden=\"true\"></div>",
+      "css": ".ds-doorway{--ds-gap-start:2.5rem;--ds-gap-width:18px;position:relative;height:12px;background:linear-gradient(var(--fw-line,#e3daca),var(--fw-line,#e3daca)) left bottom/var(--ds-gap-start) 1px no-repeat,linear-gradient(var(--fw-line,#e3daca),var(--fw-line,#e3daca)) right bottom/calc(100% - var(--ds-gap-start) - var(--ds-gap-width)) 1px no-repeat}.ds-doorway::before{content:'';position:absolute;left:calc(var(--ds-gap-start) - 1px);bottom:0;width:calc(var(--ds-gap-width) + 2px);height:11px;border:1px solid var(--fw-ink-2,#52627a);border-top:0;border-bottom:0}.ds-doorway::after{content:'';position:absolute;left:calc(var(--ds-gap-start) + 2px);bottom:-3px;width:5px;height:11px;background:var(--fw-accent,#e77b35);transform:skewY(18deg);transform-origin:0 0}"
+    },
+    {
+      "name": "Docs Aside",
+      "kind": "card",
+      "refersTo": "aside-note",
+      "description": "Hairline aside panels; the variant shows in tint and icon color, never a thick colored bar.",
+      "html": "<aside class=\"ds-aside ds-aside-caution\"><p class=\"ds-aside-title\">Caution</p><p class=\"ds-aside-body\">Credentials live only in Secrets; the operator never echoes them to status.</p></aside>",
+      "css": ".ds-aside{border:1px solid var(--fw-line,#e3daca);border-radius:10px;padding:1rem 1.125rem;color:var(--fw-ink,#172b4d);font:400 15px/1.6 var(--fw-font-sans,system-ui,sans-serif)}.ds-aside-title{margin:0 0 .5rem;font-size:1rem;font-weight:600}.ds-aside-body{margin:0;color:var(--fw-ink-2,#52627a)}.ds-aside-caution{background:var(--fw-warm,#fcebd9);border-color:rgb(231 123 53/.45)}.ds-aside-caution .ds-aside-title{color:var(--fw-accent-ink,#b5541c)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Charted Passage",
+    "overview": "The logo's door is the product, and the page is drawn like a nautical chart that proves it. A single saturated orange channel pours out of the mark's open doorway, doglegs at 18°, crosses a sealed ink coastline through a doorway, and runs down the left gutter as the spine of the whole page — through a doorway notch in every section divider — until it ends at the star door. Cream chart paper, navy ink, fine hachured land, and dashed fairway limits do the work that gradients, bento grids, and neon hero art do elsewhere.\n\nDensity is deliberate and editorial: a 1240px column, split grids that pair flat copy with drawn evidence (the mechanism diagram, real YAML, the fail-closed gates), and quiet hairline rules instead of filled cards. The type system is one confident grotesk carrying everything, a mono reserved for code and the terse \"without Flareway\" voice, and a small serif italic used strictly as the chart's annotation hand. Motion is a short load-time choreography — the door swings, the channel draws, a request rides in — and every animation collapses to its final state under prefers-reduced-motion.\n\nThe dark theme is the same chart re-inked for night watch: deep navy paper, pale ink, the same orange channel. Code panels stay navy in both themes — the YAML lives belowdecks regardless of the weather.",
+    "keyCharacteristics": [
+      "One orange channel, drawn as a line, is the only saturated element on the page.",
+      "The doorway motif (two jamb ticks + an orange leaf skewed 18°) marks every \"current\" or \"open\" state: active tab, CTA, section dividers, sidebar, gates.",
+      "Flat surfaces with hairline separation; a single ambient shadow reserved for code panels and the closing star CTA.",
+      "Schibsted Grotesk everywhere; JetBrains Mono for code and technical voice; Alegreya italic only as chart annotation.",
+      "Proof over decoration: diagrams, real manifests, and conformance numbers replace testimonials and icon grids."
+    ],
+    "rules": [
+      { "name": "The Graphics-Only Orange Rule", "body": "On light grounds, saturated orange never renders text, backgrounds, or focus rings; anything needing orange words uses Orange Ink. In the dark theme the raw orange may be text. Focus outlines are always ink.", "section": "colors" },
+      { "name": "The One Channel Rule", "body": "There is exactly one accent hue, and it earns its rarity: the channel, the leaf, the star. If an element isn't part of the passage, it stays navy on paper.", "section": "colors" },
+      { "name": "The Chart Voice Rule", "body": "Alegreya italic speaks only from the drawing — annotations, the cartouche plate caption. Headings, labels, and buttons never set it, and no other serif appears.", "section": "typography" },
+      { "name": "The Tabular Counts Rule", "body": "tabular-nums applies to counted digits (\"37/37\", star counts, line numbers) and never to digits inside names like \"Apache-2.0\".", "section": "typography" },
+      { "name": "The Spine Rule", "body": "Content never crosses the channel. Divider rules are drawn so the channel passes through a doorway; on narrow screens the gutter is reserved space, not overlap.", "section": "layout" },
+      { "name": "The Belowdecks Rule", "body": "Elevation marks a change of medium — the navy code well, the room behind the star door — never a resting state. Nothing hovers.", "section": "elevation" },
+      { "name": "The Doorway Motif Rule", "body": "Every \"passage\" or \"current\" marker is the same figure: two short ink jamb ticks bracketing a gap, with an orange door leaf skewed 18° on its hinge. It appears as the active-tab notch, the primary button's leaf, the divider gap, the sidebar glyph, the fail-closed gates, and the column-door in Why.", "section": "shapes" }
+    ],
+    "dos": [
+      "Do draw the doorway motif — jambs + 18° orange leaf — for current/open states instead of pills, filled backgrounds, or colored side bars.",
+      "Do keep code panels navy in both themes; the code palette is a separate weather system.",
+      "Do separate ink text from orange graphics; reach for Orange Ink (#b5541c) the moment orange must be read, not seen.",
+      "Do use hairlines (Hairline / Hairline Soft) for all separation; reserve the single shadow for belowdecks surfaces.",
+      "Do render the lockup and mark from the brand vectors (src/components/brand/paths.ts); the wordmark is an outline, never re-typeset.",
+      "Do honor prefers-reduced-motion and prefers-color-scheme; under reduced motion every leaf is drawn open and every line drawn complete.",
+      "Do keep buttons 48px tall, ink focus outlines 2px with a 3px offset, and prose measures at 46–75ch."
+    ],
+    "donts": [
+      "Don't put saturated orange in text, filled backgrounds, or focus rings on light grounds — it is a graphic channel, not ink.",
+      "Don't add eyebrow/kicker labels above headings; the system speaks in H2 + lede.",
+      "Don't introduce a second accent hue, gradients on content surfaces, or hard offset shadows; translucency belongs to the sticky header only.",
+      "Don't set UI text, labels, or headings in Alegreya — it is the chart's annotation hand only.",
+      "Don't restyle, re-proportion, or re-color the fixed logo mark or wordmark, and never combine the Kubernetes Gateway API and Cloudflare logos (brand commitment).",
+      "Don't mark current nav or sidebar items with filled pills or accent backgrounds — the doorway glyph is the convention.",
+      "Don't invent testimonials, metrics, or status disclaimers; proof is drawn from the repo, never fabricated."
+    ]
+  }
+}
