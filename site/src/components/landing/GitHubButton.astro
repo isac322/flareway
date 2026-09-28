@@ -1,0 +1,26 @@
+---
+// Header GitHub link with the star affordance. Markup and class names are shared
+// with the docs header (.fw-gh); the count renders only when fetched at build time.
+import { formatStars, REPO_URL } from '../../data/github';
+import { landingCopy } from '../../data/landing-copy';
+import Icon from './Icon.astro';
+
+interface Props {
+	stars?: number;
+}
+
+const { stars } = Astro.props;
+const copy = landingCopy.header;
+const ariaLabel =
+	stars === undefined ? copy.githubAria : copy.githubAriaCount.replace('{count}', String(stars));
+---
+
+<a class="fw-gh" href={REPO_URL} aria-label={ariaLabel}>
+	<Icon name="github" class="fw-gh-mark" />
+	<span class="fw-gh-label">{copy.githubLabel}</span>
+	<span class="fw-gh-star" aria-hidden="true">
+		<Icon name="star" />
+		{copy.starLabel}
+		{stars !== undefined && <span class="num">{formatStars(stars)}</span>}
+	</span>
+</a>

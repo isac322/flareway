@@ -1,0 +1,41 @@
+---
+// S2: what `cloudflared` alone matches versus what an HTTPRoute can express
+// through Flareway's Envoy. The right column lists Extended features the
+// conformance report claims and passed; nothing beyond that list.
+import { landingCopy } from '../../data/landing-copy';
+
+const copy = landingCopy.why;
+---
+
+<section class="why" aria-labelledby="why-h">
+	<div class="wrap">
+		<div class="section-head section-head-stack">
+			<h2 id="why-h">{copy.heading}</h2>
+			<p set:html={copy.ledeHtml} />
+		</div>
+		<div class="why-grid">
+			<figure class="why-alone">
+				<figcaption set:html={copy.alone.captionHtml} />
+				<ul>{copy.alone.items.map((item) => <li>{item}</li>)}</ul>
+				<p>{copy.alone.note}</p>
+			</figure>
+			<div class="why-door" aria-hidden="true"><span></span></div>
+			<figure class="why-with">
+				<figcaption set:html={copy.with.captionHtml} />
+				<dl>
+					{
+						copy.with.items.map((item) => (
+							<div>
+								<dt>{item.gloss}</dt>
+								<dd>
+									<code>{item.feature}</code>
+								</dd>
+							</div>
+						))
+					}
+				</dl>
+				<p set:html={copy.with.noteHtml} />
+			</figure>
+		</div>
+	</div>
+</section>

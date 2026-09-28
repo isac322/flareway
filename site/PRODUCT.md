@@ -33,7 +33,7 @@ Evaluated through: `helm template` rendering (no cluster or credentials needed),
 - Access: `AccessApplication` targets routes; Envoy `jwt_authn` verifies `Cf-Access-Jwt-Assertion` against Cloudflare JWKS.
 - `CloudflareTunnel` Direct mode for non-Gateway TCP/SSH/RDP/bastion origins.
 - Security: two authorization layers (Kubernetes RBAC + `CloudflareAccount.spec.grants`), fail-closed, explicit `AdoptById` adoption, credentials only in Secrets, `Programmed` only after DNS, tunnel, xDS, and Envoy converge.
-- Status: experimental, `v1alpha1`, single-replica controller, not yet production ingress. This must stay visible; never implied otherwise.
+- Status: API group `flareway.bhyoo.com/v1alpha1`, single-replica controller. The maintainer runs it in production; the site carries no "experimental" / "not production" status messaging (owner decision, 2026-09-28). Do not add production-grade, HA, or adoption claims either.
 - Conformance: local `dev` run on kind in `conformanceMode` (Cloudflare paths disabled): GatewayHTTP Core 37/37, claimed Extended 30/30, 13 unsupported features listed.
 
 ## Brand Commitments
@@ -49,7 +49,7 @@ Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.
 
 ## Product Principles
 
-1. Honesty over hype: every claim traceable to the repo; experimental status stated plainly.
+1. Honesty over hype: every claim traceable to the repo; no invented adoption, metrics, or guarantees.
 2. Show the mechanism: outbound-only tunnel + Envoy routing is the story.
 3. Kubernetes-native first: standard Gateway API objects, zero annotations.
 4. Fail closed: security posture is a feature, not fine print.

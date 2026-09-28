@@ -1,0 +1,43 @@
+---
+// S6: the two authorization layers drawn as gates in series, then the
+// guarantees that hold on uncertainty.
+import { landingCopy } from '../../data/landing-copy';
+import Icon from './Icon.astro';
+
+const copy = landingCopy.failClosed;
+---
+
+<section class="fail" aria-labelledby="fail-h">
+	<div class="wrap fail-grid">
+		<div class="fail-intro">
+			<h2 id="fail-h">{copy.heading}</h2>
+			<p class="fail-lede" set:html={copy.ledeHtml} />
+			<ol class="gates">
+				{
+					copy.gates.map((gate) => (
+						<li>
+							<span class="gate-mark" aria-hidden="true" />
+							<div>
+								<h3>{gate.title}</h3>
+								<p set:html={gate.bodyHtml} />
+							</div>
+						</li>
+					))
+				}
+			</ol>
+		</div>
+		<div class="fail-rest">
+			<dl class="guarantees">
+				{
+					copy.guarantees.map((item) => (
+						<div>
+							<dt set:html={item.titleHtml} />
+							<dd set:html={item.bodyHtml} />
+						</div>
+					))
+				}
+			</dl>
+			<a class="more" href={copy.more.href}>{copy.more.label}<Icon name="arrow" class="arrow" /></a>
+		</div>
+	</div>
+</section>

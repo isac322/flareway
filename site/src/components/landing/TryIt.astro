@@ -1,0 +1,45 @@
+---
+// S8: the zero-credential `helm template` trial, verbatim from README.md.
+import { landingCopy } from '../../data/landing-copy';
+import CodeFile from './CodeFile.astro';
+import Icon from './Icon.astro';
+
+const copy = landingCopy.tryIt;
+---
+
+<section class="try" id="try" aria-labelledby="try-h">
+	<div class="wrap">
+		<div class="section-head section-head-stack">
+			<h2 id="try-h">{copy.heading}</h2>
+			<p set:html={copy.ledeHtml} />
+		</div>
+		<div class="try-grid">
+			<div class="try-main">
+				<div class="code code-cmd">
+					<CodeFile
+						name={copy.commandCaption}
+						source={copy.command}
+						fileKey="sh"
+						label={copy.commandCaption}
+						copyLabel={copy.copy}
+						copiedLabel={copy.copied}
+						copyFailedLabel={copy.copyFailed}
+						shell
+					/>
+				</div>
+				<div class="ctas">
+					<a class="btn btn-primary" href={copy.primary.href}>
+						{copy.primary.label}
+						<Icon name="arrow" class="arrow" />
+					</a>
+					<a class="btn btn-secondary" href={copy.secondary.href}>{copy.secondary.label}</a>
+				</div>
+			</div>
+			<div class="try-prints">
+				<h3>{copy.printsHeading}</h3>
+				<ul class="prints">{copy.printsHtml.map((item) => <li set:html={item} />)}</ul>
+				{copy.notesHtml.map((note) => <p set:html={note} />)}
+			</div>
+		</div>
+	</div>
+</section>

@@ -1,0 +1,52 @@
+---
+// S1: the chart cartouche (lockup plate on hachured land, drawn by
+// landing-chart.ts) and the flat intro block.
+import { landingCopy } from '../../data/landing-copy';
+import Icon from './Icon.astro';
+import Lockup from './Lockup.astro';
+
+const copy = landingCopy.hero;
+---
+
+<section
+	class="hero"
+	aria-labelledby="hero-h"
+	data-note-opened={copy.chartOpened}
+	data-note-no-inbound={copy.chartNoInbound}
+>
+	<div class="wrap hero-grid">
+		<div class="cartouche">
+			<div class="plate">
+				<Lockup id="hero-lockup" class="hero-lockup" label={copy.lockupLabel} />
+				<p class="plate-foot">{copy.plateNote}</p>
+			</div>
+		</div>
+		<div class="hero-copy">
+			<h1 id="hero-h" set:html={copy.titleHtml} />
+			<p class="lede" set:html={copy.ledeHtml} />
+			<div class="ctas">
+				<a class="btn btn-primary" href={copy.primary.href}>
+					{copy.primary.label}
+					<Icon name="arrow" class="arrow" />
+				</a>
+				<a class="btn btn-secondary" href={copy.secondary.href}>
+					<Icon name="github" />
+					{copy.secondary.label}
+				</a>
+			</div>
+			<a class="tertiary" href={copy.tertiaryHref} set:html={copy.tertiaryHtml} />
+			<ul class="proof" aria-label={copy.proofLabel}>
+				{
+					copy.proof.map((item) => (
+						<li>
+							<a href={item.href}>
+								<strong>{item.value}</strong>
+								<span>{item.label}</span>
+							</a>
+						</li>
+					))
+				}
+			</ul>
+		</div>
+	</div>
+</section>

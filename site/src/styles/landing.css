@@ -1,0 +1,2000 @@
+/* Landing page (direction E). Colors, fonts, and motion come from tokens.css;
+ * this file adds layout and the chart grammar only. */
+
+:root {
+	--fw-landing-wrap: 1240px;
+	--fw-landing-gut: clamp(20px, 4vw, 48px);
+	/* Channel width; landing-chart.ts reads it. */
+	--fw-landing-channel: 12px;
+}
+
+@media (min-width: 1321px) {
+	:root {
+		--fw-landing-channel: var(--fw-channel);
+	}
+}
+
+/* ---------- base + browser surfaces ---------- */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	scrollbar-color: var(--fw-line) var(--fw-bg);
+	scroll-padding-top: 88px;
+	accent-color: var(--fw-accent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	html {
+		scroll-behavior: smooth;
+	}
+}
+
+body {
+	margin: 0;
+	background: var(--fw-bg);
+	color: var(--fw-ink);
+	font: 400 17px/1.6 var(--fw-font-sans);
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+	caret-color: var(--fw-accent);
+	overflow-x: clip;
+}
+
+::selection {
+	background: var(--fw-warm);
+	color: var(--fw-ink);
+}
+
+::-webkit-scrollbar {
+	width: 12px;
+	height: 12px;
+}
+::-webkit-scrollbar-track {
+	background: var(--fw-bg);
+}
+::-webkit-scrollbar-thumb {
+	background: var(--fw-line);
+	border: 3px solid var(--fw-bg);
+	border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: var(--fw-ink-2);
+}
+
+a {
+	color: inherit;
+	text-underline-offset: 0.22em;
+	text-decoration-thickness: 1px;
+}
+
+:focus-visible {
+	outline: 2px solid var(--fw-accent);
+	outline-offset: 3px;
+	border-radius: 4px;
+}
+
+code,
+pre {
+	font-family: var(--fw-font-mono);
+	font-variant-ligatures: none;
+}
+
+code {
+	font-size: 0.88em;
+}
+
+h1,
+h2,
+h3 {
+	text-wrap: balance;
+}
+
+p {
+	text-wrap: pretty;
+}
+
+.wrap {
+	max-width: var(--fw-landing-wrap);
+	margin: 0 auto;
+	padding: 0 var(--fw-landing-gut);
+}
+
+/* ---------- header ---------- */
+.site-head {
+	position: sticky;
+	top: 0;
+	z-index: 30;
+	background: color-mix(in srgb, var(--fw-bg) 92%, transparent);
+	border-bottom: 1px solid var(--fw-line);
+}
+
+@supports (backdrop-filter: blur(1px)) {
+	.site-head {
+		background: color-mix(in srgb, var(--fw-bg) 86%, transparent);
+		backdrop-filter: saturate(1.4) blur(10px);
+	}
+}
+
+.head-row {
+	display: grid;
+	grid-template-columns: auto 1fr auto;
+	align-items: center;
+	column-gap: 28px;
+	height: 64px;
+}
+
+.brand {
+	display: flex;
+	align-items: center;
+	color: var(--fw-ink);
+	flex: none;
+}
+
+.brand svg {
+	display: block;
+	height: 27px;
+	width: auto;
+}
+
+.tabs ul {
+	display: flex;
+	gap: 2px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	font-size: 15px;
+	font-weight: 500;
+}
+
+.tabs a {
+	display: block;
+	position: relative;
+	padding: 8px 12px;
+	border-radius: 8px;
+	color: var(--fw-ink-2);
+	text-decoration: none;
+	white-space: nowrap;
+	transition:
+		color 0.2s,
+		background-color 0.2s;
+}
+
+.tabs a:hover {
+	color: var(--fw-ink);
+	background: var(--fw-tint);
+}
+
+.tabs a[aria-current] {
+	color: var(--fw-ink);
+	font-weight: 600;
+}
+
+/* Active tab: a doorway notch in the header's bottom edge with the leaf swung open. */
+.tabs a[aria-current]::after {
+	content: '';
+	position: absolute;
+	left: 50%;
+	bottom: -14px;
+	width: 18px;
+	height: 11px;
+	margin-left: -9px;
+	background: var(--fw-bg);
+	border: 1px solid var(--fw-ink-2);
+	border-bottom: 0;
+}
+
+.tabs a[aria-current]::before {
+	content: '';
+	position: absolute;
+	left: 50%;
+	bottom: -17px;
+	width: 5px;
+	height: 11px;
+	margin-left: -7px;
+	background: var(--fw-accent);
+	transform: skewY(var(--fw-door-slant));
+	transform-origin: 0 0;
+	z-index: 1;
+}
+
+/* GitHub button with the star affordance (shared markup with the docs header). */
+.fw-gh {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	height: 36px;
+	padding: 0 12px;
+	border: 1px solid var(--fw-line);
+	border-radius: 8px;
+	background: var(--fw-panel);
+	color: var(--fw-ink);
+	font-size: 14px;
+	font-weight: 500;
+	text-decoration: none;
+	white-space: nowrap;
+	transition:
+		border-color 0.2s,
+		background-color 0.2s;
+}
+
+.fw-gh:hover {
+	border-color: var(--fw-ink-2);
+}
+
+.fw-gh-mark {
+	width: 18px;
+	height: 18px;
+	flex: none;
+}
+
+.fw-gh-star {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-left: 2px;
+	padding-left: 10px;
+	border-left: 1px solid var(--fw-line);
+	color: var(--fw-ink-2);
+}
+
+.fw-gh-star svg {
+	width: 14px;
+	height: 14px;
+	flex: none;
+	transition: transform 0.3s var(--fw-ease);
+}
+
+.fw-gh:hover .fw-gh-star svg,
+.fw-gh:focus-visible .fw-gh-star svg {
+	transform: rotate(-12deg) scale(1.1);
+}
+
+.fw-gh .num {
+	color: var(--fw-ink);
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+}
+
+.icon-star {
+	fill: var(--fw-accent);
+	stroke: var(--fw-accent-ink);
+	stroke-width: 1;
+	stroke-linejoin: round;
+}
+
+/* ---------- chart layers ---------- */
+main,
+.foot,
+.divider {
+	position: relative;
+	z-index: 1;
+}
+
+#underlay,
+#overlay {
+	position: absolute;
+	top: 0;
+	left: 0;
+	pointer-events: none;
+	overflow: visible;
+}
+
+#underlay {
+	z-index: 0;
+}
+
+#overlay {
+	z-index: 2;
+}
+
+.l-land {
+	fill: var(--fw-tint);
+}
+
+.l-land-hach {
+	opacity: var(--fw-hachure-opacity);
+}
+
+.l-hach line {
+	stroke: var(--fw-ink);
+	stroke-width: 0.7;
+}
+
+.l-coast {
+	fill: none;
+	stroke: var(--fw-ink);
+	stroke-width: 1.6;
+	stroke-linejoin: round;
+}
+
+.l-contour {
+	fill: none;
+	stroke: var(--fw-line);
+	stroke-width: 1.1;
+}
+
+.l-tick {
+	stroke: var(--fw-ink);
+	stroke-width: 2.4;
+	stroke-linecap: round;
+}
+
+.l-leaf {
+	stroke: var(--fw-accent);
+	stroke-width: 4.5;
+	stroke-linecap: butt;
+	fill: none;
+}
+
+.l-arr {
+	stroke: var(--fw-ink);
+	stroke-width: 1.3;
+	stroke-dasharray: 3 4;
+	fill: none;
+}
+
+.l-x {
+	stroke: var(--fw-ink);
+	stroke-width: 2;
+	stroke-linecap: round;
+	fill: none;
+}
+
+.l-note {
+	font: italic 400 16px var(--fw-font-note);
+	fill: var(--fw-ink-2);
+}
+
+.l-note-ink {
+	font: italic 500 16.5px var(--fw-font-note);
+	fill: var(--fw-ink);
+}
+
+/* The star door: tall jambs, a dashed swing arc, and the leaf swung into the closing section. */
+.l-tick-end {
+	stroke-width: 3;
+}
+
+.l-swing {
+	fill: none;
+	stroke: var(--fw-ink-2);
+	stroke-width: 1.2;
+	stroke-dasharray: 3 4;
+}
+
+.l-leaf-end {
+	stroke-width: 6;
+}
+
+.gap {
+	fill: var(--fw-bg);
+}
+
+#overlay .chan {
+	fill: none;
+	stroke: var(--fw-accent);
+	stroke-linejoin: round;
+	stroke-linecap: round;
+}
+
+#overlay .lim {
+	fill: none;
+	stroke: var(--fw-ink);
+	stroke-width: 1.4;
+	stroke-dasharray: 6 7;
+	opacity: 0.83;
+}
+
+#overlay .d-dot {
+	fill: var(--fw-ink);
+	stroke: var(--fw-bg);
+	stroke-width: 2;
+}
+
+/* ---------- hero ---------- */
+.hero {
+	position: relative;
+	padding: clamp(36px, 5.5vw, 64px) 0 clamp(48px, 7vh, 84px);
+	min-height: min(800px, calc(94svh - 64px));
+}
+
+.hero-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+	gap: clamp(32px, 4.5vw, 64px);
+	align-items: center;
+	min-height: inherit;
+}
+
+.cartouche {
+	align-self: start;
+	position: relative;
+	/* Level with the headline, leaving land above and the coast crossing below. */
+	margin-top: clamp(24px, 16vh, 168px);
+}
+
+.plate {
+	display: inline-block;
+	background: var(--fw-panel);
+	border: 1px solid var(--fw-ink);
+	padding: clamp(18px, 2.2vw, 28px) clamp(20px, 2.4vw, 30px) 12px;
+	box-shadow:
+		inset 0 0 0 4px var(--fw-panel),
+		inset 0 0 0 5px var(--fw-line);
+}
+
+.plate > svg {
+	display: block;
+	width: clamp(290px, 30vw, 430px);
+	height: auto;
+	color: var(--fw-ink);
+	overflow: visible;
+}
+
+/* Right-aligned so the channel, which leaves through the frame below the mark, never crosses it. */
+.plate-foot {
+	margin: 16px 0 0;
+	padding: 10px 0 0 34%;
+	border-top: 1px solid var(--fw-line);
+	font: italic 400 16px/1.3 var(--fw-font-note);
+	color: var(--fw-ink-2);
+	text-align: right;
+}
+
+.hero-lockup .lockup-door {
+	transform-box: fill-box;
+	transform-origin: 0 50%;
+}
+
+.hero-copy {
+	position: relative;
+	/* Set by landing-chart.ts on stacked layouts so the headline clears the coast. */
+	margin-top: var(--fw-landing-coast-clear, 0px);
+}
+
+h1 {
+	font-size: clamp(2.35rem, 1.1rem + 3.1vw, 3.6rem);
+	line-height: 1.04;
+	letter-spacing: -0.03em;
+	font-weight: 700;
+	margin: 0 0 22px;
+	max-width: 15ch;
+}
+
+h1 code {
+	font-size: 0.84em;
+	font-weight: 600;
+	letter-spacing: -0.035em;
+	padding: 0 0.04em;
+}
+
+h1 sup,
+.lede sup,
+.section-head sup {
+	font-size: 0.34em;
+	font-weight: 500;
+	vertical-align: 0.95em;
+	letter-spacing: 0;
+	margin-left: 0.04em;
+}
+
+.lede sup,
+.section-head sup {
+	font-size: 0.6em;
+	vertical-align: 0.6em;
+}
+
+.lede {
+	font-size: clamp(1.05rem, 0.98rem + 0.3vw, 1.2rem);
+	line-height: 1.55;
+	color: var(--fw-ink-2);
+	max-width: 56ch;
+	margin: 0 0 30px;
+}
+
+.lede code {
+	color: var(--fw-ink);
+	font-size: 0.86em;
+}
+
+/* ---------- buttons ---------- */
+.ctas {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px;
+}
+
+.btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 48px;
+	padding: 0 22px;
+	border-radius: 10px;
+	font: 600 16px/1.2 var(--fw-font-sans);
+	text-decoration: none;
+	transition:
+		background-color 0.2s var(--fw-ease),
+		border-color 0.2s,
+		transform 0.2s var(--fw-ease);
+}
+
+.btn:active {
+	transform: translateY(1px);
+}
+
+.btn svg {
+	width: 18px;
+	height: 18px;
+	flex: none;
+}
+
+/* Primary: a doorway notch at the bottom-left edge, the leaf swinging wider on hover. */
+.btn-primary {
+	position: relative;
+	padding-left: 40px;
+	background: var(--fw-btn-bg);
+	color: var(--fw-btn-ink);
+}
+
+.btn-primary::before {
+	content: '';
+	position: absolute;
+	left: 17px;
+	bottom: 0;
+	width: 10px;
+	height: 15px;
+	background: var(--fw-bg);
+	border-radius: 1px 1px 0 0;
+}
+
+.btn-primary::after {
+	content: '';
+	position: absolute;
+	left: 18px;
+	bottom: -3px;
+	width: 6px;
+	height: 16px;
+	background: var(--fw-accent);
+	transform-origin: 0 100%;
+	transition: transform 0.35s var(--fw-ease);
+}
+
+.btn-primary:hover::after,
+.btn-primary:focus-visible::after {
+	transform: skewY(var(--fw-door-slant)) scaleX(0.8);
+}
+
+.btn-primary:hover {
+	background: var(--fw-btn-hover);
+}
+
+.btn-primary .arrow {
+	transition: transform 0.3s var(--fw-ease);
+}
+
+.btn-primary:hover .arrow {
+	transform: translateX(3px);
+}
+
+.btn-secondary {
+	border: 1px solid var(--fw-line);
+	color: var(--fw-ink);
+	background: var(--fw-panel);
+}
+
+.btn-secondary:hover {
+	border-color: var(--fw-ink-2);
+}
+
+.tertiary {
+	display: inline-block;
+	margin-top: 18px;
+	font-size: 15px;
+	color: var(--fw-ink-2);
+	text-decoration: underline;
+	text-decoration-color: var(--fw-line);
+	transition:
+		text-decoration-color 0.2s,
+		color 0.2s;
+}
+
+.tertiary:hover {
+	color: var(--fw-ink);
+	text-decoration-color: var(--fw-accent);
+}
+
+.tertiary code {
+	color: var(--fw-ink);
+}
+
+.more {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 28px;
+	font-weight: 600;
+	font-size: 15.5px;
+	color: var(--fw-ink);
+	text-decoration: underline;
+	text-decoration-color: var(--fw-accent);
+	text-underline-offset: 0.3em;
+}
+
+.more .arrow {
+	width: 16px;
+	height: 16px;
+	transition: transform 0.3s var(--fw-ease);
+}
+
+.more:hover .arrow {
+	transform: translateX(3px);
+}
+
+/* ---------- proof strip ---------- */
+.proof {
+	display: grid;
+	grid-template-columns: 1.4fr 1.15fr 0.8fr;
+	margin: 34px 0 0;
+	padding: 0;
+	list-style: none;
+	border-top: 1px solid var(--fw-line);
+	font-size: 13.5px;
+	line-height: 1.4;
+	color: var(--fw-ink-2);
+}
+
+.proof li {
+	padding: 14px 16px 0;
+}
+
+.proof li:first-child {
+	padding-left: 0;
+}
+
+.proof li + li {
+	border-left: 1px solid var(--fw-line);
+}
+
+.proof a {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	text-decoration: none;
+}
+
+.proof strong {
+	color: var(--fw-ink);
+	font-weight: 600;
+	font-size: 15.5px;
+	white-space: nowrap;
+	font-variant-numeric: tabular-nums;
+}
+
+.proof a:hover strong {
+	text-decoration: underline;
+	text-decoration-color: var(--fw-accent);
+}
+
+/* ---------- dividers: section borders the channel passes through ---------- */
+.divider {
+	height: 1px;
+	background: var(--fw-line);
+	max-width: var(--fw-landing-wrap);
+	margin: 0 auto;
+}
+
+.divider::before {
+	content: '';
+	position: absolute;
+	left: -70px;
+	top: 0;
+	width: 70px;
+	height: 1px;
+	background: var(--fw-line);
+}
+
+/* ---------- section scaffolding (rhythm varies per section) ---------- */
+.why,
+.works,
+.produce,
+.access,
+.fail,
+.try {
+	padding: clamp(64px, 9vw, 112px) 0;
+}
+
+.section-head {
+	display: grid;
+	grid-template-columns: minmax(0, 1.04fr) minmax(0, 1fr);
+	gap: clamp(32px, 5vw, 72px);
+	align-items: end;
+	margin-bottom: clamp(32px, 4vw, 52px);
+}
+
+.section-head-stack {
+	grid-template-columns: minmax(0, 1fr);
+	gap: 18px;
+	max-width: 62ch;
+}
+
+h2 {
+	font-size: clamp(1.9rem, 1.2rem + 2vw, 2.75rem);
+	line-height: 1.08;
+	letter-spacing: -0.028em;
+	font-weight: 700;
+	margin: 0;
+	max-width: 18ch;
+}
+
+.section-head-stack h2 {
+	max-width: 22ch;
+}
+
+.section-head p {
+	margin: 0;
+	color: var(--fw-ink-2);
+	max-width: 58ch;
+}
+
+.section-head code,
+.why code,
+.access code,
+.fail code,
+.try-prints code {
+	color: var(--fw-ink);
+}
+
+h3 {
+	font-size: 17px;
+	line-height: 1.35;
+	letter-spacing: -0.01em;
+	font-weight: 650;
+	margin: 0;
+}
+
+/* ---------- S2: why ---------- */
+.why-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 0.62fr) 44px minmax(0, 1.5fr);
+	align-items: stretch;
+}
+
+.why-grid figure {
+	margin: 0;
+}
+
+.why-grid figcaption {
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--fw-ink-2);
+	padding-bottom: 12px;
+	border-bottom: 1px solid var(--fw-ink);
+	margin-bottom: 18px;
+}
+
+.why-alone {
+	padding-right: 8px;
+}
+
+.why-alone ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	font: 500 clamp(1.5rem, 1.1rem + 1.2vw, 2rem) / 1.2 var(--fw-font-mono);
+	letter-spacing: -0.02em;
+}
+
+.why-alone li + li {
+	margin-top: 6px;
+}
+
+.why-alone p,
+.why-with > p {
+	margin: 22px 0 0;
+	font-size: 14.5px;
+	color: var(--fw-ink-2);
+	max-width: 46ch;
+}
+
+.why-with > p a {
+	color: var(--fw-ink);
+	text-decoration-color: var(--fw-accent);
+}
+
+/* The doorway between the two columns: jambs on a sealed wall, leaf swung open. */
+.why-door {
+	position: relative;
+	justify-self: center;
+	width: 2px;
+	background: var(--fw-line);
+}
+
+.why-door span {
+	position: absolute;
+	left: -10px;
+	top: 46px;
+	width: 22px;
+	height: 44px;
+	background: var(--fw-bg);
+	border-top: 2px solid var(--fw-ink);
+	border-bottom: 2px solid var(--fw-ink);
+}
+
+.why-door span::after {
+	content: '';
+	position: absolute;
+	left: 10px;
+	top: -2px;
+	width: 5px;
+	height: 42px;
+	background: var(--fw-accent);
+	transform: skewY(calc(-1 * var(--fw-door-slant)));
+	transform-origin: 0 0;
+}
+
+.why-with dl {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	column-gap: 28px;
+	margin: 0;
+}
+
+.why-with dl > div {
+	display: grid;
+	gap: 2px;
+	padding: 10px 0;
+	border-bottom: 1px solid var(--fw-line-soft);
+}
+
+.why-with dt {
+	font-weight: 600;
+	font-size: 15.5px;
+	line-height: 1.35;
+}
+
+.why-with dd {
+	margin: 0;
+	font-size: 12.5px;
+	color: var(--fw-ink-2);
+	overflow-wrap: anywhere;
+}
+
+.why-with dd code {
+	color: var(--fw-ink-2);
+}
+
+/* ---------- S3: how it works (diagram from preview E) ---------- */
+.works .figure {
+	max-width: 720px;
+	margin-left: auto;
+	margin-right: auto;
+}
+
+.figure {
+	margin: 0;
+	background: var(--fw-panel);
+	border: 1px solid var(--fw-line);
+	border-radius: 16px;
+	padding: clamp(14px, 1.8vw, 24px);
+	position: relative;
+}
+
+.figure svg {
+	display: block;
+	width: 100%;
+	height: auto;
+}
+
+.figure figcaption {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px 24px;
+	font-size: 13px;
+	color: var(--fw-ink-2);
+	padding: 12px 4px 0;
+	border-top: 1px solid var(--fw-line-soft);
+	margin-top: 10px;
+}
+
+.figure-ratio {
+	font-family: var(--fw-font-mono);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.d-t {
+	font: 600 15px var(--fw-font-sans);
+	fill: var(--fw-ink);
+}
+.d-t-sm {
+	font-size: 14px;
+}
+.d-t-tunnel {
+	font-size: 13.5px;
+}
+.d-s {
+	font: 400 12.5px var(--fw-font-sans);
+	fill: var(--fw-ink-2);
+}
+.d-m {
+	font: 500 12px var(--fw-font-mono);
+	fill: var(--fw-ink-2);
+}
+.d-mi {
+	font: 600 13px var(--fw-font-mono);
+	fill: var(--fw-ink);
+}
+.d-box {
+	fill: var(--fw-panel);
+	stroke: var(--fw-line);
+	stroke-width: 1.2;
+}
+.d-box-ink {
+	fill: var(--fw-panel);
+	stroke: var(--fw-ink);
+	stroke-width: 1.4;
+}
+.d-edge {
+	fill: var(--fw-cool);
+	stroke: var(--fw-line);
+	stroke-width: 1.2;
+}
+.d-cluster {
+	fill: var(--fw-tint);
+}
+.d-hach line {
+	stroke: var(--fw-ink);
+	stroke-width: 0.7;
+	opacity: var(--fw-hachure-opacity);
+}
+.d-note {
+	font: italic 400 15px var(--fw-font-note);
+	fill: var(--fw-ink-2);
+}
+.d-note-ink {
+	font: italic 500 15px var(--fw-font-note);
+	fill: var(--fw-ink);
+}
+.halo {
+	paint-order: stroke;
+	stroke: var(--fw-tint);
+	stroke-width: 5px;
+	stroke-linejoin: round;
+}
+.d-leaf {
+	stroke: var(--fw-accent);
+	stroke-width: 5;
+	stroke-linecap: butt;
+}
+.d-swing {
+	fill: none;
+	stroke: var(--fw-ink-2);
+	stroke-width: 1;
+	stroke-dasharray: 2 3;
+}
+.d-pod {
+	fill: var(--fw-panel);
+	stroke: var(--fw-ink-2);
+	stroke-width: 1.2;
+	stroke-dasharray: 4 4;
+}
+.d-wall {
+	stroke: var(--fw-ink);
+	stroke-width: 6;
+	stroke-linecap: butt;
+}
+.d-jamb {
+	stroke: var(--fw-ink);
+	stroke-width: 2;
+}
+.d-arrow {
+	stroke: var(--fw-ink);
+	stroke-width: 1.5;
+	fill: none;
+}
+.d-thin {
+	stroke: var(--fw-ink-2);
+	stroke-width: 1.3;
+	fill: none;
+	stroke-dasharray: 3 4;
+}
+.d-x {
+	stroke: var(--fw-ink);
+	stroke-width: 2;
+	stroke-linecap: round;
+}
+.d-ico {
+	fill: none;
+	stroke: var(--fw-ink);
+	stroke-width: 1.5;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+.d-tunnel {
+	fill: none;
+	stroke: var(--fw-accent);
+	stroke-width: 9;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+.d-tunnel-core {
+	fill: none;
+	stroke: var(--fw-bg);
+	stroke-width: 2;
+	stroke-dasharray: 2 7;
+	stroke-linecap: round;
+}
+.d-accent {
+	fill: var(--fw-accent);
+}
+.d-head {
+	fill: var(--fw-ink);
+}
+.d-dot {
+	fill: var(--fw-ink);
+}
+.dots {
+	opacity: 0;
+}
+
+/* ---------- S4: the demo ---------- */
+.produce-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.04fr) minmax(0, 1fr);
+	gap: clamp(32px, 5vw, 72px);
+	align-items: start;
+}
+
+.code {
+	background: var(--fw-code-bg);
+	color: var(--fw-code-ink);
+	border-radius: 16px;
+	overflow: hidden;
+	box-shadow: var(--fw-shadow);
+	font: 400 13.5px/1.62 var(--fw-font-mono);
+	font-variant-ligatures: none;
+}
+
+:root[data-theme='dark'] .code {
+	border: 1px solid var(--fw-line);
+	box-shadow: none;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) .code {
+		border: 1px solid var(--fw-line);
+		box-shadow: none;
+	}
+}
+
+.code-file {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 12px 18px;
+	border-bottom: 1px solid color-mix(in srgb, var(--fw-code-ink) 10%, transparent);
+	font-size: 12.5px;
+	color: var(--fw-code-dim);
+}
+
+.code-file:not(:first-child) {
+	border-top: 1px solid color-mix(in srgb, var(--fw-code-ink) 10%, transparent);
+}
+
+.code-file b {
+	color: var(--fw-code-ink);
+	font-weight: 600;
+}
+
+.copy {
+	font: 500 12px var(--fw-font-sans);
+	color: var(--fw-code-dim);
+	background: transparent;
+	border: 1px solid color-mix(in srgb, var(--fw-code-ink) 18%, transparent);
+	border-radius: 6px;
+	padding: 4px 9px;
+	cursor: pointer;
+	transition:
+		color 0.2s,
+		border-color 0.2s;
+}
+
+.copy:hover {
+	color: var(--fw-code-ink);
+	border-color: color-mix(in srgb, var(--fw-code-ink) 40%, transparent);
+}
+
+.copy[data-done] {
+	color: var(--fw-code-key);
+}
+
+.copy:focus-visible,
+.code-pre:focus-visible {
+	outline-color: var(--fw-code-key);
+	outline-offset: -2px;
+}
+
+.code-pre {
+	margin: 0;
+	padding: 12px 0 14px;
+	overflow-x: auto;
+	scrollbar-color: color-mix(in srgb, var(--fw-code-ink) 20%, transparent) transparent;
+	font: inherit;
+}
+
+.code-pre .l {
+	display: block;
+	padding: 0 18px 0 0;
+	position: relative;
+	transition: background-color 0.25s var(--fw-ease);
+}
+
+.code-pre .l::before {
+	content: attr(data-n);
+	display: inline-block;
+	width: 44px;
+	padding-right: 16px;
+	text-align: right;
+	color: var(--fw-code-gutter);
+	user-select: none;
+	font-variant-numeric: tabular-nums;
+}
+
+.code-pre .l::after {
+	content: '';
+	position: absolute;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	width: 3px;
+	background: var(--fw-accent);
+	transform: scaleY(0);
+	transition: transform 0.25s var(--fw-ease);
+}
+
+.code-pre .l.hl {
+	background: var(--fw-code-hl);
+}
+
+.code-pre .l.hl::after {
+	transform: none;
+}
+
+.code-shell .l::before {
+	content: '$';
+	width: 36px;
+	padding-right: 12px;
+}
+
+.code-shell .l + .l::before {
+	content: '';
+}
+
+.k {
+	color: var(--fw-code-key);
+}
+.v {
+	color: var(--fw-code-ink);
+}
+.p {
+	color: var(--fw-code-dim);
+}
+.n {
+	color: var(--fw-landing-code-kind);
+}
+.c {
+	color: var(--fw-code-dim);
+	font-style: italic;
+}
+
+.outputs h3 {
+	font-size: 14px;
+	font-weight: 600;
+	margin: 4px 0 10px;
+	color: var(--fw-ink-2);
+}
+
+.outputs ol {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	border-top: 1px solid var(--fw-line);
+}
+
+.outputs li {
+	border-bottom: 1px solid var(--fw-line);
+}
+
+.out {
+	display: grid;
+	grid-template-columns: 36px minmax(0, 1fr);
+	gap: 4px 14px;
+	width: 100%;
+	padding: 18px 8px 18px 0;
+	border: 0;
+	background: none;
+	text-align: left;
+	color: inherit;
+	font: inherit;
+	cursor: default;
+	position: relative;
+	border-radius: 0;
+}
+
+.out:focus-visible {
+	outline-offset: -2px;
+}
+
+.out .ico {
+	grid-row: 1 / span 2;
+	width: 36px;
+	height: 36px;
+	border-radius: 10px;
+	background: var(--fw-tint);
+	border: 1px solid var(--fw-line-soft);
+	display: grid;
+	place-items: center;
+	transition:
+		background-color 0.25s,
+		border-color 0.25s;
+}
+
+.out .ico svg {
+	width: 20px;
+	height: 20px;
+	fill: none;
+	stroke: var(--fw-ink);
+	stroke-width: 1.5;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
+.out .ico .fill {
+	fill: var(--fw-accent);
+	stroke: none;
+}
+
+.out .t {
+	font-weight: 600;
+	font-size: 17px;
+	line-height: 1.35;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 10px;
+}
+
+.out .t code {
+	font-weight: 500;
+	font-size: 13px;
+	color: var(--fw-ink-2);
+}
+
+.out .d {
+	font-size: 15px;
+	line-height: 1.55;
+	color: var(--fw-ink-2);
+}
+
+.out .d code {
+	color: var(--fw-ink);
+	font-size: 0.86em;
+}
+
+.out:hover .ico,
+.out.on .ico {
+	background: var(--fw-warm);
+	border-color: var(--fw-accent);
+}
+
+.outputs .note {
+	margin: 18px 0 0;
+	font-size: 14px;
+	color: var(--fw-ink-2);
+}
+
+.outputs .note a {
+	color: var(--fw-ink);
+}
+
+/* ---------- S5: Access and WARP ---------- */
+.access-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+	gap: clamp(32px, 5vw, 72px);
+	align-items: start;
+}
+
+.access-policy > p,
+.access-side p {
+	margin: 12px 0 0;
+	color: var(--fw-ink-2);
+	max-width: 60ch;
+}
+
+.variants {
+	margin: 28px 0 0;
+	border: 1px solid var(--fw-ink);
+	background: var(--fw-panel);
+}
+
+.variants figcaption {
+	padding: 10px 16px;
+	border-bottom: 1px solid var(--fw-line);
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--fw-ink-2);
+}
+
+.variants ul {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.variants li {
+	display: grid;
+	gap: 2px;
+	padding: 14px 16px;
+	border-right: 1px solid var(--fw-line-soft);
+	border-bottom: 1px solid var(--fw-line-soft);
+}
+
+.variants li:nth-child(3n) {
+	border-right: 0;
+}
+
+.variants li:nth-last-child(-n + 3) {
+	border-bottom: 0;
+}
+
+.variants code {
+	font-size: 15px;
+	font-weight: 600;
+}
+
+.variants span {
+	font-size: 13.5px;
+	color: var(--fw-ink-2);
+}
+
+.access-side {
+	display: grid;
+	gap: 36px;
+	padding-top: 4px;
+}
+
+.access-direct {
+	padding-top: 28px;
+	border-top: 1px dashed var(--fw-ink-2);
+}
+
+.kinds {
+	margin: 18px 0 0;
+	padding: 0 0 0 18px;
+	list-style: none;
+	border-left: 3px solid var(--fw-accent);
+}
+
+.kinds li {
+	position: relative;
+	padding: 4px 0;
+	font-size: 15px;
+}
+
+.kinds li::before {
+	content: '';
+	position: absolute;
+	left: -18px;
+	top: 50%;
+	width: 12px;
+	height: 1px;
+	background: var(--fw-ink);
+}
+
+.access-side .kinds-note {
+	margin-top: 10px;
+	font: italic 400 15.5px/1.4 var(--fw-font-note);
+}
+
+.origins {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: 16px 0 0;
+	padding: 0;
+	list-style: none;
+}
+
+.origins li {
+	padding: 4px 12px;
+	border: 1px solid var(--fw-line);
+	border-radius: 999px;
+	font: 500 13px var(--fw-font-mono);
+	background: var(--fw-panel);
+}
+
+/* ---------- S6: fail closed ---------- */
+.fail-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+	gap: clamp(40px, 6vw, 96px);
+	align-items: start;
+}
+
+.fail-lede {
+	margin: 18px 0 0;
+	color: var(--fw-ink-2);
+	max-width: 46ch;
+}
+
+.gates {
+	list-style: none;
+	margin: 36px 0 0;
+	padding: 0;
+	position: relative;
+}
+
+/* The two gates sit in series on one dashed fairway limit: both must open. */
+.gates::before {
+	content: '';
+	position: absolute;
+	left: 17px;
+	top: 8px;
+	bottom: 8px;
+	border-left: 1.4px dashed var(--fw-ink);
+	opacity: 0.8;
+}
+
+.gates li {
+	position: relative;
+	display: grid;
+	grid-template-columns: 36px minmax(0, 1fr);
+	gap: 16px;
+	padding: 0 0 28px;
+}
+
+.gates li:last-child {
+	padding-bottom: 0;
+}
+
+.gates p {
+	margin: 6px 0 0;
+	color: var(--fw-ink-2);
+	font-size: 15.5px;
+}
+
+.gate-mark {
+	position: relative;
+	width: 36px;
+	height: 28px;
+	background: var(--fw-bg);
+	border-left: 2.4px solid var(--fw-ink);
+	border-right: 2.4px solid var(--fw-ink);
+}
+
+/* A closed leaf across the doorway: the gate stays shut unless it says yes. */
+.gate-mark::after {
+	content: '';
+	position: absolute;
+	left: 3px;
+	right: 3px;
+	top: 11px;
+	height: 5px;
+	background: var(--fw-ink);
+}
+
+.guarantees {
+	margin: 0;
+	border-top: 1px solid var(--fw-ink);
+}
+
+.guarantees > div {
+	display: grid;
+	grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+	gap: 8px 24px;
+	padding: 18px 0;
+	border-bottom: 1px solid var(--fw-line);
+}
+
+.guarantees dt {
+	font-weight: 650;
+	line-height: 1.35;
+}
+
+.guarantees dd {
+	margin: 0;
+	color: var(--fw-ink-2);
+	font-size: 15.5px;
+}
+
+/* ---------- S8: try it ---------- */
+.try-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+	gap: clamp(28px, 4vw, 56px);
+	align-items: start;
+}
+
+.try-main .ctas {
+	margin-top: 24px;
+}
+
+.code-cmd {
+	font-size: 14.5px;
+}
+
+.try-prints h3 {
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--fw-ink-2);
+	margin: 0 0 10px;
+}
+
+.prints {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	border-top: 1px solid var(--fw-line);
+}
+
+.prints li {
+	padding: 8px 0;
+	border-bottom: 1px solid var(--fw-line-soft);
+	font-size: 15.5px;
+}
+
+.try-prints > p {
+	margin: 16px 0 0;
+	font-size: 14.5px;
+	color: var(--fw-ink-2);
+}
+
+/* ---------- star: the closing room behind the door the channel ends at ---------- */
+.star {
+	padding: clamp(80px, 11vw, 144px) 0 clamp(80px, 10vw, 128px);
+}
+
+.star-inner {
+	display: grid;
+	justify-items: center;
+	text-align: center;
+	gap: 20px;
+}
+
+.star-mark {
+	display: block;
+	width: clamp(96px, 11vw, 136px);
+	height: auto;
+	margin-bottom: 8px;
+}
+
+.star h2 {
+	max-width: 20ch;
+	font-size: clamp(2.1rem, 1.3rem + 2.4vw, 3.2rem);
+}
+
+.star p {
+	margin: 0;
+	max-width: 54ch;
+	color: var(--fw-ink-2);
+	font-size: clamp(1.05rem, 0.98rem + 0.3vw, 1.2rem);
+}
+
+.star-ctas {
+	display: grid;
+	justify-items: center;
+	gap: 16px;
+	margin-top: 16px;
+}
+
+.star .tertiary {
+	margin-top: 0;
+}
+
+.btn-star {
+	min-height: 64px;
+	padding: 0 34px 0 28px;
+	gap: 14px;
+	border-radius: 12px;
+	font-size: 19px;
+	background: var(--fw-btn-bg);
+	color: var(--fw-btn-ink);
+	box-shadow: var(--fw-shadow);
+}
+
+.btn-star .star-icon {
+	width: 26px;
+	height: 26px;
+	transition: transform 0.35s var(--fw-ease);
+}
+
+.btn-star:hover {
+	background: var(--fw-btn-hover);
+}
+
+.btn-star:hover .star-icon,
+.btn-star:focus-visible .star-icon {
+	transform: rotate(-14deg) scale(1.12);
+}
+
+.btn-star .num {
+	padding-left: 14px;
+	border-left: 1px solid color-mix(in srgb, var(--fw-btn-ink) 30%, transparent);
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+}
+
+/* ---------- footer ---------- */
+.foot {
+	padding: 48px 0 40px;
+	font-size: 14px;
+	color: var(--fw-ink-2);
+}
+
+.foot-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+	gap: 32px 48px;
+	padding-bottom: 36px;
+	border-bottom: 1px solid var(--fw-line);
+}
+
+.foot-brand .brand svg {
+	height: 24px;
+}
+
+.foot-brand p {
+	margin: 12px 0 0;
+}
+
+.foot-nav {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 24px;
+}
+
+.foot-nav h2 {
+	font-size: 13px;
+	letter-spacing: 0;
+	font-weight: 600;
+	color: var(--fw-ink);
+	margin: 0 0 10px;
+}
+
+.foot-nav ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.foot-nav li {
+	padding: 3px 0;
+}
+
+.foot-nav a {
+	text-decoration: none;
+}
+
+.foot-nav a:hover {
+	color: var(--fw-ink);
+	text-decoration: underline;
+	text-decoration-color: var(--fw-accent);
+}
+
+.foot-legal {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 16px 32px;
+	align-items: end;
+	padding-top: 24px;
+}
+
+.fw-legal p {
+	margin: 0 0 6px;
+	max-width: 110ch;
+	font-size: 13px;
+	line-height: 1.55;
+}
+
+.foot-legal .tertiary {
+	margin: 0;
+	font-size: 13.5px;
+}
+
+/* ---------- load motion: door swings open, channel draws, a request rides in ---------- */
+@media (prefers-reduced-motion: no-preference) {
+	.hero-lockup .lockup-door {
+		animation: fw-swing 0.8s 0.15s cubic-bezier(0.4, 0, 0.12, 1) backwards;
+	}
+	#overlay .chan {
+		stroke-dasharray: 1;
+		animation: fw-spine 1.7s 0.8s cubic-bezier(0.3, 0, 0.2, 1) backwards;
+	}
+	#overlay .lim,
+	#overlay .gap,
+	#overlay .l-tick {
+		animation: fw-fade 0.5s 1.6s backwards;
+	}
+	/* The star door swings open as the channel arrives. */
+	#overlay .l-swing,
+	#overlay .l-leaf-end {
+		animation: fw-fade 0.5s 2.3s backwards;
+	}
+	#underlay .l-anim {
+		animation: fw-fade 0.5s 1.4s backwards;
+	}
+	.d-leaf {
+		animation: fw-fade 0.3s 0.95s backwards;
+	}
+	.d-tunnel {
+		stroke-dasharray: 420;
+		animation: fw-draw 1.2s 1s var(--fw-ease) backwards;
+	}
+	.d-tunnel-core {
+		animation: fw-flow 1.6s linear infinite;
+	}
+	.d-tunnel-head {
+		animation: fw-fade 0.4s 1.9s var(--fw-ease) backwards;
+	}
+	.d-x-g {
+		animation: fw-pop 0.5s 1.6s var(--fw-ease) backwards;
+		transform-box: fill-box;
+		transform-origin: center;
+	}
+	.dots {
+		opacity: 1;
+		animation: fw-fade 0.6s 2.2s backwards;
+	}
+	/* Rebuilds after resize land in the final state. */
+	:root[data-chart-built] #overlay *,
+	:root[data-chart-built] #underlay * {
+		animation: none;
+	}
+}
+
+@keyframes fw-swing {
+	from {
+		transform: scaleX(1.62) skewY(-18.43deg);
+	}
+}
+@keyframes fw-spine {
+	from {
+		stroke-dashoffset: 1;
+	}
+}
+@keyframes fw-draw {
+	from {
+		stroke-dashoffset: 420;
+	}
+}
+@keyframes fw-flow {
+	to {
+		stroke-dashoffset: -9;
+	}
+}
+@keyframes fw-fade {
+	from {
+		opacity: 0;
+	}
+}
+@keyframes fw-pop {
+	from {
+		opacity: 0;
+		transform: scale(0.4);
+	}
+}
+
+/* ---------- responsive ---------- */
+@media (max-width: 1180px) {
+	.tabs a {
+		padding: 8px 9px;
+	}
+	.tabs ul {
+		font-size: 14.5px;
+	}
+	.head-row {
+		column-gap: 18px;
+	}
+}
+
+@media (max-width: 1060px) {
+	html {
+		scroll-padding-top: 124px;
+	}
+	.head-row {
+		grid-template-columns: auto 1fr;
+		grid-template-areas: 'brand gh' 'tabs tabs';
+		height: auto;
+	}
+	.brand {
+		grid-area: brand;
+		height: 60px;
+	}
+	.fw-gh {
+		grid-area: gh;
+		justify-self: end;
+	}
+	.tabs {
+		grid-area: tabs;
+		margin: 0 calc(-1 * var(--fw-landing-gut));
+		padding: 0 var(--fw-landing-gut);
+		border-top: 1px solid var(--fw-line-soft);
+		overflow-x: auto;
+		scrollbar-width: none;
+		mask-image: linear-gradient(90deg, #000 88%, transparent);
+	}
+	.tabs::-webkit-scrollbar {
+		display: none;
+	}
+	.tabs ul {
+		width: max-content;
+		padding: 6px 0;
+	}
+	.tabs a[aria-current]::after {
+		bottom: -8px;
+	}
+	.tabs a[aria-current]::before {
+		bottom: -11px;
+	}
+	.hero-grid,
+	.produce-grid,
+	.section-head,
+	.access-grid,
+	.fail-grid,
+	.try-grid {
+		grid-template-columns: 1fr;
+	}
+	.hero {
+		min-height: 0;
+	}
+	.hero-grid {
+		gap: 34px;
+	}
+	.hero-copy {
+		padding-top: 14px;
+	}
+	.cartouche {
+		margin-top: 4px;
+	}
+	.works .figure {
+		max-width: 620px;
+	}
+	.why-grid {
+		grid-template-columns: minmax(0, 1fr);
+		row-gap: 36px;
+	}
+	.why-door {
+		display: none;
+	}
+}
+
+@media (max-width: 640px) {
+	body {
+		font-size: 16px;
+	}
+	:root {
+		--fw-landing-gut: 26px;
+	}
+	.brand {
+		height: 56px;
+	}
+	.brand svg {
+		height: 24px;
+	}
+	.fw-gh-label {
+		display: none;
+	}
+	.fw-gh-star {
+		margin-left: 0;
+	}
+	.hero {
+		padding-top: 22px;
+	}
+	.plate {
+		padding: 16px 18px 10px;
+		max-width: 100%;
+	}
+	.plate > svg {
+		width: min(300px, 74vw);
+	}
+	.plate-foot {
+		font-size: 14.5px;
+	}
+	h1 {
+		margin-bottom: 16px;
+	}
+	.lede {
+		margin-bottom: 24px;
+	}
+	.btn {
+		min-height: 46px;
+		padding: 0 18px;
+		font-size: 15.5px;
+	}
+	.hero .ctas .btn {
+		flex: 1 1 auto;
+		justify-content: center;
+	}
+	.btn-primary {
+		padding-left: 40px;
+	}
+	.proof {
+		grid-template-columns: 1fr 1fr;
+	}
+	.proof li:first-child {
+		grid-column: 1 / -1;
+		padding-bottom: 12px;
+		border-bottom: 1px solid var(--fw-line);
+	}
+	.proof li:nth-child(2) {
+		padding-left: 0;
+		border-left: 0;
+	}
+	.figure {
+		padding: 10px;
+		border-radius: 14px;
+		margin: 0;
+	}
+	.figure figcaption {
+		flex-direction: column;
+		gap: 4px;
+		padding: 10px 6px 2px;
+	}
+	.code {
+		font-size: 12.5px;
+		border-radius: 12px;
+	}
+	.code-pre .l::before {
+		width: 36px;
+		padding-right: 12px;
+	}
+	.out .t {
+		font-size: 16px;
+	}
+	.why-with dl {
+		grid-template-columns: minmax(0, 1fr);
+	}
+	.variants ul {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+	.variants li:nth-child(3n) {
+		border-right: 1px solid var(--fw-line-soft);
+	}
+	.variants li:nth-child(2n) {
+		border-right: 0;
+	}
+	.variants li:nth-last-child(-n + 3) {
+		border-bottom: 1px solid var(--fw-line-soft);
+	}
+	.variants li:nth-last-child(-n + 2) {
+		border-bottom: 0;
+	}
+	.guarantees > div {
+		grid-template-columns: 1fr;
+	}
+	.foot-grid {
+		grid-template-columns: 1fr;
+	}
+	.foot-nav {
+		grid-template-columns: 1fr 1fr;
+	}
+	.foot-legal {
+		grid-template-columns: 1fr;
+	}
+	.btn-star {
+		width: 100%;
+		justify-content: center;
+	}
+}

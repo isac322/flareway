@@ -1,0 +1,39 @@
+---
+// The mark + wordmark lockup from the shared brand vectors. The door is its own
+// <g> so the hero can animate it swinging open; the wordmark follows
+// currentColor so it switches ink with the theme.
+import {
+	BRAND_ORANGE,
+	CLOUD_PATH,
+	DOOR_PATH,
+	LOCKUP_VIEWBOX,
+	MARK_TRANSFORM,
+	WORDMARK_PATH,
+	WORDMARK_TRANSFORM,
+} from '../brand/paths';
+
+interface Props {
+	/** Accessible name; omit when the lockup sits inside a labelled link. */
+	label?: string;
+	id?: string;
+	class?: string;
+}
+
+const { label, id, class: className } = Astro.props;
+---
+
+<svg
+	id={id}
+	class={className}
+	viewBox={LOCKUP_VIEWBOX}
+	role={label ? 'img' : undefined}
+	aria-label={label}
+	aria-hidden={label ? undefined : 'true'}
+	focusable="false"
+>
+	<g transform={MARK_TRANSFORM}>
+		<path fill={BRAND_ORANGE} d={CLOUD_PATH}></path>
+		<g class="lockup-door"><path fill={BRAND_ORANGE} fill-rule="evenodd" d={DOOR_PATH}></path></g>
+	</g>
+	<g transform={WORDMARK_TRANSFORM}><path fill="currentColor" d={WORDMARK_PATH}></path></g>
+</svg>

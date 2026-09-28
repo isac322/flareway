@@ -1,0 +1,72 @@
+---
+// One highlighted source file with a working Copy button. Lines render as
+// numbered spans so the demo can highlight the lines behind each output.
+// Highlighting covers the YAML and shell used on the landing: keys, the
+// `kind:` value, scalars, list dashes, and comments.
+// The <pre> body stays on one line because whitespace inside it would render.
+interface Props {
+	/** File name shown in the bar. */
+	name: string;
+	source: string;
+	/** Key referenced by demo `lines` specs (e.g. `g`). */
+	fileKey: string;
+	copyLabel: string;
+	copiedLabel: string;
+	copyFailedLabel: string;
+	/** Accessible label for the scrollable code region. */
+	label: string;
+	shell?: boolean;
+}
+
+const { name, source, fileKey, copyLabel, copiedLabel, copyFailedLabel, label, shell = false } = Astro.props;
+const text = source.replace(/\n+$/, '');
+
+type Token = { c?: string; t: string };
+
+const YAML_LINE = /^(\s*)(- )?([\w./-]+)(:)(\s*)(.*)$/;
+const YAML_ITEM = /^(\s*)(- )(.*)$/;
+
+const lines: Token[][] = text.split('\n').map((line) => {
+	if (shell) {
+		const [head, ...rest] = line.split(/(?=\s--)/);
+		return [{ c: line.startsWith(' ') ? undefined : 'k', t: head }, ...rest.map((t) => ({ c: 'v', t }))];
+	}
+	const comment = line.indexOf(' #');
+	const body = comment === -1 ? line : line.slice(0, comment);
+	const tail: Token[] = comment === -1 ? [] : [{ c: 'c', t: line.slice(comment) }];
+	const pair = YAML_LINE.exec(body);
+	if (pair) {
+		const [, indent, dash, key, colon, gap, value] = pair;
+		return [
+			{ t: indent },
+			...(dash ? [{ c: 'p', t: dash }] : []),
+			{ c: 'k', t: key },
+			{ c: 'p', t: colon },
+			{ t: gap },
+			{ c: key === 'kind' ? 'n' : 'v', t: value },
+			...tail,
+		];
+	}
+	const item = YAML_ITEM.exec(body);
+	if (item) return [{ t: item[1] }, { c: 'p', t: item[2] }, { c: 'v', t: item[3] }, ...tail];
+	return [{ t: body }, ...tail];
+});
+---
+
+<div class="code-file">
+	<span><b>{name}</b></span>
+	<button
+		class="copy"
+		type="button"
+		data-copy={text}
+		data-copied={copiedLabel}
+		data-copy-failed={copyFailedLabel}>{copyLabel}</button
+	>
+</div>
+<pre
+	class:list={['code-pre', { 'code-shell': shell }]}
+	data-file={fileKey}
+	tabindex="0"
+	aria-label={label}>{
+	lines.map((tokens, index) => <span class="l" data-n={index + 1}>{tokens.map((token) => (token.c ? <span class={token.c}>{token.t}</span> : token.t))}{'\n'}</span>)
+}</pre>

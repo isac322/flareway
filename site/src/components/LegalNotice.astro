@@ -1,0 +1,21 @@
+---
+// Non-affiliation disclaimer and trademark attribution, shown on every page
+// (landing footer and docs footer). Keep the wording verbatim.
+interface Props {
+	class?: string;
+}
+const { class: className } = Astro.props;
+---
+
+<div class:list={['fw-legal', className]}>
+	<p>
+		Flareway is an independent open-source project, not affiliated with, endorsed by, or sponsored
+		by Cloudflare, Inc. or the Cloud Native Computing Foundation.
+	</p>
+	<p>
+		Cloudflare, the Cloudflare logo, Cloudflare Tunnel, Cloudflare Access, and WARP are trademarks
+		and/or registered trademarks of Cloudflare, Inc. in the United States and other jurisdictions.
+		Kubernetes is a registered trademark of The Linux Foundation.
+	</p>
+	<p>Copyright 2026 Byeonghoon Yoo. Licensed under the Apache License, Version 2.0.</p>
+</div>

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Flareway is experimental software at API version `v1alpha1`. There is no
+Flareway is at API version `v1alpha1`. There is no
 LTS line and no backport policy: only the most recent release receives
 fixes. If you are running an older tag, upgrade before reporting a bug
 that may already be fixed.

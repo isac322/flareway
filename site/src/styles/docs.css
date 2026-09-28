@@ -1,28 +1,398 @@
 /*
- * Docs layout adjustments. Neutral on purpose: brand theming lands later.
+ * Starlight theming for the docs. Every color and font comes from tokens.css
+ * (loaded just before this file); nothing here hard-codes a brand value. The
+ * tokens flip between light and dark on their own, so one :root block maps
+ * Starlight's variables for both themes.
  *
- * The header gains a second row for the site-wide tabs (Header.astro), so
- * --sl-nav-height grows by the tab row. Starlight derives the sidebar, content
- * offset, and scroll padding from --sl-nav-height, so they follow automatically.
+ * Unlayered on purpose: Starlight ships its styles in cascade layers, so these
+ * rules win without specificity tricks.
  */
+
+/* ---- Starlight variables → brand tokens ----------------------------------- */
 :root {
+	/* Neutral scale, ink (strongest) to paper (background). */
+	--sl-color-white: var(--fw-ink);
+	--sl-color-gray-1: color-mix(in oklab, var(--fw-ink) 92%, var(--fw-bg));
+	--sl-color-gray-2: color-mix(in oklab, var(--fw-ink) 84%, var(--fw-bg));
+	--sl-color-gray-3: var(--fw-ink-2);
+	--sl-color-gray-4: color-mix(in oklab, var(--fw-ink-2) 70%, var(--fw-bg));
+	--sl-color-gray-5: var(--fw-line);
+	--sl-color-gray-6: var(--fw-line-soft);
+	--sl-color-gray-7: var(--fw-tint);
+	--sl-color-black: var(--fw-bg);
+
+	/* Accent: text uses the AA-safe orange ink; raw orange stays graphic-only. */
+	--sl-color-accent-low: var(--fw-warm);
+	--sl-color-accent: var(--fw-accent-ink);
+	--sl-color-accent-high: var(--fw-ink);
+	--sl-color-text: var(--fw-ink);
+	--sl-color-text-accent: var(--fw-accent-ink);
+	--sl-color-text-invert: var(--fw-bg);
+	--sl-color-bg: var(--fw-bg);
+	--sl-color-bg-nav: var(--fw-bg);
+	--sl-color-bg-sidebar: var(--fw-bg);
+	--sl-color-bg-inline-code: var(--fw-cool);
+	--sl-color-bg-accent: var(--fw-ink);
+	--sl-color-hairline-light: var(--fw-line-soft);
+	--sl-color-hairline: var(--fw-line);
+	--sl-color-hairline-shade: var(--fw-line);
+	--sl-color-backdrop-overlay: color-mix(in srgb, var(--fw-ink) 40%, transparent);
+
+	--sl-shadow-md: var(--fw-shadow);
+	--sl-shadow-lg: var(--fw-shadow);
+
+	--sl-font: var(--fw-font-sans);
+	--sl-font-mono: var(--fw-font-mono);
+
+	/* Readable docs: 17px body, calm heading scale. */
+	--sl-text-body: 1.0625rem;
+	--sl-text-code: 0.875rem;
+	--sl-text-h1: 2.125rem;
+	--sl-text-h2: 1.625rem;
+	--sl-text-h3: 1.3125rem;
+	--sl-text-h4: 1.125rem;
+	--sl-text-h5: 1rem;
+	--sl-line-height: 1.7;
+	--sl-line-height-headings: 1.2;
+
+	/* The header gains a tab row (Header.astro), so --sl-nav-height grows by it.
+	   Starlight derives the sidebar, content offset, and scroll padding from
+	   --sl-nav-height, so they follow automatically. */
 	--fw-bar-height: 3.5rem;
 	--fw-tabs-height: 2.75rem;
 	--sl-nav-height: calc(var(--fw-bar-height) + var(--fw-tabs-height));
+	--fw-measure: 70ch;
+
+	scrollbar-color: var(--fw-line) transparent;
 }
 
 @media (min-width: 50rem) {
 	:root {
 		--fw-bar-height: 4rem;
+		--sl-text-h1: 2.625rem;
+		--sl-text-h2: 1.875rem;
+		--sl-text-h3: 1.4375rem;
+		--sl-text-h4: 1.1875rem;
 	}
 }
 
-/* Tabs sit flush on the header's bottom border. */
+::selection {
+	background: var(--fw-warm);
+	color: var(--fw-ink);
+}
+
+:focus-visible {
+	outline: 2px solid var(--fw-ink);
+	outline-offset: 2px;
+	border-radius: 4px;
+}
+
+/* ---- Header ---------------------------------------------------------------- */
+/* Tabs sit flush on the header's bottom rule. */
 header.header {
 	padding-bottom: 0;
 }
 
-/* Keep the mobile menu button centred on the top row, not the whole header. */
-starlight-menu-button button {
-	top: calc((var(--fw-bar-height) - var(--sl-menu-button-size)) / 2);
+/* Mobile menu button: centred on the top bar (the header's padded area above
+   the tab row), styled like the GitHub pill beside it. The bar spans from the
+   header's top padding to the tab row, so its centre is (bar + pad-y) / 2. */
+:root {
+	--sl-menu-button-size: 2.25rem;
+}
+.sl-menu-button {
+	top: calc((var(--fw-bar-height) + var(--sl-nav-pad-y) - var(--sl-menu-button-size)) / 2);
+	border: 1px solid var(--fw-line);
+	border-radius: 8px;
+	background-color: var(--fw-panel);
+	color: var(--fw-ink);
+	box-shadow: none;
+}
+.sl-menu-button:hover,
+.sl-menu-button:has(~ :popover-open) {
+	border-color: var(--fw-ink-2);
+	background-color: var(--fw-tint);
+}
+
+/* Search trigger: a quiet hairline field on the paper (desktop shows the field). */
+@media (min-width: 50rem) {
+	site-search button[data-open-modal] {
+		border-color: var(--fw-line);
+		border-radius: 8px;
+		background-color: var(--fw-panel);
+		color: var(--fw-ink-2);
+	}
+	site-search button[data-open-modal]:hover {
+		border-color: var(--fw-ink-2);
+		color: var(--fw-ink);
+	}
+}
+
+/* ---- Page title and prose -------------------------------------------------- */
+.content-panel h1,
+.sl-markdown-content :is(h1, h2) {
+	font-weight: 700;
+	letter-spacing: -0.022em;
+	text-wrap: balance;
+}
+.sl-markdown-content :is(h3, h4, h5, h6) {
+	letter-spacing: -0.01em;
+	text-wrap: balance;
+}
+
+.sl-markdown-content {
+	font-size: var(--sl-text-body);
+}
+
+/* Prose holds a 65–75ch measure; code, tables, and figures keep the full column. */
+.sl-markdown-content :is(p, ul, ol, dl, blockquote, h1, h2, h3, h4, h5, h6):not(:where(.not-content *)) {
+	max-width: var(--fw-measure);
+}
+.sl-markdown-content :is(li, dd) :is(p, ul, ol) {
+	max-width: none;
+}
+
+/* Links: navy text with an orange (graphic) underline; hover darkens the line. */
+.sl-markdown-content a:not(:where(.not-content *)) {
+	color: var(--fw-ink);
+	text-decoration-line: underline;
+	text-decoration-color: var(--fw-accent);
+	text-decoration-thickness: 1.5px;
+	text-underline-offset: 0.2em;
+	transition: text-decoration-color 0.2s;
+}
+.sl-markdown-content a:hover:not(:where(.not-content *)) {
+	color: var(--fw-ink);
+	text-decoration-color: var(--fw-ink);
+}
+
+/* Inline code. */
+.sl-markdown-content :not(pre) > code:not(:where(.not-content *)) {
+	border: 1px solid var(--fw-line-soft);
+	border-radius: 5px;
+	color: var(--fw-ink);
+	font-size: 0.875em;
+	font-variant-ligatures: none;
+}
+.sl-markdown-content a code:not(:where(.not-content *)) {
+	color: inherit;
+}
+
+.sl-markdown-content hr:not(:where(.not-content *)) {
+	border-bottom-color: var(--fw-line);
+}
+
+.sl-markdown-content blockquote:not(:where(.not-content *)) {
+	border-inline-start: 2px solid var(--fw-line);
+	color: var(--fw-ink-2);
+}
+
+.sl-markdown-content details:not(:where(.not-content *)) {
+	--sl-details-border-color: var(--fw-line);
+	--sl-details-border-color--hover: var(--fw-ink-2);
+	border-inline-start-width: 1px;
+}
+
+/* Tables: hairline rules, mono-free header row, readable numerals. */
+.sl-markdown-content table:not(:where(.not-content *)) {
+	font-size: 0.9375rem;
+	font-variant-numeric: tabular-nums;
+}
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+	border-bottom-color: var(--fw-line-soft);
+	padding: 0.5rem 0.875rem;
+}
+.sl-markdown-content th:not(:where(.not-content *)) {
+	border-bottom: 1px solid var(--fw-ink-2);
+	color: var(--fw-ink);
+	font-weight: 600;
+	font-size: 0.875rem;
+}
+.sl-markdown-content tr:hover > td:not(:where(.not-content *)) {
+	background-color: var(--fw-tint);
+}
+
+/* ---- Asides ---------------------------------------------------------------- */
+/* Hairline panels instead of thick colored side bars; the variant shows in the
+   title and icon color. */
+.starlight-aside {
+	border: 1px solid var(--fw-line);
+	border-radius: 10px;
+	padding: 1rem 1.125rem;
+	color: var(--fw-ink);
+}
+.starlight-aside--note {
+	--sl-color-asides-text-accent: var(--fw-ink);
+	--sl-color-asides-border: var(--fw-ink-2);
+	background-color: var(--fw-cool);
+}
+.starlight-aside--tip {
+	--sl-color-asides-text-accent: var(--fw-ink);
+	--sl-color-asides-border: var(--fw-ink-2);
+	background-color: var(--fw-tint);
+}
+.starlight-aside--caution {
+	--sl-color-asides-text-accent: var(--fw-accent-ink);
+	--sl-color-asides-border: var(--fw-accent);
+	background-color: var(--fw-warm);
+	border-color: color-mix(in srgb, var(--fw-accent) 45%, var(--fw-line));
+}
+.starlight-aside--danger {
+	--sl-color-asides-border: var(--sl-color-red);
+	border-color: color-mix(in srgb, var(--sl-color-red) 45%, var(--fw-line));
+}
+.starlight-aside--caution .starlight-aside__icon {
+	color: var(--fw-accent);
+}
+.starlight-aside__title {
+	font-size: 1rem;
+}
+.starlight-aside__content a {
+	color: var(--fw-ink);
+	text-decoration-color: var(--sl-color-asides-border);
+}
+
+/* ---- Code blocks (Expressive Code; colors set in astro.config.mjs) --------- */
+.expressive-code .frame.has-title:not(.is-terminal) .title {
+	font-weight: 600;
+	letter-spacing: 0;
+}
+.expressive-code .frame .header {
+	font-family: var(--fw-font-mono);
+}
+.expressive-code .copy button {
+	border-radius: 6px;
+}
+.expressive-code .copy button:focus-visible {
+	outline: 2px solid var(--fw-accent);
+	outline-offset: 2px;
+}
+
+/* ---- Sidebar --------------------------------------------------------------- */
+/* The active page is marked by a small doorway glyph in the gutter (jambs and
+   an open orange leaf), never by a filled pill or colored side bar. */
+.sidebar-content ul a {
+	position: relative;
+	padding-inline-start: 1.375rem;
+	border-radius: 6px;
+	color: var(--fw-ink-2);
+}
+.sidebar-content ul a:hover,
+.sidebar-content ul a:focus-visible {
+	color: var(--fw-ink);
+	background-color: var(--fw-tint);
+}
+.sidebar-content ul a.large {
+	color: var(--fw-ink);
+}
+.sidebar-content ul [aria-current='page'],
+.sidebar-content ul [aria-current='page']:hover,
+.sidebar-content ul [aria-current='page']:focus-visible {
+	color: var(--fw-ink);
+	font-weight: 600;
+	background-color: transparent;
+}
+.sidebar-content ul [aria-current='page']::before {
+	content: '';
+	position: absolute;
+	inset-inline-start: 0.375rem;
+	top: 50%;
+	width: 9px;
+	height: 12px;
+	margin-top: -6px;
+	border: 1.5px solid var(--fw-ink);
+	border-bottom: 0;
+}
+.sidebar-content ul [aria-current='page']::after {
+	content: '';
+	position: absolute;
+	inset-inline-start: calc(0.375rem + 1.5px);
+	top: 50%;
+	width: 3.5px;
+	height: 10px;
+	margin-top: -4px;
+	background: var(--fw-accent);
+	transform: skewY(var(--fw-door-slant));
+	transform-origin: 0 0;
+}
+/* Nested lists indent without a side rule. */
+.sidebar-content ul ul li {
+	border-inline-start: 0;
+	margin-inline-start: 0.625rem;
+	padding-inline-start: 0;
+}
+/* Hairline dividers between groups. */
+.sidebar-content .top-level > li + li {
+	border-top: 1px solid var(--fw-line-soft);
+	padding-top: 0.5rem;
+}
+.sidebar-content summary {
+	border-radius: 6px;
+	color: var(--fw-ink);
+}
+.sidebar-content summary:hover {
+	background-color: var(--fw-tint);
+}
+
+/* Desktop sidebar edge. */
+@media (min-width: 50rem) {
+	.sidebar-pane {
+		border-inline-end-color: var(--fw-line-soft);
+	}
+}
+
+/* ---- Table of contents ----------------------------------------------------- */
+starlight-toc a,
+mobile-starlight-toc a {
+	color: var(--fw-ink-2);
+}
+starlight-toc a:hover,
+mobile-starlight-toc a:hover {
+	color: var(--fw-ink);
+}
+starlight-toc a[aria-current='true'],
+mobile-starlight-toc a[aria-current='true'] {
+	color: var(--fw-ink);
+	font-weight: 600;
+}
+
+/* ---- Buttons and badges ---------------------------------------------------- */
+.sl-link-button.primary {
+	background-color: var(--fw-btn-bg);
+	border-color: var(--fw-btn-bg);
+	color: var(--fw-btn-ink);
+}
+.sl-link-button.primary:hover {
+	background-color: var(--fw-btn-hover);
+	border-color: var(--fw-btn-hover);
+	color: var(--fw-btn-ink);
+}
+.sl-link-button.secondary {
+	border-color: var(--fw-line);
+	background-color: var(--fw-panel);
+	color: var(--fw-ink);
+}
+.sl-link-button.secondary:hover {
+	border-color: var(--fw-ink-2);
+	color: var(--fw-ink);
+}
+
+/* ---- Pagination ------------------------------------------------------------ */
+.pagination-links a {
+	border-color: var(--fw-line);
+	border-radius: 10px;
+	box-shadow: none;
+	background-color: var(--fw-panel);
+}
+.pagination-links a:hover {
+	border-color: var(--fw-ink-2);
+}
+.pagination-links .link-title {
+	color: var(--fw-ink);
+}
+
+/* ---- Scrollbars ------------------------------------------------------------ */
+/* Page scrollbars take the paper palette from :root; code panels get a thumb
+   drawn from the code ink so it reads on navy. */
+.expressive-code pre {
+	scrollbar-color: color-mix(in srgb, var(--fw-code-ink) 25%, transparent) transparent;
 }

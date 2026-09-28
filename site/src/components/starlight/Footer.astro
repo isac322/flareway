@@ -1,0 +1,64 @@
+---
+// Starlight's footer (edit link, last updated, tab-scoped pagination) followed
+// by a doorway divider and the verbatim legal notice. Starlight's optional
+// "Built with Starlight" credit is off in astro.config.mjs, so it is omitted.
+import EditLink from '@astrojs/starlight/components/EditLink.astro';
+import LastUpdated from '@astrojs/starlight/components/LastUpdated.astro';
+import LegalNotice from '../LegalNotice.astro';
+import DoorwayRule from './DoorwayRule.astro';
+import Pagination from './Pagination.astro';
+---
+
+<footer class="sl-flex">
+	<div class="meta sl-flex">
+		<EditLink />
+		<LastUpdated />
+	</div>
+	<Pagination />
+
+	<div class="fw-legal-block">
+		<DoorwayRule />
+		<LegalNotice class="fw-docs-legal" />
+	</div>
+</footer>
+
+<style>
+	footer {
+		flex-direction: column;
+		gap: 1.5rem;
+	}
+	.meta {
+		gap: 0.75rem 3rem;
+		justify-content: space-between;
+		flex-wrap: wrap;
+		margin-top: 3rem;
+		font-size: var(--sl-text-sm);
+		color: var(--fw-ink-2);
+	}
+	.meta > :global(p:only-child) {
+		margin-inline-start: auto;
+	}
+	.meta :global(a) {
+		color: var(--fw-ink-2);
+	}
+	.meta :global(a:hover) {
+		color: var(--fw-ink);
+	}
+
+	.fw-legal-block {
+		margin-top: 2.5rem;
+		print-color-adjust: exact;
+	}
+	.fw-legal-block :global(.fw-docs-legal) {
+		display: grid;
+		gap: 0.5rem;
+		max-width: 72ch;
+		margin-top: 1.25rem;
+		font-size: var(--sl-text-xs);
+		line-height: 1.55;
+		color: var(--fw-ink-2);
+	}
+	.fw-legal-block :global(.fw-docs-legal p) {
+		margin: 0;
+	}
+</style>

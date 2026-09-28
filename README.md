@@ -4,11 +4,6 @@
 
 A Kubernetes operator for Cloudflare Tunnel, Access & WARP.
 
-> **Status: experimental.** Flareway is `v1alpha1`. The controller runs a single
-> replica with serialized reconciliation, and some Cloudflare edge and WARP
-> behaviors are still under live verification. Do not run it as production
-> ingress yet.
-
 ## What it does
 
 Flareway implements the Kubernetes Gateway API (`gateway.networking.k8s.io/v1`)
@@ -35,9 +30,9 @@ Beyond that baseline, use it when you want:
   protect.
 - Private services reachable over WARP, managed as Kubernetes resources.
 
-It is not a fit when you need production-grade ingress today, a highly
-available controller, or Gateway API features the implementation does not
-support yet — see [Conformance and testing](#conformance-and-testing).
+It is not a fit when you need a highly available controller or Gateway API
+features the implementation does not support yet — see
+[Conformance and testing](#conformance-and-testing).
 
 ## How it works
 

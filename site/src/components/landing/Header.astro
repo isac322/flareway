@@ -1,0 +1,37 @@
+---
+// Landing header: lockup, the site tabs from nav.ts (same data as the docs
+// header), and the GitHub button with its star affordance.
+import { landingCopy } from '../../data/landing-copy';
+import { tabs } from '../../data/nav';
+import GitHubButton from './GitHubButton.astro';
+import Lockup from './Lockup.astro';
+
+interface Props {
+	stars?: number;
+}
+
+const { stars } = Astro.props;
+const copy = landingCopy.header;
+// The landing is the Overview surface; nav.ts points that tab at the docs overview.
+const overview = tabs[0];
+---
+
+<header class="site-head">
+	<div class="wrap head-row">
+		<a class="brand" href="/" aria-label={copy.homeLabel}><Lockup /></a>
+		<nav class="tabs" aria-label={copy.tabsLabel}>
+			<ul>
+				{
+					tabs.map((tab) => (
+						<li>
+							<a href={tab.href} aria-current={tab === overview ? 'true' : undefined}>
+								{tab.label}
+							</a>
+						</li>
+					))
+				}
+			</ul>
+		</nav>
+		<GitHubButton stars={stars} />
+	</div>
+</header>
