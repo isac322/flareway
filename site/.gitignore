@@ -9,3 +9,7 @@ node_modules/
 src/content/docs/docs/*
 !src/content/docs/docs/architecture/
 public/assets/
+
+# Local impeccable review captures and per-machine config (never committed)
+.impeccable/review/
+.impeccable/config.local.json
