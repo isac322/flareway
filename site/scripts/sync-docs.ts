@@ -2,12 +2,12 @@
  * Copies the repository's Markdown into the Starlight content collection.
  *
  * Output (gitignored, regenerated on every run):
- *   site/src/content/docs/docs/**   except the hand-authored architecture/ page
- *   site/public/assets/**           images referenced by synced pages + architecture diagrams
+ *   site/src/content/docs/docs/**   one page per PAGES entry
+ *   site/public/assets/**           images referenced by synced pages
  *
  * Run with `bun run sync` from site/. Exits non-zero when a source is missing.
  */
-import { readdir, rm, stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { join, posix, resolve } from 'node:path';
 
 const REPO_URL = 'https://github.com/isac322/flareway';
@@ -15,13 +15,6 @@ const SITE_DIR = resolve(import.meta.dir, '..');
 const REPO_DIR = resolve(SITE_DIR, '..');
 const CONTENT_DIR = join(SITE_DIR, 'src/content/docs/docs');
 const ASSETS_OUT_DIR = join(SITE_DIR, 'public/assets');
-/** Committed, hand-authored entry inside CONTENT_DIR that the sync must never touch. */
-const COMMITTED_ENTRY = 'architecture';
-/**
- * Asset globs (relative to repo assets/) copied unconditionally because the
- * committed architecture page embeds them.
- */
-const ALWAYS_COPIED_ASSETS = ['architecture/*.svg'];
 const DESCRIPTION_MAX = 155;
 
 interface Page {
@@ -39,34 +32,69 @@ interface Page {
 
 const PAGES: Page[] = [
 	{ source: 'README.md', target: 'index.md', order: 0, drop: /^!\[[^\]]*\]\(assets\/cloud-gateway\/d2\/logo-t3\.svg\)\s*$/ },
-	{ source: 'docs/operations/install.md', target: 'operations/install.md', order: 1, label: 'Install' },
+	{ source: 'docs/concepts/how-it-works.md', target: 'concepts/how-it-works.md', order: 1, label: 'How it works' },
+	{ source: 'docs/concepts/http-routing.md', target: 'concepts/http-routing.md', order: 2, label: 'HTTP routing' },
+	{
+		source: 'conformance/reports/v1.6.2/flareway/README.md',
+		target: 'concepts/conformance.md',
+		order: 3,
+		label: 'Conformance report',
+	},
+	{ source: 'docs/concepts/security-model.md', target: 'concepts/security-model.md', order: 4, label: 'Security model' },
+	{
+		source: 'docs/concepts/ownership-and-adoption.md',
+		target: 'concepts/ownership-and-adoption.md',
+		order: 5,
+		label: 'Ownership and adoption',
+	},
+	{ source: 'docs/concepts/limits.md', target: 'concepts/limits.md', order: 6, label: 'Limits' },
+	{ source: 'docs/get-started/install.md', target: 'get-started/install.md', order: 1, label: 'Install' },
+	{
+		source: 'docs/get-started/connect-cloudflare.md',
+		target: 'get-started/connect-cloudflare.md',
+		order: 2,
+		label: 'Connect Cloudflare',
+	},
+	{
+		source: 'docs/get-started/expose-a-service.md',
+		target: 'get-started/expose-a-service.md',
+		order: 3,
+		label: 'Expose a Service',
+	},
+	{
+		source: 'docs/get-started/protect-with-access.md',
+		target: 'get-started/protect-with-access.md',
+		order: 4,
+		label: 'Protect with Access',
+	},
+	{
+		source: 'docs/get-started/private-services-over-warp.md',
+		target: 'get-started/private-services-over-warp.md',
+		order: 5,
+		label: 'Private services over WARP',
+	},
+	{ source: 'docs/get-started/direct-tunnels.md', target: 'get-started/direct-tunnels.md', order: 6, label: 'Direct tunnels' },
+	{ source: 'docs/operations/troubleshooting.md', target: 'operations/troubleshooting.md', order: 1, label: 'Troubleshooting' },
 	{ source: 'docs/operations/upgrade.md', target: 'operations/upgrade.md', order: 2, label: 'Upgrade' },
-	{ source: 'docs/operations/rbac-token.md', target: 'operations/rbac-token.md', order: 3, label: 'RBAC and API tokens' },
-	{ source: 'docs/operations/troubleshooting.md', target: 'operations/troubleshooting.md', order: 4, label: 'Troubleshooting' },
 	{
 		source: 'docs/operations/freshness-and-drift.md',
 		target: 'operations/freshness-and-drift.md',
-		order: 5,
-		label: 'Freshness and drift',
+		order: 3,
+		label: 'Drift and API budget',
 	},
 	{ source: 'docs/api-reference.md', target: 'reference/api.md', order: 1, label: 'API reference' },
-	{ source: 'docs/api/README.md', target: 'reference/kubectl-explain.md', order: 2, label: 'kubectl explain guide' },
-	{
-		source: 'conformance/reports/v1.6.2/flareway/README.md',
-		target: 'conformance/gateway-api-v1-6-2.md',
-		order: 0,
-	},
+	{ source: 'charts/flareway/README.md', target: 'reference/helm-chart.md', order: 2, label: 'Helm chart values' },
+	{ source: 'docs/api/README.md', target: 'reference/kubectl-explain.md', order: 3, label: 'kubectl explain' },
 	{ source: 'CONTRIBUTING.md', target: 'project/contributing.md', order: 1, label: 'Contributing' },
 	{ source: 'SECURITY.md', target: 'project/security.md', order: 2, label: 'Security policy' },
+	{ source: 'CODE_OF_CONDUCT.md', target: 'project/code-of-conduct.md', order: 3, label: 'Code of conduct' },
 ];
 
-/** `operations/install.md` -> `/docs/operations/install/`, `index.md` -> `/docs/`. */
+/** `get-started/install.md` -> `/docs/get-started/install/`, `index.md` -> `/docs/`. */
 const routeFor = (target: string) => `/docs/${target.replace(/(^|\/)index\.md$/, '$1').replace(/\.md$/, '/')}`;
 
 /** Repo-relative source path -> site route, for rewriting links between synced pages. */
 const ROUTE_BY_SOURCE = new Map(PAGES.map((page) => [page.source, routeFor(page.target)]));
-/** Additional committed pages that repo links may point at. */
-ROUTE_BY_SOURCE.set('site/src/content/docs/docs/architecture/index.md', '/docs/architecture/');
 
 const copiedAssets = new Set<string>();
 const unmapped: string[] = [];
@@ -263,20 +291,9 @@ async function main() {
 	}
 	if (missing.length > 0) throw new Error(`missing source file(s):\n  ${missing.join('\n  ')}`);
 
-	// Clear previous output, keeping committed hand-authored pages.
+	// Clear the last run's output.
 	await rm(ASSETS_OUT_DIR, { recursive: true, force: true });
-	const existing = await readdir(CONTENT_DIR).catch(() => [] as string[]);
-	await Promise.all(
-		existing
-			.filter((entry) => entry !== COMMITTED_ENTRY)
-			.map((entry) => rm(join(CONTENT_DIR, entry), { recursive: true, force: true })),
-	);
-
-	for (const pattern of ALWAYS_COPIED_ASSETS) {
-		for await (const sub of new Bun.Glob(pattern).scan({ cwd: join(REPO_DIR, 'assets') })) {
-			await copyAsset(`assets/${sub}`);
-		}
-	}
+	await rm(CONTENT_DIR, { recursive: true, force: true });
 
 	for (const page of PAGES) {
 		const outPath = join(CONTENT_DIR, page.target);

@@ -1,29 +1,30 @@
-# Gateway API conformance reports
+# Gateway API conformance report (v1.6.2)
 
-`standard-dev-default-report.yaml` records a successful local development run on September 13, 2026. GatewayHTTP Core passed 37/37 tests, the 30 tests for the claimed Extended features passed 30/30, and the suite recorded zero skips and zero failures.
+A local development run on September 13, 2026 passed GatewayHTTP Core 37/37 and the claimed Extended tests 30/30, with zero skips and zero failures.
 
-The report's implementation version is `dev`. It is evidence for this checkout, not a release submission. The suite used `GatewayClassConfig.spec.conformanceMode: true` and verified Gateway API behavior through Envoy; it did not test Cloudflare Tunnel, DNS, Access, WARP, D-03 streaming, or D-11 private-hostname behavior.
+## Results
+
+[`standard-dev-default-report.yaml`](standard-dev-default-report.yaml) is the report the Gateway API v1.6.2 conformance suite wrote for that run, on the standard channel in default mode:
+
+| Profile | Passed | Failed | Skipped |
+|---|---|---|---|
+| GatewayHTTP Core | 37 | 0 | 0 |
+| GatewayHTTP Extended (claimed features) | 30 | 0 | 0 |
+
+## What the run covered
+
+The report's implementation version is `dev`, and the report has not been submitted to the Gateway API project. The run used `GatewayClassConfig.spec.conformanceMode: true`, in which Flareway performs no Cloudflare account operations and the suite reaches Envoy directly, so it validated Gateway API behavior through Envoy.
+
+The run did not exercise Cloudflare Tunnel, DNS, Access, or WARP. It also did not test long-lived streams through Cloudflare's edge, or whether the edge accepts the `127.0.0.1` answer Flareway gives for private hostnames.
+
+## Supported and unsupported features
+
+The [report YAML](standard-dev-default-report.yaml) lists 25 supported and 13 unsupported Extended features by name, and [HTTP routing](../../../../docs/concepts/http-routing.md) explains each one, including what Flareway does with unsupported configuration.
+
+## Serialized run
+
+The runner disables test parallelism because Flareway deliberately runs one controller replica and one Gateway reconcile worker. This serializes independent fixtures without skipping tests or weakening their assertions.
 
 ## Reproduce
 
-Run the portable workflow with Docker, Go, and `kubectl` installed:
-
-```sh
-make conformance
-```
-
-The script creates or reuses the `flareway-conf` kind cluster, installs Gateway API v1.6.2 and Flareway, builds the controller image, and applies the conformance `GatewayClass`.
-
-On Linux, it starts cloud-provider-kind and verifies that it can assign a LoadBalancer address before running the suite from the host. On macOS, or when the provider probe fails, it switches the conformance Service to `ClusterIP` and runs the compiled test binary in a Kubernetes Job. The Job writes the report to a shared volume, and the script copies it to this directory.
-The runner disables test parallelism because Flareway v1 deliberately uses one controller replica and one Gateway reconciliation worker. This serializes independent fixtures without skipping tests or weakening their assertions.
-
-Useful overrides:
-
-```sh
-KIND_CLUSTER_NAME=my-cluster \
-VERSION=dev \
-REPORT_OUTPUT="$PWD/conformance/reports/v1.6.2/flareway/standard-dev-default-report.yaml" \
-make conformance
-```
-
-The workflow does not invoke `sudo`. It pins kind, cloud-provider-kind, ko, kustomize, the kind node image, and Gateway API to the versions declared in the repository.
+To run the suite yourself, follow [Gateway API conformance run](../../../../CONTRIBUTING.md#gateway-api-conformance-run) in the contributing guide.

@@ -1,6 +1,6 @@
 ---
 // S5: Access through GEP-713 policy attachment, WARP private networking CRDs,
-// and CloudflareTunnel Direct mode.
+// and CloudflareTunnel Direct mode. Each card links to its own guide.
 import { landingCopy } from '../../data/landing-copy';
 import Icon from './Icon.astro';
 
@@ -17,7 +17,7 @@ const copy = landingCopy.access;
 			<div class="access-policy">
 				<h3>{copy.policy.heading}</h3>
 				<p set:html={copy.policy.bodyHtml} />
-				<figure class="variants">
+				<figure class="variants variants-pairs">
 					<figcaption set:html={copy.policy.variantsCaption} />
 					<ul>
 						{
@@ -38,13 +38,39 @@ const copy = landingCopy.access;
 					<p set:html={copy.warp.bodyHtml} />
 					<ul class="kinds">{copy.warp.kinds.map((kind) => <li><code>{kind}</code></li>)}</ul>
 					<p class="kinds-note" set:html={copy.warp.kindsNoteHtml} />
+					<a class="more" href={copy.warp.more.href}>{copy.warp.more.label}<Icon name="arrow" class="arrow" /></a>
 				</div>
 				<div class="access-direct">
 					<h3>{copy.direct.heading}</h3>
 					<p set:html={copy.direct.bodyHtml} />
 					<ul class="origins">{copy.direct.origins.map((origin) => <li>{origin}</li>)}</ul>
+					<a class="more" href={copy.direct.more.href}>{copy.direct.more.label}<Icon name="arrow" class="arrow" /></a>
 				</div>
 			</div>
 		</div>
 	</div>
 </section>
+
+<style>
+	/*
+	 * The variant list has four entries: lay them out two by two at every width.
+	 * Astro scopes these selectors with :where(), which adds no specificity, so the
+	 * doubled class is what lets them win over the 3-column rules in landing.css.
+	 */
+	.variants.variants-pairs ul {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+	.variants.variants-pairs li:nth-child(n) {
+		border-right: 1px solid var(--fw-line-soft);
+		border-bottom: 1px solid var(--fw-line-soft);
+	}
+	.variants.variants-pairs li:nth-child(2n) {
+		border-right: 0;
+	}
+	.variants.variants-pairs li:nth-last-child(-n + 2) {
+		border-bottom: 0;
+	}
+	.access-side .more {
+		margin-top: 16px;
+	}
+</style>

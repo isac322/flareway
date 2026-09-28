@@ -1,6 +1,8 @@
 # Troubleshooting Flareway
 
-Start with status conditions and Events. Flareway blocks traffic when it cannot prove that the requested security and routing state has reached the data plane.
+Start with status conditions and Events: `Programmed=False`, `Conflict`, `CleanupBlocked`, and `CredentialsValid=False` each name the gate that blocks traffic.
+
+Flareway blocks traffic when it cannot prove that the requested security and routing state has reached the data plane. These commands show where each object stopped:
 
 ```sh
 kubectl get gateway,httproute -A
@@ -22,7 +24,7 @@ kubectl describe accessapplication -n <namespace> <name>
 | `ConfigApplied=False` | Compare `CloudflareTunnel.status.configVersion.desired` and `.applied`; inspect data-plane Pods and cloudflared `/config` reachability. Flareway does not mark the Gateway programmed until every active Pod converges. |
 | `DNSReady=False` | The zone is not granted, the zone was not discovered, or an existing record has a foreign ownership comment. Flareway omits DNS tags and will not overwrite a foreign record. |
 | `CleanupBlocked=True` | A finalizer is preserving teardown order. Remove remaining `NetworkRoute`/`HostnameRoute` references or restore the Cloudflare permission needed for deletion. Do not strip the finalizer unless you accept remote leaks or exposed traffic. If you strip an `AccessApplication` finalizer, the controller still removes that application's AUD handoff and private-tunnel ledger Secrets from the operator namespace, but the remote Cloudflare objects are left behind. |
-| `Ready=False`, reason `RecoveryPending` | A ServiceToken create attempt was journaled as dispatched but the remote token is not yet visible, or a zone-scope recovery is waiting for the retiring token's deletion to be confirmed. Absence in the remote list is treated as unknown, not absent: the controller blocks and re-lists instead of issuing a blind create or rotate. This bounded non-convergence is intentional fail-closed behavior, not a stuck bug. |
+| `Ready=False`, reason `RecoveryPending` | A ServiceToken create attempt was journaled as dispatched but the remote token is not yet visible, or a zone-scope recovery is waiting for the retiring token's deletion to be confirmed. The controller treats absence from the remote list as unknown, so it blocks and re-lists instead of issuing a blind create or rotate. This bounded wait is intended fail-closed behavior. |
 | `PrivateListenerDegraded=True` | A private listener uses the Pod-IP fallback instead of loopback. Verify the NetworkPolicy before treating it as ready. |
 
 Deleting an `AccessApplication` never makes a protected route public. The route remains blocked unless no Access application targets it and `CloudflareAccount.spec.grants[].unprotectedHostnames` explicitly permits the hostname.
@@ -59,66 +61,35 @@ When `metrics.enabled=true`, the chart exposes the controller metrics Service. S
 
 Alert on sustained reconcile errors, rate limiting, a programmed gauge of `0`, or a desired/applied version gap. The metrics NetworkPolicy admits namespaces matching `metrics: enabled` by default; adjust `networkPolicy.metrics.namespaceSelector` for the monitoring namespace.
 
+Drift detection has its own metrics; see [Drift detection and Cloudflare API budget](freshness-and-drift.md#metrics).
+
 ## Debug logging
 
-The controller logs JSON to stderr at `info` by default. Enable `debug` to see `V(1)` entries such as the per-request `Cloudflare API request completed` lines.
-
-For a Helm install:
+The controller logs JSON to stderr at `info` by default. Enable `debug` to see `V(1)` entries such as the per-request `Cloudflare API request completed` lines:
 
 ```sh
 helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --version <chart-version> \
   --namespace flareway-system \
   --reuse-values \
   --set logging.level=debug
 ```
 
-For a Kustomize install, append the flag with a JSON6902 patch in the overlay — Go flags take the last value, so the appended `--zap-log-level=debug` wins over the shipped `--zap-log-level=info`:
+Use the chart version you already run; the `CHART` column of `helm list --namespace flareway-system` shows it. Set `logging.level=info` the same way to turn debug output off.
 
-```yaml
-patches:
-- patch: |-
-    - op: add
-      path: /spec/template/spec/containers/0/args/-
-      value: --zap-log-level=debug
-  target:
-    kind: Deployment
-```
-
-Do not use a strategic-merge patch on `args`: it replaces the whole list and drops required flags such as `--leader-elect`, the probe and metrics bind addresses, and the other `--zap-*` args. Editing the full args list in `config/manager/manager.yaml` directly is also fine.
-
-For a live Kustomize-installed Deployment, patch it in place:
-
-```sh
-kubectl -n flareway-system patch deployment flareway-controller-manager --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--zap-log-level=debug"}]'
-```
-
-Helm installs should use `helm upgrade` instead; a live `kubectl patch` drifts from the chart-rendered manifest and is reverted by the next upgrade.
-
-JSON logs can be filtered with `jq`, for example:
+Filter the JSON logs with `jq`, for example:
 
 ```sh
 kubectl -n flareway-system logs deployment/flareway-controller-manager -c manager | jq -cR 'fromjson? | select(.level == "error")'
 ```
 
-Integer levels add more controller-runtime detail: `logging.level=1` (or `--zap-log-level=1`) enables `V(1)`, and integers `2` or higher also disable the production log sampler. The chart accepts integers `1` through `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents; do not use them outside isolated debugging.
+Integer levels add more controller-runtime detail: `logging.level=1` enables `V(1)`, and integers `2` or higher also disable the production log sampler. The chart accepts integers `1` through `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents; do not use them outside isolated debugging.
 
-Rare client-go (klog) lines keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases, and like gRPC's rare ERROR lines they are not JSON. The `-R` and `fromjson?` in the example above skip those lines; plain `jq` stops at the first non-JSON line.
+Rare client-go (klog) lines keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), and gRPC's rare ERROR lines are not JSON either. The `-R` flag and `fromjson?` in the example above skip those lines; plain `jq` stops at the first non-JSON line.
 
-## Ownership and adoption
+The [Helm chart values](../../charts/flareway/README.md#logging) page lists every logging value.
 
-`managementPolicy: Managed` permits writes. `ObserveOnly` requires an `externalRef` and never claims an object by name. To adopt an existing remote object, set `externalRef`, `adoption.mode: AdoptById`, and expected attributes. Flareway compares the remote ID and expectation before setting `status.ownershipVerified`.
-
-A name match is not ownership proof. If `Conflict` persists, compare:
-
-- the Kubernetes object's UID and status remote ID;
-- the remote tag, comment, or Flareway name prefix;
-- `adoption.expect.name` or `.domain`;
-- other Terraform, GitOps, or controller writers.
-
-Keep shared Terraform-owned policies and identity providers as `ObserveOnly` with `deletionPolicy: Orphan`.
-
-## Access and Tunnel parity checks
+## Access application checks
 
 ### Application type and variant
 
@@ -137,99 +108,36 @@ An empty `spec.zone` uses the account-scoped Access endpoint. A non-empty zone i
 
 `RefNotPermitted` can also mean the matching account grant denies `accessPolicyRefs`, `accessCustomPageRefs`, `devicePostureIntegrationRefs`, `accessStandaloneApplicationRefs`, `platformObjects`, or the selected `privateRoutes`. For a private route, both the account grant selector and the route's `allowedNamespaces` must permit the consumer.
 
-### Bypass-child adoption
-
-Flareway creates a more-specific child Access application when a protected parent contains a public carve-out. Existing children are never adopted by hostname or name alone. Declare the normalized `hostname` and `path` under `spec.bypass.children[]`, set `externalRef.applicationId`, and use `adoption.mode: AdoptById` with expected attributes. An `ObserveOnly` parent needs an `externalRef` for every declared child.
-
-If a child reports `Conflict`, compare the remote application ID, normalized path, expected name/domain, and Flareway ownership tags. Do not delete the protected parent to clear a child conflict; that widens the outage and can change the parent AUD.
-
-### Gateway and Direct Tunnel ownership
-
-`CloudflareTunnel.spec.configuration.mode` defaults to `Gateway`. In that mode, the Gateway controller owns the complete remote configuration and may use `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, and `listeners`.
-
-`Direct` mode is explicit whole-object ownership. Put rules under `configuration.direct.ingress`, and configure top-level `originRequest` and `warpRouting` there. A Direct rule selects exactly one service: `http`, `https`, `tcp`, `ssh`, `rdp`, `smb`, `unix`, `unixTLS`, `helloWorld`, `httpStatus`, or `bastion`. The final rule must omit hostname and path. `originRequest.access` is valid only for HTTP-family origins; `ipRules` requires `bastion` or `proxyType: SOCKS5`.
-
-If admission says Direct mode cannot use Gateway fields, remove the Gateway-owned fields or switch the mode back to `Gateway`. Do not copy generated Gateway ingress into Direct mode while a Gateway still references the Tunnel.
-
-Gateway-mode ownership is UID-bound and sticky. If a second Gateway reports that another Gateway owns the Tunnel, do not force a handoff by changing names or timestamps. Remove or delete the current owner, then wait for its connector Deployment and Pods to drain before the successor is admitted. A remote soft-delete sets `status.deletedAt`; Flareway keeps ownership provenance for cleanup but blocks xDS, connector scale-up, addresses, private routes, and further Tunnel configuration.
-
-DNS is shared by both modes. For Managed DNS, a proxied record requires `ttl: 1`; `settings.ipv4Only` and `settings.ipv6Only` are mutually exclusive and require `proxied: true`.
-
-### WARP Connector and typed routes
-
-`NetworkRoute.spec.tunnelRef` and `HostnameRoute.spec.tunnelRef` require `name` and accept `kind: CloudflareTunnel|WARPConnector` plus an optional `namespace`; omitted `kind` defaults to `CloudflareTunnel`. `CloudflareTunnel` owns a Gateway data plane. `WARPConnector` owns a separate Mesh connector, token Secret, bounded client status, HA configuration, and explicit failover requests.
-
-For WARP Connector HA, `AWS` requires `highAvailability.enabled: true` and `aws.fnrId`; `Local` requires enabled HA and at least one `local.vips` address. `highAvailability.enabled` is create-only. A failover request needs a linked `clientId` and a new `requestId`.
-
-### Secret recovery
+## Secret recovery
 
 One-time values are not recoverable from Cloudflare and never appear in status:
-- `ServiceToken` writes `CF-Access-Client-Id` and `CF-Access-Client-Secret`, plus previous keys during a rotation grace period; a pending create is journaled (see "ServiceToken create journal" below);
+
+- `ServiceToken` writes `CF-Access-Client-Id` and `CF-Access-Client-Secret`, plus previous keys during a rotation grace period; a pending create is journaled (see [ServiceToken create journal](#servicetoken-create-journal));
 - SaaS application creation stores the generated client secret in the controller-owned Secret referenced by `status.saas.clientSecretRef`;
 - SCIM HTTP Basic passwords, bearer tokens, OAuth client secrets, and Access service tokens come from Secret or `ServiceToken` references;
 - identity-provider and posture-integration credentials use Secret key references;
 - WARP Connector and Tunnel connector tokens use controller-owned Secrets.
 
-For `IdentityProvider` SCIM, `spec.scimConfig.secretRef` is immutable after it is set. Flareway reserves the owned Secret before creating or enabling SCIM, journals ambiguous create responses, and verifies that the stored token is bound to the same remote provider ID. Replace the resource through a deliberate migration if the Secret destination must change.
+For `IdentityProvider` SCIM, `spec.scimConfig.secretRef` is immutable after it is set. Flareway reserves the owned Secret before creating or enabling SCIM, journals ambiguous create responses, and verifies that the stored token is bound to the same remote provider ID. If the Secret destination must change, replace the resource deliberately.
 
-If one of these Secrets is missing, restore it from the original secure source or create a deliberate rotation/replacement plan. Adoption does not rotate credentials, and the controller cannot reconstruct a create-only secret from status.
+If one of these Secrets is missing, restore it from the original secure source or create a deliberate rotation or replacement plan. Adoption does not rotate credentials, and the controller cannot reconstruct a create-only secret from status.
 
 ### ServiceToken create journal
 
 A managed fresh create records its intent in a controller-owned journal Secret (`flareway-st-intent-<cr-uid>`) and reserves the credential destination before the remote create. The journal binds the CR UID, cluster UID, account UID and account ID, resolved zone ID, destination Secret, `spec.name`, and a per-attempt nonce; the remote create name is `flareway/<clusterUID>/<namespace>/<crUID>/<specName>-<nonce>`.
 
 - `Ready=False`, reason `RecoveryPending`: a dispatched create is not yet visible in the remote list, or a zone-scope recovery is waiting for the retiring token's confirmed deletion. The controller re-lists and never re-creates blindly; the state resolves on its own once the remote becomes visible.
-- `Ready=False`, reason `Conflict` on a pending attempt: the journal's identity tuple drifted (a `spec.zone`, `spec.accountRef`, `spec.name`, or `spec.secretRef` edit, or an account/cluster identity change), the journal or destination Secret is foreign-owned or corrupt, or remote candidates are ambiguous. Recovery is administrative: fix the drifted field back or delete and recreate the ServiceToken so a fresh journal is bound. Flareway never adopts an ambiguous or foreign token.
+- `Ready=False`, reason `Conflict` on a pending attempt: the journal's identity tuple drifted (a `spec.zone`, `spec.accountRef`, `spec.name`, or `spec.secretRef` edit, or an account or cluster identity change), the journal or destination Secret is foreign-owned or corrupt, or remote candidates are ambiguous. Recovery is administrative: revert the drifted field, or delete and recreate the ServiceToken so a fresh journal is bound. Flareway never adopts an ambiguous or foreign token.
 - Deleting a pending ServiceToken still cleans up journaled remote tokens even when `status.tokenId` is empty. If the journal is missing, a scoped prefix sweep runs; ambiguity or a failed remote delete keeps the finalizer with `CleanupBlocked` rather than leaking the token.
-- After the status checkpoint the journal is reaped. A journal left behind after checkpoint is reap-only and never grounds a resume or rotation.
+- After the status checkpoint the journal is reaped. A journal left behind after the checkpoint is reap-only and never grounds a resume or rotation.
 - An established ServiceToken whose credential Secret is lost reports `SecretMissing` and never rotates or recreates on its own; restore the Secret from the original secure source or request an explicit rotation via `spec.rotation.requestedAt`.
 
-Cloudflare response envelopes (`success`, `errors`, `messages`, `result`, pagination) and server-owned fields are intentionally absent from spec. Diagnose them through controller conditions and bounded status rather than adding untyped fields to manifests.
+Cloudflare response envelopes (`success`, `errors`, `messages`, `result`, pagination) and server-owned fields are absent from spec by design. Diagnose them through controller conditions and bounded status rather than adding untyped fields to manifests.
 
-## Teardown
+## Other symptoms
 
-Managed Tunnel teardown is ordered:
-
-1. public ingress becomes `403` and private virtual hosts become deny-all;
-2. managed DNS records are removed;
-3. connector Pods drain and stop;
-4. Access applications are marked target-not-found and deleted only when their own policy permits it;
-5. private routes must release the Tunnel;
-6. the managed Tunnel is deleted last.
-
-A failure keeps the finalizer and reports `CleanupBlocked`. Restore access or remove the blocking reference, then let reconciliation resume.
-
-## Private WARP listeners
-
-A private listener must use `HTTPS`, include a valid `certificateRefs` Secret, and have a matching `CloudflareTunnel.spec.listeners[]` entry with `exposure: Private`. Flareway binds Envoy to the Gateway listener's declared port, not to an internal `1844x` port. Cloudflare forwards the original private destination port, so using another port would break the WARP L4 destination and the Access `portRange` contract.
-
-Private hostname routing also requires:
-
-- `DeviceSettings.spec.gatewayProxyEnabled: true`;
-- `DeviceSettings.spec.gatewayUdpProxyEnabled: true`;
-- a `HostnameRoute` or `NetworkRoute` targeting the Tunnel;
-- an Include-mode profile that includes the private hostname ranges when Include mode is used;
-- no overlap between a hostname route and a fallback DNS suffix;
-- Gateway TLS decryption, or `AccessApplication.spec.originJWT.assumeGatewayTLSDecryption: true`, when private origin JWT verification is required;
-- a compatible WARP client and Cloudflare plan.
-
-The local CoreDNS sidecar behavior is measured, but a live Cloudflare edge/WARP run has not verified whether Edge accepts a `127.0.0.1` private-hostname answer. D-11 remains live-blocked. Do not claim private hostname e2e support from envtest alone.
-
-## Streaming
-
-`HTTPRoute` `timeouts.request: 0s` and `proxy.streamIdleTimeout: 1h` configure the origin data plane for long streams. They do not remove Cloudflare Edge limits. The planned D-03 e2e case records a 150-second SSE stream and a request whose first byte is delayed by 120 seconds. That live edge measurement is currently blocked, so no release claim should state those cases passed.
-
-## End-to-end test prerequisites
-
-The e2e suite requires a dedicated test account and zone:
-
-- `FLAREWAY_E2E_CF_API_TOKEN`
-- `FLAREWAY_E2E_CF_ACCOUNT_ID`
-- `FLAREWAY_E2E_ZONE`
-- optional `FLAREWAY_E2E_KUBECONFIG`
-- `FLAREWAY_E2E_LABELS` (default `public,access`; add `warp` for the private WARP spec)
-- `FLAREWAY_E2E_WARP_DEVICE=1` only on a registered WARP runner; the e2e workflow registers the runner itself via `hack/e2e-warp-runner.sh` (per-run service token, app-scoped enrollment policy, and custom device profile, all deleted after the run)
-- optional `FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER`
-- `FLAREWAY_E2E_DEVICE_PROFILE_KIND` and explicit `FLAREWAY_E2E_ALLOW_DEFAULT_PROFILE=1` before mutating the default profile
-
-Use a dedicated account because e2e creates and deletes tunnels, DNS records, Access applications, policies, and private-network objects. Missing WARP runner or plan capability must be recorded as blocked, not passed or silently skipped.
+- A persistent `Conflict` on adoption or on a bypass child, a Tunnel owned by another Gateway, or teardown stuck at `CleanupBlocked`: see [Ownership, adoption, and teardown](../concepts/ownership-and-adoption.md).
+- Admission rejects Gateway fields on a `Direct` tunnel, or a Direct ingress rule or DNS setting is invalid: see [Direct tunnels](../get-started/direct-tunnels.md).
+- A private hostname does not resolve or connect over WARP, or a `WARPConnector` HA or route setting is rejected: see [Private services over WARP](../get-started/private-services-over-warp.md).
+- Long streams end early at the edge: Cloudflare edge limits still apply, and their behavior with long streams has not been measured live. See [Limits and boundaries](../concepts/limits.md).
+- Running the end-to-end suite: see [End-to-end test prerequisites](../../CONTRIBUTING.md#end-to-end-test-prerequisites).

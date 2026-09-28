@@ -85,6 +85,7 @@ export interface LandingCopy {
 			caption: string;
 			ratio: string;
 		};
+		more: Link;
 	};
 	demo: {
 		heading: string;
@@ -100,8 +101,9 @@ export interface LandingCopy {
 		heading: string;
 		ledeHtml: string;
 		policy: { heading: string; bodyHtml: string; variantsCaption: string; variants: { name: string; gloss: string }[] };
-		warp: { heading: string; bodyHtml: string; kinds: string[]; kindsNoteHtml: string };
-		direct: { heading: string; bodyHtml: string; origins: string[] };
+		warp: { heading: string; bodyHtml: string; kinds: string[]; kindsNoteHtml: string; more: Link };
+		direct: { heading: string; bodyHtml: string; origins: string[]; more: Link };
+		/** The policy card's link. */
 		more: Link;
 	};
 	failClosed: {
@@ -142,9 +144,9 @@ export interface LandingCopy {
 
 export const landingCopy: LandingCopy = {
 	meta: {
-		title: 'Flareway — Kubernetes Gateway API for Cloudflare Tunnel',
+		title: 'Flareway — Cloudflare Tunnel operator for Kubernetes',
 		description:
-			'A Kubernetes operator implementing the Gateway API for Cloudflare Tunnel: each Gateway becomes a tunnel, and HTTPRoute rules become Envoy routes.',
+			'Kubernetes operator that turns a Gateway into a Cloudflare Tunnel: full HTTPRoute routing in Envoy, Access verified at the origin, WARP, no inbound ports.',
 		ogTitle: 'Flareway — a Gateway that becomes a Cloudflare Tunnel',
 		siteName: 'Flareway',
 	},
@@ -165,23 +167,27 @@ export const landingCopy: LandingCopy = {
 		chartNoInbound: 'no inbound',
 		titleHtml: 'A <code>Gateway</code> that becomes a Cloudflare Tunnel<sup>™</sup>.',
 		ledeHtml:
-			'<code>Gateway</code> and <code>HTTPRoute</code> become a managed Cloudflare Tunnel and Envoy routing — Access and WARP<sup>®</sup> are CRDs too. One outbound connection, nothing inbound.',
-		primary: { label: 'Get started', href: '/docs/operations/install/' },
+			'Your standard <code>Gateway</code> and <code>HTTPRoute</code> become a managed Cloudflare Tunnel, its DNS records, and full L7 routing in an in-pod Envoy, with Cloudflare Access<sup>™</sup> verified at the origin and no inbound ports or public IPs.',
+		primary: { label: 'Get started', href: '/docs/get-started/install/' },
 		secondary: { label: 'GitHub', href: 'https://github.com/isac322/flareway' },
 		tertiaryHtml: 'Try <code>helm template</code> — no cluster, no credentials',
 		tertiaryHref: '#try',
-		proofLabel: 'Project facts',
+		proofLabel: 'How it works',
 		proof: [
 			{
-				value: 'Core 37/37',
-				label: 'Gateway API conformance, local dev run',
-				href: '/docs/conformance/gateway-api-v1-6-2/',
+				value: 'Outbound-only',
+				label: 'cloudflared dials out; no inbound ports or public IPs',
+				href: '/docs/concepts/how-it-works/',
 			},
-			{ value: '22 CRDs', label: 'flareway.bhyoo.com/v1alpha1', href: '/docs/reference/api/' },
 			{
-				value: 'Apache-2.0',
-				label: 'open source',
-				href: 'https://github.com/isac322/flareway/blob/main/LICENSE',
+				value: 'In-pod Envoy',
+				label: 'HTTPRoute rules run in Envoy, streamed over xDS',
+				href: '/docs/concepts/http-routing/',
+			},
+			{
+				value: 'Zero annotations',
+				label: 'a standard Gateway plus parametersRef',
+				href: '/docs/get-started/expose-a-service/',
 			},
 		],
 	},
@@ -205,21 +211,22 @@ export const landingCopy: LandingCopy = {
 				{ feature: 'HTTPRoutePathRedirect', gloss: 'redirects, with 303/307/308' },
 				{ feature: 'HTTPRouteRequestMirror', gloss: 'mirror requests, including by percentage' },
 				{ feature: 'HTTPRouteRequestTimeout', gloss: 'request and backend timeouts' },
+				{ feature: 'HTTPRouteCORS', gloss: 'CORS headers and preflight' },
 				{ feature: 'HTTPRouteBackendProtocolWebSocket', gloss: 'WebSocket and h2c backends' },
 				{ feature: 'BackendTLSPolicy', gloss: 'TLS to backends, with SAN validation' },
 			],
 			noteHtml:
-				'Header matches and weighted backends are Gateway API Core. Every Extended feature listed passed the local <a href="/docs/conformance/gateway-api-v1-6-2/">conformance run</a>.',
+				'Header matches and weighted backends are Gateway API Core. Every feature listed passed the local <a href="/docs/concepts/conformance/">Gateway API conformance run</a>. Read <a href="/docs/concepts/http-routing/">what routes can do</a>.',
 		},
 	},
 
 	how: {
-		heading: 'One Gateway, one tunnel, one data-plane pod.',
+		heading: 'One Gateway, one tunnel, one data plane.',
 		ledeHtml:
 			'Traffic enters only through <code>cloudflared</code>, which dials out over QUIC/HTTP2. Envoy takes decrypted requests over loopback and applies the routes the controller streams to it over xDS.',
 		figure: {
 			title: 'How traffic reaches the cluster',
-			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. One outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands requests to Envoy over loopback; the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
+			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. The outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands requests to Envoy over loopback; the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
 			browsers: 'Browsers',
 			browsersSub: 'public hostnames',
 			warp: 'WARP devices',
@@ -229,7 +236,7 @@ export const landingCopy: LandingCopy = {
 			edgeSub2: 'private network route',
 			edgeHost: '<tunnel-id>.cfargotunnel.com',
 			noInbound: 'no inbound',
-			tunnel: 'one outbound tunnel',
+			tunnel: 'outbound tunnel',
 			tunnelProto: 'QUIC / HTTP2',
 			boundary: 'sealed cluster boundary',
 			boundarySub: 'no inbound ports, no public IPs',
@@ -248,6 +255,7 @@ export const landingCopy: LandingCopy = {
 			caption: 'Traffic rides a tunnel the cluster opens outbound. Nothing listens inbound.',
 			ratio: '1 Gateway : 1 tunnel : 1 data plane',
 		},
+		more: { label: 'How Flareway works', href: '/docs/concepts/how-it-works/' },
 	},
 
 	demo: {
@@ -268,7 +276,7 @@ export const landingCopy: LandingCopy = {
 				lines: 'g:1-2,7',
 				titleHtml: 'A data-plane Deployment',
 				bodyHtml:
-					'One per <code>Gateway</code>: a pod running <code>cloudflared</code> and Envoy, plus a CoreDNS sidecar when the Gateway has private listeners.',
+					'One per <code>Gateway</code>: pods running <code>cloudflared</code> and Envoy, plus a CoreDNS sidecar when the Gateway has private listeners.',
 			},
 			{
 				lines: 'g:14-17;r:10-11',
@@ -290,41 +298,41 @@ export const landingCopy: LandingCopy = {
 			},
 		],
 		noteHtml:
-			'Access policies attach to routes through GEP-713 policy attachment — next section. More in the <a href="https://github.com/isac322/flareway/tree/main/config/samples">sample manifests</a>.',
+			'Access policies attach to routes through GEP-713 policy attachment — next section. Walk through it in <a href="/docs/get-started/expose-a-service/">Expose a Service</a>, or read the <a href="https://github.com/isac322/flareway/tree/main/config/samples">sample manifests</a>.',
 	},
 
 	access: {
-		heading: 'Access policies live next to the routes they protect.',
+		heading: 'Access enforced at the edge and at the origin.',
 		ledeHtml:
-			'Attach a Cloudflare Access<sup>™</sup> policy, not an annotation. Reach private services over WARP, managed as Kubernetes<sup>®</sup> resources.',
+			'Access policies and WARP<sup>®</sup> private networks are Kubernetes<sup>®</sup> resources. A policy attaches to the route it protects, not to an annotation.',
 		policy: {
 			heading: 'Policy attachment (GEP-713)',
 			bodyHtml:
-				'An <code>AccessApplication</code> targets a <code>Gateway</code> or an <code>HTTPRoute</code>, optionally scoped to a path prefix. Envoy’s <code>jwt_authn</code> filter verifies <code>Cf-Access-Jwt-Assertion</code> against the Cloudflare JWKS endpoint. Routes without an attachment carry no JWT filter.',
-			variantsCaption: '<code>AccessApplication</code> types',
+				'Attach an <code>AccessApplication</code> to a <code>Gateway</code> listener or an <code>HTTPRoute</code>. Flareway configures the Access application and policy at the edge, then verifies the Access JWT again at the origin: by <code>cloudflared</code> and Envoy for public hostnames, by Envoy for private ones. Until the AUD tag and team domain are known, the route stays blocked.',
+			variantsCaption: '<code>AccessApplication</code> types include',
 			variants: [
 				{ name: 'SelfHosted', gloss: 'web applications' },
 				{ name: 'SSH', gloss: 'browser SSH' },
-				{ name: 'VNC', gloss: 'browser VNC' },
 				{ name: 'RDP', gloss: 'browser RDP' },
 				{ name: 'MCP', gloss: 'MCP servers' },
-				{ name: 'ProxyEndpoint', gloss: 'identity proxy' },
 			],
 		},
 		warp: {
-			heading: 'Private networking over WARP',
+			heading: 'Private services over WARP, same Gateway',
 			bodyHtml:
-				'Private listeners terminate TLS in Envoy with a certificate Secret you supply. WARP clients reach them through Cloudflare private network routes; a CoreDNS sidecar answers private hostnames with 127.0.0.1 so that traffic also passes through Envoy.',
+				'Set a listener’s exposure to <code>Private</code>, and WARP devices reach the Service through the same <code>Gateway</code>, <code>HTTPRoute</code>, and <code>AccessApplication</code>. Envoy terminates TLS with a certificate Secret you supply; a CoreDNS sidecar answers private hostnames with 127.0.0.1 so the traffic passes through Envoy.',
 			kinds: ['VirtualNetwork', 'NetworkRoute', 'HostnameRoute', 'WARPConnector'],
 			kindsNoteHtml: 'for WARP reachability and k8s-to-VPC site-to-site links',
+			more: { label: 'Private services over WARP', href: '/docs/get-started/private-services-over-warp/' },
 		},
 		direct: {
 			heading: 'Direct mode for non-Gateway origins',
 			bodyHtml:
 				'A <code>CloudflareTunnel</code> in Direct mode owns the complete remote <code>cloudflared</code> configuration.',
 			origins: ['TCP', 'SSH', 'RDP', 'bastion'],
+			more: { label: 'Direct tunnels', href: '/docs/get-started/direct-tunnels/' },
 		},
-		more: { label: 'Read the API reference', href: '/docs/reference/api/' },
+		more: { label: 'Protect a route with Access', href: '/docs/get-started/protect-with-access/' },
 	},
 
 	failClosed: {
@@ -355,15 +363,16 @@ export const landingCopy: LandingCopy = {
 				bodyHtml: 'The controller never writes API tokens to status, Events, or request logs. Tunnel tokens and service-token secrets live only in Secrets.',
 			},
 		],
-		more: { label: 'RBAC and API tokens', href: '/docs/operations/rbac-token/' },
+		more: { label: 'Read the security model', href: '/docs/concepts/security-model/' },
 	},
 
 	tryIt: {
 		heading: 'Try it: read the install before it runs.',
 		ledeHtml:
-			'<code>helm template</code> renders what the chart would install — no cluster, no Cloudflare credentials. Needs Helm 4.3 or a compatible Helm 3 client.',
-		command: 'helm template flareway ./charts/flareway \\\n  --namespace flareway-system \\\n  --set gatewayClass.create=true',
-		commandCaption: 'from a checkout of the repository',
+			'<code>helm template</code> renders what the chart would install, so you can read it before anything runs. Needs Helm 4.3 or a compatible Helm 3 client.',
+		command:
+			'helm template flareway oci://ghcr.io/isac322/charts/flareway \\\n  --namespace flareway-system \\\n  --set gatewayClass.create=true',
+		commandCaption: 'Pulls the published chart. No cluster, no Cloudflare credentials.',
 		copy: 'Copy',
 		copied: 'Copied',
 		copyFailed: 'Select to copy',
@@ -377,19 +386,16 @@ export const landingCopy: LandingCopy = {
 			'its <code>GatewayClassConfig/default</code>',
 		],
 		notesHtml: [
-			'Add <code>--include-crds</code> to also render the 22 Flareway CRDs the chart bundles.',
+			'Add <code>--include-crds</code> to also render the Flareway CRDs.',
 			'<code>gatewayClass.create</code> defaults to <code>false</code>, so an install cannot silently take ownership of an existing <code>GatewayClass</code>.',
 		],
-		primary: { label: 'Read the install guide', href: '/docs/operations/install/' },
-		secondary: {
-			label: 'Browse the sample manifests',
-			href: 'https://github.com/isac322/flareway/tree/main/config/samples',
-		},
+		primary: { label: 'Read the install guide', href: '/docs/get-started/install/' },
+		secondary: { label: 'Check the limits first', href: '/docs/concepts/limits/' },
 	},
 
 	star: {
-		heading: 'About to write this operator yourself? Star it.',
-		bodyHtml: 'Flareway is open source under Apache-2.0. Stars are how other platform engineers find it.',
+		heading: 'Flareway is open source.',
+		bodyHtml: 'Licensed under Apache-2.0. Stars help other platform engineers find it.',
 		cta: 'Star on GitHub',
 		ctaCount: '{count} stars',
 		secondary: { label: 'Open an issue', href: 'https://github.com/isac322/flareway/issues' },
@@ -397,24 +403,34 @@ export const landingCopy: LandingCopy = {
 
 	footer: {
 		navLabel: 'Footer',
-		tagline: 'Kubernetes Gateway API for Cloudflare Tunnel.',
+		tagline: 'Cloudflare Tunnel operator for the Kubernetes Gateway API.',
 		groups: [
 			{
-				heading: 'Operate',
+				heading: 'Get started',
 				links: [
-					{ label: 'Install', href: '/docs/operations/install/' },
-					{ label: 'Upgrade', href: '/docs/operations/upgrade/' },
-					{ label: 'RBAC and API tokens', href: '/docs/operations/rbac-token/' },
-					{ label: 'Troubleshooting', href: '/docs/operations/troubleshooting/' },
+					{ label: 'Install', href: '/docs/get-started/install/' },
+					{ label: 'Connect Cloudflare', href: '/docs/get-started/connect-cloudflare/' },
+					{ label: 'Expose a Service', href: '/docs/get-started/expose-a-service/' },
+					{ label: 'Protect with Access', href: '/docs/get-started/protect-with-access/' },
 				],
 			},
 			{
-				heading: 'Reference',
+				heading: 'Concepts',
 				links: [
+					{ label: 'How it works', href: '/docs/concepts/how-it-works/' },
+					{ label: 'HTTP routing', href: '/docs/concepts/http-routing/' },
+					{ label: 'Security model', href: '/docs/concepts/security-model/' },
+					{ label: 'Limits', href: '/docs/concepts/limits/' },
+					{ label: 'Conformance report', href: '/docs/concepts/conformance/' },
+				],
+			},
+			{
+				heading: 'Operate & reference',
+				links: [
+					{ label: 'Troubleshooting', href: '/docs/operations/troubleshooting/' },
+					{ label: 'Upgrade', href: '/docs/operations/upgrade/' },
 					{ label: 'API reference', href: '/docs/reference/api/' },
-					{ label: 'kubectl explain guide', href: '/docs/reference/kubectl-explain/' },
-					{ label: 'Architecture', href: '/docs/architecture/' },
-					{ label: 'Gateway API conformance', href: '/docs/conformance/gateway-api-v1-6-2/' },
+					{ label: 'Helm chart values', href: '/docs/reference/helm-chart/' },
 				],
 			},
 			{

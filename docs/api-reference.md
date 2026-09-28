@@ -1,6 +1,8 @@
-# Flareway API Reference
+# Flareway API reference
 
-This reference describes the implemented `flareway.bhyoo.com/v1alpha1` parity surface. Generated CRDs in `config/crd/bases/` remain authoritative for validation, defaults, limits, and status schemas.
+This page covers every Kind in `flareway.bhyoo.com/v1alpha1`, such as `CloudflareTunnel` and `AccessApplication`. The generated CRDs remain authoritative.
+
+The CRDs in `config/crd/bases/` define validation, defaults, limits, and status schemas.
 
 ## Conventions
 
@@ -14,7 +16,7 @@ This reference describes the implemented `flareway.bhyoo.com/v1alpha1` parity su
 
 ## Shipped resource catalog
 
-Flareway serves 22 CRD Kinds:
+Kinds by area:
 
 | Area | Kinds |
 |---|---|
@@ -524,6 +526,8 @@ Use this sequence when moving an existing remote object under Flareway:
 Use the same process for bypass-child applications. Do not switch an application's immutable `type`, infer a Tunnel mode, replace a typed route kind, or recreate a missing one-time Secret as part of adoption. These operations can change IDs, AUDs, or credentials and require a deliberate replacement plan.
 
 The remote ownership ledger uses tags where Cloudflare supports tags, deterministic comments for DNS and private-network resources, prefixed names where only names exist, and status remote IDs. A foreign or ambiguous marker produces `Conflict`; the controller does not overwrite the object.
+
+[Ownership and adoption](concepts/ownership-and-adoption.md) explains how the ledger, adoption, and teardown fit together.
 
 ## Parity ledger and intentional exclusions
 

@@ -22,7 +22,7 @@ urgent, send a follow-up to the same address.
 ## What to include
 
 - Affected version tag or commit SHA.
-- How Flareway is installed (Helm chart or checkout) and the relevant
+- How Flareway is installed (Helm chart version and values) and the relevant
   configuration, with account IDs, tokens, and private hostnames removed.
 - Steps to reproduce, including the custom resources involved.
 - Impact: what an attacker or misconfiguration can reach or change.
@@ -39,9 +39,10 @@ invariants protect:
 - Fail-closed access enforcement and retained revocation state.
 - Credential handling: API tokens and one-time credentials in
   controller-owned Secrets, never in status or logs.
-- `Cf-Access-Jwt-Assertion` (AUD/JWT) verification at the Envoy data
-  plane.
+- Access JWT (`Cf-Access-Jwt-Assertion`) verification at the origin
+  (`cloudflared` and the Envoy data plane).
 
-The normative rules live in
+The [security model](docs/concepts/security-model.md) explains how these
+protections work. The normative rules live in
 [`.agents/rules/flareway-invariants.md`](.agents/rules/flareway-invariants.md);
 this file names the surfaces rather than restating them.
