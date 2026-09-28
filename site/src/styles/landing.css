@@ -73,7 +73,8 @@ a {
 }
 
 :focus-visible {
-	outline: 2px solid var(--fw-accent);
+	/* Ink clears 3:1 on cream and dark grounds alike; orange is reserved for graphics. */
+	outline: 2px solid var(--fw-ink);
 	outline-offset: 3px;
 	border-radius: 4px;
 }
@@ -281,7 +282,8 @@ main,
 	top: 0;
 	left: 0;
 	pointer-events: none;
-	overflow: visible;
+	/* Clip to the sized box so off-canvas coast control points never widen the page. */
+	overflow: hidden;
 }
 
 #underlay {
@@ -369,6 +371,11 @@ main,
 
 .l-leaf-end {
 	stroke-width: 6;
+}
+
+/* Leaves rotate about their hinge, set per element in user units by landing-chart.ts. */
+.l-leaf-swing {
+	transform-box: view-box;
 }
 
 .gap {
@@ -674,6 +681,10 @@ h1 sup,
 	font-weight: 600;
 	font-size: 15.5px;
 	white-space: nowrap;
+}
+
+/* Tabular figures only on counts (see Hero.astro), not on names like "Apache-2.0". */
+.proof .num {
 	font-variant-numeric: tabular-nums;
 }
 
@@ -1197,16 +1208,13 @@ h3 {
 }
 
 .outputs h3 {
-	font-size: 14px;
-	font-weight: 600;
-	margin: 4px 0 10px;
-	color: var(--fw-ink-2);
+	margin: 4px 0 12px;
 }
 
 .outputs ol {
 	list-style: none;
 	margin: 0;
-	padding: 0;
+	padding: 6px 0 0;
 	border-top: 1px solid var(--fw-line);
 }
 
@@ -1381,10 +1389,21 @@ h3 {
 }
 
 .kinds {
+	position: relative;
 	margin: 18px 0 0;
-	padding: 0 0 0 18px;
+	padding: 0 0 0 20px;
 	list-style: none;
-	border-left: 3px solid var(--fw-accent);
+}
+
+/* The route line the four kinds branch from: a 2px orange line, not a list border. */
+.kinds::before {
+	content: '';
+	position: absolute;
+	left: 0;
+	top: 4px;
+	bottom: 4px;
+	width: 2px;
+	background: var(--fw-accent);
 }
 
 .kinds li {
@@ -1398,7 +1417,7 @@ h3 {
 	position: absolute;
 	left: -18px;
 	top: 50%;
-	width: 12px;
+	width: 14px;
 	height: 1px;
 	background: var(--fw-ink);
 }
@@ -1536,15 +1555,12 @@ h3 {
 }
 
 .try-prints h3 {
-	font-size: 14px;
-	font-weight: 600;
-	color: var(--fw-ink-2);
-	margin: 0 0 10px;
+	margin: 0 0 12px;
 }
 
 .prints {
 	margin: 0;
-	padding: 0;
+	padding: 4px 0 0;
 	list-style: none;
 	border-top: 1px solid var(--fw-line);
 }
@@ -1665,7 +1681,7 @@ h3 {
 	gap: 24px;
 }
 
-.foot-nav h2 {
+.foot-nav .foot-h {
 	font-size: 13px;
 	letter-spacing: 0;
 	font-weight: 600;
@@ -1727,13 +1743,24 @@ h3 {
 	#overlay .l-tick {
 		animation: fw-fade 0.5s 1.6s backwards;
 	}
-	/* The star door swings open as the channel arrives. */
-	#overlay .l-swing,
-	#overlay .l-leaf-end {
+	#overlay .l-swing {
 		animation: fw-fade 0.5s 2.3s backwards;
 	}
 	#underlay .l-anim {
 		animation: fw-fade 0.5s 1.4s backwards;
+	}
+	/* Leaves appear closed across their doorway, then swing open as the spine
+	   arrives; the star door opens last. Reduced motion: drawn open, static. */
+	#overlay .l-leaf-swing,
+	#underlay .l-leaf-swing {
+		animation:
+			fw-fade 0.3s 1.3s backwards,
+			fw-leaf 0.7s 1.6s var(--fw-ease) backwards;
+	}
+	#overlay .l-leaf-end {
+		animation:
+			fw-fade 0.3s 2s backwards,
+			fw-leaf 0.9s 2.3s var(--fw-ease) backwards;
 	}
 	.d-leaf {
 		animation: fw-fade 0.3s 0.95s backwards;
@@ -1782,6 +1809,11 @@ h3 {
 @keyframes fw-flow {
 	to {
 		stroke-dashoffset: -9;
+	}
+}
+@keyframes fw-leaf {
+	from {
+		transform: rotate(var(--fw-leaf-closed));
 	}
 }
 @keyframes fw-fade {
@@ -1854,7 +1886,8 @@ h3 {
 	.access-grid,
 	.fail-grid,
 	.try-grid {
-		grid-template-columns: 1fr;
+		/* minmax(0, …): long code lines scroll inside their block instead of widening the page. */
+		grid-template-columns: minmax(0, 1fr);
 	}
 	.hero {
 		min-height: 0;
@@ -1887,6 +1920,15 @@ h3 {
 	:root {
 		--fw-landing-gut: 26px;
 	}
+	/* The spine is pinned at the left edge here (landing-chart.ts); content below the
+	   header keeps ≥20px from its inner fairway limit. */
+	main .wrap {
+		padding-left: 44px;
+	}
+	/* The spine has already turned off toward the star door, so the star room stays centred. */
+	main .star .wrap {
+		padding-left: var(--fw-landing-gut);
+	}
 	.brand {
 		height: 56px;
 	}
@@ -1907,7 +1949,7 @@ h3 {
 		max-width: 100%;
 	}
 	.plate > svg {
-		width: min(300px, 74vw);
+		width: min(300px, calc(100vw - 108px));
 	}
 	.plate-foot {
 		font-size: 14.5px;
@@ -1982,16 +2024,16 @@ h3 {
 		border-bottom: 0;
 	}
 	.guarantees > div {
-		grid-template-columns: 1fr;
+		grid-template-columns: minmax(0, 1fr);
 	}
 	.foot-grid {
-		grid-template-columns: 1fr;
+		grid-template-columns: minmax(0, 1fr);
 	}
 	.foot-nav {
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 	}
 	.foot-legal {
-		grid-template-columns: 1fr;
+		grid-template-columns: minmax(0, 1fr);
 	}
 	.btn-star {
 		width: 100%;

@@ -61,8 +61,10 @@ function startChart(reduced: boolean): void {
 
 	const layout = () => {
 		const root = document.documentElement;
-		const W = root.scrollWidth;
-		const H = root.scrollHeight;
+		// Size the chart from the layout, never from the scroll extent: the chart
+		// itself contributes to scrollWidth/scrollHeight, which would feed back.
+		const W = root.clientWidth;
+		const H = Math.ceil((document.querySelector('.foot')?.getBoundingClientRect().bottom ?? 0) + window.scrollY);
 		const sx = window.scrollX;
 		const sy = window.scrollY;
 		const ctm = lockup.getScreenCTM();
@@ -73,7 +75,9 @@ function startChart(reduced: boolean): void {
 		const wrapRect = heroWrap.getBoundingClientRect();
 		const contentLeft = wrapRect.left + sx + parseFloat(getComputedStyle(heroWrap).paddingLeft);
 		const cw = parseFloat(getComputedStyle(root).getPropertyValue('--fw-landing-channel')) || 12;
-		const gutX = Math.max(10, contentLeft - 30);
+		// Narrow screens pin the spine to the edge; landing.css widens the content's
+		// left inset there so text keeps ≥20px from the inner fairway limit.
+		const gutX = W <= 640 ? 12 : Math.max(10, contentLeft - 30);
 		const endY = endDivider.getBoundingClientRect().top + sy;
 		const markRect = starMark.getBoundingClientRect();
 		const endX = markRect.left + sx + markRect.width / 2;
@@ -187,15 +191,30 @@ function startChart(reduced: boolean): void {
 		}
 		text(dcx + cw / 2 + (desk ? 20 : 14), plateB + (desk ? 34 : 26), 'l-note-ink l-anim', notes.opened);
 
-		// A doorway notch: the border opens across the channel, framed by two ink jambs.
-		const doorway = (x: number, y: number, parent: Element) => {
-			mk('rect', { x: x - cw / 2 - 8, y: y - 3, width: cw + 16, height: 7, class: 'gap' }, parent);
-			for (const side of [1, -1]) {
-				const bx = x + side * (cw / 2 + 8);
-				mk('path', { d: `M ${bx} ${y - 6} L ${bx} ${y + 6}`, class: 'l-tick' }, parent);
-			}
+		// A door leaf in plan: hinged at (hx, y), swung into the section below, 18°
+		// off the perpendicular. `closed` is the rotation that lays it back across
+		// the opening; the entrance animation swings it open from there.
+		const leaf = (hx: number, y: number, dx: number, length: number, closed: number, cls: string, parent: Element) => {
+			const end: Point = [hx + dx * length * Math.sin((18 * Math.PI) / 180), y + length * Math.cos((18 * Math.PI) / 180)];
+			mk('path', { d: `M ${hx} ${y} L ${end[0]} ${end[1]}`, class: cls, style: `transform-origin: ${hx}px ${y}px; --fw-leaf-closed: ${closed}deg` }, parent);
+			return end;
 		};
-		doorway(px, py, underlay);
+
+		// A doorway notch: the border opens across the channel between two ink jambs,
+		// and the leaf swings off the outer jamb away from the channel — to the left
+		// where the margin has room (desktop), otherwise to the right, clear of the
+		// section's text, which starts at least a padding below the border.
+		const doorway = (x: number, y: number, parent: Element, extra = '') => {
+			const jamb = cw / 2 + 8;
+			mk('rect', { x: x - jamb, y: y - 3, width: 2 * jamb, height: 7, class: 'gap' }, parent);
+			for (const side of [1, -1]) {
+				mk('path', { d: `M ${x + side * jamb} ${y - 6} L ${x + side * jamb} ${y + 6}`, class: `l-tick ${extra}` }, parent);
+			}
+			const length = 2 * jamb;
+			const dir = x - jamb - length * Math.sin((18 * Math.PI) / 180) > 4 ? -1 : 1;
+			leaf(x + dir * jamb, y, dir, length, dir * 108, `l-leaf l-leaf-swing ${extra}`, parent);
+		};
+		doorway(px, py, underlay, 'l-anim');
 
 		// The plate's bottom edge opens where the channel leaves it.
 		mk('rect', { x: dcx - cw / 2 - 6, y: plateB - 2, width: cw + 12, height: 4, class: 'gap' }, overlay);
@@ -226,7 +245,7 @@ function startChart(reduced: boolean): void {
 			mk('path', { d: `M ${bx} ${endY - 10} L ${bx} ${endY + 10}`, class: 'l-tick l-tick-end' }, overlay);
 		}
 		mk('path', { d: `M ${endX - doorW / 2} ${endY} A ${doorW} ${doorW} 0 0 0 ${leafEnd[0]} ${leafEnd[1]}`, class: 'l-swing' }, overlay);
-		mk('path', { d: `M ${hingeX} ${endY} L ${leafEnd[0]} ${leafEnd[1]}`, class: 'l-leaf l-leaf-end' }, overlay);
+		leaf(hingeX, endY, -1, doorW, 72, 'l-leaf l-leaf-end l-leaf-swing', overlay);
 
 		// A request rides the channel inbound once, from the star door up to the hero door, and parks there.
 		if (!reduced) {

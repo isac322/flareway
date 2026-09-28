@@ -165,7 +165,7 @@ export const landingCopy: LandingCopy = {
 		chartNoInbound: 'no inbound',
 		titleHtml: 'A <code>Gateway</code> that becomes a Cloudflare Tunnel<sup>™</sup>.',
 		ledeHtml:
-			'Flareway implements the Kubernetes<sup>®</sup> Gateway API on the Cloudflare<sup>®</sup> edge. <code>Gateway</code> and <code>HTTPRoute</code> become a managed tunnel and Envoy routing; Cloudflare Access<sup>™</sup> policies and WARP<sup>®</sup> private networking are CRDs. One outbound connection — nothing listens inbound.',
+			'<code>Gateway</code> and <code>HTTPRoute</code> become a managed Cloudflare Tunnel and Envoy routing — Access and WARP<sup>®</sup> are CRDs too. One outbound connection, nothing inbound.',
 		primary: { label: 'Get started', href: '/docs/operations/install/' },
 		secondary: { label: 'GitHub', href: 'https://github.com/isac322/flareway' },
 		tertiaryHtml: 'Try <code>helm template</code> — no cluster, no credentials',
@@ -224,7 +224,7 @@ export const landingCopy: LandingCopy = {
 			browsersSub: 'public hostnames',
 			warp: 'WARP devices',
 			warpSub: 'private network routes',
-			edge: 'Cloudflare edge',
+			edge: 'Cloudflare® edge',
 			edgeSub1: 'edge TLS · proxied CNAME',
 			edgeSub2: 'private network route',
 			edgeHost: '<tunnel-id>.cfargotunnel.com',
@@ -296,7 +296,7 @@ export const landingCopy: LandingCopy = {
 	access: {
 		heading: 'Access policies live next to the routes they protect.',
 		ledeHtml:
-			'Attach a policy, not an annotation. Reach private services over WARP, managed as Kubernetes resources.',
+			'Attach a Cloudflare Access<sup>™</sup> policy, not an annotation. Reach private services over WARP, managed as Kubernetes<sup>®</sup> resources.',
 		policy: {
 			heading: 'Policy attachment (GEP-713)',
 			bodyHtml:

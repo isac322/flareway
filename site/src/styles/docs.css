@@ -252,12 +252,34 @@ header.header {
 }
 
 /* ---- Code blocks (Expressive Code; colors set in astro.config.mjs) --------- */
+/* Title bars match the landing's code-file bars: a mono caption on the navy
+   panel, inset like the code body, no faux window chrome. */
+.expressive-code .frame .header {
+	justify-content: flex-start;
+	align-items: center;
+	font-family: var(--fw-font-mono);
+	font-size: 0.8125rem;
+	padding-block: 0.625rem;
+	padding-inline: var(--ec-codePadInl);
+}
+/* Terminal frames: no traffic-light dots — show a quiet "shell" caption
+   instead; a titled frame shows its file name. */
+.expressive-code .frame.is-terminal .header::before {
+	display: none;
+}
+.expressive-code .frame.is-terminal .title {
+	font-weight: 600;
+	color: var(--ec-codeFg);
+}
+.expressive-code .frame.is-terminal .title:empty::before {
+	content: 'shell';
+	font-weight: 400;
+	color: var(--ec-gtrFg);
+}
 .expressive-code .frame.has-title:not(.is-terminal) .title {
+	padding-inline: 0;
 	font-weight: 600;
 	letter-spacing: 0;
-}
-.expressive-code .frame .header {
-	font-family: var(--fw-font-mono);
 }
 .expressive-code .copy button {
 	border-radius: 6px;
@@ -348,6 +370,10 @@ mobile-starlight-toc a {
 starlight-toc a:hover,
 mobile-starlight-toc a:hover {
 	color: var(--fw-ink);
+}
+/* Mobile "On this page" dropdown: inset the list from the panel edges. */
+mobile-starlight-toc .dropdown {
+	padding-block: 0.5rem;
 }
 starlight-toc a[aria-current='true'],
 mobile-starlight-toc a[aria-current='true'] {
