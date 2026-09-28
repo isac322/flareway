@@ -50,7 +50,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessGroup
 metadata:
   name: developers
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
