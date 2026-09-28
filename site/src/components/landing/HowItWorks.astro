@@ -1,0 +1,137 @@
+---
+// S3: the architecture diagram from preview E. Text comes from landing-copy;
+// geometry is fixed to the 520×596 drawing.
+import { landingCopy } from '../../data/landing-copy';
+
+const copy = landingCopy.how;
+const f = copy.figure;
+---
+
+<section class="works" aria-labelledby="works-h">
+	<div class="wrap">
+		<div class="section-head">
+			<h2 id="works-h">{copy.heading}</h2>
+			<p set:html={copy.ledeHtml} />
+		</div>
+		<figure class="figure">
+			<svg viewBox="0 0 520 596" role="img" aria-labelledby="dg-title dg-desc">
+				<title id="dg-title">{f.title}</title>
+				<desc id="dg-desc">{f.desc}</desc>
+				<defs>
+					<pattern
+						id="dg-hach"
+						class="d-hach"
+						patternUnits="userSpaceOnUse"
+						width="7"
+						height="7"
+						patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="7"></line></pattern
+					>
+					<marker
+						id="dg-ah"
+						viewBox="0 0 10 10"
+						refX="8"
+						refY="5"
+						markerWidth="7"
+						markerHeight="7"
+						orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9 Z" class="d-head"></path></marker
+					>
+				</defs>
+
+				<rect class="d-box" x="16" y="16" width="232" height="60" rx="12"></rect>
+				<g class="d-ico" transform="translate(32 32)">
+					<circle cx="14" cy="14" r="12"></circle><ellipse cx="14" cy="14" rx="5" ry="12"></ellipse><path
+						d="M2.5 10h23M2.5 18h23"></path>
+				</g>
+				<text class="d-t" x="72" y="42">{f.browsers}</text>
+				<text class="d-s" x="72" y="61">{f.browsersSub}</text>
+
+				<rect class="d-box" x="272" y="16" width="232" height="60" rx="12"></rect>
+				<g class="d-ico" transform="translate(288 34)">
+					<rect x="3" y="0" width="22" height="15" rx="2"></rect><path d="M0 20h28"></path>
+				</g>
+				<text class="d-t" x="328" y="42">{f.warp}</text>
+				<text class="d-s" x="328" y="61">{f.warpSub}</text>
+
+				<path class="d-arrow" d="M132 76 V116" marker-end="url(#dg-ah)"></path>
+				<path class="d-arrow" d="M388 76 V116" marker-end="url(#dg-ah)"></path>
+
+				<rect class="d-edge" x="16" y="122" width="488" height="84" rx="12"></rect>
+				<text class="d-t" x="34" y="152">{f.edge}</text>
+				<text class="d-s" x="34" y="172">{f.edgeSub1}</text>
+				<text class="d-s" x="34" y="190">{f.edgeSub2}</text>
+				<text class="d-m" x="486" y="152" text-anchor="end">{f.edgeHost}</text>
+
+				<g class="d-x-g">
+					<path class="d-arrow" d="M56 206 V244"></path>
+					<path class="d-x" d="M50 248 l12 12 M62 248 l-12 12"></path>
+					<path class="d-arrow" d="M464 206 V244"></path>
+					<path class="d-x" d="M458 248 l12 12 M470 248 l-12 12"></path>
+				</g>
+				<text class="d-note" x="68" y="229">{f.noInbound}</text>
+				<text class="d-note" x="452" y="229" text-anchor="end">{f.noInbound}</text>
+
+				<rect class="d-cluster" x="0" y="277" width="520" height="319"></rect>
+				<rect x="0" y="277" width="520" height="319" fill="url(#dg-hach)"></rect>
+				<path class="d-wall" d="M0 274 H236 M284 274 H520"></path>
+				<path class="d-swing" d="M236 274 A48 48 0 0 1 268 228"></path>
+				<path class="d-leaf" d="M284 272 L300 229"></path>
+				<path class="d-jamb" d="M236 268 V280 M284 268 V280"></path>
+				<text class="d-note-ink halo" x="506" y="299" text-anchor="end">{f.boundary}</text>
+				<text class="d-s halo" x="506" y="316" text-anchor="end">{f.boundarySub}</text>
+
+				<rect class="d-box" x="404" y="350" width="104" height="56" rx="10"></rect>
+				<text class="d-t d-t-sm" x="456" y="374" text-anchor="middle">{f.controllerName}</text>
+				<text class="d-s" x="456" y="393" text-anchor="middle">{f.controllerSub}</text>
+				<path class="d-thin" d="M404 378 H382" marker-end="url(#dg-ah)"></path>
+				<text class="d-m" x="456" y="428" text-anchor="middle">{f.xds}</text>
+
+				<rect class="d-pod" x="28" y="322" width="360" height="148" rx="12"></rect>
+				<text class="d-m" x="372" y="342" text-anchor="end">{f.podLabel}</text>
+				<rect class="d-box-ink" x="44" y="354" width="136" height="50" rx="9"></rect>
+				<text class="d-mi" x="112" y="384" text-anchor="middle">{f.cloudflared}</text>
+				<rect class="d-box-ink" x="228" y="354" width="136" height="50" rx="9"></rect>
+				<text class="d-mi" x="296" y="384" text-anchor="middle">{f.envoy}</text>
+				<path class="d-arrow" d="M180 379 H222" marker-end="url(#dg-ah)"></path>
+				<text class="d-m" x="204" y="422" text-anchor="middle">{f.loopback}</text>
+				<text class="d-s" x="44" y="456">{f.coredns}</text>
+
+				<path class="d-arrow" d="M296 404 V494" marker-end="url(#dg-ah)"></path>
+				<rect class="d-box" x="228" y="500" width="136" height="44" rx="9"></rect>
+				<text class="d-t d-t-sm" x="296" y="527" text-anchor="middle">{f.service}</text>
+				<path class="d-arrow" d="M364 522 H398" marker-end="url(#dg-ah)"></path>
+				<rect class="d-box" x="404" y="500" width="104" height="44" rx="9"></rect>
+				<text class="d-t d-t-sm" x="456" y="527" text-anchor="middle">{f.pods}</text>
+				<text class="d-s" x="286" y="490" text-anchor="end">{f.routed}</text>
+
+				<path class="d-tunnel" d="M112 354 V330 Q112 316 126 316 H246 Q260 316 260 302 V214"></path>
+				<path class="d-tunnel-core" d="M112 350 V330 Q112 316 126 316 H246 Q260 316 260 302 V218"></path>
+				<g class="d-tunnel-head"><path class="d-accent" d="M249 218 L260 202 L271 218 Z"></path></g>
+				<text class="d-t d-t-tunnel" x="310" y="246">{f.tunnel}</text>
+				<text class="d-m" x="310" y="263">{f.tunnelProto}</text>
+				<text class="d-note-ink halo" x="134" y="304">{f.opened}</text>
+
+				<g class="dots" aria-hidden="true">
+					<circle class="d-dot" r="4.5" opacity="0">
+						<set attributeName="opacity" to="1" begin="2.4s"></set>
+						<animateMotion
+							dur="3.4s"
+							begin="2.4s"
+							repeatCount="indefinite"
+							calcMode="linear"
+							path="M132 76 V196 H250 V316 H126 Q112 316 112 330 V379 H296 V522 H456"></animateMotion>
+					</circle>
+					<circle class="d-dot" r="4.5" opacity="0">
+						<set attributeName="opacity" to="1" begin="4.1s"></set>
+						<animateMotion
+							dur="3.4s"
+							begin="4.1s"
+							repeatCount="indefinite"
+							calcMode="linear"
+							path="M388 76 V196 H270 V316 H126 Q112 316 112 330 V379 H296 V522 H456"></animateMotion>
+					</circle>
+				</g>
+			</svg>
+			<figcaption><span>{f.caption}</span><span class="figure-ratio">{f.ratio}</span></figcaption>
+		</figure>
+	</div>
+</section>

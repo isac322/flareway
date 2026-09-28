@@ -1,0 +1,17 @@
+---
+import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
+import SidebarPersister from '@astrojs/starlight/components/SidebarPersister.astro';
+import SidebarSublist from '@astrojs/starlight/components/SidebarSublist.astro';
+import { sidebarForPath } from '../../data/nav';
+
+// Show only the entries belonging to the active top tab.
+const sidebar = sidebarForPath(Astro.locals.starlightRoute.sidebar, Astro.url.pathname);
+---
+
+<SidebarPersister>
+	<SidebarSublist sublist={sidebar} />
+</SidebarPersister>
+
+<div class="md:sl-hidden">
+	<MobileMenuFooter />
+</div>

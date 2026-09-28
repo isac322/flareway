@@ -73,7 +73,7 @@ Flareway CRDs remain after `helm uninstall`, following Helm's CRD lifecycle. Wor
 
 ## Conformance-only installation
 
-Conformance mode excludes Cloudflare Tunnel, DNS, Access, and WARP. It is for Gateway API validation, not production ingress.
+Conformance mode excludes Cloudflare Tunnel, DNS, Access, and WARP. Use it only for Gateway API conformance validation; it does not serve traffic through Cloudflare.
 
 ```sh
 helm upgrade --install flareway ./charts/flareway \

@@ -1,0 +1,35 @@
+---
+// The closing moment: the page's channel ends at the wide doorway in the border
+// above this section (drawn by landing-chart.ts); behind it stands the mark
+// with its door open, and the star control.
+import { formatStars, REPO_URL } from '../../data/github';
+import { landingCopy } from '../../data/landing-copy';
+import { BRAND_ORANGE, CLOUD_PATH, DOOR_PATH, MARK_VIEWBOX } from '../brand/paths';
+import Icon from './Icon.astro';
+
+interface Props {
+	stars?: number;
+}
+
+const { stars } = Astro.props;
+const copy = landingCopy.star;
+---
+
+<section class="star" aria-labelledby="star-h">
+	<div class="wrap star-inner">
+		<svg class="star-mark" viewBox={MARK_VIEWBOX} aria-hidden="true" focusable="false">
+			<path fill={BRAND_ORANGE} d={CLOUD_PATH}></path>
+			<path fill={BRAND_ORANGE} fill-rule="evenodd" d={DOOR_PATH}></path>
+		</svg>
+		<h2 id="star-h">{copy.heading}</h2>
+		<p set:html={copy.bodyHtml} />
+		<div class="star-ctas">
+			<a class="btn btn-star" href={REPO_URL}>
+				<Icon name="star" class="star-icon" />
+				{copy.cta}
+				{stars !== undefined && <span class="num">{copy.ctaCount.replace('{count}', formatStars(stars))}</span>}
+			</a>
+			<a class="tertiary" href={copy.secondary.href}>{copy.secondary.label}</a>
+		</div>
+	</div>
+</section>

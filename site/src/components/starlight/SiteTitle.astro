@@ -1,0 +1,51 @@
+---
+// The Flareway lockup: orange cloud-with-doorway mark plus the wordmark
+// outlines (never re-typeset in a font). Vectors come from brand/paths.ts;
+// colors come from tokens.css so the wordmark ink follows the theme.
+import {
+	CLOUD_PATH,
+	DOOR_PATH,
+	LOCKUP_VIEWBOX,
+	MARK_TRANSFORM,
+	WORDMARK_PATH,
+	WORDMARK_TRANSFORM,
+} from '../brand/paths';
+
+const { siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex">
+	<svg class="lockup" viewBox={LOCKUP_VIEWBOX} aria-hidden="true" focusable="false">
+		<g class="mark" transform={MARK_TRANSFORM}>
+			<path d={CLOUD_PATH}></path>
+			<path fill-rule="evenodd" d={DOOR_PATH}></path>
+		</g>
+		<g transform={WORDMARK_TRANSFORM}>
+			<path fill="currentColor" d={WORDMARK_PATH}></path>
+		</g>
+	</svg>
+	<span class="sr-only">Flareway</span>
+</a>
+
+<style>
+	.site-title {
+		align-items: center;
+		color: var(--fw-ink);
+		text-decoration: none;
+		border-radius: 4px;
+	}
+	.mark {
+		fill: var(--fw-accent);
+	}
+	.lockup {
+		display: block;
+		height: 1.625rem;
+		width: auto;
+		flex: none;
+	}
+	@media (max-width: 30rem) {
+		.lockup {
+			height: 1.375rem;
+		}
+	}
+</style>

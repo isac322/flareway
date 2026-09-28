@@ -1,0 +1,90 @@
+/* Flareway design tokens shared by the landing page and the Starlight docs.
+ * Light is the default; dark applies when Starlight's theme picker sets
+ * data-theme="dark", or when the OS prefers dark and no explicit light
+ * choice was made. */
+@import "@fontsource-variable/schibsted-grotesk";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource/alegreya/latin-400-italic.css";
+
+:root {
+  --fw-bg: #fffaf2;
+  --fw-ink: #172b4d;
+  --fw-ink-2: #52627a;
+  --fw-line: #e3daca;
+  --fw-line-soft: #efe6d6;
+  --fw-panel: #ffffff;
+  --fw-tint: #fdf6ec;
+  --fw-warm: #fcebd9;
+  --fw-cool: #eef2f8;
+  --fw-accent: #e77b35; /* graphics only on light grounds */
+  --fw-accent-ink: #b5541c; /* orange-family text on light */
+  --fw-code-bg: #172b4d;
+  --fw-code-ink: #e6edf3;
+  --fw-code-key: #f5d3b8;
+  --fw-code-dim: #a9b5c8;
+  --fw-code-hl: rgb(231 123 53 / 0.16);
+  --fw-code-gutter: #7f8fa8;
+  --fw-btn-bg: #172b4d;
+  --fw-btn-ink: #fffaf2;
+  --fw-btn-hover: #0f1f3a;
+  --fw-shadow: 0 1px 2px rgb(23 43 77 / 0.06), 0 12px 32px -12px rgb(23 43 77 / 0.18);
+  --fw-hachure-opacity: 0.2;
+  --fw-font-sans: "Schibsted Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
+  --fw-font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --fw-font-note: "Alegreya", Georgia, serif; /* chart annotations only */
+  --fw-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --fw-channel: 22px;
+  --fw-door-slant: 18deg;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --fw-bg: #161b22;
+  --fw-ink: #e6edf3;
+  --fw-ink-2: #9aa7bc;
+  --fw-line: #2e3644;
+  --fw-line-soft: #232a35;
+  --fw-panel: #1c2129;
+  --fw-tint: #1a1f2a;
+  --fw-warm: #2a2118;
+  --fw-cool: #1d222b;
+  --fw-accent-ink: #e77b35;
+  --fw-code-bg: #1a1f2a;
+  --fw-code-dim: #8b98ac;
+  --fw-code-gutter: #6b7890;
+  --fw-btn-bg: #e6edf3;
+  --fw-btn-ink: #161b22;
+  --fw-btn-hover: #ffffff;
+  --fw-shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 16px 40px -16px rgb(0 0 0 / 0.6);
+  --fw-hachure-opacity: 0.13;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --fw-bg: #161b22;
+    --fw-ink: #e6edf3;
+    --fw-ink-2: #9aa7bc;
+    --fw-line: #2e3644;
+    --fw-line-soft: #232a35;
+    --fw-panel: #1c2129;
+    --fw-tint: #1a1f2a;
+    --fw-warm: #2a2118;
+    --fw-cool: #1d222b;
+    --fw-accent-ink: #e77b35;
+    --fw-code-bg: #1a1f2a;
+    --fw-code-dim: #8b98ac;
+    --fw-code-gutter: #6b7890;
+    --fw-btn-bg: #e6edf3;
+    --fw-btn-ink: #161b22;
+    --fw-btn-hover: #ffffff;
+    --fw-shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 16px 40px -16px rgb(0 0 0 / 0.6);
+    --fw-hachure-opacity: 0.13;
+    color-scheme: dark;
+  }
+}
+
+/* Landing: YAML `kind:` values in code panels (code panels stay navy in both themes). */
+:root {
+  --fw-landing-code-kind: #f4b585;
+}

@@ -81,7 +81,7 @@ conventions.
 
 ## API changes
 
-Flareway is experimental (`v1alpha1`); API changes are expected and
+Flareway's API is `v1alpha1`; API changes are expected and
 accepted. When you change a CRD kind or field, update the generated CRDs
 (`make manifests`), deepcopy code (`make generate`), and
 `docs/api-reference.md` in the same change — `Generation diff` fails

@@ -1,0 +1,39 @@
+---
+// S9: docs index, conformance, license, and the verbatim legal notice.
+import { landingCopy } from '../../data/landing-copy';
+import LegalNotice from '../LegalNotice.astro';
+import Lockup from './Lockup.astro';
+
+const copy = landingCopy.footer;
+---
+
+<footer class="foot">
+	<div class="wrap">
+		<div class="foot-grid">
+			<div class="foot-brand">
+				<a class="brand" href="/" aria-label={landingCopy.header.homeLabel}><Lockup /></a>
+				<p>{copy.tagline}</p>
+			</div>
+			<nav class="foot-nav" aria-label={copy.navLabel}>
+				{
+					copy.groups.map((group) => (
+						<div>
+							<p class="foot-h">{group.heading}</p>
+							<ul>
+								{group.links.map((link) => (
+									<li>
+										<a href={link.href}>{link.label}</a>
+									</li>
+								))}
+							</ul>
+						</div>
+					))
+				}
+			</nav>
+		</div>
+		<div class="foot-legal">
+			<LegalNotice />
+			<a class="tertiary" href="#top">{copy.top}</a>
+		</div>
+	</div>
+</footer>

@@ -1,0 +1,79 @@
+---
+// S4: the two sample manifests, verbatim from config/samples, beside what the
+// controller produces. Hovering, focusing, or pressing an output highlights the
+// YAML lines behind it (landing-chart.ts).
+import gatewayYaml from '../../../../config/samples/gateway_v1_gateway.yaml?raw';
+import routeYaml from '../../../../config/samples/gateway_v1_httproute.yaml?raw';
+import { landingCopy } from '../../data/landing-copy';
+import CodeFile from './CodeFile.astro';
+
+const copy = landingCopy.demo;
+const labels = { copyLabel: copy.copy, copiedLabel: copy.copied, copyFailedLabel: copy.copyFailed };
+// One glyph per output, in order: tunnel arch, Deployment, DNS record, routes, Programmed.
+const glyphs = ['tunnel', 'deployment', 'dns', 'routes', 'programmed'] as const;
+---
+
+<section class="produce" aria-labelledby="produce-h">
+	<div class="wrap">
+		<div class="section-head">
+			<h2 id="produce-h">{copy.heading}</h2>
+			<p set:html={copy.ledeHtml} />
+		</div>
+		<div class="produce-grid">
+			<div class="code">
+				<CodeFile name="gateway_v1_gateway.yaml" source={gatewayYaml} fileKey="g" label="gateway_v1_gateway.yaml" {...labels} />
+				<CodeFile name="gateway_v1_httproute.yaml" source={routeYaml} fileKey="r" label="gateway_v1_httproute.yaml" {...labels} />
+			</div>
+			<div class="outputs">
+				<h3>{copy.outputsHeading}</h3>
+				<ol>
+					{
+						copy.outputs.map((output, index) => (
+							<li>
+								<button class="out" type="button" data-lines={output.lines} aria-pressed="false">
+									<span class="ico" aria-hidden="true">
+										<svg viewBox="0 0 20 20" focusable="false">
+											{glyphs[index % glyphs.length] === 'tunnel' && (
+												<Fragment>
+													<path d="M4 16 V9 a6 6 0 0 1 12 0 V16" />
+													<path class="fill" d="M8 16 V10.5 a2 2 0 0 1 4 0 V16 Z" />
+												</Fragment>
+											)}
+											{glyphs[index % glyphs.length] === 'deployment' && (
+												<Fragment>
+													<rect x="3" y="4" width="14" height="12" rx="2" />
+													<path d="M10 4 V16" />
+												</Fragment>
+											)}
+											{glyphs[index % glyphs.length] === 'dns' && (
+												<Fragment>
+													<path d="M3 6 h9 M3 10 h6 M3 14 h9" />
+													<path d="M13 10 h4 m-2-2 l2 2 -2 2" />
+												</Fragment>
+											)}
+											{glyphs[index % glyphs.length] === 'routes' && (
+												<Fragment>
+													<path d="M3 10 h5 l3-5 h6 M8 10 l3 5 h6" />
+													<circle cx="3" cy="10" r="1.2" class="fill" />
+												</Fragment>
+											)}
+											{glyphs[index % glyphs.length] === 'programmed' && (
+												<Fragment>
+													<circle cx="10" cy="10" r="7" />
+													<path d="M6.8 10.2 l2.2 2.2 4.4-4.6" />
+												</Fragment>
+											)}
+										</svg>
+									</span>
+									<span class="t" set:html={output.titleHtml} />
+									<span class="d" set:html={output.bodyHtml} />
+								</button>
+							</li>
+						))
+					}
+				</ol>
+				<p class="note" set:html={copy.noteHtml} />
+			</div>
+		</div>
+	</div>
+</section>

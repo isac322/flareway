@@ -1,0 +1,50 @@
+---
+// S5: Access through GEP-713 policy attachment, WARP private networking CRDs,
+// and CloudflareTunnel Direct mode.
+import { landingCopy } from '../../data/landing-copy';
+import Icon from './Icon.astro';
+
+const copy = landingCopy.access;
+---
+
+<section class="access" aria-labelledby="access-h">
+	<div class="wrap">
+		<div class="section-head">
+			<h2 id="access-h">{copy.heading}</h2>
+			<p set:html={copy.ledeHtml} />
+		</div>
+		<div class="access-grid">
+			<div class="access-policy">
+				<h3>{copy.policy.heading}</h3>
+				<p set:html={copy.policy.bodyHtml} />
+				<figure class="variants">
+					<figcaption set:html={copy.policy.variantsCaption} />
+					<ul>
+						{
+							copy.policy.variants.map((variant) => (
+								<li>
+									<code>{variant.name}</code>
+									<span>{variant.gloss}</span>
+								</li>
+							))
+						}
+					</ul>
+				</figure>
+				<a class="more" href={copy.more.href}>{copy.more.label}<Icon name="arrow" class="arrow" /></a>
+			</div>
+			<div class="access-side">
+				<div class="access-warp">
+					<h3>{copy.warp.heading}</h3>
+					<p set:html={copy.warp.bodyHtml} />
+					<ul class="kinds">{copy.warp.kinds.map((kind) => <li><code>{kind}</code></li>)}</ul>
+					<p class="kinds-note" set:html={copy.warp.kindsNoteHtml} />
+				</div>
+				<div class="access-direct">
+					<h3>{copy.direct.heading}</h3>
+					<p set:html={copy.direct.bodyHtml} />
+					<ul class="origins">{copy.direct.origins.map((origin) => <li>{origin}</li>)}</ul>
+				</div>
+			</div>
+		</div>
+	</div>
+</section>

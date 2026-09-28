@@ -1,0 +1,48 @@
+---
+// Section divider in the landing's chart grammar: a hairline rule broken by a
+// doorway (two jamb ticks) with the orange door leaf swung across the gap.
+interface Props {
+	class?: string;
+}
+const { class: className } = Astro.props;
+---
+
+<div class:list={['fw-doorway-rule', className]} aria-hidden="true"></div>
+
+<style>
+	.fw-doorway-rule {
+		--gap-start: 2.5rem;
+		--gap-width: 18px;
+		position: relative;
+		height: 12px;
+		/* Two rule segments with the doorway gap between them. */
+		background:
+			linear-gradient(var(--fw-line), var(--fw-line)) left bottom / var(--gap-start) 1px no-repeat,
+			linear-gradient(var(--fw-line), var(--fw-line)) right bottom /
+				calc(100% - var(--gap-start) - var(--gap-width)) 1px no-repeat;
+	}
+	/* Jambs: ticks rising from the rule at both sides of the gap. */
+	.fw-doorway-rule::before {
+		content: '';
+		position: absolute;
+		inset-inline-start: calc(var(--gap-start) - 1px);
+		bottom: 0;
+		width: calc(var(--gap-width) + 2px);
+		height: 11px;
+		border: 1px solid var(--fw-ink-2);
+		border-top: 0;
+		border-bottom: 0;
+	}
+	/* Door leaf, hinged on the near jamb and dropping past the rule. */
+	.fw-doorway-rule::after {
+		content: '';
+		position: absolute;
+		inset-inline-start: calc(var(--gap-start) + 2px);
+		bottom: -3px;
+		width: 5px;
+		height: 11px;
+		background: var(--fw-accent);
+		transform: skewY(var(--fw-door-slant));
+		transform-origin: 0 0;
+	}
+</style>

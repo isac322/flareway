@@ -1,0 +1,109 @@
+---
+// Landing page (direction E). Copy: src/data/landing-copy.ts. Chart and
+// channel geometry: src/scripts/landing-chart.ts (the page reads fully without it).
+import AccessWarp from '../components/landing/AccessWarp.astro';
+import Demo from '../components/landing/Demo.astro';
+import FailClosed from '../components/landing/FailClosed.astro';
+import Footer from '../components/landing/Footer.astro';
+import Header from '../components/landing/Header.astro';
+import Hero from '../components/landing/Hero.astro';
+import HowItWorks from '../components/landing/HowItWorks.astro';
+import Star from '../components/landing/Star.astro';
+import TryIt from '../components/landing/TryIt.astro';
+import Why from '../components/landing/Why.astro';
+import { getStars, REPO_URL } from '../data/github';
+import { landingCopy } from '../data/landing-copy';
+import '../styles/tokens.css';
+import '../styles/landing.css';
+
+const SITE = 'https://flareway.bhyoo.com';
+const canonical = `${SITE}/`;
+const ogImage = `${SITE}/og.png`;
+const meta = landingCopy.meta;
+const stars = await getStars();
+
+const jsonLd = JSON.stringify([
+	{
+		'@context': 'https://schema.org',
+		'@type': 'SoftwareSourceCode',
+		name: 'Flareway',
+		description: meta.description,
+		url: canonical,
+		codeRepository: REPO_URL,
+		programmingLanguage: 'Go',
+		license: 'https://www.apache.org/licenses/LICENSE-2.0',
+		author: { '@type': 'Person', name: 'Byeonghoon Yoo' },
+	},
+	{
+		'@context': 'https://schema.org',
+		'@type': 'WebSite',
+		name: meta.siteName,
+		url: canonical,
+	},
+]).replace(/</g, '\\u003c');
+---
+
+<!doctype html>
+<html lang="en" id="top">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<script is:inline>
+			// Same key and values as Starlight's theme picker so both surfaces agree.
+			try {
+				const theme = localStorage.getItem('starlight-theme');
+				if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+			} catch {}
+		</script>
+		<title>{meta.title}</title>
+		<meta name="description" content={meta.description} />
+		<link rel="canonical" href={canonical} />
+		<meta name="color-scheme" content="light dark" />
+		<meta name="theme-color" media="(prefers-color-scheme: light)" content="#FFFAF2" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161B22" />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<link rel="sitemap" href="/sitemap-index.xml" />
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content={meta.siteName} />
+		<meta property="og:title" content={meta.ogTitle} />
+		<meta property="og:description" content={meta.description} />
+		<meta property="og:url" content={canonical} />
+		<meta property="og:image" content={ogImage} />
+		<meta property="og:image:width" content="1280" />
+		<meta property="og:image:height" content="640" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content={meta.ogTitle} />
+		<meta name="twitter:description" content={meta.description} />
+		<meta name="twitter:image" content={ogImage} />
+		<script is:inline type="application/ld+json" set:html={jsonLd} />
+	</head>
+	<body>
+		<svg id="underlay" aria-hidden="true"></svg>
+		<Header stars={stars} />
+		<main>
+			<Hero />
+			<div class="divider" aria-hidden="true"></div>
+			<Why />
+			<div class="divider" aria-hidden="true"></div>
+			<HowItWorks />
+			<div class="divider" aria-hidden="true"></div>
+			<Demo />
+			<div class="divider" aria-hidden="true"></div>
+			<AccessWarp />
+			<div class="divider" aria-hidden="true"></div>
+			<FailClosed />
+			<div class="divider" aria-hidden="true"></div>
+			<TryIt />
+			<div class="divider divider-end" aria-hidden="true"></div>
+			<Star stars={stars} />
+		</main>
+		<div class="divider divider-foot" aria-hidden="true"></div>
+		<Footer />
+		<svg id="overlay" aria-hidden="true"></svg>
+		<script>
+			import { startLanding } from '../scripts/landing-chart';
+			startLanding();
+		</script>
+	</body>
+</html>

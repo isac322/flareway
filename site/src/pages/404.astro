@@ -1,0 +1,124 @@
+---
+// Not-found page in the chart's voice: the mark with its door shut, and two
+// ways back to charted water.
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { CLOUD_PATH, MARK_VIEWBOX } from '../components/brand/paths';
+
+// Closed door: a flat leaf filling the cloud's doorway (x 44–84, y 58–108 in
+// mark coordinates), knob cut out on the latch side.
+const CLOSED_DOOR_PATH = 'M50 64 H78 V108 H50 Z M70 84 h4 v6 h-4 Z';
+---
+
+<StarlightPage
+	frontmatter={{
+		title: 'No channel charted here',
+		template: 'splash',
+		editUrl: false,
+		pagefind: false,
+		tableOfContents: false,
+	}}
+>
+	<div class="fw-404 not-content">
+		<svg class="fw-404-mark" viewBox={MARK_VIEWBOX} role="img" aria-label="The Flareway mark with its door closed">
+			<path class="cloud" d={CLOUD_PATH}></path>
+			<path class="door" fill-rule="evenodd" d={CLOSED_DOOR_PATH}></path>
+			<line class="sill" x1="40" y1="108.5" x2="88" y2="108.5"></line>
+		</svg>
+		<div class="fw-404-copy">
+			<p class="lede">
+				The page you were steering for isn't on this chart. It may have moved when the documentation was reorganized.
+			</p>
+			<p class="note">404 · page not found</p>
+			<ul class="fw-404-links">
+				<li><a class="primary" href="/">Back to the overview</a></li>
+				<li><a class="secondary" href="/docs/">Open the documentation</a></li>
+			</ul>
+		</div>
+	</div>
+</StarlightPage>
+
+<style>
+	.fw-404 {
+		display: grid;
+		grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+		gap: clamp(1.5rem, 5vw, 3.5rem);
+		align-items: center;
+		max-width: 48rem;
+		margin-block: 1rem 3rem;
+	}
+	.fw-404-mark {
+		width: 100%;
+		height: auto;
+		overflow: visible;
+	}
+	.cloud,
+	.door {
+		fill: var(--fw-accent);
+	}
+	/* Hairline at the threshold so the shut door reads as a panel, not a gap. */
+	.door {
+		stroke: var(--fw-bg);
+		stroke-width: 1.5;
+	}
+	.sill {
+		stroke: var(--fw-ink);
+		stroke-width: 1.5;
+		stroke-linecap: round;
+	}
+	.lede {
+		max-width: 52ch;
+		font-size: 1.125rem;
+		line-height: 1.6;
+		color: var(--fw-ink);
+		text-wrap: pretty;
+	}
+	.note {
+		margin-top: 0.5rem;
+		font: italic 400 1rem/1.4 var(--fw-font-note);
+		color: var(--fw-ink-2);
+	}
+	.fw-404-links {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 1.75rem;
+		padding: 0;
+		list-style: none;
+	}
+	.fw-404-links a {
+		display: inline-flex;
+		align-items: center;
+		height: 2.75rem;
+		padding-inline: 1.125rem;
+		border: 1px solid transparent;
+		border-radius: 10px;
+		font-weight: 600;
+		text-decoration: none;
+		transition:
+			background-color 0.2s,
+			border-color 0.2s;
+	}
+	.fw-404-links .primary {
+		background: var(--fw-btn-bg);
+		color: var(--fw-btn-ink);
+	}
+	.fw-404-links .primary:hover {
+		background: var(--fw-btn-hover);
+	}
+	.fw-404-links .secondary {
+		border-color: var(--fw-line);
+		background: var(--fw-panel);
+		color: var(--fw-ink);
+	}
+	.fw-404-links .secondary:hover {
+		border-color: var(--fw-ink-2);
+	}
+	@media (max-width: 36rem) {
+		.fw-404 {
+			grid-template-columns: 1fr;
+		}
+		.fw-404-mark {
+			width: 7rem;
+		}
+	}
+</style>
