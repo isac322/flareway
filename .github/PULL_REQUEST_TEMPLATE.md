@@ -20,5 +20,6 @@
 - [ ] `make lint-fix`, `make test`, and `make verify-generated` pass locally
 - [ ] `make verify-artifacts` run (packaging, schema, or SDK-surface changes)
 - [ ] Generated artifacts regenerated (`make manifests` / `make generate`) if types or markers changed — never hand-edited
-- [ ] `docs/` updated if behavior, install, or API surface changed
+- [ ] Code, docs, and website match: every changed behavior, field, default, flag, chart value, sample, or install step is updated in `README.md`, `docs/`, and `site/src/` in this PR (see "Code, docs, and website must match" in `AGENTS.md`)
+- [ ] `cd site && bun run build && bun run check` pass
 - [ ] No secrets, account IDs, or private hostnames added (this is a public repository)

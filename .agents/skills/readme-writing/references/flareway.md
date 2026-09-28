@@ -70,7 +70,7 @@ description (keep it ≤ 155 characters, plain prose, not a list or image).
   Cloudflare Tunnel, DNS, Access, and WARP; it validates Envoy behavior, not
   the edge path. Result numbers belong only on the conformance report page.
   Source:
-  [`conformance/reports/v1.6.2/flareway/README.md`](../../../../conformance/reports/v1.6.2/flareway/README.md).
+  [`docs/conformance/v1.6.2/flareway/README.md`](../../../../docs/conformance/v1.6.2/flareway/README.md).
 
 ## Architecture (smallest accurate model)
 
@@ -97,20 +97,21 @@ Gateway and account (`GatewayClassConfig`, `CloudflareAccount`,
 `NetworkRoute`, `HostnameRoute`, `WARPConnector`), and account-wide settings.
 The README does not list or count them; `docs/concepts/how-it-works.md` has
 the table. Schema source of truth: `config/crd/bases/` and
-[`docs/api-reference.md`](../../../../docs/api-reference.md).
+[`docs/reference/api.md`](../../../../docs/reference/api.md).
 
 ## First safe action and install path
 
 - Install only from the public OCI chart
   `oci://ghcr.io/isac322/charts/flareway`. Never document `./charts/flareway`,
   `charts/flareway/crds/`, a git checkout, `go run`, or Kustomize overlays
-  as a user install path; contributor workflows stay in `CONTRIBUTING.md`.
+  as a user install path; contributor workflows stay in `docs/CONTRIBUTING.md`.
 - Safe first action, needing no cluster or credentials:
 
   ```sh
   helm template flareway oci://ghcr.io/isac322/charts/flareway \
     --namespace flareway-system \
-    --set gatewayClass.create=true
+    --set gatewayClass.create=true \
+    --set gatewayClass.config.accountRefName=example-account
   ```
 
   It renders the controller Deployment, RBAC, Services, NetworkPolicies,
@@ -124,9 +125,12 @@ the table. Schema source of truth: `config/crd/bases/` and
   client, a Cloudflare account and scoped API token, a DNS zone for public
   listeners, WARP prerequisites for private listeners.
 - Namespace is fixed `flareway-system`; `namespace.create` defaults `false`
-  → use `--create-namespace`. `gatewayClass.create` defaults `false` →
-  `--set gatewayClass.create=true` (prevents silently taking an existing
-  GatewayClass).
+  → use `--create-namespace`. The install step sets no `gatewayClass.*`
+  values (`gatewayClass.create` defaults `false`); the GatewayClass is
+  created in Connect Cloudflare with `helm upgrade --reuse-values --set
+  gatewayClass.create=true --set gatewayClass.config.accountRefName=<account>`
+  because the CRD rejects a GatewayClassConfig without `accountRef` outside
+  conformance mode.
 - Never invite applying `config/samples/` files blindly: they contain
   placeholders (API token, account ID, hostnames, IdP/policy IDs) that must
   be replaced first.
@@ -137,7 +141,7 @@ the table. Schema source of truth: `config/crd/bases/` and
 - Concepts:
   [`docs/concepts/how-it-works.md`](../../../../docs/concepts/how-it-works.md),
   [`docs/concepts/http-routing.md`](../../../../docs/concepts/http-routing.md),
-  [`conformance/reports/v1.6.2/flareway/README.md`](../../../../conformance/reports/v1.6.2/flareway/README.md),
+  [`docs/conformance/v1.6.2/flareway/README.md`](../../../../docs/conformance/v1.6.2/flareway/README.md),
   [`docs/concepts/security-model.md`](../../../../docs/concepts/security-model.md),
   [`docs/concepts/ownership-and-adoption.md`](../../../../docs/concepts/ownership-and-adoption.md),
   [`docs/concepts/limits.md`](../../../../docs/concepts/limits.md)
@@ -153,16 +157,16 @@ the table. Schema source of truth: `config/crd/bases/` and
   [`docs/operations/upgrade.md`](../../../../docs/operations/upgrade.md),
   [`docs/operations/freshness-and-drift.md`](../../../../docs/operations/freshness-and-drift.md)
 - Reference:
-  [`docs/api-reference.md`](../../../../docs/api-reference.md),
+  [`docs/reference/api.md`](../../../../docs/reference/api.md),
   [`charts/flareway/README.md`](../../../../charts/flareway/README.md),
-  [`docs/api/README.md`](../../../../docs/api/README.md),
+  [`docs/reference/kubectl-explain.md`](../../../../docs/reference/kubectl-explain.md),
   [`config/samples/`](../../../../config/samples/)
 - Project:
-  [`CONTRIBUTING.md`](../../../../CONTRIBUTING.md),
-  [`SECURITY.md`](../../../../SECURITY.md),
-  [`CODE_OF_CONDUCT.md`](../../../../CODE_OF_CONDUCT.md),
-  design documents in Korean
-  ([`docs/design/001-cloudflare-gateway-api-integration.md`](../../../../docs/design/001-cloudflare-gateway-api-integration.md))
+  [`docs/CONTRIBUTING.md`](../../../../docs/CONTRIBUTING.md),
+  [`docs/SECURITY.md`](../../../../docs/SECURITY.md),
+  [`docs/CODE_OF_CONDUCT.md`](../../../../docs/CODE_OF_CONDUCT.md),
+  architecture decisions
+  ([`docs/adr/README.md`](../../../../docs/adr/README.md))
 
 ## License and maintenance
 

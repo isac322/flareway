@@ -106,7 +106,7 @@ If admission reports that a variant is missing or mismatched, change the discrim
 
 An empty `spec.zone` uses the account-scoped Access endpoint. A non-empty zone is resolved by exact DNS name from `CloudflareAccount.status.verified.zones`. If the zone is absent there, fix account token permissions or the zone name; do not copy a zone ID into the DNS-name field.
 
-`RefNotPermitted` can also mean the matching account grant denies `accessPolicyRefs`, `accessCustomPageRefs`, `devicePostureIntegrationRefs`, `accessStandaloneApplicationRefs`, `platformObjects`, or the selected `privateRoutes`. For a private route, both the account grant selector and the route's `allowedNamespaces` must permit the consumer.
+`RefNotPermitted` can also mean the matching account grant denies `accessPolicyRefs`, `accessCustomPageRefs`, `devicePostureIntegrationRefs`, `accessStandaloneApplicationRefs`, `platformObjects`, or the selected `privateRoutes`. On a `NetworkRoute` or `HostnameRoute`, it means the route's `allowedNamespaces` does not admit the referenced tunnel's namespace, or the account grant for that namespace denies the route. On a `DeviceProfile`, it means a route's `allowedNamespaces` does not admit the profile's namespace. On an `AccessApplication`, the route is read from the application's namespace; the account grant and the route's `allowedNamespaces` must both admit that namespace.
 
 ## Secret recovery
 
@@ -140,4 +140,4 @@ Cloudflare response envelopes (`success`, `errors`, `messages`, `result`, pagina
 - Admission rejects Gateway fields on a `Direct` tunnel, or a Direct ingress rule or DNS setting is invalid: see [Direct tunnels](../get-started/direct-tunnels.md).
 - A private hostname does not resolve or connect over WARP, or a `WARPConnector` HA or route setting is rejected: see [Private services over WARP](../get-started/private-services-over-warp.md).
 - Long streams end early at the edge: Cloudflare edge limits still apply, and their behavior with long streams has not been measured live. See [Limits and boundaries](../concepts/limits.md).
-- Running the end-to-end suite: see [End-to-end test prerequisites](../../CONTRIBUTING.md#end-to-end-test-prerequisites).
+- Running the end-to-end suite: see [End-to-end test prerequisites](../CONTRIBUTING.md#end-to-end-test-prerequisites).

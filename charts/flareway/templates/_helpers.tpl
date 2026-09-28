@@ -66,9 +66,25 @@ control-plane: controller-manager
 {{- end -}}
 
 {{/*
+Controller-manager drift and freshness flags. When reused values lack
+`reconcile` or one of its keys, that key falls back to its values.yaml default;
+dig keeps an explicit false.
+*/}}
+{{- define "flareway.reconcileArgs" -}}
+{{- $reconcile := .Values.reconcile | default dict -}}
+{{- $freshness := dig "freshness" dict $reconcile -}}
+- --drift-policy={{ dig "driftPolicy" "Overwrite" $reconcile }}
+- --freshness-authz={{ dig "authz" "60s" $freshness }}
+- --freshness-traffic={{ dig "traffic" "300s" $freshness }}
+- --freshness-indirect={{ dig "indirect" "1800s" $freshness }}
+- --freshness-display={{ dig "display" "0s" $freshness }}
+- --disable-sweep={{ dig "disableSweep" false $reconcile }}
+{{- end -}}
+
+{{/*
 Controller-manager logging flags, appended last so they always win.
-Releases installed before `logging` existed reuse values without it, so every
-key falls back to its values.yaml default; dig keeps an explicit false.
+When reused values lack `logging` or one of its keys, that key falls back to
+its values.yaml default; dig keeps an explicit false.
 */}}
 {{- define "flareway.loggingArgs" -}}
 {{- $logging := .Values.logging | default dict -}}

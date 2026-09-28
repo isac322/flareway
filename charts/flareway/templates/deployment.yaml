@@ -53,6 +53,7 @@ spec:
             - --webhook-port=-1
             - --xds-bind-address=:{{ .Values.xds.service.port }}
             {{- include "flareway.controllerArgs" . | nindent 12 }}
+            {{- include "flareway.reconcileArgs" . | nindent 12 }}
             {{- if .Values.metrics.enabled }}
             - --metrics-bind-address=:{{ .Values.metrics.service.port }}
             - --metrics-secure={{ .Values.metrics.secure }}

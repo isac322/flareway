@@ -2,7 +2,7 @@
 
 Attach an `AccessApplication` to a Gateway listener or `HTTPRoute` rule. Flareway creates the Access app and verifies the Access JWT at the origin.
 
-This page continues from [Expose a Service through Cloudflare Tunnel](expose-a-service.md) and protects the `public` Gateway in the `default` namespace. The manifests come from [`config/samples/`](../../config/samples/). Replace every ID, name, and hostname in them with your own.
+This page continues from [Expose a Service through Cloudflare Tunnel](expose-a-service.md) and protects the `public` Gateway in the `default` namespace. The shared Access objects it uses live in the `flareway-platform` namespace. The manifests come from [`config/samples/`](../../config/samples/). Replace every ID, name, and hostname in them with your own.
 
 ## Before you start
 
@@ -14,12 +14,12 @@ The grant that selects your namespace decides what an `AccessApplication` may do
 
 - `hostnames` and `zones` must cover the protected hostname.
 - `unprotectedHostnames` is a security boundary. List a hostname there only when at least one of its routes should be served without Access. Public paths carved out below a protected path need it.
-- `accessPolicyRefs: Allowed` lets an application reference an `AccessPolicy` or `AccessGroup` in another namespace.
+- `accessPolicyRefs: Allowed` lets an application reference an `AccessPolicy` or `AccessGroup` in another namespace. `accessCustomPageRefs: Allowed` does the same for an `AccessCustomPage`.
 - Flareway treats `AccessPolicy`, `AccessGroup`, `IdentityProvider`, `AccessCustomPage`, and `DevicePostureRule` as platform objects, even when it only observes them. The namespace that holds them needs a grant with `platformObjects: Allowed`.
 
-The grant in [Connect a Cloudflare account](connect-cloudflare.md) sets `platformObjects: Denied` for `default`. Before you create the objects on this page, change it to `platformObjects: Allowed` in `cloudflareaccount.yaml` and apply the file again. The later guides reference these policies from other namespaces, so they stay in `default`.
+The account from [Connect a Cloudflare account](connect-cloudflare.md) keeps tenants and shared objects apart. The `default` grant sets `platformObjects: Denied`, `accessPolicyRefs: Allowed`, and `accessCustomPageRefs: Allowed`, so applications in `default` can reference shared objects but not create them. The shared objects on this page live in `flareway-platform`, whose grant sets `platformObjects: Allowed`. [`flareway_v1alpha1_cloudflareaccount.yaml`](../../config/samples/flareway_v1alpha1_cloudflareaccount.yaml) creates that namespace and both grants.
 
-To keep the policies in a namespace your platform team controls instead, reference them with `policyRef.namespace`; the application's grant needs `accessPolicyRefs: Allowed`. Identity provider references have no namespace: `allowedIdpRefs[].name` names an `IdentityProvider` in the application's own namespace, and `allowedIdpRefs[].externalId` names a Cloudflare identity provider by ID without any object. A custom page in another namespace uses `customPageRefs[].objectRef.namespace` and needs `accessCustomPageRefs: Allowed`.
+An application in `default` references the shared objects by namespace: `policyRef.namespace` for policies and `customPageRefs[].objectRef.namespace` for custom pages. Identity provider references have no namespace: `allowedIdpRefs[].name` names an `IdentityProvider` in the application's own namespace, and `allowedIdpRefs[].externalId` names a Cloudflare identity provider by ID without any object. An application outside `flareway-platform` therefore names the shared identity provider by its Cloudflare ID.
 
 ## Reuse existing policies and identity providers
 
@@ -32,7 +32,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: IdentityProvider
 metadata:
   name: google
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -51,7 +51,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
   name: deny-everyone
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -65,13 +65,13 @@ spec:
   deletionPolicy: Orphan
 ```
 
-The same file declares `allow-developers-warp`, an observed `Allow` policy that includes the `developers` group and requires the `warp` posture rule. Their samples are [`flareway_v1alpha1_accessgroup_observeonly.yaml`](../../config/samples/flareway_v1alpha1_accessgroup_observeonly.yaml) and [`flareway_v1alpha1_deviceposturerule_observeonly.yaml`](../../config/samples/flareway_v1alpha1_deviceposturerule_observeonly.yaml). It also declares `bypass-public-api`, a managed `Bypass` policy used for public carve-outs below.
+The same file declares `allow-developers-warp`, an observed `Allow` policy that includes the `developers` group and requires the `warp` posture rule. Their samples are [`flareway_v1alpha1_accessgroup_observeonly.yaml`](../../config/samples/flareway_v1alpha1_accessgroup_observeonly.yaml) and [`flareway_v1alpha1_deviceposturerule_observeonly.yaml`](../../config/samples/flareway_v1alpha1_deviceposturerule_observeonly.yaml), both in `flareway-platform`. It also declares `bypass-public-api`, a managed `Bypass` policy used for public carve-outs below.
 
 An application can also attach a Cloudflare policy directly by ID with `externalRef.policyId` in its `policies` list, without an `AccessPolicy` object.
 
 ## Attach an `AccessApplication`
 
-This application protects the `web` listener of the `public` Gateway, so every path on `app.example.com` requires Access. It comes from [`flareway_v1alpha1_accessapplication_variants.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_variants.yaml) and also references the custom page in [`flareway_v1alpha1_accesscustompage.yaml`](../../config/samples/flareway_v1alpha1_accesscustompage.yaml):
+This application protects the `web` listener of the `public` Gateway, so every path on `app.example.com` requires Access. It comes from [`flareway_v1alpha1_accessapplication_variants.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_variants.yaml) and also references the custom page in [`flareway_v1alpha1_accesscustompage.yaml`](../../config/samples/flareway_v1alpha1_accesscustompage.yaml), which lives in `flareway-platform`:
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
@@ -95,19 +95,24 @@ spec:
     allowAuthenticateViaWarp: true
     autoRedirectToIdentity: true
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference the shared provider in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000001"
     appLauncherVisible: true
     customPageRefs:
     - objectRef:
         name: accesscustompage-sample
+        namespace: flareway-platform
     tags:
     - example
     - admin
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
       name: deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
     audienceScope: Application
@@ -221,11 +226,14 @@ spec:
     customPageRefs:
     - objectRef:
         name: accesscustompage-sample
+        namespace: flareway-platform
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
       name: deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
   bypass:
@@ -246,6 +254,7 @@ spec:
       policyRef:
         policyRef:
           name: bypass-public-api
+          namespace: flareway-platform
       deletionPolicy: Delete
   managementPolicy: Managed
   deletionPolicy: Delete
@@ -284,6 +293,6 @@ Deleting an `AccessApplication` never makes a protected route public by itself. 
 
 ## Other application types
 
-`AccessApplication` also supports `SSH`, `VNC`, `RDP`, `MCP`, and `ProxyEndpoint`, and the variants sample carries one of each. Applications that do not attach to a Gateway, such as SaaS, Bookmark, or WARP enrollment apps, use `AccessStandaloneApplication`. The [API reference](../api-reference.md) documents every field.
+`AccessApplication` also supports `SSH`, `VNC`, `RDP`, `MCP`, and `ProxyEndpoint`, and the variants sample carries one of each. Applications that do not attach to a Gateway, such as SaaS, Bookmark, or WARP enrollment apps, use `AccessStandaloneApplication`. The [API reference](../reference/api.md) documents every field.
 
 Next: [Reach private Services over Cloudflare WARP](private-services-over-warp.md).

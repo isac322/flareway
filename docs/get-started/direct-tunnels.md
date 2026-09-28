@@ -10,7 +10,7 @@ A Direct tunnel has no Gateway data plane. Flareway creates the tunnel, writes i
 
 ## Before you start
 
-Complete [Install](install.md) and [Connect a Cloudflare account](connect-cloudflare.md). The example uses the `demo` namespace from [Reach private Services over Cloudflare WARP](private-services-over-warp.md). If you skipped that guide, create `demo` first, or change the manifest's namespace to one you have.
+Complete [Install](install.md) and [Connect a Cloudflare account](connect-cloudflare.md). The example lives in `flareway-platform`, which the account sample creates.
 
 The grant that selects the tunnel's namespace must allow four things:
 
@@ -19,22 +19,23 @@ The grant that selects the tunnel's namespace must allow four things:
 - every ingress hostname in `hostnames`, and its zone in `zones`. The zone must also be one the account verified.
 - every hostname whose rule does not require Access at the origin in `unprotectedHostnames`. A rule requires it when its effective `originRequest.access` sets `required: true`; a rule-level `originRequest` replaces the top-level one for this check.
 
-For the example below, change the `demo` grant from the WARP guide so these fields read:
+The `flareway-platform` grant in [`flareway_v1alpha1_cloudflareaccount.yaml`](../../config/samples/flareway_v1alpha1_cloudflareaccount.yaml) covers the example with these fields:
 
 ```yaml
     hostnames:
-    - admin.internal.example
     - "*.direct.example.com"
+    - "*.internal.example"
     zones:
     - example.com
     exposures:
-    - Private
     - Public
+    - Private
     unprotectedHostnames:
     - "*.direct.example.com"
+    platformObjects: Allowed
 ```
 
-Keep its other fields, including `platformObjects: Allowed`, and apply `cloudflareaccount.yaml` again. The wildcard also covers `http.direct.example.com`, whose rule requires Access; Flareway checks `unprotectedHostnames` only for rules that do not. If you skipped the WARP guide, add a grant for your namespace with these fields plus `platformObjects: Allowed`.
+The `unprotectedHostnames` wildcard also covers `http.direct.example.com`, whose rule requires Access; Flareway checks `unprotectedHostnames` only for rules that do not.
 
 ## Configure `configuration.mode: Direct`
 
@@ -60,7 +61,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareTunnel
 metadata:
   name: direct-services
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -176,7 +177,7 @@ Apply it, then find the connector token Secret:
 
 ```sh
 kubectl apply -f direct-services.yaml
-kubectl -n demo get cloudflaretunnel direct-services \
+kubectl -n flareway-platform get cloudflaretunnel direct-services \
   -o jsonpath='{.status.connectorTokenSecretRef.name}'
 ```
 
@@ -185,7 +186,7 @@ The Secret is named `flareway-tunnel-direct-services`, and its `token` key holds
 Check the tunnel's conditions:
 
 ```sh
-kubectl -n demo get cloudflaretunnel direct-services \
+kubectl -n flareway-platform get cloudflaretunnel direct-services \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
 
@@ -208,6 +209,6 @@ Do not attach a Direct tunnel to a Gateway. To move a tunnel from Gateway mode t
 
 Set `spec.managementToken.resources: [Logs]` to request a short-lived token for the tunnel's logs. Flareway writes the issued token only to a Secret the tunnel owns and names it in `status.managementTokenSecretRef`. The chart exposes no global setting for Direct mode or management tokens; both are set per `CloudflareTunnel`.
 
-The [API reference](../api-reference.md) documents every Direct field.
+The [API reference](../reference/api.md) documents every Direct field.
 
 Next: [Troubleshooting](../operations/troubleshooting.md).

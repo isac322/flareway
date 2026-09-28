@@ -11,7 +11,7 @@ body:
         this is a public repository.
 
         For security vulnerabilities, do not open an issue. Email
-        bhyoo@bhyoo.com instead (see SECURITY.md).
+        bhyoo@bhyoo.com instead (see docs/SECURITY.md).
 
   - type: input
     id: flareway-version

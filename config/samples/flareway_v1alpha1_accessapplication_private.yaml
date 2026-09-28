@@ -1,8 +1,11 @@
+# Both applications live in flareway-platform. A targetRef-based application
+# must share its Gateway's namespace, and a private destination names a
+# NetworkRoute in the application's own namespace.
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessApplication
 metadata:
   name: private-https
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -32,7 +35,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessApplication
 metadata:
   name: private-l4
-  namespace: flareway-system
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -43,7 +46,8 @@ spec:
     private:
       networkRouteRef:
         name: private-services
-      cidr: 10.20.0.0/16
+      # cidr must lie inside the NetworkRoute network (10.96.0.0/12).
+      cidr: 10.96.0.0/16
       portRange: "443"
       l4Protocol: TCP
   application:

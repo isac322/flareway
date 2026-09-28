@@ -51,6 +51,24 @@
         "encoder": {"type": "string", "enum": ["json", "console"]}
       }
     },
+    "reconcile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "driftPolicy": {"type": "string", "enum": ["Overwrite", "Hold"]},
+        "freshness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "authz": {"$ref": "#/definitions/freshnessDuration"},
+            "traffic": {"$ref": "#/definitions/freshnessDuration"},
+            "indirect": {"$ref": "#/definitions/freshnessDuration"},
+            "display": {"$ref": "#/definitions/freshnessDuration"}
+          }
+        },
+        "disableSweep": {"type": "boolean"}
+      }
+    },
     "controllers": {
       "type": "object",
       "additionalProperties": false,
@@ -219,6 +237,7 @@
     }
   },
   "definitions": {
+    "freshnessDuration": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"},
     "networkPolicyPeer": {
       "type": "object",
       "additionalProperties": false,

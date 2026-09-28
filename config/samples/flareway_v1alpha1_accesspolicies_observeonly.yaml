@@ -2,7 +2,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
   name: allow-developers-warp
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -52,7 +52,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
   name: deny-everyone
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -69,7 +69,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
   name: bypass-public-api
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

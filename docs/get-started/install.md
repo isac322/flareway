@@ -9,10 +9,11 @@ Rendering the chart needs no cluster and no Cloudflare credentials, so you can r
 ```sh
 helm template flareway oci://ghcr.io/isac322/charts/flareway \
   --namespace flareway-system \
-  --set gatewayClass.create=true
+  --set gatewayClass.create=true \
+  --set gatewayClass.config.accountRefName=example-account
 ```
 
-The output contains the controller Deployment and its ServiceAccount, the RBAC objects (three ClusterRoles, two ClusterRoleBindings, a Role, and a RoleBinding), the metrics and xDS Services, three NetworkPolicies, and, because `gatewayClass.create=true`, `GatewayClass/flareway` with `GatewayClassConfig/default`. Add `--include-crds` to print the Flareway CRDs as well.
+The output contains the controller Deployment and its ServiceAccount, the RBAC objects (three ClusterRoles, two ClusterRoleBindings, a Role, and a RoleBinding), the metrics and xDS Services, and three NetworkPolicies. The two `gatewayClass` values add `GatewayClass/flareway` and a `GatewayClassConfig/default` that names the `example-account` CloudflareAccount; [Connect a Cloudflare account](connect-cloudflare.md) sets the same values on a real cluster. Add `--include-crds` to print the Flareway CRDs as well.
 
 ## Prerequisites
 
@@ -33,31 +34,26 @@ kubectl apply --server-side \
 
 ## Install the chart
 
-The chart installs Flareway's CRDs, the controller, its RBAC, the xDS Service, and optional `GatewayClass` resources into the fixed operator namespace `flareway-system`:
+The chart installs Flareway's CRDs, the controller, its RBAC, and the xDS Service into the fixed operator namespace `flareway-system`:
 
 ```sh
 helm upgrade --install flareway oci://ghcr.io/isac322/charts/flareway \
   --version <chart-version> \
   --namespace flareway-system \
-  --create-namespace \
-  --set gatewayClass.create=true \
-  --set gatewayClass.config.accountRefName=example-account
+  --create-namespace
 ```
 
 `helm show chart oci://ghcr.io/isac322/charts/flareway` prints the latest `version`; release notes are on GitHub Releases.
 
-`gatewayClass.create` defaults to `false` so that an install cannot silently take ownership of an existing `GatewayClass`. Setting it to `true` creates `GatewayClass/flareway` and `GatewayClassConfig/default`.
-
-A `GatewayClassConfig` must name a default `CloudflareAccount` unless it runs in conformance mode, and the API server rejects one that does not. The command above names `example-account`, the account you create in [Connect a Cloudflare account](connect-cloudflare.md). The account does not have to exist yet, but the names must match.
+This install creates no `GatewayClass`. `gatewayClass.create` defaults to `false` so that an install cannot silently take ownership of an existing `GatewayClass`, and a `GatewayClassConfig` must name a `CloudflareAccount` unless it runs in conformance mode. You create `GatewayClass/flareway` and `GatewayClassConfig/default` in [Connect a Cloudflare account](connect-cloudflare.md), after the account exists.
 
 ## Verify the installation
 
 ```sh
 kubectl -n flareway-system rollout status deployment/flareway-controller-manager
-kubectl get gatewayclass flareway
 ```
 
-The rollout finishes, and the `GatewayClass` shows `ACCEPTED` as `True`. Flareway accepts the class once its `GatewayClassConfig` exists.
+The rollout finishes when the controller is ready.
 
 ## Controller groups
 

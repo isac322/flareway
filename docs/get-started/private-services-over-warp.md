@@ -4,7 +4,7 @@ Serve a Service only to WARP devices through a private Gateway listener, with En
 
 The private path uses the same `Gateway`, `HTTPRoute`, and `AccessApplication` objects as a public one. Live acceptance of the private-hostname answer by the Cloudflare edge has not been verified; see [Limits](../concepts/limits.md#private-listeners) and [What is not verified live](#what-is-not-verified-live).
 
-This page serves `admin.internal.example` from the `demo` namespace and keeps every object it creates in `demo`. The manifests start from [`config/samples/`](../../config/samples/); where this page changes a sample, it says so. Replace every ID, name, and hostname with your own.
+This page serves `admin.internal.example` from the `flareway-platform` namespace, where the shared Access objects from [Protect a route with Cloudflare Access](protect-with-access.md) already live. A private listener needs a `VirtualNetwork` in its own namespace, and only a namespace whose grant sets `platformObjects: Allowed` can manage one, so the private Gateway, its routes, and its Access applications all live there. The manifests are the samples in [`config/samples/`](../../config/samples/). Replace every ID, name, and hostname with your own.
 
 ## Before you start
 
@@ -17,51 +17,42 @@ Your Cloudflare account needs:
 
 The API token needs the Private network capability (read and write virtual networks, CIDR routes, and private hostname routes) and read access to device settings. [Connect a Cloudflare account](connect-cloudflare.md) lists every capability.
 
-This page also uses the Access policies from [Protect a route with Cloudflare Access](protect-with-access.md), which live in `default`.
+This page also uses the `flareway-platform` grant from [Connect a Cloudflare account](connect-cloudflare.md) and the Access policies from [Protect a route with Cloudflare Access](protect-with-access.md).
 
-## Create the namespace, Service, and certificate
+## Create the Service and certificate
 
-Create the `demo` namespace with the labels from [`gateway_v1_private_gateway.yaml`](../../config/samples/gateway_v1_private_gateway.yaml):
+[`flareway_v1alpha1_cloudflareaccount.yaml`](../../config/samples/flareway_v1alpha1_cloudflareaccount.yaml) creates `flareway-platform` with the label `flareway.bhyoo.com/allow-origin-jwt-disable: "true"`, which approves the `originJWT.mode: Disabled` application in [Protect it with Access](#protect-it-with-access).
 
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: demo
-  labels:
-    flareway.bhyoo.com/tenant: demo
-    flareway.bhyoo.com/allow-origin-jwt-disable: "true"
-```
-
-`flareway.bhyoo.com/tenant: demo` is the label the routes below select. `flareway.bhyoo.com/allow-origin-jwt-disable` approves the `originJWT.mode: Disabled` application in [Protect it with Access](#protect-it-with-access).
-
-In `demo`, you also need:
+In `flareway-platform`, you also need:
 
 - a Service named `demo-admin` that serves HTTP on port `9090`, or change the `HTTPRoute` backend below to a Service you already run;
 - a TLS Secret named `admin-internal-tls` for `admin.internal.example`. Envoy serves this certificate to WARP devices, so they must trust it. Flareway does not issue certificates; use cert-manager or an internal CA.
 
-## Grant the namespace
+## Check the grant
 
-Add this entry to `spec.grants` of `example-account` in `cloudflareaccount.yaml`, then apply the file again:
+The `flareway-platform` grant from [Connect a Cloudflare account](connect-cloudflare.md) already covers this page:
 
 ```yaml
   - namespaceSelector:
       matchLabels:
-        kubernetes.io/metadata.name: demo
+        kubernetes.io/metadata.name: flareway-platform
     hostnames:
-    - admin.internal.example
+    - "*.direct.example.com"
+    - "*.internal.example"
     zones:
     - example.com
     exposures:
+    - Public
     - Private
-    accessPolicyRefs: Allowed
+    unprotectedHostnames:
+    - "*.direct.example.com"
     privateRoutes:
       networkRouteSelector:
         matchLabels:
-          flareway.bhyoo.com/tenant: demo
+          flareway.bhyoo.com/private-route: platform
       hostnameRouteSelector:
         matchLabels:
-          flareway.bhyoo.com/tenant: demo
+          flareway.bhyoo.com/private-route: platform
     backends:
       namespaces: Same
       kinds:
@@ -69,26 +60,25 @@ Add this entry to `spec.grants` of `example-account` in `cloudflareaccount.yaml`
     platformObjects: Allowed
 ```
 
-Each field opens one gate:
+Each field opens one gate for this page:
 
-- `hostnames` and `exposures: [Private]` allow the private listener. A grant needs at least one zone; Flareway does not check private hostnames against `zones`.
-- `accessPolicyRefs: Allowed` lets the applications in `demo` use the policies in `default`.
-- `privateRoutes` selects the `HostnameRoute` and `NetworkRoute` objects that may target tunnels in `demo`, by their labels.
-- `backends` lets the `HTTPRoute` send traffic to Services in `demo`.
-- `platformObjects: Allowed` lets `demo` hold `VirtualNetwork`, `HostnameRoute`, `NetworkRoute`, and `WARPConnector` objects.
+- `*.internal.example` in `hostnames` and `Private` in `exposures` allow the private listener. A grant needs at least one zone; Flareway does not check private hostnames against `zones`.
+- `privateRoutes` selects the `HostnameRoute` and `NetworkRoute` objects the namespace may use, by their `flareway.bhyoo.com/private-route: platform` label.
+- `backends` lets the `HTTPRoute` send traffic to Services in `flareway-platform`.
+- `platformObjects: Allowed` lets `flareway-platform` hold `VirtualNetwork`, `HostnameRoute`, `NetworkRoute`, and `WARPConnector` objects.
 
-`admin.internal.example` is not in `unprotectedHostnames`, so the hostname stays blocked until an `AccessApplication` protects it. The [security model](../concepts/security-model.md) explains why grants and Kubernetes RBAC must both allow each object.
+The applications on this page reference policies in their own namespace, so they need no `accessPolicyRefs`. `admin.internal.example` is not in `unprotectedHostnames`, so the hostname stays blocked until an `AccessApplication` protects it. The [security model](../concepts/security-model.md) explains why grants and Kubernetes RBAC must both allow each object.
 
 ## Declare the virtual network and routes
 
-A `VirtualNetwork` owns one account-scoped Cloudflare virtual network. A private listener uses a virtual network from its own namespace: the one its tunnel listener names in `virtualNetworkRef`, or, without a reference, the one with `isDefault: true`. This is [`flareway_v1alpha1_virtualnetwork.yaml`](../../config/samples/flareway_v1alpha1_virtualnetwork.yaml) moved from `flareway-system` to `demo`:
+A `VirtualNetwork` owns one account-scoped Cloudflare virtual network. A private listener uses a virtual network from its own namespace: the one its tunnel listener names in `virtualNetworkRef`, or, without a reference, the one with `isDefault: true`. This is [`flareway_v1alpha1_virtualnetwork.yaml`](../../config/samples/flareway_v1alpha1_virtualnetwork.yaml):
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: VirtualNetwork
 metadata:
   name: private-services
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -99,16 +89,16 @@ spec:
   deletionPolicy: Orphan
 ```
 
-A `HostnameRoute` sends one private hostname to the tunnel. This is `private-admin` from [`flareway_v1alpha1_hostnameroute.yaml`](../../config/samples/flareway_v1alpha1_hostnameroute.yaml), moved to `demo`:
+A `HostnameRoute` sends one private hostname to the tunnel. This is `private-admin` from [`flareway_v1alpha1_hostnameroute.yaml`](../../config/samples/flareway_v1alpha1_hostnameroute.yaml):
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: HostnameRoute
 metadata:
   name: private-admin
-  namespace: demo
+  namespace: flareway-platform
   labels:
-    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/private-route: platform
 spec:
   accountRef:
     name: example-account
@@ -116,27 +106,24 @@ spec:
   tunnelRef:
     kind: CloudflareTunnel
     name: private-gateway
-    namespace: demo
+    namespace: flareway-platform
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: demo
+    from: Same
   comment: Private admin hostname through the Gateway tunnel
   managementPolicy: Managed
   deletionPolicy: Delete
 ```
 
-A `NetworkRoute` sends a CIDR to the tunnel, here the Kubernetes Service range. This is `private-services` from [`flareway_v1alpha1_networkroute.yaml`](../../config/samples/flareway_v1alpha1_networkroute.yaml), moved to `demo` so that its `virtualNetworkRef` resolves; the reference names a `VirtualNetwork` in the route's own namespace:
+A `NetworkRoute` sends a CIDR to the tunnel, here the Kubernetes Service range. This is `private-services` from [`flareway_v1alpha1_networkroute.yaml`](../../config/samples/flareway_v1alpha1_networkroute.yaml); its `virtualNetworkRef` names the `VirtualNetwork` above, which must be in the route's own namespace:
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: NetworkRoute
 metadata:
   name: private-services
-  namespace: demo
+  namespace: flareway-platform
   labels:
-    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/private-route: platform
 spec:
   accountRef:
     name: example-account
@@ -144,33 +131,30 @@ spec:
   tunnelRef:
     kind: CloudflareTunnel
     name: private-gateway
-    namespace: demo
+    namespace: flareway-platform
   virtualNetworkRef:
     name: private-services
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: demo
+    from: Same
   comment: Kubernetes Service CIDR through the Gateway tunnel
   managementPolicy: Managed
   deletionPolicy: Delete
 ```
 
-`tunnelRef.kind` is `CloudflareTunnel` or `WARPConnector` and defaults to `CloudflareTunnel`. Without `virtualNetworkRef`, a route uses the account's default virtual network. `allowedNamespaces` decides which namespaces may use the route. The routes wait with `Pending` until the tunnel below exists and is accepted.
+`tunnelRef.kind` is `CloudflareTunnel` or `WARPConnector` and defaults to `CloudflareTunnel`. Without `virtualNetworkRef`, a route uses the account's default virtual network. `allowedNamespaces` decides which namespaces the route admits: the referenced tunnel's namespace must be admitted, and so must the namespace of any `DeviceProfile` that includes the route. With `from: Same`, the tunnel must be in the route's namespace. An `AccessApplication` references a route in its own namespace. The routes wait with `Pending` until the tunnel below exists and is accepted.
 
 A private listener can also get its `HostnameRoute` automatically: by default, Flareway creates one in its own namespace for each private listener hostname. This page declares `private-admin` itself and turns that off with `hostnameRoute.create: false`.
 
 ## Add the private listener
 
-This is [`gateway_v1_private_gateway.yaml`](../../config/samples/gateway_v1_private_gateway.yaml) without the Namespace, which you already created, and with one added line: `virtualNetworkRef` on the tunnel listener, which points the listener at `private-services`.
+This is [`gateway_v1_private_gateway.yaml`](../../config/samples/gateway_v1_private_gateway.yaml). The tunnel listener's `virtualNetworkRef` points the listener at `private-services`.
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareTunnel
 metadata:
   name: private-gateway
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -195,7 +179,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: private-gateway
-  namespace: demo
+  namespace: flareway-platform
 spec:
   gatewayClassName: flareway
   infrastructure:
@@ -221,7 +205,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: private-admin
-  namespace: demo
+  namespace: flareway-platform
 spec:
   parentRefs:
   - name: private-gateway
@@ -246,14 +230,14 @@ One Gateway cannot expose the same hostname as both public and private; the tunn
 
 The hostname forwards no traffic until an `AccessApplication` protects it. Private hostnames take the same `AccessApplication` as public ones, with one difference: `cloudflared` does not check them, so Envoy's `jwt_authn` filter is the only origin JWT check. Cloudflare can add the Access JWT to private traffic only when Zero Trust Gateway TLS decryption is on. Flareway does not observe that setting, so an application with `originJWT.mode: Required` on a private listener stays blocked and unprogrammed until you set `originJWT.assumeGatewayTLSDecryption: true`. That field records the platform's promise that decryption is on.
 
-This is `private-https` from [`flareway_v1alpha1_accessapplication_private.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_private.yaml), with `namespace: default` added to each policy reference so that it uses the policies from the Protect guide:
+This is `private-https` from [`flareway_v1alpha1_accessapplication_private.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_private.yaml). A `targetRefs` application must share its Gateway's namespace, and it uses the policies from the Protect guide in the same namespace:
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessApplication
 metadata:
   name: private-https
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -272,17 +256,15 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
-      namespace: default
   - policyRef:
       name: deny-everyone
-      namespace: default
   originJWT:
     mode: Disabled
   managementPolicy: Managed
   deletionPolicy: Delete
 ```
 
-`private-https` protects the private listener with Access at the edge only, because `originJWT.mode` is `Disabled`; the `demo` namespace label allows that. For an origin JWT check on this listener, turn on Zero Trust Gateway TLS decryption and set `originJWT.mode: Required` with `assumeGatewayTLSDecryption: true`. [Security model](../concepts/security-model.md#access-enforcement) compares the public and private checks.
+`private-https` protects the private listener with Access at the edge only, because `originJWT.mode` is `Disabled`; the `flareway-platform` namespace label allows that. For an origin JWT check on this listener, turn on Zero Trust Gateway TLS decryption and set `originJWT.mode: Required` with `assumeGatewayTLSDecryption: true`. [Security model](../concepts/security-model.md#access-enforcement) compares the public and private checks.
 
 ## How resolution works
 
@@ -301,11 +283,11 @@ The tunnel's `PrivateListenerDegraded` condition reports how the listener is bou
 Check the Gateway, the tunnel, the application, and the private-network objects:
 
 ```sh
-kubectl -n demo get gateway private-gateway
-kubectl -n demo get cloudflaretunnel private-gateway \
+kubectl -n flareway-platform get gateway private-gateway
+kubectl -n flareway-platform get cloudflaretunnel private-gateway \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
-kubectl -n demo get accessapplication private-https
-kubectl -n demo get virtualnetwork,hostnameroute,networkroute
+kubectl -n flareway-platform get accessapplication private-https
+kubectl -n flareway-platform get virtualnetwork,hostnameroute,networkroute
 ```
 
 When the Gateway reports `Programmed=True`, request the hostname from an enrolled WARP device. Cloudflare Access evaluates the request against the policies, and an allowed request reaches `demo-admin`:
@@ -316,14 +298,14 @@ curl https://admin.internal.example/
 
 ## Protect a private CIDR
 
-An `AccessApplication` can also protect a CIDR behind a `NetworkRoute`, without a Gateway target. This is `private-l4` from [`flareway_v1alpha1_accessapplication_private.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_private.yaml), changed in three places: it lives in `demo` next to its route, its `cidr` lies inside the route's `10.96.0.0/12`, and it references the policies in `default`. The sample's `originJWT` block is removed because it has no effect on a CIDR destination.
+An `AccessApplication` can also protect a CIDR behind a `NetworkRoute`, without a Gateway target. This is `private-l4` from [`flareway_v1alpha1_accessapplication_private.yaml`](../../config/samples/flareway_v1alpha1_accessapplication_private.yaml). It lives in `flareway-platform` next to its route, and its `cidr` lies inside the route's `10.96.0.0/12`:
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessApplication
 metadata:
   name: private-l4
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -334,6 +316,7 @@ spec:
     private:
       networkRouteRef:
         name: private-services
+      # cidr must lie inside the NetworkRoute network (10.96.0.0/12).
       cidr: 10.96.0.0/16
       portRange: "443"
       l4Protocol: TCP
@@ -345,15 +328,16 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
-      namespace: default
   - policyRef:
       name: deny-everyone
-      namespace: default
+  originJWT:
+    mode: Required
+    assumeGatewayTLSDecryption: true
   managementPolicy: Managed
   deletionPolicy: Delete
 ```
 
-`networkRouteRef` names a route in the application's namespace. `cidr` must lie inside the route's network, or the application reports `RefNotPermitted`; without `cidr`, the application covers the whole route. Cloudflare Access checks this traffic at the edge only: the traffic does not pass through Envoy's `jwt_authn` filter, and the application's `OriginJWTEnforced` condition reports `NotApplicable`.
+`networkRouteRef` names a route in the application's namespace. `cidr` must lie inside the route's network, or the application reports `RefNotPermitted`; without `cidr`, the application covers the whole route. Cloudflare Access checks this traffic at the edge only: the traffic does not pass through Envoy's `jwt_authn` filter, so the `originJWT` block has no effect and the application's `OriginJWTEnforced` condition reports `NotApplicable`.
 
 ## Connect another site with `WARPConnector`
 
@@ -364,7 +348,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: WARPConnector
 metadata:
   name: branch-local
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -388,16 +372,16 @@ spec:
   deletionPolicy: Orphan
 ```
 
-Routes reach the site with `tunnelRef.kind: WARPConnector`. This is `branch-office` from the `NetworkRoute` sample, moved to `demo`; it sends the branch CIDR to `branch-local`:
+Routes reach the site with `tunnelRef.kind: WARPConnector`. This is `branch-office` from [`flareway_v1alpha1_networkroute.yaml`](../../config/samples/flareway_v1alpha1_networkroute.yaml); it sends the branch CIDR to `branch-local`:
 
 ```yaml
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: NetworkRoute
 metadata:
   name: branch-office
-  namespace: demo
+  namespace: flareway-platform
   labels:
-    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/private-route: platform
 spec:
   accountRef:
     name: example-account
@@ -405,13 +389,10 @@ spec:
   tunnelRef:
     kind: WARPConnector
     name: branch-local
-    namespace: demo
+    namespace: flareway-platform
   # virtualNetworkRef is optional; omission selects the account default virtual network.
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: demo
+    from: Same
   comment: Branch CIDR through the local-HA WARP Connector
   managementPolicy: Managed
   deletionPolicy: Delete

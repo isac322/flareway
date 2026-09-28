@@ -1,3 +1,15 @@
+# flareway-platform holds shared objects that tenants use but do not own:
+# Access policies, groups, identity providers, custom pages, device posture,
+# service tokens, standalone applications, private networking, WARP
+# connectors, the Direct tunnel, and the private Gateway.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flareway-platform
+  labels:
+    # The private-https AccessApplication in this namespace sets originJWT Disabled.
+    flareway.bhyoo.com/allow-origin-jwt-disable: "true"
+---
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareAccount
 metadata:
@@ -10,6 +22,8 @@ spec:
       namespace: flareway-system
       key: api-token
   grants:
+  # Tenant grant: public hostnames and references to shared objects in
+  # flareway-platform. Tenants cannot create platform objects.
   - namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: default
@@ -23,8 +37,37 @@ spec:
     - app.example.com
     - public.example.com
     accessPolicyRefs: Allowed
+    accessCustomPageRefs: Allowed
     backends:
       namespaces: Same
       kinds:
       - Service
     platformObjects: Denied
+  # Platform grant: shared objects, the Direct tunnel's public hostnames, and
+  # private hostnames and routes served through the private Gateway and WARP
+  # connectors.
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flareway-platform
+    hostnames:
+    - "*.direct.example.com"
+    - "*.internal.example"
+    zones:
+    - example.com
+    exposures:
+    - Public
+    - Private
+    unprotectedHostnames:
+    - "*.direct.example.com"
+    privateRoutes:
+      networkRouteSelector:
+        matchLabels:
+          flareway.bhyoo.com/private-route: platform
+      hostnameRouteSelector:
+        matchLabels:
+          flareway.bhyoo.com/private-route: platform
+    backends:
+      namespaces: Same
+      kinds:
+      - Service
+    platformObjects: Allowed

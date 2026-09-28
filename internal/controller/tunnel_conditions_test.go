@@ -24,7 +24,7 @@ package controller
 // single-threaded, scripted interleaving of the real production status
 // writers and the shared patchTunnelConditions helper.
 //
-// Coverage map (docs/qa/issue-92-status-consistency.md):
+// Coverage map (issue #92; docs/adr/0004-tunnel-status-condition-ownership.md):
 //   QA-92-16a/b — transient/persistent CAS conflict with real interleaved writes
 //   QA-92-23    — Gateway ConfigApplied=False commit atomically demotes Ready
 //   QA-92-24    — stale tunnel snapshot cannot resurrect Ready over live False

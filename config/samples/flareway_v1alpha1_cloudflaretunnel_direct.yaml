@@ -2,7 +2,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareTunnel
 metadata:
   name: direct-services
-  namespace: demo
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

@@ -56,11 +56,12 @@ or Access protection domain. A hostname that must stay blocked gets a
 Envoy does the routing. The controller compiles `HTTPRoute` rules into Envoy
 listeners and route tables and streams them over xDS (Delta ADS). Matching,
 rewrites, redirects, mirrors, timeouts, and weighted splits therefore run in
-Envoy, beyond what `cloudflared` ingress rules can express. [HTTP
-routing](http-routing.md) lists what is supported.
+Envoy, beyond what `cloudflared` ingress rules can express.
+[HTTP routing](http-routing.md) lists what is supported.
 
-The data plane runs the upstream `cloudflared`, Envoy, and CoreDNS images,
-pinned by digest in the chart defaults. Flareway does not fork them.
+The data plane runs the upstream `cloudflared` and Envoy images; a Gateway with
+private listeners also runs a CoreDNS sidecar. The chart defaults pin each image
+by digest. Flareway does not fork them.
 
 ## Public and private listeners
 
@@ -82,9 +83,9 @@ hostname has not been verified live; see [Limits](limits.md).
 When an `AccessApplication` targets a listener or route, Flareway creates the
 Cloudflare Access application and policy at the edge and verifies the Access
 JWT again at the origin: `cloudflared` and Envoy check it for public
-hostnames, and Envoy checks it for private ones. [Security
-model](security-model.md) covers the defaults, the blocked state before the
-AUD tag is known, and what happens when a policy is deleted.
+hostnames, and Envoy checks it for private ones.
+[Security model](security-model.md) covers the defaults, the blocked state
+before the AUD tag is known, and what happens when a policy is deleted.
 
 ## Gateway mode and Direct mode
 
@@ -121,12 +122,12 @@ Flareway's own resources are in the `flareway.bhyoo.com/v1alpha1` API group:
 | Private network | `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, `WARPConnector` |
 | Account-wide settings | `DeviceProfile`, `DeviceSettings`, `ZeroTrustOrganization`, `ZeroTrustGatewayPolicy`, `ZeroTrustList` |
 
-The [API reference](../api-reference.md) documents every field.
+The [API reference](../reference/api.md) documents every field.
 
-## Design documents
+## Architecture decisions
 
-The design documents specify the full model, including ownership, adoption,
-and fail-closed behavior. They are written in Korean:
-
-- [Cloudflare Gateway API integration](../design/001-cloudflare-gateway-api-integration.md)
-- [Tunnel status consistency](../design/002-tunnel-status-consistency.md)
+The [architecture decision records](../adr/README.md) explain why Flareway is
+built this way. Start with
+[ADR 0001: Gateway API on Cloudflare Tunnel](../adr/0001-gateway-api-on-cloudflare.md)
+for the overall model; the tunnel status contract is in
+[ADR 0004: One field manager for tunnel conditions](../adr/0004-tunnel-status-condition-ownership.md).

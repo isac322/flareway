@@ -31,7 +31,7 @@ Gateway API does not define where regular-expression paths rank against other pa
 
 Flareway supports GatewayHTTP Core: `Gateway`, `HTTPRoute`, and `ReferenceGrant`. That includes `Exact` and `PathPrefix` path matches, exact header matches, request header modification, request redirects, and weighted `backendRefs`. Flareway also accepts `RegularExpression` for path, header, and query parameter matches.
 
-The Extended features below are the ones Flareway claims in its conformance report. Each name is a Gateway API feature name.
+The Extended features below are the ones Flareway claims in `GatewayClass.status.supportedFeatures`. Each name is a Gateway API feature name.
 
 ### Matching
 
@@ -40,6 +40,7 @@ The Extended features below are the ones Flareway claims in its conformance repo
 | `HTTPRouteMethodMatching` | Match on the HTTP method. |
 | `HTTPRouteQueryParamMatching` | Match on query parameters. |
 | `HTTPRouteParentRefPort` | Attach a route to Gateway listeners by `parentRefs[].port`. |
+| `HTTPRouteDestinationPortMatching` | A route whose `parentRefs[].port` matches no listener is not accepted: it reports `Accepted=False` with reason `NoMatchingParent`. |
 
 ### Rewrites, redirects, and response headers
 
@@ -104,15 +105,15 @@ The two listener features were verified in conformance mode, where clients conne
 
 ## Not supported, and what happens
 
-The conformance report lists these Extended features as unsupported. Where Flareway rejects or drops the configuration, the status says so:
+Flareway does not claim these Extended features. Where it rejects or drops the configuration, the status says so:
 
 | Feature | What happens |
 |---|---|
 | `HTTPRouteRetry`, `HTTPRouteRetryBackendTimeout`, `HTTPRouteRetryConnectionError` | A rule with `retry` is dropped. The route reports `PartiallyInvalid=True` with a `Dropped Rule` message, or `Accepted=False` when every rule is dropped. |
-| `GatewayStaticAddresses` | A Gateway with `spec.addresses` reports `Accepted=False` with reason `UnsupportedAddress`. Cloudflare's edge owns the public addresses. |
+| `GatewayStaticAddresses`, `GatewayAddressEmpty` | A Gateway with any `spec.addresses` entry, including one without a value that asks for a dynamically assigned address, reports `Accepted=False` with reason `UnsupportedAddress`. Cloudflare's edge owns the public addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
 | `ListenerSet` | A Gateway with `spec.allowedListeners` reports `Accepted=False` with reason `ListenersNotValid`. |
 | `GatewayPort8080` | Public listeners must be HTTP on port 80 or HTTPS on port 443. Any other port marks the listener `PortUnavailable`. Private HTTPS listeners accept any port. |
-| `GatewayAddressEmpty`, `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback`, `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteDestinationPortMatching`, `HTTPRouteNamedRouteRule` | Flareway does not claim these features. Do not depend on them. |
+| `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback`, `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteNamedRouteRule` | Flareway does not claim these features. Do not depend on them. |
 
 Some configuration falls outside the feature list:
 
@@ -131,4 +132,4 @@ See [Limits](limits.md) for the rest of Flareway's boundaries.
 
 ## Evidence
 
-The feature names on this page come from the report of a local Gateway API conformance run. The [conformance report](../../conformance/reports/v1.6.2/flareway/README.md) gives the results and what the run did not cover.
+The supported feature names on this page are the list the controller publishes in `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go`). A local Gateway API conformance run tested every one of them; the [conformance report](../conformance/v1.6.2/flareway/README.md) gives the results and what the run did not cover.

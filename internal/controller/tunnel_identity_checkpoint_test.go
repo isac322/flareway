@@ -25,7 +25,7 @@ package controller
 // for the pre-create commit, ensureRemoteTunnel against the deterministic
 // fake for the create boundary, and persistRemoteIdentity for the capture.
 //
-// Coverage map (docs/qa/issue-92-status-consistency.md):
+// Coverage map (issue #92; docs/adr/0004-tunnel-status-condition-ownership.md):
 //   QA-92-46 — a generation bump between create and checkpoint still captures
 //              the full remote identity; the next pass takes the managed path
 //              and never calls CreateTunnel again

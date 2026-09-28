@@ -1,6 +1,6 @@
 # Gateway API conformance report (v1.6.2)
 
-A local development run on September 13, 2026 passed GatewayHTTP Core 37/37 and the claimed Extended tests 30/30, with zero skips and zero failures.
+A local development run on September 28, 2026 passed GatewayHTTP Core 37/37 and the claimed Extended tests 31/31, with zero skips and zero failures.
 
 ## Results
 
@@ -9,7 +9,7 @@ A local development run on September 13, 2026 passed GatewayHTTP Core 37/37 and 
 | Profile | Passed | Failed | Skipped |
 |---|---|---|---|
 | GatewayHTTP Core | 37 | 0 | 0 |
-| GatewayHTTP Extended (claimed features) | 30 | 0 | 0 |
+| GatewayHTTP Extended (claimed features) | 31 | 0 | 0 |
 
 ## What the run covered
 
@@ -19,7 +19,7 @@ The run did not exercise Cloudflare Tunnel, DNS, Access, or WARP. It also did no
 
 ## Supported and unsupported features
 
-The [report YAML](standard-dev-default-report.yaml) lists 25 supported and 13 unsupported Extended features by name, and [HTTP routing](../../../../docs/concepts/http-routing.md) explains each one, including what Flareway does with unsupported configuration.
+The [report YAML](standard-dev-default-report.yaml) lists 26 supported and 12 unsupported Extended features by name, and [HTTP routing](../../../concepts/http-routing.md) explains each one, including what Flareway does with unsupported configuration.
 
 ## Serialized run
 
@@ -27,4 +27,4 @@ The runner disables test parallelism because Flareway deliberately runs one cont
 
 ## Reproduce
 
-To run the suite yourself, follow [Gateway API conformance run](../../../../CONTRIBUTING.md#gateway-api-conformance-run) in the contributing guide.
+To run the suite yourself, follow [Gateway API conformance run](../../../CONTRIBUTING.md#gateway-api-conformance-run) in the contributing guide.

@@ -2,7 +2,7 @@
 
 `kubectl explain` reads the schema installed in your cluster, so it matches your deployed CRDs. The commands below cover every Flareway Kind.
 
-Flareway serves `v1alpha1` resources in the `flareway.bhyoo.com` API group. The generated CRDs in [`config/crd/bases/`](../../config/crd/bases/) are the schema source of truth. The design document explains behavior, ownership, and security contracts without duplicating every OpenAPI field: [`docs/design/001-cloudflare-gateway-api-integration.md`](../design/001-cloudflare-gateway-api-integration.md).
+Flareway serves `v1alpha1` resources in the `flareway.bhyoo.com` API group. The generated CRDs in [`config/crd/bases/`](../../config/crd/bases/) are the schema source of truth. The [API reference](api.md) describes each kind and its fields, and [ADR 0001](../adr/0001-gateway-api-on-cloudflare.md) records the design decisions behind the API.
 
 ## Inspect the installed schema
 

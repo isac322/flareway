@@ -38,7 +38,7 @@ and they cannot rewrite, redirect, mirror, or split traffic by weight.
 
 The routing features Flareway claims passed the Gateway API conformance suite
 in a local run through Envoy; the
-[conformance report](conformance/reports/v1.6.2/flareway/README.md) states what
+[conformance report](docs/conformance/v1.6.2/flareway/README.md) states what
 that run covered.
 
 ## How it works
@@ -70,14 +70,16 @@ You need Helm 4.3 or a compatible Helm 3 client.
 ```sh
 helm template flareway oci://ghcr.io/isac322/charts/flareway \
   --namespace flareway-system \
-  --set gatewayClass.create=true
+  --set gatewayClass.create=true \
+  --set gatewayClass.config.accountRefName=example-account
 ```
 
 The output contains the controller Deployment, RBAC, Services, and
-NetworkPolicies, plus `GatewayClass/flareway` and `GatewayClassConfig/default`
-because of `gatewayClass.create=true`. Add `--include-crds` to also render the
-Flareway CRDs. `gatewayClass.create` defaults to `false` so that an install
-cannot take ownership of an existing `GatewayClass`.
+NetworkPolicies, plus `GatewayClass/flareway` because of
+`gatewayClass.create=true` and its `GatewayClassConfig/default`, which names
+the `example-account` CloudflareAccount. Add `--include-crds` to also render
+the Flareway CRDs. `gatewayClass.create` defaults to `false` so that an
+install cannot silently take ownership of an existing `GatewayClass`.
 
 ## Start here
 
@@ -118,7 +120,7 @@ verified.
 
 - **Concepts:** [How it works](docs/concepts/how-it-works.md),
   [HTTP routing](docs/concepts/http-routing.md),
-  [Conformance report](conformance/reports/v1.6.2/flareway/README.md),
+  [Conformance report](docs/conformance/v1.6.2/flareway/README.md),
   [Security model](docs/concepts/security-model.md),
   [Ownership and adoption](docs/concepts/ownership-and-adoption.md),
   [Limits](docs/concepts/limits.md)
@@ -131,14 +133,14 @@ verified.
 - **Operations:** [Troubleshooting](docs/operations/troubleshooting.md),
   [Upgrade](docs/operations/upgrade.md),
   [Drift and API budget](docs/operations/freshness-and-drift.md)
-- **Reference:** [API reference](docs/api-reference.md),
+- **Reference:** [API reference](docs/reference/api.md),
   [Helm chart values](charts/flareway/README.md),
-  [kubectl explain](docs/api/README.md),
+  [kubectl explain](docs/reference/kubectl-explain.md),
   [example manifests](config/samples/)
-- **Project:** [Contributing](CONTRIBUTING.md),
-  [Security policy](SECURITY.md),
-  [Code of conduct](CODE_OF_CONDUCT.md),
-  [design documents (Korean)](docs/design/001-cloudflare-gateway-api-integration.md)
+- **Project:** [Contributing](docs/CONTRIBUTING.md),
+  [Security policy](docs/SECURITY.md),
+  [Code of conduct](docs/CODE_OF_CONDUCT.md),
+  [Architecture decisions](docs/adr/README.md)
 
 Next: [How Flareway works](docs/concepts/how-it-works.md).
 

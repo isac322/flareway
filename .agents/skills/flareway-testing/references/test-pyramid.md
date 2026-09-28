@@ -71,7 +71,7 @@ pinned toolchain directive is not rewritten. Requires a working Docker daemon;
   or when the provider never assigns an address, it falls back to compiling
   `test/conformance` (`-tags conformance`) into a runner image executed as an
   in-cluster Job against the ClusterIP GatewayClassConfig.
-- Writes the report to `conformance/reports/<gateway-api-version>/flareway/`
+- Writes the report to `docs/conformance/<gateway-api-version>/flareway/`
   and runner logs to `artifacts/conformance/`. `CONFORMANCE_RUN_TEST` narrows
   to one upstream test.
 - The suite runs serially (`DisableParallelTests`) because Flareway v1

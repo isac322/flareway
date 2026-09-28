@@ -240,7 +240,7 @@ jobs:
       - name: Run Gateway API conformance
         env:
           LOCALBIN: ${{ runner.temp }}/bin
-          REPORT_OUTPUT: ${{ github.workspace }}/conformance/reports/v1.6.2/flareway/standard-${{ needs.metadata.outputs.tag }}-default-report.yaml
+          REPORT_OUTPUT: ${{ github.workspace }}/docs/conformance/v1.6.2/flareway/standard-${{ needs.metadata.outputs.tag }}-default-report.yaml
           VERSION: ${{ needs.metadata.outputs.tag }}
         run: hack/run-conformance.sh
       - name: Upload conformance report and diagnostics
@@ -249,7 +249,7 @@ jobs:
         with:
           name: gateway-api-conformance-${{ needs.metadata.outputs.tag }}
           path: |
-            conformance/reports/v1.6.2/flareway/
+            docs/conformance/v1.6.2/flareway/
             artifacts/conformance/
           if-no-files-found: error
           retention-days: 14

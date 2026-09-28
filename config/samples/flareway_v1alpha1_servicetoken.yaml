@@ -2,11 +2,11 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: ServiceToken
 metadata:
   name: automation
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
-  name: flareway/default/automation
+  name: flareway/flareway-platform/automation
   enabled: true
   duration: 8760h
   secretRef:

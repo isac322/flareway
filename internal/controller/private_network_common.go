@@ -227,8 +227,10 @@ func privateVirtualNetworkReferenceName(ref *corev1.LocalObjectReference) string
 	return ref.Name
 }
 
-// privateRouteAllowsNamespace reports whether a route's consumer namespace is allowed.
-// AccessApplication and route reconcilers share this check so neither path can bypass it.
+// privateRouteAllowsNamespace reports whether a route's allowedNamespaces admits a namespace.
+// Route reconcilers apply it to the referenced tunnel's namespace and the DeviceProfile
+// reconciler to consumer namespaces; AccessApplication destinations use the equivalent check
+// in internal/gatewayapi/private_access.go.
 func privateRouteAllowsNamespace(routeNamespace string, allowed v1alpha1.AllowedNamespaces, namespace *corev1.Namespace) (bool, error) {
 	if namespace == nil {
 		return false, errors.New("consumer Namespace is required")

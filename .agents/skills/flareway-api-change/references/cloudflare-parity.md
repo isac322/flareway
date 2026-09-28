@@ -110,8 +110,8 @@ The ledger is hand-maintained; there is no generator. Typical flows:
 
 ## Related documentation
 
-`docs/api-reference.md` ("Parity ledger and intentional exclusions") and the
-design document §5.6 record the same ownership boundary in prose: mutable
-fields become typed spec, server-owned values become bounded status, envelope
-and deprecated wire fields are excluded. Keep those tables consistent with
-ledger dispositions when the boundary moves.
+`docs/reference/api.md` ("Parity ledger and intentional exclusions") and
+`docs/adr/0001-gateway-api-on-cloudflare.md` record the same ownership
+boundary in prose: mutable fields become typed spec, server-owned values
+become bounded status, envelope and deprecated wire fields are excluded. Keep
+those documents consistent with ledger dispositions when the boundary moves.

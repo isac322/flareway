@@ -126,8 +126,8 @@ intent.
 1. `kubebuilder create api --group flareway --version v1alpha1 --kind <Kind>`
    (add `--controller=false` for config-only kinds such as
    `GatewayClassConfig`, `--namespaced=false` for cluster scope).
-2. Name per the design catalog; the `Cloudflare` prefix is reserved for
-   `CloudflareAccount` and `CloudflareTunnel`.
+2. Name the kind like the existing kinds in `PROJECT`; the `Cloudflare` prefix
+   is reserved for `CloudflareAccount` and `CloudflareTunnel`.
 3. Fill in spec/status following the conventions above; register the kind with
    the scheme.
 4. Add samples, docs entries, and parity-ledger owner/rows if the kind maps a

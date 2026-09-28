@@ -42,7 +42,7 @@ jobs:
       - name: Run portable conformance workflow
         env:
           LOCALBIN: ${{ runner.temp }}/bin
-          REPORT_OUTPUT: ${{ github.workspace }}/conformance/reports/v1.6.2/flareway/standard-${{ github.sha }}-default-report.yaml
+          REPORT_OUTPUT: ${{ github.workspace }}/docs/conformance/v1.6.2/flareway/standard-${{ github.sha }}-default-report.yaml
           VERSION: ${{ github.sha }}
         run: hack/run-conformance.sh
 
@@ -52,7 +52,7 @@ jobs:
         with:
           name: gateway-api-conformance-${{ github.sha }}
           path: |
-            conformance/reports/v1.6.2/flareway/
+            docs/conformance/v1.6.2/flareway/
             artifacts/conformance/
           if-no-files-found: error
           retention-days: 14

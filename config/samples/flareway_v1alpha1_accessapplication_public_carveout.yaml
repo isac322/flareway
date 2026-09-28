@@ -75,11 +75,14 @@ spec:
     customPageRefs:
     - objectRef:
         name: accesscustompage-sample
+        namespace: flareway-platform
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
       name: deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
   bypass:
@@ -100,6 +103,7 @@ spec:
       policyRef:
         policyRef:
           name: bypass-public-api
+          namespace: flareway-platform
       deletionPolicy: Delete
   managementPolicy: Managed
   deletionPolicy: Delete

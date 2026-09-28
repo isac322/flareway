@@ -1,5 +1,8 @@
 # Complete example for a protected application with public API carve-outs.
 # Flareway creates one child bypass Access application for each public path.
+# The identity provider and Access policies are shared objects in the
+# flareway-platform namespace, which flareway_v1alpha1_cloudflareaccount.yaml
+# creates. The apps namespace references them across namespaces.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -46,6 +49,18 @@ spec:
       kinds:
       - Service
     platformObjects: Denied
+  # Platform grant for the shared identity provider and Access policies. The
+  # schema requires hostnames, zones, and exposures; none of these objects use them.
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flareway-platform
+    hostnames:
+    - "*.internal.example"
+    zones:
+    - example.com
+    exposures:
+    - Private
+    platformObjects: Allowed
 ---
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareTunnel
@@ -174,8 +189,8 @@ spec:
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: IdentityProvider
 metadata:
-  name: google
-  namespace: apps
+  name: workload-google
+  namespace: flareway-platform
 spec:
   accountRef:
     name: workload-example-account
@@ -189,8 +204,8 @@ spec:
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
-  name: allow-developers-warp
-  namespace: apps
+  name: workload-allow-developers-warp
+  namespace: flareway-platform
 spec:
   accountRef:
     name: workload-example-account
@@ -212,8 +227,8 @@ spec:
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessPolicy
 metadata:
-  name: deny-everyone
-  namespace: apps
+  name: workload-deny-everyone
+  namespace: flareway-platform
 spec:
   accountRef:
     name: workload-example-account
@@ -251,13 +266,17 @@ spec:
     skipInterstitial: true
     autoRedirectToIdentity: true
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference workload-google in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000011"
     appLauncherVisible: false
   policies:
   - policyRef:
-      name: allow-developers-warp
+      name: workload-allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
-      name: deny-everyone
+      name: workload-deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
   bypass:
@@ -301,13 +320,17 @@ spec:
     skipInterstitial: true
     autoRedirectToIdentity: true
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference workload-google in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000011"
     appLauncherVisible: false
   policies:
   - policyRef:
-      name: allow-developers-warp
+      name: workload-allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
-      name: deny-everyone
+      name: workload-deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed

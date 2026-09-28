@@ -52,7 +52,7 @@ Evaluated through: `helm template` rendering of the published chart `oci://ghcr.
 
 ## Evidence on Hand
 
-Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.svg`), social card, README, docs (`docs/operations/*`, `docs/api-reference.md`, `docs/api/README.md`, `docs/design/*`), conformance report (`conformance/reports/v1.6.2/flareway/README.md`), sample manifests. No users, testimonials, logos of adopters, benchmarks, pricing, or download counts exist; never fabricate them.
+Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.svg`), social card, README, docs (`docs/operations/*`, `docs/reference/api.md`, `docs/reference/kubectl-explain.md`, `docs/adr/*`), conformance report (`docs/conformance/v1.6.2/flareway/README.md`), sample manifests. No users, testimonials, logos of adopters, benchmarks, pricing, or download counts exist; never fabricate them.
 
 ## Product Principles
 

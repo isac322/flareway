@@ -138,4 +138,26 @@ None of these carry account, object, or namespace labels.
 
 ## Setting the flags
 
-`--freshness-authz`, `--freshness-traffic`, `--freshness-indirect`, `--freshness-display`, `--drift-policy`, and `--disable-sweep` are controller-manager arguments. The Helm chart exposes no values for them and does not pass them to the manager, so a chart install runs with the defaults on this page.
+`--freshness-authz`, `--freshness-traffic`, `--freshness-indirect`, `--freshness-display`, `--drift-policy`, and `--disable-sweep` are controller-manager arguments. The Helm chart sets them from its `reconcile` values, and the chart defaults match the defaults on this page:
+
+| Value | Flag | Default |
+|---|---|---|
+| `reconcile.driftPolicy` | `--drift-policy` | `Overwrite` |
+| `reconcile.freshness.authz` | `--freshness-authz` | `60s` |
+| `reconcile.freshness.traffic` | `--freshness-traffic` | `300s` |
+| `reconcile.freshness.indirect` | `--freshness-indirect` | `1800s` |
+| `reconcile.freshness.display` | `--freshness-display` | `0s` |
+| `reconcile.disableSweep` | `--disable-sweep` | `false` |
+
+To hold drift and shorten the traffic grade on an installed release:
+
+```sh
+helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --version <chart-version> \
+  --namespace flareway-system \
+  --reuse-values \
+  --set reconcile.driftPolicy=Hold \
+  --set reconcile.freshness.traffic=120s
+```
+
+The [chart README](../../charts/flareway/README.md#drift-detection-and-freshness) lists the accepted formats for each value.

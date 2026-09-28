@@ -4,7 +4,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: saas-scim-credentials
-  namespace: default
+  namespace: flareway-platform
 type: Opaque
 stringData:
   clientSecret: replace-with-scim-oauth-client-secret
@@ -13,7 +13,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: saas-oidc-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -108,7 +108,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: saas-saml-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -150,7 +150,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: bookmark-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -174,7 +174,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: infrastructure-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -227,7 +227,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: app-launcher-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -268,7 +268,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: warp-enrollment-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -298,7 +298,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: browser-isolation-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -321,7 +321,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: dashboard-sso-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
@@ -344,7 +344,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: mcp-portal-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account
