@@ -11,15 +11,15 @@ For each Gateway, the Gateway reconciler creates and applies the owned dataplane
 
 `GatewayClassConfig` accepts values that Kubernetes admission can still reject. A `nodeSelector` key such as `bad key!` passes the CRD schema, but the API server rejects the resulting Deployment as `Invalid`. Admission webhooks, Pod Security, quotas, RBAC, and immutable-field rules can reject a mutation in the same way.
 
-Issue #105 reported that such a rejection left the Gateway claiming `Programmed=True` with no Event. Three behaviors combined:
+Such a rejection can leave the Gateway claiming `Programmed=True` with no Event (issue #105). Three behaviors combine:
 
 1. Reconcile persists the Gateway's pre-reconcile status before the owned-object loop, so a stored `Programmed=True` is written back unchanged.
 2. `prepareConditions` demotes `Programmed` to `Unknown` only when its `observedGeneration` differs from the Gateway generation. A `GatewayClassConfig` edit does not change the Gateway generation, so the stale `True` survives.
-3. The loop returned the mutation error directly. Nothing between the failed mutation and the error return recorded the rejection.
+3. The loop returns the mutation error directly. Nothing between the failed mutation and the error return records the rejection.
 
-The error still reached controller-runtime, so the object was retried, and the existing Deployment and Services kept serving. The defect was truthfulness: a Gateway could report `Programmed=True` at the current generation indefinitely while Kubernetes rejected its desired dataplane.
+The error still reaches controller-runtime, so the object is retried and the existing Deployment and Services keep serving. The risk is truthfulness: a Gateway can report `Programmed=True` at the current generation indefinitely while Kubernetes rejects its desired dataplane.
 
-The response had to separate a durable rejection from ordinary retry noise. Transient API errors and observation failures must not flap `Programmed`. Status and Events must not echo raw API error payloads, which can carry webhook text or other sensitive detail.
+The response has to separate a durable rejection from ordinary retry noise. Transient API errors and observation failures must not flap `Programmed`. Status and Events must not echo raw API error payloads, which can carry webhook text or other sensitive detail.
 
 ## Decision
 

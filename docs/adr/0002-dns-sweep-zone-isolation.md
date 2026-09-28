@@ -14,7 +14,7 @@ DNS records differ from the other kinds because they live in zones. The DNS targ
 
 Under the account-wide rule, one denied zone ends the whole DNS pass (issue #93). The records already collected from healthy zones are thrown away, the zones after it are never listed, and drift in the zones the token can read goes undetected on every pass. The outcome does not depend on where the denied zone sits in the list. The guard that skips checkpoints in unlisted zones never runs, because the pass stops before judgement.
 
-A DNS listing failure needed a narrower scope than a whole pass. The decision also had to keep two properties:
+A DNS listing failure must have a narrower scope than a whole pass. The decision also has to keep two properties:
 
 - No false missing verdicts. A zone that did not list must never make its checkpointed records look absent.
 - No hidden degradation. A pass that could not read every zone must not report `ok` or advance the last-success timestamp.

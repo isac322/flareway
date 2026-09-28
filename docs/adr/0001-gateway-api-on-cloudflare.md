@@ -42,10 +42,12 @@ For a walkthrough of the resulting system, see
 
 ### Integration model
 
-Each Flareway-managed `Gateway` owns one Cloudflare Tunnel and one data-plane
-Deployment. Each data-plane Pod runs upstream `cloudflared`, Envoy, and a
-CoreDNS sidecar. `cloudflared` carries traffic from the Cloudflare edge into the
-Pod and enforces origin JWT checks per hostname. Envoy implements `HTTPRoute`
+In Cloudflare mode, each Flareway-managed `Gateway` owns one Cloudflare
+Tunnel and one data-plane Deployment. Its data-plane Pods run upstream
+`cloudflared` and Envoy; conformance mode omits `cloudflared`, and a
+Gateway with private listeners adds a CoreDNS sidecar. `cloudflared`
+carries traffic from the Cloudflare edge into the Pod and enforces origin
+JWT checks per hostname. Envoy implements `HTTPRoute`
 semantics. The controller compiles every attached `HTTPRoute` into Envoy
 configuration, delivered over Delta ADS/SDS, and into a single whole-object
 `cloudflared` ingress configuration.
@@ -64,9 +66,10 @@ Traffic follows one of two paths:
   `cloudflared` dials it, and Envoy terminates TLS on the port the Gateway
   listener declares and applies the same compiled routes.
 
-In Cloudflare mode, Envoy listeners and the DNS sidecar bind to `127.0.0.1`
-only. The exceptions are the private-listener Pod IP fallback (D13) and
-conformance mode (D14).
+In Cloudflare mode, Envoy listeners bind to `127.0.0.1` only, and a
+Gateway with private listeners also runs a CoreDNS sidecar bound to
+`127.0.0.1`. The exceptions are the private-listener Pod IP fallback (D13)
+and conformance mode (D14).
 
 The controller is split into feature groups that can be switched on and off
 independently: gateway, access, private-network, device, and organization
@@ -187,16 +190,23 @@ the whole list or object on each write. Two writers would overwrite each
 other, so one reconciler aggregates the desired state and writes once.
 
 **D10. Ownership needs remote metadata, a status ID, and explicit adoption.**
-Every managed kind shares `managementPolicy: Managed | ObserveOnly`,
-`deletionPolicy: Delete | Orphan`, `externalRef`, and
-`adoption.mode: None | AdoptById`. A newly created object is owned through its
-recorded remote ID and Flareway metadata (tags, comment, or name prefix,
-depending on the Cloudflare object). An existing object is taken over only with
-`AdoptById` and a matching `adoption.expect`. A name match alone never
-transfers ownership. `ObserveOnly` reads and reports but performs no remote or
-credential mutation. Rationale: Cloudflare accounts are often shared with
-Terraform, the dashboard, or other clusters. Silent adoption could delete or
-rewrite objects that belong to someone else. See
+Kinds that manage a remote object share
+`managementPolicy: Managed | ObserveOnly` and
+`deletionPolicy: Delete | Orphan`. A kind whose remote object has a durable
+identifier also supports `externalRef` and
+`adoption.mode: None | AdoptById`. The account singletons `DeviceSettings`
+and `ZeroTrustOrganization` omit `externalRef` and adoption, and
+`ZeroTrustOrganization` permits only `deletionPolicy: Orphan`; a
+`DeviceProfile` of kind `Default` rejects `externalRef` and adoption too.
+Consult each kind's schema for its exact lifecycle fields. A newly created
+object is owned through its recorded remote ID and Flareway metadata (tags,
+comment, or name prefix, depending on the Cloudflare object). An existing
+object is taken over only with `AdoptById` and a matching `adoption.expect`.
+A name match alone never transfers ownership. `ObserveOnly` reads and
+reports but performs no remote or credential mutation. Rationale: Cloudflare
+accounts are often shared with Terraform, the dashboard, or other clusters.
+Silent adoption could delete or rewrite objects that belong to someone
+else. See
 [Ownership and adoption](../concepts/ownership-and-adoption.md).
 
 **D11. `CloudflareAccount.spec.grants[]` defines the tenant boundary.** A
@@ -220,9 +230,10 @@ through a real Cloudflare zone. Claiming conformance through the edge would
 need a fake edge, while dropping the suite would leave Gateway API behavior
 unverified.
 
-**D13. Private hostnames resolve through a Pod-local DNS sidecar.** Each
-data-plane Pod runs CoreDNS bound to `127.0.0.1:53`. It answers private
-listener hostnames (exact and single-label wildcard) with `127.0.0.1` and
+**D13. Private hostnames resolve through a Pod-local DNS sidecar.** A
+Gateway with at least one private listener runs a CoreDNS sidecar in its
+data-plane Pod, bound to `127.0.0.1:53`. It answers private listener
+hostnames (exact and single-label wildcard) with `127.0.0.1` and
 forwards everything else to the Pod's resolver
 (`internal/dataplane/dns.go:79-113`). If the edge does not accept a loopback
 answer, a private listener can fall back to Pod IP binding. The sidecar then
@@ -340,8 +351,9 @@ on a Flareway hostname reaches a port the edge does not serve. See
 
 ### Negative
 
-- Each Gateway runs its own `cloudflared`, Envoy, and CoreDNS Pods and uses its
-  own tunnel. Many small Gateways cost more than one shared connector.
+- Each Gateway runs its own data-plane Pod (`cloudflared`, Envoy, and, for
+  private listeners, CoreDNS) and uses its own tunnel. Many small Gateways
+  cost more than one shared connector.
 - Envoy adds a hop and a component to operate between `cloudflared` and the
   backend.
 - A public hostname that mixes protected and unprotected paths needs a proof

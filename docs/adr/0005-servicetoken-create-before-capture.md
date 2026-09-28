@@ -8,9 +8,9 @@
 
 Cloudflare returns a service token's client secret only in the response to `CreateServiceToken`. Invariant G6 requires Flareway to capture such one-time credentials durably, in a controller-owned Secret, before it reports the resource Ready.
 
-A create-then-write reconcile has a window between the remote create and the credential Secret write. Issue #94 reported what happens when the Secret write fails in that window, for example on an API server 503: the reconcile returns an error with `status.tokenId` empty and no Secret. The next pass has no record of the issued token. The only recovery path read the token ID from an annotation on the credential Secret, which did not exist, so the retry called `CreateServiceToken` again and stranded the first token. The deletion path removed only the recorded `status.tokenId`, and the account sweeper reported orphans without reclaiming them, so nothing cleaned up the stranded token.
+A create-then-write reconcile has a window between the remote create and the credential Secret write. If the Secret write fails in that window, for example on an API server 503, the pass returns an error with `status.tokenId` empty and no Secret (issue #94). The next pass then has no record of the issued token; recovering the ID from an annotation on the credential Secret is impossible because the Secret does not exist, so a retry that calls `CreateServiceToken` again strands the first token. Deleting the recorded `status.tokenId` removes only what status knows, the account sweeper reports orphans without reclaiming them, and the unrecorded token survives.
 
-The stranded token is a provenance failure more than a Ready failure: the controller loses the identity of a remote object it created. A fix had to hold three properties:
+An unrecorded token is a provenance failure more than a Ready failure: the controller loses the identity of a remote object it created. The design must hold three properties:
 
 - The controller never creates a second token for one attempt, even across a crash.
 - It never adopts, rotates, or deletes a remote token whose provenance it cannot prove.
@@ -18,7 +18,7 @@ The stranded token is a provenance failure more than a Ready failure: the contro
 
 ## Decision
 
-A managed fresh create records its intent in a durable journal before the remote create. Recovery resumes from the journal instead of creating blindly. The implementation is in `internal/controller/servicetoken_recovery.go`, with the entry points in `servicetoken_controller.go`. The public API and the shared Cloudflare client are unchanged.
+A managed fresh create records its intent in a durable journal before the remote create. Recovery resumes from the journal instead of creating blindly. The implementation is in `internal/controller/servicetoken_recovery.go`, with the entry points in `servicetoken_controller.go`.
 
 ### The journal
 
@@ -59,7 +59,7 @@ The name is capped at 200 characters by truncating `spec.name`. The prefix up to
 When a journal exists and `status.tokenId` is empty, recovery runs after grant authorization and before the freshness gate:
 
 - The journal must match the live spec, account, and cluster ID. A `spec.zone` or `accountRef` edit during a pending attempt reports `Conflict`. A verified-zone status flap does not: recovery resumes under the journaled zone ID.
-- A journal under `ObserveOnly` or `AdoptById` reports `Conflict`. ObserveOnly with an unresolved journal and no `status.tokenId` reports `RecoveryPending`.
+- A pending journal under `AdoptById` reports `Conflict`. Under `ObserveOnly`, an unresolved journal with no `status.tokenId` reports `RecoveryPending` and performs no recovery mutation.
 - The controller reads the destination Secret first. A credential counts as committed only when the client ID, client secret, and token ID annotation are all non-empty. A committed credential converges without rotating or re-creating. If its token ID differs from the journaled issued ID, the controller reports `Conflict`.
 
 Otherwise the phase decides:
@@ -98,6 +98,6 @@ An established token whose credential Secret disappears reports `SecretMissing`.
 | Record `status.tokenId` right after the create | Moves the window without closing it. A failed status write strands the token exactly as a failed Secret write does. |
 | Delete the token in the same reconcile when the Secret write fails | The rollback lives in memory. A crash between the failed write and the rollback strands the token. |
 | Adopt a remote token by name on retry | A name cannot prove provenance. It can pick a duplicate, a token from another cluster, or a token in another scope, and it cannot recover the one-time secret. Violates G2 and G3. |
-| Redesign the Accepted and Ready condition API for recovery states | Changes `api/`, which was out of scope. Existing reasons (`RecoveryPending`, `Conflict`, `CleanupBlocked`, `SecretMissing`) express the states. |
+| Redesign the Accepted and Ready condition API for recovery states | Existing condition reasons (`RecoveryPending`, `Conflict`, `CleanupBlocked`, `SecretMissing`) express the recovery states; a redesigned condition API adds surface without adding information. |
 | Sign attempt names with an HMAC against forgery | Speculative. A forged name still has to match the full name with a random nonce. |
 | Match attempts by prefix alone | Weakens provenance. Any token under the prefix could qualify for rotation or deletion; exact attempt-name matching narrows mutation to the recorded attempt. |

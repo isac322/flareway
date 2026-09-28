@@ -8,14 +8,9 @@
 
 The controller manager logs through controller-runtime's zap integration (`sigs.k8s.io/controller-runtime/pkg/log/zap`). Its `zap.Options` struct picks the encoder, level, stacktrace level, and sampling from one switch, `Development`, and `opts.BindFlags` exposes that switch and its parts as `--zap-*` flags.
 
-Issue #96 describes the failure mode. With `Development: true` set in `cmd/main.go` and no `--zap-*` flag passed by the Helm chart or the Kustomize manifests, every standard install runs in development mode:
+The controller, Helm chart, and Kustomize manifests must expose consistent production logging defaults and supported overrides. The decision balances machine-readable output, diagnostic detail, sampling, and credential safety, and it settles three things: the binary's own default, how the chart and manifests express logging, and which logging paths the policy covers.
 
-- console-encoded, multi-line output that log pipelines cannot parse as JSON;
-- `debug` level, where most volume is the per-request `V(1)` line `Cloudflare API request completed` from `internal/cloudflare/client.go`;
-- stacktraces on warnings and a panic on DPanic entries;
-- no sampling.
-
-Operators then have no supported way to change the format short of editing the Deployment by hand. The decision had to settle three things: the binary's own default, how the chart and manifests express logging, and which logging paths the policy covers.
+Zap's `Development` mode controls all of those from one switch. Its profile is unsuitable for standard installs (issue #96): console-encoded, multi-line output that log pipelines cannot parse as JSON; a `debug` level dominated by the per-request `V(1)` line `Cloudflare API request completed` from `internal/cloudflare/client.go`; stacktraces on warnings and panics on DPanic entries; and no sampling. The shipped default must keep that profile opt-in and expose the zap flags as supported chart and manifest overrides.
 
 ## Decision
 
