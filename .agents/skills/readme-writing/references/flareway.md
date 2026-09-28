@@ -3,124 +3,166 @@
 Project facts for the README evidence brief. Paths below are
 repository-root-relative; links are relative to this file. Load this before
 drafting — every README claim must trace to one of these sources. This map
-is a dated snapshot (2026-09-18): refresh it against the repository before
+is a dated snapshot (2026-09-28): refresh it against the repository before
 reuse — versions, defaults, and doc paths drift. Apply the
 repository invariants in [`../../../rules/flareway-invariants.md`](../../../rules/flareway-invariants.md)
 rather than restating them.
 
+The README is also the site's `/docs/` Overview page (synced by
+`site/scripts/sync-docs.ts`). Its H1 becomes the page `<title>` (keep it
+≤ 49 characters) and its first plain paragraph after the H1 becomes the meta
+description (keep it ≤ 155 characters, plain prose, not a list or image).
+
 ## Identity and selected assets
 
-- Main line (exact): **A Kubernetes operator for Cloudflare Tunnel, Access &
-  WARP.**
+- H1: **Flareway: Gateway API on Cloudflare Tunnel.**
+- First paragraph: what Flareway is (a Kubernetes operator), that a `Gateway`
+  becomes a Cloudflare Tunnel with no inbound ports, that `HTTPRoute` rules
+  run in Envoy, and that Access is verified.
+- Brand line used on the landing page: "A Gateway that becomes a Cloudflare
+  Tunnel."
 - User-selected brand assets: the **D2** mark with **T3** typography for the
-  logo, and the **M2** wording for the main line above.
-  - Logo: [`assets/cloud-gateway/d2/logo-t3.svg`](../../../../assets/cloud-gateway/d2/logo-t3.svg)
-  - Architecture diagrams, both bound to this fact map:
+  logo.
+  - Logo: [`assets/cloud-gateway/d2/logo-t3.svg`](../../../../assets/cloud-gateway/d2/logo-t3.svg).
+    The sync drops this exact line from the Overview page; keep it on its own
+    line in that form.
+  - Architecture diagrams:
     [`assets/architecture/layers-light.svg`](../../../../assets/architecture/layers-light.svg)
     with its dark counterpart `layers-dark.svg` (four layers: clients,
-    Cloudflare edge, one outbound tunnel through a sealed cluster boundary,
+    Cloudflare edge, an outbound tunnel through a sealed cluster boundary,
     the Kubernetes data plane), and
     [`assets/architecture/topology.svg`](../../../../assets/architecture/topology.svg)
-    (the same system in Kubernetes-object terms). Embed the layered pair with
-    `<picture>` so dark mode switches; link the topology rather than
-    embedding a second hero image.
+    (the same system in Kubernetes-object terms). The README embeds the
+    layered pair with `<picture>` so dark mode switches;
+    `docs/concepts/how-it-works.md` embeds both.
   - Every diagram must keep the product concept legible: one sealed cluster
-    boundary, one blocked inbound marker, a single outbound tunnel opened by
+    boundary, one blocked inbound marker, outbound connections opened by
     `cloudflared`, and the public/private split beyond the edge.
 
-## Maturity — state it, never soften it
+## Selling points (in this order)
 
-- `Status: experimental`, API version `v1alpha1`; not production ingress.
-- The controller runs a **single replica with serialized reconciliation** —
-  never let this read as HA.
-- Under live verification: whether the edge accepts a `127.0.0.1` answer for
-  private hostnames, and long-streaming limits.
-- Conformance: local `dev` run on kind — GatewayHTTP Core 37/37, claimed
-  Extended 30/30 — under `conformanceMode`, which disables Cloudflare
-  Tunnel, DNS, Access, and WARP. It validates Envoy behavior, not the edge
-  path. The report lists 13 unsupported features (e.g. `ListenerSet`,
-  `HTTPRouteRetry`). Source:
+1. Full HTTPRoute routing behind the tunnel — method, header, and query
+   matches, rewrites, redirects, mirroring, timeouts, CORS, and weighted
+   splits run in Envoy; `cloudflared` ingress rules alone match only hostname
+   and an unanchored path regex.
+2. Access enforced at the edge and origin — an `AccessApplication` creates the
+   Cloudflare Access application and policy; the Access JWT is verified again
+   at the origin by `cloudflared` and Envoy for public hostnames and by Envoy
+   for private ones.
+3. Private services over WARP, same Gateway — `exposure: Private` listeners,
+   Envoy terminates TLS with your certificate. Caveat: live edge acceptance of
+   the `127.0.0.1` private-hostname answer is unverified.
+4. Fails closed on shared clusters — Kubernetes RBAC and
+   `CloudflareAccount.spec.grants` must both allow; deleting a policy never
+   makes a protected route public; `AdoptById` is required to take over an
+   existing object; `Programmed` only after edge DNS, tunnel sessions, xDS,
+   and Envoy converge.
+
+## Status and scope — state as design, not as a warning
+
+- API version `v1alpha1` (state it only as the API version).
+- The controller runs as one replica with leader election. Describe this as
+  design scope.
+- Unverified live: whether the edge accepts a `127.0.0.1` answer for private
+  hostnames, and long-streaming limits. Source:
+  [`docs/operations/troubleshooting.md`](../../../../docs/operations/troubleshooting.md).
+- Conformance: a local `dev` run under `conformanceMode`, which disables
+  Cloudflare Tunnel, DNS, Access, and WARP; it validates Envoy behavior, not
+  the edge path. Result numbers belong only on the conformance report page.
+  Source:
   [`conformance/reports/v1.6.2/flareway/README.md`](../../../../conformance/reports/v1.6.2/flareway/README.md).
 
 ## Architecture (smallest accurate model)
 
-- A `Gateway` maps to one `CloudflareTunnel` and one data-plane Deployment
-  with three containers:
+- A `Gateway` references its `CloudflareTunnel` through
+  `spec.infrastructure.parametersRef` (no annotations) and gets one
+  data-plane Deployment whose pods run:
   - `cloudflared` — outbound QUIC/HTTP2 to Cloudflare's edge; no inbound
-    ports or public IPs.
-  - Envoy — receives decrypted traffic over loopback; L7 routing streamed
-    over xDS (Delta ADS): path/header/query/method matching, rewrites,
-    weighted backends; verifies `Cf-Access-Jwt-Assertion` via `jwt_authn`
-    when an Access application attaches (GEP-713 policy attachment).
-  - CoreDNS sidecar — resolves private hostnames to `127.0.0.1` so WARP
-    traffic flows through Envoy.
+    ports or public IPs; transport only, forwarding each hostname to a
+    loopback Envoy port.
+  - Envoy — L7 routing streamed over xDS (Delta ADS).
+  - CoreDNS sidecar (private listeners only) — resolves private hostnames to
+    `127.0.0.1` so WARP traffic flows through Envoy.
 - Public listeners get proxied CNAMEs to the tunnel hostname with an
-  ownership comment; private listeners terminate TLS at Envoy over
-  Cloudflare private network routes.
+  ownership comment; private listeners terminate TLS at Envoy and are reached
+  over Cloudflare private network routes.
 - `CloudflareTunnel` also has a Direct mode owning the full remote
   `cloudflared` config for non-Gateway services (TCP, SSH, RDP, bastion).
-- An ASCII diagram is sufficient; no extra diagram assets needed.
-- Full model: [`docs/design/001-cloudflare-gateway-api-integration.md`](../../../../docs/design/001-cloudflare-gateway-api-integration.md).
+- Full explanation: [`docs/concepts/how-it-works.md`](../../../../docs/concepts/how-it-works.md).
 
-## Capabilities
+## Resource families
 
-22 CRDs in `flareway.bhyoo.com/v1alpha1`, four groups — Gateway & account
-(`GatewayClassConfig`, `CloudflareAccount`, `CloudflareTunnel`), Access (10
-kinds), private networking (`VirtualNetwork`, `NetworkRoute`,
-`HostnameRoute`, `WARPConnector`), account-wide settings (5 kinds). List
-groups, not the full inventory; the schema source of truth is
-`config/crd/bases/` and [`docs/api-reference.md`](../../../../docs/api-reference.md).
+Gateway and account (`GatewayClassConfig`, `CloudflareAccount`,
+`CloudflareTunnel`), Access, private networking (`VirtualNetwork`,
+`NetworkRoute`, `HostnameRoute`, `WARPConnector`), and account-wide settings.
+The README does not list or count them; `docs/concepts/how-it-works.md` has
+the table. Schema source of truth: `config/crd/bases/` and
+[`docs/api-reference.md`](../../../../docs/api-reference.md).
 
 ## First safe action and install path
 
-- Safe first action: render manifests locally — `helm template` or
-  `helm upgrade --install --dry-run` against the checkout chart
-  `./charts/flareway`. A rendered-manifest path plus an explicit install
-  link is an acceptable first task for an experimental operator; a live
-  install is not obligatory.
+- Install only from the public OCI chart
+  `oci://ghcr.io/isac322/charts/flareway`. Never document `./charts/flareway`,
+  `charts/flareway/crds/`, a git checkout, `go run`, or Kustomize overlays
+  as a user install path; contributor workflows stay in `CONTRIBUTING.md`.
+- Safe first action, needing no cluster or credentials:
+
+  ```sh
+  helm template flareway oci://ghcr.io/isac322/charts/flareway \
+    --namespace flareway-system \
+    --set gatewayClass.create=true
+  ```
+
+  It renders the controller Deployment, RBAC, Services, NetworkPolicies,
+  `GatewayClass/flareway`, and `GatewayClassConfig/default`;
+  `--include-crds` adds the Flareway CRDs. Preview commands omit `--version`.
+- Install and upgrade commands use `--version <chart-version>`; `helm show
+  chart oci://ghcr.io/isac322/charts/flareway` prints the latest `version`.
+  Do not hard-code a chart version.
 - Real install prerequisites: Gateway API **v1.6.2 Standard** CRDs applied
-  first (the chart does not install them), Helm 4.3/compatible, a Cloudflare
-  account + scoped API token, a DNS zone for public listeners, WARP
-  prerequisites for private listeners.
+  first (the chart does not install them), Helm 4.3 or a compatible Helm 3
+  client, a Cloudflare account and scoped API token, a DNS zone for public
+  listeners, WARP prerequisites for private listeners.
 - Namespace is fixed `flareway-system`; `namespace.create` defaults `false`
   → use `--create-namespace`. `gatewayClass.create` defaults `false` →
   `--set gatewayClass.create=true` (prevents silently taking an existing
   GatewayClass).
-- Set `gatewayClass.config.accountRefName` only **after** the
-  `CloudflareAccount` CR exists.
-- Never invite applying `config/samples/workload_application.yaml` blindly:
-  it contains placeholders (API token, account ID, hostnames, IdP/policy
-  IDs) that must be replaced first.
-- OCI chart: `oci://ghcr.io/isac322/charts/flareway` — published "after it
-  has been published"; do not invent a release tag.
-- Source: [`docs/operations/install.md`](../../../../docs/operations/install.md).
+- Never invite applying `config/samples/` files blindly: they contain
+  placeholders (API token, account ID, hostnames, IdP/policy IDs) that must
+  be replaced first.
+- Source: [`docs/get-started/install.md`](../../../../docs/get-started/install.md).
 
-## Security model (one paragraph, link for detail)
+## Documentation links (site tab order)
 
-Two authorization layers must both allow: Kubernetes RBAC and
-`CloudflareAccount.spec.grants` (namespaces, hostnames, zones, exposures).
-Fail-closed on denial; explicit `AdoptById` adoption for existing remote
-objects; credentials in Secrets, never in status; `Programmed` only after
-edge DNS, tunnel sessions, xDS, and the data plane converge. Detail:
-[`docs/operations/rbac-token.md`](../../../../docs/operations/rbac-token.md).
-
-## Documentation links that exist
-
-- [`docs/operations/install.md`](../../../../docs/operations/install.md) —
-  install
-- [`docs/operations/upgrade.md`](../../../../docs/operations/upgrade.md) —
-  upgrade
-- [`docs/operations/rbac-token.md`](../../../../docs/operations/rbac-token.md)
-  — RBAC and API tokens
-- [`docs/operations/troubleshooting.md`](../../../../docs/operations/troubleshooting.md)
-  — troubleshooting
-- [`docs/api-reference.md`](../../../../docs/api-reference.md) and
-  [`docs/api/README.md`](../../../../docs/api/README.md) — API reference
-- [`docs/design/001-cloudflare-gateway-api-integration.md`](../../../../docs/design/001-cloudflare-gateway-api-integration.md)
-  — design document
-- [`conformance/reports/v1.6.2/flareway/README.md`](../../../../conformance/reports/v1.6.2/flareway/README.md)
-  — conformance report
-- [`config/samples/`](../../../../config/samples/) — example manifests
+- Concepts:
+  [`docs/concepts/how-it-works.md`](../../../../docs/concepts/how-it-works.md),
+  [`docs/concepts/http-routing.md`](../../../../docs/concepts/http-routing.md),
+  [`conformance/reports/v1.6.2/flareway/README.md`](../../../../conformance/reports/v1.6.2/flareway/README.md),
+  [`docs/concepts/security-model.md`](../../../../docs/concepts/security-model.md),
+  [`docs/concepts/ownership-and-adoption.md`](../../../../docs/concepts/ownership-and-adoption.md),
+  [`docs/concepts/limits.md`](../../../../docs/concepts/limits.md)
+- Get started:
+  [`docs/get-started/install.md`](../../../../docs/get-started/install.md),
+  [`docs/get-started/connect-cloudflare.md`](../../../../docs/get-started/connect-cloudflare.md),
+  [`docs/get-started/expose-a-service.md`](../../../../docs/get-started/expose-a-service.md),
+  [`docs/get-started/protect-with-access.md`](../../../../docs/get-started/protect-with-access.md),
+  [`docs/get-started/private-services-over-warp.md`](../../../../docs/get-started/private-services-over-warp.md),
+  [`docs/get-started/direct-tunnels.md`](../../../../docs/get-started/direct-tunnels.md)
+- Operations:
+  [`docs/operations/troubleshooting.md`](../../../../docs/operations/troubleshooting.md),
+  [`docs/operations/upgrade.md`](../../../../docs/operations/upgrade.md),
+  [`docs/operations/freshness-and-drift.md`](../../../../docs/operations/freshness-and-drift.md)
+- Reference:
+  [`docs/api-reference.md`](../../../../docs/api-reference.md),
+  [`charts/flareway/README.md`](../../../../charts/flareway/README.md),
+  [`docs/api/README.md`](../../../../docs/api/README.md),
+  [`config/samples/`](../../../../config/samples/)
+- Project:
+  [`CONTRIBUTING.md`](../../../../CONTRIBUTING.md),
+  [`SECURITY.md`](../../../../SECURITY.md),
+  [`CODE_OF_CONDUCT.md`](../../../../CODE_OF_CONDUCT.md),
+  design documents in Korean
+  ([`docs/design/001-cloudflare-gateway-api-integration.md`](../../../../docs/design/001-cloudflare-gateway-api-integration.md))
 
 ## License and maintenance
 
@@ -131,8 +173,16 @@ channels.
 
 ## Claims not to make
 
-- No production-ready, HA, or multi-replica implications.
-- No universal/100% conformance, zero-cost, or performance guarantees.
-- No "latest released chart" assertion or invented release tags.
+- No "experimental", "beta", "not production", "production-grade",
+  "battle-tested", HA, multi-replica, or adoption/user-count claims.
+- No counts as selling points (CRD totals, conformance pass counts) outside
+  the conformance report.
+- No "Gateway API conformant", "certified", or edge-path conformance claims;
+  say it passed the conformance suite in a local run and link the report.
+- No "Envoy verifies every request" or "one outbound connection" (the
+  connector defaults to two replicas).
+- No competitor names, and no "only", "first", or "no other operator".
+- No performance, latency, cost, or free-tier guarantees.
+- No change narrative: describe current behavior only, never "now", "no
+  longer", or "previously".
 - No silent widening of supported mode boundaries (Gateway vs Direct).
-- No edge-path conformance claims — conformanceMode is Envoy-only.

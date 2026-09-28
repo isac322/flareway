@@ -68,11 +68,18 @@ function flarewayCodeTheme(/** @type {'dark' | 'light'} */ type) {
 
 export default defineConfig({
 	site: siteUrl,
+	// Moved docs routes. The static build emits a meta-refresh page for each.
+	redirects: {
+		'/docs/operations/install': '/docs/get-started/install/',
+		'/docs/operations/rbac-token': '/docs/get-started/connect-cloudflare/',
+		'/docs/architecture': '/docs/concepts/how-it-works/',
+		'/docs/conformance/gateway-api-v1-6-2': '/docs/concepts/conformance/',
+	},
 	integrations: [
 		starlight({
 			title: 'Flareway',
 			description:
-				'Kubernetes Gateway API on Cloudflare Tunnel with an in-pod Envoy data plane, plus Cloudflare Access and WARP as CRDs.',
+				'Kubernetes operator that turns a Gateway into a Cloudflare Tunnel, with full HTTPRoute routing in Envoy and Cloudflare Access and WARP as Kubernetes resources.',
 			favicon: '/favicon.svg',
 			// src/pages/404.astro renders the not-found page through StarlightPage.
 			disable404Route: true,

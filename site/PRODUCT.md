@@ -16,25 +16,32 @@ Platform and Kubernetes engineers (homelab operators through small platform team
 
 ## Product Purpose
 
-Flareway is a Kubernetes operator that implements the Gateway API (`gateway.networking.k8s.io/v1`) on top of Cloudflare's edge: a `Gateway` becomes a Cloudflare Tunnel, `HTTPRoute` rules become L7 routing executed by an in-pod Envoy data plane, and Cloudflare Access policies attach to routes via GEP-713 policy attachment. It also manages WARP private networking and Zero Trust account resources as CRDs (22 CRDs in `flareway.bhyoo.com/v1alpha1`). Success for the site: a visitor understands the mechanism in one viewport, trusts the engineering rigor, and follows through to the install guide or the GitHub repository.
+Flareway is a Kubernetes operator that implements the Gateway API (`gateway.networking.k8s.io/v1`) on top of Cloudflare's edge: a `Gateway` becomes a Cloudflare Tunnel, `HTTPRoute` rules become L7 routing executed by an in-pod Envoy data plane, and Cloudflare Access policies attach to routes via GEP-713 policy attachment. It also manages WARP private networking and Zero Trust account resources as CRDs in `flareway.bhyoo.com/v1alpha1`. Counts such as the number of CRDs or conformance tests are evidence, not selling points: they appear only on the conformance report page, never on the landing page, the Overview, or other Concepts pages. Success for the site: a visitor understands the mechanism in one viewport, trusts the engineering rigor, and follows through to the install guide or the GitHub repository.
 
 ## Positioning
 
-`cloudflared` alone matches only hostnames and simple paths. Flareway pairs `cloudflared` (outbound-only transport) with an in-pod Envoy fed over xDS, so standard `HTTPRoute` method/header/query matches, rewrites, and weighted splits work behind a Cloudflare Tunnel, and Access (Zero Trust) policies live next to the routes they protect. One outbound connection; nothing listens for inbound traffic on the cluster side.
+`cloudflared` alone matches only hostnames and unanchored paths. Flareway pairs `cloudflared` (outbound-only transport) with an in-pod Envoy fed over xDS, so standard `HTTPRoute` method/header/query matches, rewrites, redirects, mirroring, timeouts, CORS, and weighted splits work behind a Cloudflare Tunnel. Nothing listens for inbound traffic on the cluster side, and no inbound ports or public IPs are needed. Do not say "one outbound connection": the connector runs two replicas by default (chart value `gatewayClass.config.connector.replicas: 2`).
+
+The primary promise: your standard `Gateway` and `HTTPRoute` become a managed Cloudflare Tunnel, its DNS records, and full L7 routing in an in-pod Envoy, with Cloudflare Access verified at the origin and no inbound ports or public IPs. Four supporting points, in this order:
+
+1. Full HTTPRoute routing behind the tunnel.
+2. Access enforced at the edge and origin.
+3. Private services over WARP, same Gateway.
+4. Fails closed on shared clusters.
 
 ## Operating Context
 
-Evaluated through: `helm template` rendering (no cluster or credentials needed), `config/samples/` manifests, the Helm chart (`charts/flareway`, OCI chart on release), `kubectl explain`, the Gateway API conformance report, and the design document. Installed with Gateway API v1.6.2 Standard CRDs, a Cloudflare account with a scoped API token, a DNS zone for public listeners, and WARP prerequisites for private listeners.
+Evaluated through: `helm template` rendering of the published chart `oci://ghcr.io/isac322/charts/flareway` (no cluster or credentials needed), `config/samples/` manifests, `kubectl explain`, the Gateway API conformance report, and the design document. Installed only from that public OCI chart; user-facing docs never build from source, `go run`, or apply Kustomize overlays. Installed with Gateway API v1.6.2 Standard CRDs, a Cloudflare account with a scoped API token, a DNS zone for public listeners, and WARP prerequisites for private listeners.
 
 ## Capabilities and Constraints
 
 - Gateway ↔ CloudflareTunnel ↔ data-plane Deployment, 1:1:1. Pod runs `cloudflared` + Envoy (+ CoreDNS sidecar for private listeners).
 - Public listeners: Cloudflare owns edge TLS; proxied CNAMEs with ownership marked in record comments. Private listeners: Envoy terminates TLS with user-supplied certificates; WARP clients reach via private network routes.
-- Access: `AccessApplication` targets routes; Envoy `jwt_authn` verifies `Cf-Access-Jwt-Assertion` against Cloudflare JWKS.
+- Access: an `AccessApplication` attaches to a `Gateway` listener or an `HTTPRoute`; the controller configures the Cloudflare Access application and policy, and the Access JWT is verified again at the origin. For public hostnames both `cloudflared` (`originRequest.access`) and Envoy `jwt_authn` check it; for private (WARP) hostnames Envoy `jwt_authn` checks it. Until the AUD tag and team domain are known, the route stays blocked. Origin JWT mode defaults to `Required`; `Disabled` is an explicit opt-out. Routes without an `AccessApplication` carry no JWT check. Deleting an `AccessApplication` never makes a protected route public.
 - `CloudflareTunnel` Direct mode for non-Gateway TCP/SSH/RDP/bastion origins.
 - Security: two authorization layers (Kubernetes RBAC + `CloudflareAccount.spec.grants`), fail-closed, explicit `AdoptById` adoption, credentials only in Secrets, `Programmed` only after DNS, tunnel, xDS, and Envoy converge.
 - Status: API group `flareway.bhyoo.com/v1alpha1`, single-replica controller. The maintainer runs it in production; the site carries no "experimental" / "not production" status messaging (owner decision, 2026-09-28). Do not add production-grade, HA, or adoption claims either.
-- Conformance: local `dev` run on kind in `conformanceMode` (Cloudflare paths disabled): GatewayHTTP Core 37/37, claimed Extended 30/30, 13 unsupported features listed.
+- Conformance: local `dev` run on kind in `conformanceMode` (Cloudflare paths disabled): GatewayHTTP Core 37/37, claimed Extended 30/30, 13 unsupported features listed. These numbers are evidence for the conformance report page only.
 
 ## Brand Commitments
 

@@ -1,18 +1,14 @@
-# Flareway Helm chart
+# Flareway Helm chart values
 
-This chart installs the Flareway controller manager, its RBAC, Services, NetworkPolicies, and generated Flareway CRDs. Gateway API CRDs are a separate prerequisite.
+The chart at `oci://ghcr.io/isac322/charts/flareway` installs the controller, RBAC, Services, NetworkPolicies, and Flareway CRDs, but not Gateway API CRDs.
+
+Print every default with `helm show values oci://ghcr.io/isac322/charts/flareway --version <chart-version>`. `helm show chart oci://ghcr.io/isac322/charts/flareway` prints the latest `version`; release notes are on GitHub Releases. For installation steps, see the [install guide](https://flareway.bhyoo.com/docs/get-started/install/).
 
 ## CRDs
 
-The chart packages every generated `flareway.bhyoo.com` CRD in `crds/`, including:
+The chart packages every generated `flareway.bhyoo.com` CRD in `crds/`. Print them with `helm show crds oci://ghcr.io/isac322/charts/flareway --version <chart-version>`.
 
-- `AccessStandaloneApplication`
-- `AccessCustomPage`
-- `AccessInfrastructureTarget`
-- `DevicePostureIntegration`
-- `WARPConnector`
-
-Helm installs files from `crds/` before the chart templates. Helm does not upgrade or delete those CRDs during a normal chart upgrade or uninstall. The chart has no uninstall hooks and does not contact Cloudflare or delete remote resources during uninstall.
+Helm installs files from `crds/` before the chart templates. Helm does not upgrade or delete those CRDs during a normal chart upgrade or uninstall; the [upgrade guide](https://flareway.bhyoo.com/docs/operations/upgrade/) applies them first. The chart has no uninstall hooks and does not contact Cloudflare or delete remote resources during uninstall.
 
 ## Controller groups
 
@@ -26,7 +22,9 @@ All controller groups default to enabled. The values map directly to the control
 | `controllers.device` | `--enable-device-controllers` | `DeviceProfile`, `DeviceSettings` |
 | `controllers.organization` | `--enable-organization-controllers` | `ZeroTrustOrganization`, `ZeroTrustGatewayPolicy`, `ZeroTrustList` |
 
-`WARPConnector` follows `controllers.privateNetwork`; it does not have an independent chart switch. The installed ClusterRole includes the permissions required by every supported controller group, including each new resource's main, status, and finalizer subresources.
+`WARPConnector` follows `controllers.privateNetwork`; it has no independent chart switch. The installed ClusterRole includes the permissions required by every controller group, including each resource's main, status, and finalizer subresources.
+
+Disabling a group changes which controller owns remote objects. Follow the [controller group steps](https://flareway.bhyoo.com/docs/operations/upgrade/#changing-controller-groups) before turning one off.
 
 ## Tunnel runtime settings
 
@@ -36,6 +34,8 @@ Tunnel configuration mode and management-token issuance are resource-level setti
 - `CloudflareTunnel.spec.managementToken` is optional and opt-in. When requested, Flareway writes the issued token only to the tunnel-owned Secret referenced from status.
 
 The chart therefore does not expose global Direct-mode or management-token values.
+
+The drift-detection and freshness flags (`--freshness-*`, `--drift-policy`, `--disable-sweep`) have no chart values either; the manager runs with their defaults. See [Drift detection and Cloudflare API budget](https://flareway.bhyoo.com/docs/operations/freshness-and-drift/).
 
 ## Main values
 
@@ -66,11 +66,11 @@ The chart therefore does not expose global Direct-mode or management-token value
 | `gatewayClass.config.conformanceMode` | `false` | Run the generated Gateway class without Cloudflare integration. |
 | `gatewayClass.config.scheduling` | `{}` | Dataplane pod placement (`nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`) rendered into the `GatewayClassConfig`. |
 
-See `values.yaml` for pod placement, security context, resources, Service annotations, and complete `GatewayClassConfig` defaults. The top-level `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` values place only the controller-manager pod; dataplane pods are placed through `gatewayClass.config.scheduling`.
+`helm show values` lists pod placement, security context, resources, Service annotations, and the complete `GatewayClassConfig` defaults. The top-level `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` values place only the controller-manager pod; dataplane pods are placed through `gatewayClass.config.scheduling`.
 
 ## Logging
 
-The controller defaults to production logging: JSON lines on stderr at `info` level, with error entries carrying a `stacktrace` field. Three values map to the manager's zap flags and are rendered unconditionally at the end of the manager args:
+The controller logs JSON lines to stderr at `info` level, and error entries carry a `stacktrace` field. Three values map to the manager's zap flags and are rendered unconditionally at the end of the manager args:
 
 | Value | Flag | Accepted values |
 |---|---|---|
@@ -80,10 +80,11 @@ The controller defaults to production logging: JSON lines on stderr at `info` le
 
 `warn` is not an accepted level; the flag parser and the values schema both reject it.
 
-An explicit `logging.level` or `logging.encoder` always overrides the development-mode defaults, so `logging.development=true` alone keeps JSON output at `info` and only switches development semantics: no sampling, warn-level stacktraces, full object dumps, and panics on DPanic entries. To reproduce the exact pre-change output (console encoder at `debug`), set all three:
+An explicit `logging.level` or `logging.encoder` always overrides the development-mode defaults. `logging.development=true` alone therefore keeps JSON output at `info` and switches only development semantics: no sampling, warn-level stacktraces, full object dumps, and panics on DPanic entries. For human-readable console output at `debug`, set all three:
 
 ```sh
-helm upgrade flareway charts/flareway \
+helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --version <chart-version> \
   --namespace flareway-system \
   --reuse-values \
   --set logging.development=true \
@@ -91,10 +92,12 @@ helm upgrade flareway charts/flareway \
   --set logging.encoder=console
 ```
 
-In production mode the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Errors are degraded during bursts, never fully suppressed. The sampler is disabled by `logging.development=true` or an integer `logging.level` of `2` or higher — `logging.level=debug` does not disable it.
+In production mode the controller-runtime sampler applies: for each (level, message) pair the first 100 entries per second pass, then one in every 100. Debug/V(1), info, and error entries are all sampled; only `V(N)` with `N >= 2` bypasses it. Bursts thin out error entries but never suppress them fully. `logging.development=true` or an integer `logging.level` of `2` or higher disables the sampler; `logging.level=debug` does not.
 
-Two documented exceptions do not use the configured format. Rare client-go (klog) lines, such as `HTTP2 has been explicitly disabled` or invalid `HTTP2_*` environment warnings, keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`), unchanged from earlier releases. gRPC's own logger may also print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`). Neither is JSON.
+Two kinds of line do not use the configured format. Rare client-go (klog) lines, such as `HTTP2 has been explicitly disabled` or invalid `HTTP2_*` environment warnings, keep klog's own text format (`I0923 12:00:00.000000 1 file.go:123] msg`). gRPC's own logger may also print rare ERROR-severity text lines (`YYYY/MM/DD hh:mm:ss ERROR: ...`). Neither is JSON.
 
 The chart schema caps integer levels at `6`. The raw `--zap-log-level` flag accepts larger integers, but levels `8` and higher make client-go log API request and response bodies (truncated to 1024 bytes at `8` and 10240 bytes at `9`, complete from `10`), including Secret contents. Do not use them outside isolated debugging.
 
-Only these three logging knobs are exposed; other zap options such as stacktrace level, time encoding, or extra args are not configurable through the chart.
+The chart exposes only these three logging values; other zap options such as stacktrace level, time encoding, or extra args are not configurable through the chart.
+
+For filtering JSON logs and reading debug output, see [Troubleshooting](https://flareway.bhyoo.com/docs/operations/troubleshooting/#debug-logging).

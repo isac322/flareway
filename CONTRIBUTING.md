@@ -1,5 +1,7 @@
 # Contributing
 
+This guide covers the local toolchain, the checks CI runs, the conformance and end-to-end workflows, and the pull request rules.
+
 ## Prerequisites
 
 - Go toolchain matching `go.mod` (currently Go 1.27.x).
@@ -29,6 +31,69 @@ Never hand-edit generated output (`config/crd/bases/`,
 `config/rbac/role.yaml`, `**/zz_generated.*.go`, chart CRDs). Change the
 source markers or types and regenerate with `make manifests` or
 `make generate`.
+
+## Gateway API conformance run
+
+The [conformance report](conformance/reports/v1.6.2/flareway/README.md)
+comes from this workflow. Run it with Docker, Go, and `kubectl` installed:
+
+```sh
+make conformance
+```
+
+The script creates or reuses the `flareway-conf` kind cluster, installs
+Gateway API v1.6.2 and Flareway, builds the controller image, and applies
+the conformance `GatewayClass`.
+
+On Linux, it starts cloud-provider-kind and verifies that it can assign a
+LoadBalancer address before running the suite from the host. On macOS, or
+when the provider probe fails, it switches the conformance Service to
+`ClusterIP` and runs the compiled test binary in a Kubernetes Job. The Job
+writes the report to a shared volume, and the script copies it to
+`conformance/reports/v1.6.2/flareway/`.
+
+The runner disables test parallelism because Flareway deliberately uses one
+controller replica and one Gateway reconciliation worker. This serializes
+independent fixtures without skipping tests or weakening their assertions.
+
+Useful overrides:
+
+```sh
+KIND_CLUSTER_NAME=my-cluster \
+VERSION=dev \
+REPORT_OUTPUT="$PWD/conformance/reports/v1.6.2/flareway/standard-dev-default-report.yaml" \
+make conformance
+```
+
+The workflow does not invoke `sudo`. It pins kind, cloud-provider-kind, ko,
+kustomize, the kind node image, and Gateway API to the versions declared in
+the repository.
+
+## End-to-end test prerequisites
+
+The end-to-end suite runs against real Cloudflare with `make e2e`, which
+selects specs by `FLAREWAY_E2E_LABELS`. It requires a dedicated test
+account and zone:
+
+- `FLAREWAY_E2E_CF_API_TOKEN`
+- `FLAREWAY_E2E_CF_ACCOUNT_ID`
+- `FLAREWAY_E2E_ZONE`
+- optional `FLAREWAY_E2E_KUBECONFIG`
+- `FLAREWAY_E2E_LABELS` (default `public,access`; add `warp` for the
+  private WARP spec)
+- `FLAREWAY_E2E_WARP_DEVICE=1` only on a registered WARP runner; the e2e
+  workflow registers the runner itself via `hack/e2e-warp-runner.sh`
+  (per-run service token, app-scoped enrollment policy, and custom device
+  profile, all deleted after the run)
+- optional `FLAREWAY_E2E_WARP_UNREGISTERED_DNS_SERVER`
+- `FLAREWAY_E2E_DEVICE_PROFILE_KIND` and explicit
+  `FLAREWAY_E2E_ALLOW_DEFAULT_PROFILE=1` before mutating the default
+  profile
+
+Use a dedicated account because the suite creates and deletes tunnels, DNS
+records, Access applications, policies, and private-network objects. Record
+a missing WARP runner or plan capability as blocked, not as passed or
+silently skipped.
 
 ## CI caches
 

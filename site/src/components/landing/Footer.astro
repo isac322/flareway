@@ -14,7 +14,7 @@ const copy = landingCopy.footer;
 				<a class="brand" href="/" aria-label={landingCopy.header.homeLabel}><Lockup /></a>
 				<p>{copy.tagline}</p>
 			</div>
-			<nav class="foot-nav" aria-label={copy.navLabel}>
+			<nav class="foot-nav" aria-label={copy.navLabel} style={`--foot-cols: ${copy.groups.length}`}>
 				{
 					copy.groups.map((group) => (
 						<div>
@@ -37,3 +37,20 @@ const copy = landingCopy.footer;
 		</div>
 	</div>
 </footer>
+
+<style>
+	/*
+	 * One column per footer group on wide screens, two per row below the
+	 * 1060px breakpoint landing.css uses. Astro scopes these selectors with
+	 * :where(), which adds no specificity, so the parent class is what lets
+	 * them win over the 3-column rule in landing.css.
+	 */
+	.foot-grid .foot-nav {
+		grid-template-columns: repeat(var(--foot-cols), minmax(0, 1fr));
+	}
+	@media (max-width: 1060px) {
+		.foot-grid .foot-nav {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+</style>

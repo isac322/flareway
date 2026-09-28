@@ -23,8 +23,20 @@ export interface NavTab {
 export const tabs: readonly NavTab[] = [
 	{ label: 'Overview', href: '/docs/', match: '/docs/', sidebar: { kind: 'link' } },
 	{
+		label: 'Concepts',
+		href: '/docs/concepts/how-it-works/',
+		match: '/docs/concepts/',
+		sidebar: { kind: 'group', directory: 'docs/concepts' },
+	},
+	{
+		label: 'Get started',
+		href: '/docs/get-started/install/',
+		match: '/docs/get-started/',
+		sidebar: { kind: 'group', directory: 'docs/get-started' },
+	},
+	{
 		label: 'Operations',
-		href: '/docs/operations/install/',
+		href: '/docs/operations/troubleshooting/',
 		match: '/docs/operations/',
 		sidebar: { kind: 'group', directory: 'docs/operations' },
 	},
@@ -33,18 +45,6 @@ export const tabs: readonly NavTab[] = [
 		href: '/docs/reference/api/',
 		match: '/docs/reference/',
 		sidebar: { kind: 'group', directory: 'docs/reference' },
-	},
-	{
-		label: 'Architecture',
-		href: '/docs/architecture/',
-		match: '/docs/architecture/',
-		sidebar: { kind: 'link' },
-	},
-	{
-		label: 'Conformance',
-		href: '/docs/conformance/gateway-api-v1-6-2/',
-		match: '/docs/conformance/',
-		sidebar: { kind: 'link' },
 	},
 	{
 		label: 'Project',

@@ -2,6 +2,7 @@
 // S3: the architecture diagram from preview E. Text comes from landing-copy;
 // geometry is fixed to the 520×596 drawing.
 import { landingCopy } from '../../data/landing-copy';
+import Icon from './Icon.astro';
 
 const copy = landingCopy.how;
 const f = copy.figure;
@@ -133,5 +134,16 @@ const f = copy.figure;
 			</svg>
 			<figcaption><span>{f.caption}</span><span class="figure-ratio">{f.ratio}</span></figcaption>
 		</figure>
+		<div class="works-more">
+			<a class="more" href={copy.more.href}>{copy.more.label}<Icon name="arrow" class="arrow" /></a>
+		</div>
 	</div>
 </section>
+
+<style>
+	.works-more {
+		max-width: 720px;
+		margin-left: auto;
+		margin-right: auto;
+	}
+</style>

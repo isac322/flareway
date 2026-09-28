@@ -1,171 +1,146 @@
-# Flareway
+# Flareway: Gateway API on Cloudflare Tunnel
 
 ![Flareway logo: an orange cloud with a doorway beside the Flareway wordmark](assets/cloud-gateway/d2/logo-t3.svg)
 
-A Kubernetes operator for Cloudflare Tunnel, Access & WARP.
+Flareway turns a Kubernetes `Gateway` into a Cloudflare Tunnel, runs `HTTPRoute` rules in Envoy, and verifies Access at the origin, with no inbound ports.
 
-## What it does
+## The problem
 
-Flareway implements the Kubernetes Gateway API (`gateway.networking.k8s.io/v1`)
-on top of Cloudflare's edge. A `Gateway` you declare in the cluster becomes a
-Cloudflare Tunnel; `HTTPRoute` rules become L7 routing; Cloudflare Access
-policies attach to routes through the standard policy-attachment model
-(GEP-713). Everything is declarative: the controller reconciles Kubernetes
-resources into Cloudflare configuration, tracks ownership, and requires
-explicit adoption of existing remote resources.
+Cloudflare Tunnel exposes a cluster without inbound firewall ports or public
+IPs: `cloudflared` dials out to Cloudflare's edge and carries requests back.
+On its own, `cloudflared` routes only by hostname and an unanchored path
+regex. Its ingress rules cannot match methods, headers, or query parameters,
+and they cannot rewrite, redirect, mirror, or split traffic by weight.
 
-## Why it is useful
+## Why Flareway
 
-Cloudflare Tunnel gives a cluster inbound reachability without opening inbound
-firewall ports or assigning public IPs to cluster nodes, but `cloudflared`
-alone matches only hostnames and simple paths. It cannot evaluate HTTP
-methods, query parameters, header matches, or weighted canary splits. Flareway
-pairs `cloudflared` with an in-pod Envoy data plane so the tunnel handles
-transport while Envoy handles supported `HTTPRoute` matches and filters.
+- **Full HTTPRoute routing behind the tunnel.** Method, header, and query
+  matches, rewrites, redirects, mirroring, timeouts, CORS, and weighted splits
+  work through the tunnel without a second proxy for you to run.
+  [HTTP routing](docs/concepts/http-routing.md)
+- **Access enforced at the edge and origin.** Attach an `AccessApplication` to
+  a listener or route: Flareway creates the Cloudflare Access application and
+  policy, then verifies the Access JWT again inside the cluster, so a request
+  that did not pass Access is refused at the origin. You never copy an AUD tag
+  by hand. [Security model](docs/concepts/security-model.md)
+- **Private services over WARP, same Gateway.** Mark a listener `Private` and
+  WARP devices reach the Service through the same `Gateway`, `HTTPRoute`, and
+  `AccessApplication`, with Envoy terminating TLS using your certificate.
+  Virtual networks, routes, and WARP connectors are Kubernetes resources.
+  Whether the Cloudflare edge accepts the `127.0.0.1` answer for private
+  hostnames has not been verified live; see [Limits](docs/concepts/limits.md).
+  [Private services over WARP](docs/get-started/private-services-over-warp.md)
+- **Fails closed on shared clusters.** A namespace can use only the
+  hostnames, zones, and exposures the platform granted it. Deleting a policy
+  never makes a protected route public, existing Cloudflare objects are never
+  taken over by name, and `Programmed` means traffic has converged.
+  [Security model](docs/concepts/security-model.md)
 
-Beyond that baseline, use it when you want:
-
-- Standard `Gateway`/`HTTPRoute` resources instead of tunnel-specific config.
-- Cloudflare Access (Zero Trust) policies declared next to the routes they
-  protect.
-- Private services reachable over WARP, managed as Kubernetes resources.
-
-It is not a fit when you need a highly available controller or Gateway API
-features the implementation does not support yet — see
-[Conformance and testing](#conformance-and-testing).
+The routing features Flareway claims passed the Gateway API conformance suite
+in a local run through Envoy; the
+[conformance report](conformance/reports/v1.6.2/flareway/README.md) states what
+that run covered.
 
 ## How it works
 
-Each `Gateway` maps to one `CloudflareTunnel` and one data-plane Deployment.
-The pod runs `cloudflared` and Envoy, plus a CoreDNS sidecar when the Gateway
-has private listeners:
+Each `Gateway` gets one `CloudflareTunnel` and one data-plane Deployment. The
+Gateway names its tunnel through the standard `infrastructure.parametersRef`,
+with no annotations.
 
-- `cloudflared` opens outbound QUIC/HTTP2 connections to Cloudflare's edge.
-  No inbound ports or public IPs are required.
-- Envoy receives decrypted requests from `cloudflared` over loopback and
-  applies the routing rules the controller streams to it over xDS (Delta ADS):
-  path, header, query, and method matching, rewrites, and weighted backends.
-- A CoreDNS sidecar is added for Gateways with private listeners. It resolves
-  private hostnames to `127.0.0.1` so WARP private traffic also flows through
-  Envoy.
+- `cloudflared` dials out to Cloudflare's edge over QUIC or HTTP/2 and forwards
+  each hostname to Envoy over loopback. It carries transport only.
+- Envoy runs the `HTTPRoute` rules that the controller streams to it over xDS
+  (Delta ADS).
+- For a Gateway with private listeners, a CoreDNS sidecar answers private
+  hostnames with `127.0.0.1`, so WARP traffic also passes through Envoy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/layers-dark.svg">
-  <img src="assets/architecture/layers-light.svg" alt="Four layers: Internet and WARP clients, the Cloudflare edge with edge TLS and private network routes, one outbound tunnel piercing a sealed cluster boundary while inbound is blocked, and the Kubernetes data-plane pod feeding Services and backend Pods">
+  <img src="assets/architecture/layers-light.svg" alt="Four layers: Internet and WARP clients, the Cloudflare edge with edge TLS and private network routes, an outbound tunnel through a sealed cluster boundary while inbound is blocked, and the Kubernetes data-plane pod feeding Services and backend Pods">
 </picture>
 
-Both exposure modes ride that one outbound connection: public hostnames reach
-it through the Cloudflare edge, and WARP devices reach it through a private
-network route. Nothing listens for inbound traffic on the cluster side. For
-the same picture in Kubernetes-object terms — node, controller pod, and the
-data-plane pod's containers — see the
-[cluster topology diagram](assets/architecture/topology.svg).
+[How Flareway works](docs/concepts/how-it-works.md) covers listeners, TLS,
+Access, Direct mode, and the full object map.
 
-When an `AccessApplication` targets a route, the controller configures the
-matching Cloudflare Access application and policy, and configures Envoy's
-`jwt_authn` filter to verify the `Cf-Access-Jwt-Assertion` token against
-Cloudflare's JWKS endpoint. Routes without an Access attachment carry no JWT
-filter.
+## Try it without a cluster
 
-For public listeners, Cloudflare owns edge TLS: Flareway creates proxied CNAME
-records pointing to the tunnel hostname, marks ownership in the record
-comment, and rejects a listener that references its own certificates. Private
-listeners are the reverse — Envoy terminates TLS, so `certificateRefs` is
-required and must name a Secret you supply (cert-manager or an internal CA;
-Flareway does not issue certificates). WARP clients then reach the service
-through Cloudflare's private network routes.
-
-`CloudflareTunnel` also supports a Direct mode that owns the complete remote
-`cloudflared` configuration for non-Gateway services such as TCP, SSH, RDP,
-and bastion origins.
-
-The full model, including ownership, adoption, and fail-closed behavior, is in
-the [design document](docs/design/001-cloudflare-gateway-api-integration.md).
-
-## Try it: render the manifests
-
-Rendering the chart needs no cluster and no Cloudflare credentials. It prints
-what an install would create, so you can read it before anything runs.
-
-Prerequisite: Helm 4.3 or a compatible Helm 3 client.
+Rendering the published chart needs no cluster and no Cloudflare credentials.
+You need Helm 4.3 or a compatible Helm 3 client.
 
 ```sh
-helm template flareway ./charts/flareway \
+helm template flareway oci://ghcr.io/isac322/charts/flareway \
   --namespace flareway-system \
   --set gatewayClass.create=true
 ```
 
-This prints the controller Deployment, RBAC, Services, NetworkPolicies, and —
-because `gatewayClass.create=true` — a `GatewayClass/flareway` plus its
-`GatewayClassConfig/default`. Add `--include-crds` to also render the 22
-Flareway CRDs the chart bundles. `gatewayClass.create` defaults to `false` so
-an install cannot silently take ownership of an existing `GatewayClass`.
+The output contains the controller Deployment, RBAC, Services, and
+NetworkPolicies, plus `GatewayClass/flareway` and `GatewayClassConfig/default`
+because of `gatewayClass.create=true`. Add `--include-crds` to also render the
+Flareway CRDs. `gatewayClass.create` defaults to `false` so that an install
+cannot take ownership of an existing `GatewayClass`.
 
-To go further, the [installation guide](docs/operations/install.md) covers the
-real prerequisites — Gateway API v1.6.2 Standard CRDs, a Cloudflare account
-and scoped API token, a DNS zone for public listeners, WARP prerequisites for
-private listeners — and the `helm upgrade --install` commands for a checkout
-and for the OCI chart once a release is published. Working example manifests,
-credential Secret, `CloudflareAccount` grant, tunnel, Gateway, and Access
-resources, are in [`config/samples/`](config/samples/); every ID, token, and
-hostname in them is a placeholder you must replace before applying.
+## Start here
 
-## Capabilities
+You need a Kubernetes cluster with the Gateway API v1.6.2 Standard CRDs, Helm,
+a Cloudflare account with a scoped API token, and a DNS zone in that account
+for public hostnames. Then follow the guides in order:
 
-Flareway ships 22 CRDs in `flareway.bhyoo.com/v1alpha1`, grouped by area:
+1. [Install](docs/get-started/install.md)
+2. [Connect Cloudflare](docs/get-started/connect-cloudflare.md)
+3. [Expose a Service](docs/get-started/expose-a-service.md)
 
-- **Gateway and account** — `GatewayClassConfig`, `CloudflareAccount`,
-  `CloudflareTunnel`: scoped API credentials, per-namespace grants, tunnel
-  lifecycle, and managed DNS.
-- **Access** — applications, policies, groups, identity providers, device
-  posture, service tokens.
-- **Private networking** — `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`,
-  `WARPConnector` for WARP reachability and k8s-to-VPC site-to-site links.
-- **Account-wide settings** — device profiles and settings, Zero Trust
-  organization, gateway policies, and lists.
+## When it fits, and when it doesn't
 
-The [API reference](docs/api-reference.md) documents every kind; the generated
-CRDs in `config/crd/bases/` are the schema source of truth.
+Flareway fits when you want standard `Gateway` and `HTTPRoute` resources in
+front of Cloudflare Tunnel, Access policies declared next to the routes they
+protect, private services over WARP, or several namespaces sharing one
+Cloudflare account under explicit grants.
 
-## Conformance and testing
+Check these boundaries first:
 
-The [Gateway API conformance report](conformance/reports/v1.6.2/flareway/README.md)
-records a local `dev` run on a kind cluster: GatewayHTTP Core passed 37/37 and
-the claimed Extended features passed 30/30. Two caveats matter:
+- The controller runs as one replica with leader election.
+- `HTTPRoute` is the only route kind. A listener whose `allowedRoutes.kinds`
+  names `GRPCRoute`, `TLSRoute`, `TCPRoute`, or `UDPRoute` reports
+  `ResolvedRefs=False` with reason `InvalidRouteKinds`. For TCP, SSH, or RDP
+  origins, use a [Direct tunnel](docs/get-started/direct-tunnels.md).
+- Some Gateway API features are not supported, including `HTTPRouteRetry`,
+  `ListenerSet`, `GatewayStaticAddresses`, and
+  `HTTPRouteBackendRequestHeaderModification`.
+- Cloudflare's edge limits still apply: it waits 100 seconds for response
+  headers (up to 6,000 on Enterprise), caps request bodies by plan, and closes
+  WebSockets after 100 seconds idle. It does not serve redirects to ports
+  other than 80 and 443 on public hostnames.
 
-- The run used `conformanceMode`, which disables Cloudflare Tunnel, DNS,
-  Access, and WARP entirely. It validates Gateway API behavior through Envoy,
-  not the Cloudflare edge path.
-- The report lists 13 unsupported features (for example `ListenerSet` and
-  `HTTPRouteRetry`).
-
-End-to-end tests against a real Cloudflare account cover the edge path
-(tunnels, DNS, Access) and, on a registered WARP runner, private networking.
-Some live behaviors remain unverified: whether the edge accepts a `127.0.0.1`
-answer for private hostnames, and long-streaming limits. See
-[troubleshooting](docs/operations/troubleshooting.md) for the current state.
-
-## Security model
-
-Two authorization layers both must allow an operation: Kubernetes RBAC for the
-controller, and `CloudflareAccount.spec.grants` for which namespaces,
-hostnames, zones, and exposures may use an account. Flareway fails closed on
-denial, requires explicit `AdoptById` adoption for existing remote objects,
-keeps credentials in Secrets and out of status, and reports a Gateway
-`Programmed` only after edge DNS, tunnel sessions, xDS configuration, and the
-Envoy data plane have all converged. Details:
-[RBAC and API tokens](docs/operations/rbac-token.md).
+[Limits](docs/concepts/limits.md) lists every boundary and what is not yet
+verified.
 
 ## Documentation
 
-- [Installation](docs/operations/install.md)
-- [Upgrade](docs/operations/upgrade.md)
-- [RBAC and Cloudflare API tokens](docs/operations/rbac-token.md)
-- [Troubleshooting](docs/operations/troubleshooting.md)
-- [API reference](docs/api-reference.md) and [kubectl explain guide](docs/api/README.md)
-- [Design document](docs/design/001-cloudflare-gateway-api-integration.md)
-- [Gateway API conformance report](conformance/reports/v1.6.2/flareway/README.md)
-- [Example manifests](config/samples/)
+- **Concepts:** [How it works](docs/concepts/how-it-works.md),
+  [HTTP routing](docs/concepts/http-routing.md),
+  [Conformance report](conformance/reports/v1.6.2/flareway/README.md),
+  [Security model](docs/concepts/security-model.md),
+  [Ownership and adoption](docs/concepts/ownership-and-adoption.md),
+  [Limits](docs/concepts/limits.md)
+- **Get started:** [Install](docs/get-started/install.md),
+  [Connect Cloudflare](docs/get-started/connect-cloudflare.md),
+  [Expose a Service](docs/get-started/expose-a-service.md),
+  [Protect with Access](docs/get-started/protect-with-access.md),
+  [Private services over WARP](docs/get-started/private-services-over-warp.md),
+  [Direct tunnels](docs/get-started/direct-tunnels.md)
+- **Operations:** [Troubleshooting](docs/operations/troubleshooting.md),
+  [Upgrade](docs/operations/upgrade.md),
+  [Drift and API budget](docs/operations/freshness-and-drift.md)
+- **Reference:** [API reference](docs/api-reference.md),
+  [Helm chart values](charts/flareway/README.md),
+  [kubectl explain](docs/api/README.md),
+  [example manifests](config/samples/)
+- **Project:** [Contributing](CONTRIBUTING.md),
+  [Security policy](SECURITY.md),
+  [Code of conduct](CODE_OF_CONDUCT.md),
+  [design documents (Korean)](docs/design/001-cloudflare-gateway-api-integration.md)
+
+Next: [How Flareway works](docs/concepts/how-it-works.md).
 
 ## License
 
