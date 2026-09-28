@@ -8,15 +8,9 @@
 
 Two reconcilers write `CloudflareTunnel` status with server-side apply (SSA). The tunnel reconciler owns the remote tunnel data (`tunnelId`, `dnsRecords`, `clients`, `addresses`, and the identity fields) under the `flareway-tunnel` field manager. In Gateway configuration mode, the Gateway reconciler owns `configVersion`, `hostnames`, and `listeners` under `flareway-gateway`. Both reconcilers also author conditions: the Gateway reconciler reports `ConfigApplied`, and the tunnel reconciler reports `TunnelReady`, `DNSReady`, and the aggregate `Ready`.
 
-`Ready` is a function of `TunnelReady`, `ConfigApplied`, and `DNSReady`. Independent condition commits from independent snapshots can tear: on a converged Gateway, three symptoms combine (issue #92):
+`Ready` is a function of `TunnelReady`, `ConfigApplied`, and `DNSReady`. If the two writers each committed their own conditions from their own snapshots, independent commits could expose a `Ready` value inconsistent with its inputs, restore an obsolete transition timestamp, and generate unnecessary watch events (issue #92): a mid-pass `ConfigApplied=False` could reach consumers such as `kubectl wait` and GitOps health checks, a restored `True` could move `lastTransitionTime` backwards, and a `Ready` derived from a stale snapshot could persist alongside `ConfigApplied=False`. Every condition write would also bump `resourceVersion` and wake both reconcilers through their tunnel watches, so a transient `False` would feed its own churn.
 
-- A Gateway reconcile writes `ConfigApplied=False` (reason `Pending`) partway through the pass and restores `True` at the end, so consumers such as `kubectl wait`, GitOps health checks, and alerts can observe a false negative on a healthy tunnel.
-- The restored `True` takes its `lastTransitionTime` from the pass's starting snapshot, so the timestamp moves backwards.
-- The tunnel reconciler derives `Ready` from a stale snapshot and commits it separately, so `(ConfigApplied=False, Ready=True)` can persist on the API server.
-
-Each condition write also bumps `resourceVersion` and wakes both reconcilers through their tunnel watches, so a transient `False` feeds its own churn.
-
-The design must keep `Ready` consistent with its inputs in every persisted revision, keep a converged tunnel quiet, and keep crash windows around the Cloudflare configuration push fail-closed.
+Conditions must therefore merge against live state and commit together with `Ready` in one transaction; unchanged conditions must not trigger another write. The design must keep `Ready` consistent with its inputs in every persisted revision, keep a converged tunnel quiet, and keep crash windows around the Cloudflare configuration push fail-closed.
 
 ## Decision
 
@@ -86,7 +80,7 @@ The Gateway reconciler writes `ConfigApplied=False` before the programming gate 
 
 ### Remote identity capture
 
-`CreateTunnel` is not idempotent, and `status.tunnelId` is the only record of the created object. The tunnel reconciler commits its conditions before calling `ensureRemoteTunnel`, so the status subresource exists before any create. `persistRemoteIdentity` then records the identity with an RFC 6902 JSON Patch. The patch has one precondition, a `test` operation on `/metadata/uid`, and adds the identity fields the remote read returns — `tunnelId`, `accountId`, `name`, `tunnelType`, `configSource`, `connectorState`, `createdAt`, `deletedAt`, and `ownershipVerified` — skipping any that are absent rather than writing a JSON null. It carries no generation or `resourceVersion` precondition, so a spec edit or a concurrent status write cannot veto the capture. JSON Patch has no SSA ownership semantics, so the patch cannot delete or claim condition entries.
+`CreateTunnel` is not idempotent, and `status.tunnelId` is the only record of the created object. The tunnel reconciler commits its conditions before calling `ensureRemoteTunnel`, so the status subresource exists before any create. `persistRemoteIdentity` then records the identity with an RFC 6902 JSON Patch. The patch has one precondition, a `test` operation on `/metadata/uid`, and adds the identity fields the remote read returns: `tunnelId`, `accountId`, `name`, `tunnelType`, `configSource`, `connectorState`, `createdAt`, `deletedAt`, and `ownershipVerified`. It skips any that are absent rather than writing a JSON null. It carries no generation or `resourceVersion` precondition, so a spec edit or a concurrent status write cannot veto the capture. JSON Patch has no SSA ownership semantics, so the patch cannot delete or claim condition entries.
 
 ### Watches
 

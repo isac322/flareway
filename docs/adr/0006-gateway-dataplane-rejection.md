@@ -11,15 +11,13 @@ For each Gateway, the Gateway reconciler creates and applies the owned dataplane
 
 `GatewayClassConfig` accepts values that Kubernetes admission can still reject. A `nodeSelector` key such as `bad key!` passes the CRD schema, but the API server rejects the resulting Deployment as `Invalid`. Admission webhooks, Pod Security, quotas, RBAC, and immutable-field rules can reject a mutation in the same way.
 
-Such a rejection can leave the Gateway claiming `Programmed=True` with no Event (issue #105). Three behaviors combine:
+A `GatewayClassConfig` edit does not change the Gateway generation, so generation-based invalidation alone cannot establish dataplane convergence. If a mutation loop merely returned admission errors (issue #105):
 
-1. Reconcile persists the Gateway's pre-reconcile status before the owned-object loop, so a stored `Programmed=True` is written back unchanged.
-2. `prepareConditions` demotes `Programmed` to `Unknown` only when its `observedGeneration` differs from the Gateway generation. A `GatewayClassConfig` edit does not change the Gateway generation, so the stale `True` survives.
-3. The loop returns the mutation error directly. Nothing between the failed mutation and the error return records the rejection.
+1. The pre-reconcile status persisted before the owned-object loop would be written back unchanged.
+2. A stale `Programmed=True` would survive, because `prepareConditions` demotes `Programmed` to `Unknown` only when its `observedGeneration` differs from the Gateway generation.
+3. Nothing between the failed mutation and the error return would record the rejection, so a Gateway could claim `Programmed=True` at the current generation indefinitely while Kubernetes rejects its desired dataplane with no Event, even though the error still reaches controller-runtime for retry and the existing Deployment and Services keep serving.
 
-The error still reaches controller-runtime, so the object is retried and the existing Deployment and Services keep serving. The risk is truthfulness: a Gateway can report `Programmed=True` at the current generation indefinitely while Kubernetes rejects its desired dataplane.
-
-The response has to separate a durable rejection from ordinary retry noise. Transient API errors and observation failures must not flap `Programmed`. Status and Events must not echo raw API error payloads, which can carry webhook text or other sensitive detail.
+Rejection reporting must therefore occur at the mutation boundary, before returning the error for retry, without disrupting the serving dataplane. It also has to separate a durable rejection from ordinary retry noise: transient API errors and observation failures must not flap `Programmed`, and status and Events must not echo raw API error payloads, which can carry webhook text or other sensitive detail.
 
 ## Decision
 

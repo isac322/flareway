@@ -12,7 +12,7 @@ For every kind the sweep follows one fail-closed rule. A listing that fails part
 
 DNS records differ from the other kinds because they live in zones. The DNS target lists records zone by zone with one `ListDNSRecordsByComment` call per zone and judges them against the `status.dnsRecords` checkpoints of managed `CloudflareTunnel` objects (see the [API reference](../reference/api.md)). A Cloudflare API token can hold DNS read permission for some zones and not others, so a zone can return HTTP 403 while the rest of the account lists normally.
 
-Under the account-wide rule, one denied zone ends the whole DNS pass (issue #93). The records already collected from healthy zones are thrown away, the zones after it are never listed, and drift in the zones the token can read goes undetected on every pass. The outcome does not depend on where the denied zone sits in the list. The guard that skips checkpoints in unlisted zones never runs, because the pass stops before judgement.
+A DNS sweep that applied that same account-wide rule would end the whole pass on the first denied zone (issue #93): it would throw away the records already collected from healthy zones, never list the zones after it, and leave drift in the zones the token can read undetected on every pass. The outcome does not depend on where the denied zone sits in the list. The guard that skips checkpoints in unlisted zones would never run, because the pass stops before judgement.
 
 A DNS listing failure must have a narrower scope than a whole pass. The decision also has to keep two properties:
 
