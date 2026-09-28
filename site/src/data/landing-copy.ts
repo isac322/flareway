@@ -6,7 +6,7 @@
 //   with `set:html`: use only <code>, <sup>, <em>, <strong>, and <a>.
 // - Every other field is plain text and is escaped.
 // - Every claim must trace to the repository (README.md, config/samples/,
-//   conformance/reports/v1.6.2/flareway/). ™/® marks go on first use only.
+//   docs/conformance/v1.6.2/flareway/). ™/® marks go on first use only.
 // - `lines` on demo outputs reference YAML lines as `<file>:<from>-<to>` where
 //   file is `g` (gateway_v1_gateway.yaml) or `r` (gateway_v1_httproute.yaml).
 
@@ -371,7 +371,7 @@ export const landingCopy: LandingCopy = {
 		ledeHtml:
 			'<code>helm template</code> renders what the chart would install, so you can read it before anything runs. Needs Helm 4.3 or a compatible Helm 3 client.',
 		command:
-			'helm template flareway oci://ghcr.io/isac322/charts/flareway \\\n  --namespace flareway-system \\\n  --set gatewayClass.create=true',
+			'helm template flareway oci://ghcr.io/isac322/charts/flareway \\\n  --namespace flareway-system \\\n  --set gatewayClass.create=true \\\n  --set gatewayClass.config.accountRefName=example-account',
 		commandCaption: 'Pulls the published chart. No cluster, no Cloudflare credentials.',
 		copy: 'Copy',
 		copied: 'Copied',
@@ -383,7 +383,7 @@ export const landingCopy: LandingCopy = {
 			'Services',
 			'NetworkPolicies',
 			'<code>GatewayClass/flareway</code>, because <code>gatewayClass.create=true</code>',
-			'its <code>GatewayClassConfig/default</code>',
+			'its <code>GatewayClassConfig/default</code>, which names the <code>example-account</code> CloudflareAccount',
 		],
 		notesHtml: [
 			'Add <code>--include-crds</code> to also render the Flareway CRDs.',

@@ -4,7 +4,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: posture-access-client-id
-  namespace: default
+  namespace: flareway-platform
 type: Opaque
 stringData:
   clientId: replace-with-access-client-id
@@ -13,7 +13,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: posture-access-client-secret
-  namespace: default
+  namespace: flareway-platform
 type: Opaque
 stringData:
   clientSecret: replace-with-access-client-secret
@@ -25,7 +25,7 @@ metadata:
     app.kubernetes.io/name: flareway
     app.kubernetes.io/managed-by: kustomize
   name: devicepostureintegration-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

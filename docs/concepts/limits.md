@@ -12,7 +12,7 @@ The controller runs as one replica with leader election enabled, and Gateways ar
 
 Flareway implements `HTTPRoute`. `GRPCRoute`, `TLSRoute`, `TCPRoute`, and `UDPRoute` are not implemented. A listener whose `allowedRoutes.kinds` names any kind other than `HTTPRoute` reports `ResolvedRefs=False` with reason `InvalidRouteKinds`. To reach private TCP services, use a `NetworkRoute` or a [Direct tunnel](../get-started/direct-tunnels.md).
 
-The [conformance report](../../conformance/reports/v1.6.2/flareway/README.md) lists these Gateway API features as unsupported:
+The controller does not claim these Gateway API features in `GatewayClass.status.supportedFeatures`:
 
 - `GatewayAddressEmpty`
 - `GatewayBackendClientCertificate`
@@ -21,7 +21,6 @@ The [conformance report](../../conformance/reports/v1.6.2/flareway/README.md) li
 - `GatewayPort8080`
 - `GatewayStaticAddresses`
 - `HTTPRouteBackendRequestHeaderModification`
-- `HTTPRouteDestinationPortMatching`
 - `HTTPRouteNamedRouteRule`
 - `HTTPRouteRetry`
 - `HTTPRouteRetryBackendTimeout`
@@ -32,7 +31,7 @@ Some of these are refused with a specific reason:
 
 | Configuration | Result |
 |---|---|
-| `Gateway.spec.addresses` set | `Accepted=False`, reason `UnsupportedAddress`. Cloudflare owns the edge address. |
+| `Gateway.spec.addresses` set, with or without a value (`GatewayStaticAddresses`, `GatewayAddressEmpty`) | `Accepted=False`, reason `UnsupportedAddress`. Cloudflare owns the edge addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
 | `Gateway.spec.allowedListeners` set (`ListenerSet`) | `Accepted=False`, reason `ListenersNotValid`. |
 | An `ExtensionRef` filter on a rule | The rule is invalid with reason `InvalidKind`. Flareway defines no extension filter kinds. |
 | A `backendRef` to anything other than a core `Service` | Reason `InvalidKind`. An `ExternalName` Service is treated as not found. |
@@ -73,7 +72,7 @@ For long streams, set `timeouts.request: 0s` on the `HTTPRoute` and raise `proxy
 
 Access revocation is bounded by token expiry. Cloudflare propagates a revoked session to its edge in about 20 to 30 seconds, but `cloudflared` and Envoy validate Access JWTs without calling Cloudflare, so a signed token stays valid at the origin until its `exp` time.
 
-Out-of-band edits are detected after a delay. Changes made through Kubernetes apply at once. Edits made in the Cloudflare dashboard or by another tool are found by a periodic sweep. Its default intervals are 60 seconds for Access objects, 5 minutes for tunnels, DNS, and private routes, and 30 minutes for device and organization settings. Between completed passes the sweep waits the interval plus up to 20% jitter, and sweep duration, rate limiting, and API failures can delay detection further, so treat these as polling intervals rather than deadlines. They are controller flags; the Helm chart exposes no values for them.
+Out-of-band edits are detected after a delay. Changes made through Kubernetes apply at once. Edits made in the Cloudflare dashboard or by another tool are found by a periodic sweep. Its default intervals are 60 seconds for Access objects, 5 minutes for tunnels, DNS, and private routes, and 30 minutes for device and organization settings. Between completed passes the sweep waits the interval plus up to 20% jitter, and sweep duration, rate limiting, and API failures can delay detection further, so treat these as polling intervals rather than deadlines. The Helm chart sets the intervals with its `reconcile.freshness` values.
 
 Cloudflare API calls share a fixed budget. Reconcilers use 3.5 requests per second and the drift sweep uses 0.5, which keeps both inside Cloudflare's account limit of 4.0 requests per second.
 
@@ -81,6 +80,6 @@ Cloudflare API calls share a fixed budget. Reconcilers use 3.5 requests per seco
 
 ## API and support
 
-The API version is `flareway.bhyoo.com/v1alpha1`. Only the most recent release receives fixes; there is no long-term support line and no backport policy. See the [security policy](../../SECURITY.md) for how to report a vulnerability.
+The API version is `flareway.bhyoo.com/v1alpha1`. Only the most recent release receives fixes; there is no long-term support line and no backport policy. See the [security policy](../SECURITY.md) for how to report a vulnerability.
 
 Next: [Install Flareway](../get-started/install.md).

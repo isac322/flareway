@@ -2,9 +2,9 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: HostnameRoute
 metadata:
   name: private-admin
-  namespace: flareway-system
+  namespace: flareway-platform
   labels:
-    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/private-route: platform
 spec:
   accountRef:
     name: example-account
@@ -12,12 +12,9 @@ spec:
   tunnelRef:
     kind: CloudflareTunnel
     name: private-gateway
-    namespace: demo
+    namespace: flareway-platform
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: demo
+    from: Same
   comment: Private admin hostname through the Gateway tunnel
   managementPolicy: Managed
   deletionPolicy: Delete
@@ -26,9 +23,9 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: HostnameRoute
 metadata:
   name: branch-dns
-  namespace: flareway-system
+  namespace: flareway-platform
   labels:
-    flareway.bhyoo.com/tenant: demo
+    flareway.bhyoo.com/private-route: platform
 spec:
   accountRef:
     name: example-account
@@ -36,12 +33,9 @@ spec:
   tunnelRef:
     kind: WARPConnector
     name: branch-local
-    namespace: demo
+    namespace: flareway-platform
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: demo
+    from: Same
   comment: Private DNS hostname through the local-HA WARP Connector
   managementPolicy: Managed
   deletionPolicy: Delete

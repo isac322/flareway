@@ -110,6 +110,17 @@ spec:
         namespaces: Same
         kinds: [Service]
       platformObjects: Denied
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: flareway-platform
+      hostnames: ["app.example.com", "ssh.example.com"]
+      zones: ["example.com"]
+      exposures: [Public, Private]
+      unprotectedHostnames: ["app.example.com", "ssh.example.com"]
+      privateRoutes:
+        networkRouteSelector: {}
+        hostnameRouteSelector: {}
+      platformObjects: Allowed
 ```
 
 A matching grant is required before a controller reads a referenced Secret or calls Cloudflare. Grants independently authorize hostname, DNS zone, listener exposure, reusable policy references, custom pages, posture integrations, standalone applications, private routes, platform objects, and Kubernetes backends.
@@ -156,16 +167,16 @@ spec:
     allowAuthenticateViaWarp: true
     autoRedirectToIdentity: true
     allowedIdpRefs:
-      - name: corporate-oidc
+      - externalId: "00000000-0000-0000-0000-000000000001"
     customPageRefs:
       - objectRef:
           name: access-denied
-          namespace: flareway-system
+          namespace: flareway-platform
     serviceAuth401Redirect: true
   policies:
     - policyRef:
         name: employees
-        namespace: flareway-system
+        namespace: flareway-platform
   originJWT:
     mode: Required
     audienceScope: Application
@@ -216,7 +227,7 @@ spec:
       worker: {workerId: "worker-id"}
 ```
 
-The referenced route must cover the private destination. Both the matching account grant and the route's `allowedNamespaces` must authorize the application namespace.
+The referenced route must cover the private destination. `networkRouteRef` and `hostnameRouteRef` name a route in the application's own namespace. The matching account grant must authorize the application namespace for that route kind and labels. The route's `allowedNamespaces` is evaluated against that same namespace: `Same` and `All` always admit it, and `Selector` admits it only when the namespace labels match.
 
 #### Attached variants
 
@@ -268,7 +279,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessStandaloneApplication
 metadata:
   name: device-enrollment
-  namespace: flareway-system
+  namespace: flareway-platform
 spec:
   accountRef: {name: production}
   type: WARP
@@ -318,7 +329,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: ServiceToken
 metadata:
   name: deployment-client
-  namespace: payments
+  namespace: flareway-platform
 spec:
   accountRef: {name: production}
   name: deployment-client
@@ -389,7 +400,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: CloudflareTunnel
 metadata:
   name: direct-origin
-  namespace: platform
+  namespace: flareway-platform
 spec:
   accountRef: {name: production}
   tunnel: {name: direct-origin}
@@ -456,7 +467,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: WARPConnector
 metadata:
   name: mesh-egress
-  namespace: flareway-system
+  namespace: flareway-platform
 spec:
   accountRef: {name: production}
   name: mesh-egress
@@ -481,24 +492,21 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: NetworkRoute
 metadata:
   name: payments-cidr
-  namespace: platform
+  namespace: flareway-platform
 spec:
   accountRef: {name: production}
   network: 10.40.0.0/16
   tunnelRef:
     kind: WARPConnector
     name: mesh-egress
-    namespace: flareway-system
+    namespace: flareway-platform
   virtualNetworkRef: {name: production}
   allowedNamespaces:
-    from: Selector
-    selector:
-      matchLabels:
-        flareway.bhyoo.com/tenant: payments
+    from: Same
   deletionPolicy: Orphan
 ```
 
-`TunnelReference.kind` is `CloudflareTunnel` or `WARPConnector`; omission defaults to `CloudflareTunnel`. `NetworkRoute` and `HostnameRoute` both use this reference and `allowedNamespaces.from: Same|All|Selector`.
+`TunnelReference.kind` is `CloudflareTunnel` or `WARPConnector`; omission defaults to `CloudflareTunnel`. `NetworkRoute` and `HostnameRoute` both use this reference and `allowedNamespaces.from: Same|All|Selector` (default `Same`). The route controller checks the namespace of the referenced tunnel against `allowedNamespaces` and reports `RefNotPermitted` when it is not admitted, so a `Same` route must reference a tunnel in its own namespace. A `DeviceProfile` can include a route only when the route's `allowedNamespaces` admits the profile's namespace.
 
 ## Zero Trust organization, Gateway policies, and lists
 
@@ -527,7 +535,7 @@ Use the same process for bypass-child applications. Do not switch an application
 
 The remote ownership ledger uses tags where Cloudflare supports tags, deterministic comments for DNS and private-network resources, prefixed names where only names exist, and status remote IDs. A foreign or ambiguous marker produces `Conflict`; the controller does not overwrite the object.
 
-[Ownership and adoption](concepts/ownership-and-adoption.md) explains how the ledger, adoption, and teardown fit together.
+[Ownership and adoption](../concepts/ownership-and-adoption.md) explains how the ledger, adoption, and teardown fit together.
 
 ## Parity ledger and intentional exclusions
 

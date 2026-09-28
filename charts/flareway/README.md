@@ -35,8 +35,6 @@ Tunnel configuration mode and management-token issuance are resource-level setti
 
 The chart therefore does not expose global Direct-mode or management-token values.
 
-The drift-detection and freshness flags (`--freshness-*`, `--drift-policy`, `--disable-sweep`) have no chart values either; the manager runs with their defaults. See [Drift detection and Cloudflare API budget](https://flareway.bhyoo.com/docs/operations/freshness-and-drift/).
-
 ## Main values
 
 | Value | Default | Description |
@@ -51,6 +49,12 @@ The drift-detection and freshness flags (`--freshness-*`, `--drift-policy`, `--d
 | `logging.development` | `false` | Run the controller logger in development mode (`--zap-devel`). |
 | `logging.level` | `info` | Controller log level (`--zap-log-level`). |
 | `logging.encoder` | `json` | Controller log encoder (`--zap-encoder`). |
+| `reconcile.driftPolicy` | `Overwrite` | Reaction to out-of-band Cloudflare changes (`--drift-policy`). |
+| `reconcile.freshness.authz` | `60s` | Read-skip TTL for T1 (Access) kinds (`--freshness-authz`). |
+| `reconcile.freshness.traffic` | `300s` | Read-skip TTL for T2 (traffic-path) kinds (`--freshness-traffic`). |
+| `reconcile.freshness.indirect` | `1800s` | Read-skip TTL for T3 (device and organization) kinds (`--freshness-indirect`). |
+| `reconcile.freshness.display` | `0s` | Read-skip TTL for T4 display-only reads (`--freshness-display`). |
+| `reconcile.disableSweep` | `false` | Stop the periodic drift sweep worker (`--disable-sweep`). |
 | `controllers.gateway` | `true` | Enable the Gateway and account controller group. |
 | `controllers.access` | `true` | Enable the Access controller group. |
 | `controllers.privateNetwork` | `true` | Enable private-network and WARP Connector controllers. |
@@ -67,6 +71,34 @@ The drift-detection and freshness flags (`--freshness-*`, `--drift-policy`, `--d
 | `gatewayClass.config.scheduling` | `{}` | Dataplane pod placement (`nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`) rendered into the `GatewayClassConfig`. |
 
 `helm show values` lists pod placement, security context, resources, Service annotations, and the complete `GatewayClassConfig` defaults. The top-level `nodeSelector`, `tolerations`, `affinity`, and `topologySpreadConstraints` values place only the controller-manager pod; dataplane pods are placed through `gatewayClass.config.scheduling`.
+
+## Drift detection and freshness
+
+The `reconcile` values map to the manager's drift and freshness flags and are rendered unconditionally after the controller group flags. Their defaults match the manager's built-in defaults.
+
+| Value | Flag | Accepted values |
+|---|---|---|
+| `reconcile.driftPolicy` | `--drift-policy` | `Overwrite` restores the desired state over an out-of-band change. `Hold` reports the drift and skips the remote write until the spec changes or the remote is repaired. |
+| `reconcile.freshness.authz` | `--freshness-authz` | Duration; applies to `AccessApplication`, `AccessStandaloneApplication`, `AccessPolicy`, `AccessGroup`, `AccessCustomPage`, `AccessInfrastructureTarget`, `ServiceToken`, `IdentityProvider` |
+| `reconcile.freshness.traffic` | `--freshness-traffic` | Duration; applies to `CloudflareTunnel`, DNS records, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute` |
+| `reconcile.freshness.indirect` | `--freshness-indirect` | Duration; applies to `DeviceProfile`, `DeviceSettings`, `DevicePostureRule`, `DevicePostureIntegration`, `ZeroTrustOrganization`, `WARPConnector` |
+| `reconcile.freshness.display` | `--freshness-display` | Duration; no Flareway kind uses the T4 grade |
+| `reconcile.disableSweep` | `--disable-sweep` | `true` or `false` |
+
+A freshness value is how long a converged object skips Cloudflare reads. The schema accepts a whole number followed by `ms`, `s`, `m`, or `h`, such as `90s` or `30m`. `0s` keeps that grade's gate closed, so its objects read Cloudflare on every pass. The manager exits at startup unless the positive values satisfy `authz` ≤ `traffic` ≤ `indirect`; the schema does not check that ordering.
+
+With `reconcile.disableSweep=true`, freshness gates keep working, and out-of-band drift is detected only when an object's TTL expires.
+
+```sh
+helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \
+  --version <chart-version> \
+  --namespace flareway-system \
+  --reuse-values \
+  --set reconcile.driftPolicy=Hold \
+  --set reconcile.freshness.traffic=120s
+```
+
+For grades, the sweep, detection bounds, and API budget, see [Drift detection and Cloudflare API budget](https://flareway.bhyoo.com/docs/operations/freshness-and-drift/).
 
 ## Logging
 

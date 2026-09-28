@@ -2,7 +2,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: DeviceSettings
 metadata:
   name: default
-  namespace: flareway-system
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

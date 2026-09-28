@@ -121,12 +121,12 @@ Flareway's own resources are in the `flareway.bhyoo.com/v1alpha1` API group:
 | Private network | `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, `WARPConnector` |
 | Account-wide settings | `DeviceProfile`, `DeviceSettings`, `ZeroTrustOrganization`, `ZeroTrustGatewayPolicy`, `ZeroTrustList` |
 
-The [API reference](../api-reference.md) documents every field.
+The [API reference](../reference/api.md) documents every field.
 
-## Design documents
+## Architecture decisions
 
-The design documents specify the full model, including ownership, adoption,
-and fail-closed behavior. They are written in Korean:
-
-- [Cloudflare Gateway API integration](../design/001-cloudflare-gateway-api-integration.md)
-- [Tunnel status consistency](../design/002-tunnel-status-consistency.md)
+The [architecture decision records](../adr/README.md) explain why Flareway is
+built this way. Start with
+[ADR 0001: Gateway API on Cloudflare Tunnel](../adr/0001-gateway-api-on-cloudflare.md)
+for the overall model; the tunnel status contract is in
+[ADR 0004: One field manager for tunnel conditions](../adr/0004-tunnel-status-condition-ownership.md).

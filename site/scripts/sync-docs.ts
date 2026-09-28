@@ -35,7 +35,7 @@ const PAGES: Page[] = [
 	{ source: 'docs/concepts/how-it-works.md', target: 'concepts/how-it-works.md', order: 1, label: 'How it works' },
 	{ source: 'docs/concepts/http-routing.md', target: 'concepts/http-routing.md', order: 2, label: 'HTTP routing' },
 	{
-		source: 'conformance/reports/v1.6.2/flareway/README.md',
+		source: 'docs/conformance/v1.6.2/flareway/README.md',
 		target: 'concepts/conformance.md',
 		order: 3,
 		label: 'Conformance report',
@@ -82,12 +82,49 @@ const PAGES: Page[] = [
 		order: 3,
 		label: 'Drift and API budget',
 	},
-	{ source: 'docs/api-reference.md', target: 'reference/api.md', order: 1, label: 'API reference' },
+	{ source: 'docs/reference/api.md', target: 'reference/api.md', order: 1, label: 'API reference' },
 	{ source: 'charts/flareway/README.md', target: 'reference/helm-chart.md', order: 2, label: 'Helm chart values' },
-	{ source: 'docs/api/README.md', target: 'reference/kubectl-explain.md', order: 3, label: 'kubectl explain' },
-	{ source: 'CONTRIBUTING.md', target: 'project/contributing.md', order: 1, label: 'Contributing' },
-	{ source: 'SECURITY.md', target: 'project/security.md', order: 2, label: 'Security policy' },
-	{ source: 'CODE_OF_CONDUCT.md', target: 'project/code-of-conduct.md', order: 3, label: 'Code of conduct' },
+	{ source: 'docs/reference/kubectl-explain.md', target: 'reference/kubectl-explain.md', order: 3, label: 'kubectl explain' },
+	{ source: 'docs/CONTRIBUTING.md', target: 'project/contributing.md', order: 1, label: 'Contributing' },
+	{ source: 'docs/SECURITY.md', target: 'project/security.md', order: 2, label: 'Security policy' },
+	{ source: 'docs/CODE_OF_CONDUCT.md', target: 'project/code-of-conduct.md', order: 3, label: 'Code of conduct' },
+	{ source: 'docs/adr/README.md', target: 'project/adr/index.md', order: 0, label: 'Overview' },
+	{
+		source: 'docs/adr/0001-gateway-api-on-cloudflare.md',
+		target: 'project/adr/0001-gateway-api-on-cloudflare.md',
+		order: 1,
+		label: '0001 Gateway API on Cloudflare',
+	},
+	{
+		source: 'docs/adr/0002-dns-sweep-zone-isolation.md',
+		target: 'project/adr/0002-dns-sweep-zone-isolation.md',
+		order: 2,
+		label: '0002 DNS sweep zone isolation',
+	},
+	{
+		source: 'docs/adr/0003-production-logging-defaults.md',
+		target: 'project/adr/0003-production-logging-defaults.md',
+		order: 3,
+		label: '0003 Production logging defaults',
+	},
+	{
+		source: 'docs/adr/0004-tunnel-status-condition-ownership.md',
+		target: 'project/adr/0004-tunnel-status-condition-ownership.md',
+		order: 4,
+		label: '0004 Tunnel status conditions',
+	},
+	{
+		source: 'docs/adr/0005-servicetoken-create-before-capture.md',
+		target: 'project/adr/0005-servicetoken-create-before-capture.md',
+		order: 5,
+		label: '0005 ServiceToken create before capture',
+	},
+	{
+		source: 'docs/adr/0006-gateway-dataplane-rejection.md',
+		target: 'project/adr/0006-gateway-dataplane-rejection.md',
+		order: 6,
+		label: '0006 Gateway dataplane rejection',
+	},
 ];
 
 /** `get-started/install.md` -> `/docs/get-started/install/`, `index.md` -> `/docs/`. */

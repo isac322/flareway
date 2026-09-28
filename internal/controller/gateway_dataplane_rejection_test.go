@@ -52,7 +52,7 @@ import (
 // These specs drive the real Gateway Reconcile against a stateful fake API
 // seeded with a healthy, same-generation Programmed=True Gateway, and inject
 // typed API failures at the owned-object boundary. They pin the observable
-// contract of docs/qa-gateway-dataplane-rejection.md (Q4-Q9, Q11): which
+// contract of docs/adr/0006-gateway-dataplane-rejection.md: which
 // failures demote Programmed, which Events are emitted, what the caller can
 // still discover from the returned error, and what is left untouched.
 

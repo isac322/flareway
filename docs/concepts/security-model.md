@@ -15,7 +15,7 @@ An operation proceeds only when both layers allow it. Deny is the default:
 
 ## Account grants
 
-A grant selects namespaces with a label selector and lists what those namespaces may use. This grant from [`config/samples/flareway_v1alpha1_cloudflareaccount.yaml`](../../config/samples/flareway_v1alpha1_cloudflareaccount.yaml) lets the `default` namespace publish public hostnames under `example.com`:
+A grant selects namespaces with a label selector and lists what those namespaces may use. [`config/samples/flareway_v1alpha1_cloudflareaccount.yaml`](../../config/samples/flareway_v1alpha1_cloudflareaccount.yaml) declares two grants: one for a tenant namespace and one for a platform namespace. This tenant grant lets the `default` namespace publish public hostnames under `example.com` and reference shared Access objects, but not create them:
 
 ```yaml
 grants:
@@ -32,6 +32,7 @@ grants:
   - app.example.com
   - public.example.com
   accessPolicyRefs: Allowed
+  accessCustomPageRefs: Allowed
   backends:
     namespaces: Same
     kinds:
@@ -53,9 +54,9 @@ grants:
 
 Treat `unprotectedHostnames` as a security boundary. Add a hostname only when the platform intends to serve at least one route on it without Access. A public path carve-out under a protected parent also needs its hostname here, even though the parent path stays protected.
 
-Leave `platformObjects: Denied` unless you trust the namespace to manage these shared account resources.
+Leave `platformObjects: Denied` unless you trust the namespace to manage these shared account resources. The samples give that trust to one namespace, `flareway-platform`, whose grant sets `platformObjects: Allowed`, adds `Private` to `exposures`, and selects private routes by the label `flareway.bhyoo.com/private-route: platform`. Shared Access objects, private networking, WARP connectors, the Direct tunnel, and the private Gateway live there. Tenant namespaces keep `platformObjects: Denied` and reach the shared Access objects through `policyRef.namespace` and `customPageRefs[].objectRef.namespace`, which `accessPolicyRefs` and `accessCustomPageRefs` permit.
 
-The grant fields are defined in the [API reference](../api-reference.md). The Cloudflare API token and the capabilities each feature needs are covered in [Connect a Cloudflare account](../get-started/connect-cloudflare.md).
+The grant fields are defined in the [API reference](../reference/api.md). The Cloudflare API token and the capabilities each feature needs are covered in [Connect a Cloudflare account](../get-started/connect-cloudflare.md).
 
 ## Authorize before provisioning
 
@@ -133,4 +134,4 @@ Split tenant RBAC by duty:
 - Platform teams own `CloudflareAccount`, its grants, account-wide settings, and shared private-network resources.
 - Only Secret administrators read credential, AUD, tunnel-token, and service-token Secrets.
 
-[Ownership, adoption, and teardown](ownership-and-adoption.md) covers how Flareway claims and releases Cloudflare objects. To report a vulnerability, follow the [security policy](../../SECURITY.md).
+[Ownership, adoption, and teardown](ownership-and-adoption.md) covers how Flareway claims and releases Cloudflare objects. To report a vulnerability, follow the [security policy](../SECURITY.md).

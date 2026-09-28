@@ -26,15 +26,36 @@ import (
 )
 
 func TestPrivateGatewaySampleAuthorizesOriginJWTDisableAndReferencesTLSSecret(t *testing.T) {
-	objects := decodeSample(t, "gateway_v1_private_gateway.yaml")
-	namespace := sampleByKind(t, objects, "Namespace")
+	namespace := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_cloudflareaccount.yaml"), "Namespace")
+	if namespace.GetName() != "flareway-platform" {
+		t.Fatalf("CloudflareAccount sample namespace = %q, want flareway-platform", namespace.GetName())
+	}
 	if namespace.GetLabels()["flareway.bhyoo.com/allow-origin-jwt-disable"] != "true" {
 		t.Fatal("private Gateway namespace must explicitly approve originJWT Disabled")
+	}
+	objects := decodeSample(t, "gateway_v1_private_gateway.yaml")
+	for _, object := range objects {
+		if object.GetNamespace() != namespace.GetName() {
+			t.Fatalf("%s %s namespace = %q, want %q", object.GetKind(), object.GetName(), object.GetNamespace(), namespace.GetName())
+		}
 	}
 	tunnel := sampleByKind(t, objects, "CloudflareTunnel")
 	mode, found, err := unstructured.NestedString(tunnel.Object, "spec", "configuration", "mode")
 	if err != nil || !found || mode != "Gateway" {
 		t.Fatalf("private tunnel configuration mode = %q, found=%t, err=%v", mode, found, err)
+	}
+	tunnelListeners, found, err := unstructured.NestedSlice(tunnel.Object, "spec", "listeners")
+	if err != nil || !found || len(tunnelListeners) != 1 {
+		t.Fatalf("private tunnel listeners = %#v, found=%t, err=%v", tunnelListeners, found, err)
+	}
+	vnetName, found, err := unstructured.NestedString(tunnelListeners[0].(map[string]any), "virtualNetworkRef", "name")
+	if err != nil || !found {
+		t.Fatalf("private tunnel listener virtualNetworkRef found=%t err=%v", found, err)
+	}
+	// A private listener only uses a VirtualNetwork from the tunnel's own namespace.
+	vnet := sampleByKind(t, decodeSample(t, "flareway_v1alpha1_virtualnetwork.yaml"), "VirtualNetwork")
+	if vnet.GetName() != vnetName || vnet.GetNamespace() != tunnel.GetNamespace() {
+		t.Fatalf("VirtualNetwork %s/%s does not serve private listener VirtualNetwork %s/%s", vnet.GetNamespace(), vnet.GetName(), tunnel.GetNamespace(), vnetName)
 	}
 	gateway := sampleByKind(t, objects, "Gateway")
 	listeners, found, err := unstructured.NestedSlice(gateway.Object, "spec", "listeners")

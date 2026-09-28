@@ -56,7 +56,7 @@ import (
 )
 
 // This file implements the QA matrix of
-// docs/design/002-dns-sweep-zone-isolation-qa.md (issue #93): per-zone listing
+// docs/adr/0002-dns-sweep-zone-isolation.md (issue #93): per-zone listing
 // failures must be isolated so one denied zone cannot discard the healthy
 // zones' drift findings. The probe harness injects faults only at the
 // flarecloudflare.API boundary; the real sweepDNSRecords, RunTargetOnce, and

@@ -27,7 +27,7 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="${VERSION:-dev}"
 fi
 
-REPORT_OUTPUT="${REPORT_OUTPUT:-conformance/reports/v1.6.2/flareway/standard-${VERSION}-default-report.yaml}"
+REPORT_OUTPUT="${REPORT_OUTPUT:-docs/conformance/v1.6.2/flareway/standard-${VERSION}-default-report.yaml}"
 if [[ "${REPORT_OUTPUT}" != /* ]]; then
   REPORT_OUTPUT="${ROOT_DIR}/${REPORT_OUTPUT}"
 fi

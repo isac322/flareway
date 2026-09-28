@@ -6,8 +6,8 @@ Publish a Service on a public hostname with a `CloudflareTunnel`, `Gateway`, and
 
 This guide changes a real Cloudflare account. You need:
 
-- Flareway installed as in [Install](install.md), with `GatewayClass/flareway` accepted.
-- The `CloudflareAccount` from [Connect a Cloudflare account](connect-cloudflare.md), with `Accepted` and `CredentialsValid` both `True`, and a token that has the tunnel and DNS capabilities.
+- Flareway installed as in [Install](install.md).
+- The `CloudflareAccount` and `GatewayClass/flareway` from [Connect a Cloudflare account](connect-cloudflare.md). The account shows `Accepted` and `CredentialsValid` both `True`, its token has the tunnel and DNS capabilities, and the class shows `Accepted=True`.
 - A namespace that matches the account's grant. The examples use `default`.
 - A hostname in a zone the grant allows. Because this route has no Access application, the hostname must also be listed in the grant's `unprotectedHostnames`.
 - A Service to publish in the same namespace. The examples send traffic to `example-service` on port 8080.

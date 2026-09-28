@@ -42,7 +42,7 @@ invariants protect:
 - Access JWT (`Cf-Access-Jwt-Assertion`) verification at the origin
   (`cloudflared` and the Envoy data plane).
 
-The [security model](docs/concepts/security-model.md) explains how these
+The [security model](concepts/security-model.md) explains how these
 protections work. The normative rules live in
-[`.agents/rules/flareway-invariants.md`](.agents/rules/flareway-invariants.md);
+[`.agents/rules/flareway-invariants.md`](../.agents/rules/flareway-invariants.md);
 this file names the surfaces rather than restating them.

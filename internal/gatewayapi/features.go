@@ -41,6 +41,7 @@ var supportedFeatures = []features.FeatureName{
 	features.SupportHTTPRouteBackendProtocolWebSocket,
 	features.SupportHTTPRouteBackendTimeout,
 	features.SupportHTTPRouteCORS,
+	features.SupportHTTPRouteDestinationPortMatching,
 	features.SupportHTTPRouteHostRewrite,
 	features.SupportHTTPRouteMethodMatching,
 	features.SupportHTTPRouteParentRefPort,

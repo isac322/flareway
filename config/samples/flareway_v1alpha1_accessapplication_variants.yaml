@@ -1,5 +1,7 @@
 # Gateway-attached Access application variants. Object references and remote IDs
 # are examples; replace them before applying these manifests.
+# Access policies and the custom page are shared objects in flareway-platform;
+# the default namespace grant permits these cross-namespace references.
 apiVersion: flareway.bhyoo.com/v1alpha1
 kind: AccessApplication
 metadata:
@@ -21,19 +23,24 @@ spec:
     allowAuthenticateViaWarp: true
     autoRedirectToIdentity: true
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference the shared provider in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000001"
     appLauncherVisible: true
     customPageRefs:
     - objectRef:
         name: accesscustompage-sample
+        namespace: flareway-platform
     tags:
     - example
     - admin
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   - policyRef:
       name: deny-everyone
+      namespace: flareway-platform
   originJWT:
     mode: Required
     audienceScope: Application
@@ -63,6 +70,7 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed
@@ -91,6 +99,7 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed
@@ -127,6 +136,7 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed
@@ -150,10 +160,13 @@ spec:
     name: MCP server
     sessionDuration: 8h
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference the shared provider in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000001"
     customPageRefs:
     - objectRef:
         name: accesscustompage-sample
+        namespace: flareway-platform
     oauthConfiguration:
       enabled: true
       dynamicClientRegistration:
@@ -168,6 +181,7 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed
@@ -193,10 +207,13 @@ spec:
     sessionDuration: 8h
     autoRedirectToIdentity: true
     allowedIdpRefs:
-    - name: google
+    # IdentityProvider objects resolve only in the application namespace;
+    # reference the shared provider in flareway-platform by its Cloudflare ID.
+    - externalId: "00000000-0000-0000-0000-000000000001"
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
   managementPolicy: Managed
@@ -263,6 +280,7 @@ spec:
   policies:
   - policyRef:
       name: allow-developers-warp
+      namespace: flareway-platform
   originJWT:
     mode: Required
     audienceScope: Hostname
@@ -293,6 +311,7 @@ spec:
   policies:
   - policyRef:
       name: allow-reporting-service
+      namespace: flareway-platform
   originJWT:
     mode: Required
     audienceScope: Hostname

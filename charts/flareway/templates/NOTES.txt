@@ -5,12 +5,10 @@ Prerequisite: install the Gateway API v1.6.2 standard CRDs before creating a Gat
   kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
 
 {{- if not .Values.gatewayClass.create }}
-The chart did not create a GatewayClass. Create a GatewayClassConfig and GatewayClass, or reinstall with:
+The chart did not create a GatewayClass. After you create a CloudflareAccount, create it with:
 
-  --set gatewayClass.create=true
-{{- else if and (not .Values.gatewayClass.config.conformanceMode) (not .Values.gatewayClass.config.accountRefName) }}
-GatewayClass {{ .Values.gatewayClass.name }} was created without an accountRef. Create a CloudflareAccount and set
-GatewayClassConfig {{ .Values.gatewayClass.configName }} spec.accountRef before using Cloudflare mode.
+  helm upgrade {{ .Release.Name }} oci://ghcr.io/isac322/charts/flareway --version {{ .Chart.Version }} --namespace {{ include "flareway.namespace" . }} --reuse-values \
+    --set gatewayClass.create=true --set gatewayClass.config.accountRefName=<CloudflareAccount name>
 {{- end }}
 
 The chart bundles only Flareway CRDs. Helm retains CRDs and the system namespace on uninstall.

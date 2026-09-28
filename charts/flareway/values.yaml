@@ -36,6 +36,28 @@ logging:
   # --zap-encoder: json or console.
   encoder: json
 
+# Drift handling and Cloudflare read freshness. Each value maps to one
+# controller-manager flag; the defaults match the manager's built-in defaults.
+reconcile:
+  # --drift-policy: Overwrite restores the desired state over out-of-band
+  # changes; Hold skips the remote write until the spec changes or the remote
+  # is repaired.
+  driftPolicy: Overwrite
+  # How long a converged object skips Cloudflare reads, per freshness grade.
+  # 0s keeps the gate closed, so every pass reads Cloudflare. Positive values
+  # must satisfy authz <= traffic <= indirect.
+  freshness:
+    # --freshness-authz: T1 kinds such as AccessApplication and AccessPolicy.
+    authz: 60s
+    # --freshness-traffic: T2 kinds such as CloudflareTunnel and DNS records.
+    traffic: 300s
+    # --freshness-indirect: T3 kinds such as DeviceProfile and WARPConnector.
+    indirect: 1800s
+    # --freshness-display: T4 display-only reads. No Flareway kind uses T4.
+    display: 0s
+  # --disable-sweep: stop the periodic drift sweep worker.
+  disableSweep: false
+
 # Each value controls one controller-manager feature flag. All groups remain
 # enabled by default. The shared CloudflareAccount controller runs whenever any
 # controller group is enabled.

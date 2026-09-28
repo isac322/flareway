@@ -12,7 +12,7 @@ Resources that represent a distinct Cloudflare object, addressed by ID, use thre
 | `adoption.mode` | `None`, `AdoptById` | `AdoptById` requires an `externalRef` and the `adoption.expect` attributes the remote object must match. A matching name is never enough. |
 | `deletionPolicy` | `Delete`, `Orphan` | `Delete` removes the remote object when the Kubernetes object is deleted. `Orphan` leaves it in Cloudflare. |
 
-Defaults and the exact reference path differ by kind; the [API reference](../api-reference.md) lists them. A `CloudflareTunnel` takes its reference at `spec.tunnel.externalRef`. The account singletons `DeviceSettings` and `ZeroTrustOrganization` have no `externalRef` or adoption block and default to `ObserveOnly`, and `ZeroTrustOrganization` accepts only `deletionPolicy: Orphan`.
+Defaults and the exact reference path differ by kind; the [API reference](../reference/api.md) lists them. A `CloudflareTunnel` takes its reference at `spec.tunnel.externalRef`. The account singletons `DeviceSettings` and `ZeroTrustOrganization` have no `externalRef` or adoption block and default to `ObserveOnly`, and `ZeroTrustOrganization` accepts only `deletionPolicy: Orphan`.
 
 ## The ownership ledger
 

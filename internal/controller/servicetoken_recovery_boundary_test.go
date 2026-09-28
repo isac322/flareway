@@ -23,7 +23,7 @@ package controller
 // boundaries, and non-managed paths. The journal is always discovered through
 // the Secrets the CR owns — never through its private name or key layout.
 //
-// QA matrix mapping (docs/qa/servicetoken-create-recovery.md §5):
+// QA matrix mapping (issue #94; docs/adr/0005-servicetoken-create-before-capture.md):
 //   ST-QA-08  TestServiceTokenForeignDestinationSecretBlocksCreate
 //   ST-QA-09  TestServiceTokenImmutableDestinationBlocksCreate
 //   ST-QA-10  TestServiceTokenAmbiguousRemoteCandidatesBlockResume

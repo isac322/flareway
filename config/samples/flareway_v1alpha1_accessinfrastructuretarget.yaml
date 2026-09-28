@@ -5,7 +5,7 @@ metadata:
     app.kubernetes.io/name: flareway
     app.kubernetes.io/managed-by: kustomize
   name: accessinfrastructuretarget-sample
-  namespace: default
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

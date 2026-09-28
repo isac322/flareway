@@ -34,7 +34,7 @@ source markers or types and regenerate with `make manifests` or
 
 ## Gateway API conformance run
 
-The [conformance report](conformance/reports/v1.6.2/flareway/README.md)
+The [conformance report](conformance/v1.6.2/flareway/README.md)
 comes from this workflow. Run it with Docker, Go, and `kubectl` installed:
 
 ```sh
@@ -50,7 +50,7 @@ LoadBalancer address before running the suite from the host. On macOS, or
 when the provider probe fails, it switches the conformance Service to
 `ClusterIP` and runs the compiled test binary in a Kubernetes Job. The Job
 writes the report to a shared volume, and the script copies it to
-`conformance/reports/v1.6.2/flareway/`.
+`docs/conformance/v1.6.2/flareway/`.
 
 The runner disables test parallelism because Flareway deliberately uses one
 controller replica and one Gateway reconciliation worker. This serializes
@@ -61,7 +61,7 @@ Useful overrides:
 ```sh
 KIND_CLUSTER_NAME=my-cluster \
 VERSION=dev \
-REPORT_OUTPUT="$PWD/conformance/reports/v1.6.2/flareway/standard-dev-default-report.yaml" \
+REPORT_OUTPUT="$PWD/docs/conformance/v1.6.2/flareway/standard-dev-default-report.yaml" \
 make conformance
 ```
 
@@ -135,7 +135,8 @@ type, optional scope, imperative subject.
 
 Area-specific guidance is documented, not tribal:
 
-- `docs/` — install, operations, API reference, design, troubleshooting.
+- `docs/` — install, operations, API reference, architecture decisions
+  (`docs/adr/`), troubleshooting.
 - `.agents/skills/` — per-area guides: API changes, reconciliation,
   security invariants, testing, releases.
 - `.agents/rules/flareway-invariants.md` — the normative invariants
@@ -148,6 +149,6 @@ conventions.
 
 Flareway's API is `v1alpha1`; API changes are expected and
 accepted. When you change a CRD kind or field, update the generated CRDs
-(`make manifests`), deepcopy code (`make generate`), and
-`docs/api-reference.md` in the same change — `Generation diff` fails
-otherwise.
+(`make manifests`) and deepcopy code (`make generate`); `Generation diff`
+fails when either is stale. Update `docs/reference/api.md` in the same
+change; it is written by hand.

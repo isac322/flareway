@@ -2,7 +2,7 @@ apiVersion: flareway.bhyoo.com/v1alpha1
 kind: ZeroTrustGatewayPolicy
 metadata:
   name: allow-private-egress
-  namespace: flareway-system
+  namespace: flareway-platform
 spec:
   accountRef:
     name: example-account

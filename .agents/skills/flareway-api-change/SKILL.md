@@ -27,7 +27,7 @@ Read current values from source; never copy counts or versions into docs:
 - `Makefile` — generation and verification targets.
 - `hack/parity/main.go` — pinned SDK module/version, ledger expectations.
 - `go.mod` — the SDK version the parity pin must match.
-- `docs/design/001-cloudflare-gateway-api-integration.md` — design contract.
+- `docs/adr/0001-gateway-api-on-cloudflare.md` — design decision record.
 
 ## Workflow
 
@@ -40,8 +40,8 @@ Read current values from source; never copy counts or versions into docs:
 3. Update `api/v1alpha1/validation_markers_test.go` when you add or change CEL
    rules or markers it pins, and `config/samples/` when the user-facing shape
    changes.
-4. Update `docs/api-reference.md` and `docs/api/README.md` when the public API
-   surface changes.
+4. Update `docs/reference/api.md` and `docs/reference/kubectl-explain.md` when
+   the public API surface changes.
 5. If the change alters Cloudflare field coverage, the SDK pin, or
    `internal/cloudflare` declarations, update the parity ledger — see
    [references/cloudflare-parity.md](references/cloudflare-parity.md).
@@ -71,8 +71,8 @@ Details and rationale: [references/schema-and-generation.md](references/schema-a
   and `infrastructure.labels/annotations`. Flareway-written annotations and
   labels are typed constants in `api/v1alpha1/*_types.go`.
 - Kind naming: the `Cloudflare` prefix is reserved for `CloudflareAccount` and
-  `CloudflareTunnel`; other kinds use the approved catalog names in the design
-  document.
+  `CloudflareTunnel`; other kinds follow the naming of the existing kinds in
+  `PROJECT`.
 
 ## Verification
 

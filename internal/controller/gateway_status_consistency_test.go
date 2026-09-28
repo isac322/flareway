@@ -54,9 +54,9 @@ import (
 )
 
 // This file is the envtest-component tier of the issue-92 status-consistency
-// QA plan (docs/qa/issue-92-status-consistency.md). Every spec drives the real
-// GatewayReconciler against a dedicated envtest control plane owned by the
-// fixture; the fixture's own CloudflareAccountReconciler and
+// QA plan (docs/adr/0004-tunnel-status-condition-ownership.md). Every spec
+// drives the real GatewayReconciler against a dedicated envtest control plane
+// owned by the fixture; the fixture's own CloudflareAccountReconciler and
 // CloudflareTunnelReconciler are stepped explicitly so provisioning and
 // tunnel-owned status writes can never interleave with a fault scenario. Only
 // the outer dependency boundaries (Cloudflare API, dataplane prober, xDS ACK
