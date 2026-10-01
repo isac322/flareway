@@ -52,27 +52,35 @@ cache. `ClearSnapshot` drops the snapshot and convergence state.
 `AckTracker` (`tracker.go`) semantics — read these before "fixing" a stuck
 ACK:
 
-- `ExpectSnapshot` records only types whose resource fingerprint changed.
-  Unchanged types emit no Delta response and never block convergence;
-  removed types do not block either.
+- `ExpectSnapshot` records the current resource fingerprints and required
+  types (bootstrap LDS/CDS and referenced resources). Every live stream must
+  prove each present type it subscribes to or is required to subscribe to.
+  Existing ACK evidence remains valid while its fingerprint is unchanged;
+  removed types do not block convergence.
 - `OnResponse` binds the response nonce to the stream and proves the stream
   subscribes to that type. `OnRequest` consumes ACK/NACK by nonce and
-  records type subscriptions; subscription-only requests (no nonce) just
-  mark the type subscribed.
+  records type subscriptions. Requests without a nonce can also prove held
+  resources through initial versions.
 - **Reconnect initial versions**: a reconnected client that reports
   `initial_resource_versions` matching the current versions gets those
-  types accepted without a response — the cache emits nothing in that case,
-  so initial versions are the only protocol evidence of convergence.
-- `OnStreamClosed` forgets that stream's nonces and subscriptions; a changed
-  type stops blocking once no remaining stream subscribes to it.
-- `Forget(node)` drops convergence records but keeps live stream identity —
-  Delta requests carry `Node` only on the first request of a stream.
-- `IsACKed(node, version)` is true only when every changed type that at
-  least one live stream subscribes to has ACKed the exact version. An empty
-  expected set converges immediately; a non-empty set requires a live
-  stream, so a dead Envoy cannot converge vacuously.
+  types accepted without a response. Unchanged named subscriptions can
+  produce no response; initial wildcard subscriptions can receive an empty
+  response. Initial fingerprints received before the first snapshot are
+  retained per stream/type and evaluated once when that snapshot is known.
+  A mismatch is discarded. Responses or nonce-bearing requests supersede
+  pending initial proof, so later updates or NACKs cannot replay it.
+- `OnStreamClosed` forgets that stream's nonces, subscriptions, ACK/NACK
+  records, and pending initial proof. Replacement streams start unproven.
+- `Forget(node)` drops convergence records and pending initial proof but
+  keeps live stream identity and subscriptions; Delta requests carry `Node`
+  only on the first request of a stream.
+- `IsACKed(node, version)` requires current-fingerprint proof from every
+  live stream for its subscribed and required present types, with no current
+  NACK. An empty snapshot converges immediately; a non-empty snapshot
+  requires a live stream, so a dead Envoy cannot converge vacuously.
 - `ConvergenceDetails`/`ACKDetails` explains the wait (which type, which
-  version); `LastNACK` returns the latest rejection detail.
+  version); `LastNACK` returns the earliest live stream's rejection for the
+  currently expected snapshot.
 
 ## The Cloudflare programming gate
 

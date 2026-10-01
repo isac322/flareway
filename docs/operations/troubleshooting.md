@@ -31,6 +31,20 @@ Deleting an `AccessApplication` never makes a protected route public. The route 
 
 Deleting an `AccessApplication` that never reached a Cloudflare write, such as one in a namespace its `CloudflareAccount` does not grant, skips remote cleanup and releases the finalizer. After Flareway has attempted a Cloudflare write for it, deletion needs the namespace grant. If the grant was removed, the object reports `CleanupBlocked=True` with `RefNotPermitted` until the grant is restored.
 
+## xDS convergence after a controller restart
+
+Envoy reconnects with the resource versions it already holds. Flareway
+retains that initial proof even if it arrives before the controller publishes
+its first snapshot. Matching versions count toward convergence separately
+for each live stream and resource type. An unchanged named subscription may
+produce no xDS response, so a new ACK is not always needed.
+
+If `Programmed=False` names an `Envoy xDS ACK` gate, check the listed missing
+types and the Envoy logs for a NACK or a disconnected stream. Mismatched or
+missing initial versions still require an acknowledged response. Closing a
+stream or clearing the Gateway snapshot discards its proof; a replacement
+stream cannot inherit another stream's ACK.
+
 ## Events
 
 Flareway emits these warning reasons only when entering the corresponding condition state:

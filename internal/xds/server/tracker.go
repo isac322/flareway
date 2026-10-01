@@ -71,18 +71,23 @@ type AckTracker struct {
 	fingerprints  map[string]map[string]string
 	acked         map[int64]map[string]streamAck
 	nacks         map[int64]NACK
+	// initialFingerprints holds bootstrap proof received before a snapshot is
+	// known. Each stream/type has at most one immutable fingerprint, consumed
+	// by the first expectation or superseding protocol activity.
+	initialFingerprints map[int64]map[string]string
 }
 
 // NewAckTracker returns an empty, concurrency-safe tracker.
 func NewAckTracker() *AckTracker {
 	return &AckTracker{
-		pending:       make(map[int64]map[string]map[string]pendingResponse),
-		nodes:         make(map[int64]string),
-		subscriptions: make(map[int64]map[string]struct{}),
-		expected:      make(map[string]expectedSnapshot),
-		fingerprints:  make(map[string]map[string]string),
-		acked:         make(map[int64]map[string]streamAck),
-		nacks:         make(map[int64]NACK),
+		pending:             make(map[int64]map[string]map[string]pendingResponse),
+		nodes:               make(map[int64]string),
+		subscriptions:       make(map[int64]map[string]struct{}),
+		expected:            make(map[string]expectedSnapshot),
+		fingerprints:        make(map[string]map[string]string),
+		acked:               make(map[int64]map[string]streamAck),
+		nacks:               make(map[int64]NACK),
+		initialFingerprints: make(map[int64]map[string]string),
 	}
 }
 
@@ -113,6 +118,12 @@ func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[strin
 	for streamID, streamNode := range t.nodes {
 		if streamNode == node {
 			delete(t.nacks, streamID)
+			for typeURL, fingerprint := range t.initialFingerprints[streamID] {
+				t.acceptInitialFingerprintLocked(streamID, node, typeURL, fingerprint)
+			}
+			// Initial holdings describe stream bootstrap, not future snapshots.
+			// Consume even mismatches so fingerprint cycling cannot revive them.
+			delete(t.initialFingerprints, streamID)
 		}
 	}
 }
@@ -135,6 +146,7 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 		return
 	}
 	t.subscribeLocked(streamID, resp.GetTypeUrl())
+	t.forgetInitialFingerprintLocked(streamID, resp.GetTypeUrl())
 	byType := t.pending[streamID]
 	if byType == nil {
 		byType = make(map[string]map[string]pendingResponse)
@@ -152,8 +164,8 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 }
 
 // OnRequest consumes an ACK or NACK and records the stream's type
-// subscription. Subscription-only requests have no nonce and do not alter
-// convergence state beyond marking the type subscribed.
+// subscription. Requests without a nonce may prove held resources through
+// initial versions, even before the first snapshot is known.
 func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) {
 	if req == nil {
 		return
@@ -171,6 +183,7 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 		t.acceptInitialVersionsLocked(streamID, node, req.GetTypeUrl(), req.GetInitialResourceVersions())
 		return
 	}
+	t.forgetInitialFingerprintLocked(streamID, req.GetTypeUrl())
 	byType := t.pending[streamID]
 	if byType == nil {
 		return
@@ -221,18 +234,31 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 
 // acceptInitialVersionsLocked recognizes a reconnected Delta client that
 // reports it already holds the exact current resource versions. The snapshot
-// cache emits no response in that case, so the initial versions are the only
-// protocol evidence available for convergence.
+// cache can emit no response for unchanged named subscriptions, so initial
+// versions may be the only protocol evidence available for convergence.
 func (t *AckTracker) acceptInitialVersionsLocked(streamID int64, node, typeURL string, versions map[string]string) {
 	if node == "" || typeURL == "" || len(versions) == 0 {
 		return
 	}
-	expected, ok := t.expected[node]
-	if !ok {
+	fingerprint, err := fingerprintVersionMap(versions)
+	if err != nil || fingerprint == "" {
 		return
 	}
-	fingerprint, err := fingerprintVersionMap(versions)
-	if err != nil || fingerprint == "" || fingerprint != t.fingerprints[node][typeURL] {
+	if _, ok := t.expected[node]; !ok {
+		byType := t.initialFingerprints[streamID]
+		if byType == nil {
+			byType = make(map[string]string)
+			t.initialFingerprints[streamID] = byType
+		}
+		byType[typeURL] = fingerprint
+		return
+	}
+	t.acceptInitialFingerprintLocked(streamID, node, typeURL, fingerprint)
+}
+
+func (t *AckTracker) acceptInitialFingerprintLocked(streamID int64, node, typeURL, fingerprint string) {
+	expected, ok := t.expected[node]
+	if !ok || fingerprint != t.fingerprints[node][typeURL] {
 		return
 	}
 	byType := t.acked[streamID]
@@ -243,6 +269,14 @@ func (t *AckTracker) acceptInitialVersionsLocked(streamID int64, node, typeURL s
 	byType[typeURL] = streamAck{version: expected.version, fingerprint: fingerprint}
 	if nack, found := t.nacks[streamID]; found && nack.Version == expected.version && nack.TypeURL == typeURL {
 		delete(t.nacks, streamID)
+	}
+}
+
+func (t *AckTracker) forgetInitialFingerprintLocked(streamID int64, typeURL string) {
+	byType := t.initialFingerprints[streamID]
+	delete(byType, typeURL)
+	if len(byType) == 0 {
+		delete(t.initialFingerprints, streamID)
 	}
 }
 
@@ -257,6 +291,7 @@ func (t *AckTracker) OnStreamClosed(streamID int64) {
 	delete(t.subscriptions, streamID)
 	delete(t.acked, streamID)
 	delete(t.nacks, streamID)
+	delete(t.initialFingerprints, streamID)
 }
 
 // Forget removes every convergence record associated with node while keeping
@@ -272,6 +307,7 @@ func (t *AckTracker) Forget(node string) {
 		if streamNode == node {
 			delete(t.acked, streamID)
 			delete(t.nacks, streamID)
+			delete(t.initialFingerprints, streamID)
 		}
 	}
 	for streamID, byType := range t.pending {
