@@ -190,8 +190,9 @@ func (s *Server) ClearSnapshot(node string) {
 	s.tracker.Forget(node)
 }
 
-// IsACKed reports whether all resource types changed in version were ACKed.
-// A snapshot with no resource changes is converged immediately after publication.
+// IsACKed reports whether every live stream has proven the current resource
+// fingerprints for its subscribed and required types. Matching initial versions
+// on reconnect count as proof even when received before snapshot publication.
 func (s *Server) IsACKed(node, version string) bool {
 	return s.tracker.IsACKed(node, version)
 }

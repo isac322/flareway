@@ -77,8 +77,9 @@ When `Programmed` stays `False`, work the gate in order — see
 
 1. `cloudflared` Pods: `/ready` returns 200 and `/config` reports the desired
    version on every active Pod.
-2. Envoy: the Delta ADS stream ACKed the published snapshot version; a NACK
-   or a missing stream blocks convergence.
+2. Envoy: every live Delta ADS stream proves the current resource fingerprints
+   through ACKs or matching initial versions. A current NACK or a missing
+   stream blocks convergence.
 3. DNS: every public listener hostname has a record in
    `status.dnsRecords` (skipped for `dns.mode: External`).
 4. Private listeners: `DeviceSettings` proxy flags, ready `VirtualNetwork`,
