@@ -908,7 +908,25 @@ func (r *GatewayReconciler) cloudflareGate(
 	}
 
 	dnsReady = tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(gateway, tunnel)
+	if !dnsReady {
+		lagging = append(lagging, "managed DNS records")
+	}
 	return len(lagging) == 0, lagging, dnsReady, nil
+}
+
+func (r *GatewayReconciler) cloudflareConverged(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, version, snapshot string) (bool, []string, bool, error) {
+	ready, lagging, dnsReady, err := r.cloudflareGate(ctx, gateway, tunnel, version, snapshot)
+	if !dnsReady {
+		filtered := lagging[:0]
+		for _, item := range lagging {
+			if item != "managed DNS records" {
+				filtered = append(filtered, item)
+			}
+		}
+		lagging = filtered
+		ready = len(lagging) == 0
+	}
+	return ready, lagging, dnsReady, err
 }
 
 func parseVersion(version string) (int64, error) {
@@ -1208,7 +1226,7 @@ func (r *GatewayReconciler) gatewayPromotionGuard(
 			return fmt.Errorf("%w: compiled xDS snapshot %s is not ACKed", errTunnelConvergenceLost, snapshotVersion)
 		}
 		if requireGate {
-			ready, lagging, _, err := r.cloudflareGate(ctx, gateway, live, fmt.Sprint(result.version), snapshotVersion)
+			ready, lagging, _, err := r.cloudflareConverged(ctx, gateway, live, fmt.Sprint(result.version), snapshotVersion)
 			if err != nil {
 				return fmt.Errorf("%w: %v", errTunnelGateObservation, err)
 			}

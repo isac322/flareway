@@ -512,7 +512,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		pending = r.setProgrammedStatus(&statuses.Gateway, &gateway, key, version, acked, deploymentReady, addressReady, addressMessage)
 	} else {
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
-		ready, lagging, dnsReady, err := r.cloudflareGate(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
+		ready, lagging, dnsReady, err := r.cloudflareConverged(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
 		if err != nil {
 			// Observation failure is not proof of convergence: demote while
 			// this Gateway still holds the writer identity, then surface the
