@@ -176,9 +176,9 @@ func accessBindingDigest(domain ir.ProtectionDomain) string {
 		return ""
 	}
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t", domain.AccessApplication, domain.Access.AuthDomain, domain.Access.TeamName, domain.Access.OptionsPreflightBypass)
+	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t", domain.AccessApplication, domain.Access.AuthDomain, domain.Access.TeamName, domain.Access.OptionsPreflightBypass)
 	for _, aud := range domain.Access.CanonicalAUDs() {
-		fmt.Fprintf(h, "\x00%s", aud)
+		_, _ = fmt.Fprintf(h, "\x00%s", aud)
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
