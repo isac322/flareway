@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -41,8 +42,8 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
-	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/authz"
+	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/freshness"
@@ -100,19 +101,19 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 		return gateway, false, nil
 	}
 
-	currentGuards := make(map[string]v1alpha1.HostnameGuard, len(tunnel.Status.Hostnames))
+	currentGuards := make(map[string]v1alpha1.CloudflareTunnelHostnameStatus, len(tunnel.Status.Hostnames))
 	// applicationGuards records each host's guard per Access application
 	// regardless of protection domain name, so a domain renamed across
 	// releases still sees the guard the tunnel reports for its host.
-	applicationGuards := make(map[string]v1alpha1.HostnameGuard, len(tunnel.Status.Hostnames))
+	applicationGuards := make(map[string]v1alpha1.CloudflareTunnelHostnameStatus, len(tunnel.Status.Hostnames))
 	unprotectedHosts := make(map[string]bool)
 	for _, hostname := range tunnel.Status.Hostnames {
 		host := strings.ToLower(hostname.Hostname)
-		currentGuards[strings.Join([]string{host, hostname.ProtectionDomain, hostname.AccessApplication}, "\x00")] = hostname.Guard
+		currentGuards[strings.Join([]string{host, hostname.ProtectionDomain, hostname.AccessApplication}, "\x00")] = hostname
 		if hostname.AccessApplication != "" {
 			applicationKey := host + "\x00" + hostname.AccessApplication
-			if applicationGuards[applicationKey] != v1alpha1.HostnameGuardForwarding {
-				applicationGuards[applicationKey] = hostname.Guard
+			if applicationGuards[applicationKey].Guard != v1alpha1.HostnameGuardForwarding {
+				applicationGuards[applicationKey] = hostname
 			}
 		}
 		if hostname.Guard == v1alpha1.HostnameGuardUnprotected {
@@ -126,16 +127,16 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 		}
 		for _, virtualHost := range domain.VirtualHosts {
 			host := strings.ToLower(virtualHost.Hostname)
-			guard, found := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
+			status, found := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
 			if !found && domain.AccessApplication != "" {
-				guard = applicationGuards[host+"\x00"+domain.AccessApplication]
+				status, found = applicationGuards[host+"\x00"+domain.AccessApplication]
 			}
-			if guard == v1alpha1.HostnameGuardBlocked {
+			if found && status.Guard == v1alpha1.HostnameGuardBlocked && status.AccessBinding == accessBindingDigest(domain) {
 				// The block-first handshake already completed for this domain;
 				// a public carve-out on the same hostname must not re-block it.
 				continue
 			}
-			if guard == v1alpha1.HostnameGuardForwarding || unprotectedHosts[host] {
+			if !found || status.AccessBinding != accessBindingDigest(domain) || status.Guard == v1alpha1.HostnameGuardForwarding || unprotectedHosts[host] {
 				requiresBlock = true
 				break
 			}
@@ -152,11 +153,34 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 	blocked.Domains = append([]ir.ProtectionDomain(nil), gateway.Domains...)
 	for index := range blocked.Domains {
 		if blocked.Domains[index].Protected {
+			// Only changed bindings enter the block-first handshake.
+			keep := true
+			for _, vh := range blocked.Domains[index].VirtualHosts {
+				if st, ok := currentGuards[strings.Join([]string{strings.ToLower(vh.Hostname), blocked.Domains[index].Name, blocked.Domains[index].AccessApplication}, "\x00")]; ok && st.AccessBinding == accessBindingDigest(blocked.Domains[index]) && st.Guard == v1alpha1.HostnameGuardForwarding {
+					keep = false
+					break
+				}
+			}
+			if !keep {
+				continue
+			}
 			blocked.Domains[index].Guard = ir.GuardBlocked
 			blocked.Domains[index].Access = nil
 		}
 	}
 	return &blocked, true, nil
+}
+
+func accessBindingDigest(domain ir.ProtectionDomain) string {
+	if domain.Access == nil {
+		return ""
+	}
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t", domain.AccessApplication, domain.Access.AuthDomain, domain.Access.TeamName, domain.Access.OptionsPreflightBypass)
+	for _, aud := range domain.Access.CanonicalAUDs() {
+		fmt.Fprintf(h, "\x00%s", aud)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, applications []v1alpha1.AccessApplication) {
@@ -938,9 +962,6 @@ func (r *GatewayReconciler) cloudflareGate(
 	}
 
 	dnsReady = tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(gateway, tunnel)
-	if !dnsReady {
-		lagging = append(lagging, "managed DNS records")
-	}
 	return len(lagging) == 0, lagging, dnsReady, nil
 }
 
@@ -970,6 +991,31 @@ func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool
 	return len(wanted) == 0
 }
 
+// blockHostnamesForConflictedListeners keeps only listeners with a conflicted
+// managed DNS record fail-closed while unrelated listeners can promote.
+func blockHostnamesForConflictedListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) {
+	conflicted := make(map[string]struct{})
+	for _, record := range tunnel.Status.DNSRecords {
+		if record.State == dnsRecordStateConflict {
+			conflicted[strings.ToLower(record.Hostname)] = struct{}{}
+		}
+	}
+	for i := range hostnames {
+		for _, domain := range gateway.Domains {
+			if domain.Name != hostnames[i].ProtectionDomain {
+				continue
+			}
+			for _, listener := range gateway.Listeners {
+				if listener.Name == domain.ListenerName && listener.Exposure == ir.ExposurePublic {
+					if _, ok := conflicted[strings.ToLower(listener.Hostname)]; ok {
+						hostnames[i].Guard = v1alpha1.HostnameGuardBlocked
+					}
+				}
+			}
+		}
+	}
+}
+
 func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha1.CloudflareTunnelHostnameStatus {
 	result := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0)
 	teardown := gateway.Cloudflare != nil && gateway.Cloudflare.Teardown
@@ -988,6 +1034,7 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 				AccessApplication: domain.AccessApplication,
 				Guard:             guard,
 				AppliedVersion:    appliedVersion,
+				AccessBinding:     accessBindingDigest(domain),
 			})
 		}
 	}

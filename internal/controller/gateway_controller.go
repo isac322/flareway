@@ -512,7 +512,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		pending = r.setProgrammedStatus(&statuses.Gateway, &gateway, key, version, acked, deploymentReady, addressReady, addressMessage)
 	} else {
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
-		ready, lagging, _, err := r.cloudflareGate(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
+		ready, lagging, dnsReady, err := r.cloudflareGate(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
 		if err != nil {
 			// Observation failure is not proof of convergence: demote while
 			// this Gateway still holds the writer identity, then surface the
@@ -535,7 +535,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			pending = true
 		}
-		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready, message)
+		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready && dnsReady, message)
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -553,6 +553,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if ready || denySnapshotApplied {
 			config.Applied = cloudflareResult.version
 			hostnames = desiredTunnelHostnames(compiled, cloudflareResult.version)
+			if !dnsReady {
+				blockHostnamesForConflictedListeners(compiled, tunnel, hostnames)
+			}
 			conditionStatus = metav1.ConditionTrue
 			reason = "Applied"
 			if denySnapshotApplied && !ready {
