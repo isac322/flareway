@@ -483,7 +483,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			); err != nil {
 				return ctrl.Result{}, err
 			}
-			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message)
+			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message, nil)
 			if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -535,7 +535,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			pending = true
 		}
-		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready && dnsReady, message)
+		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready && dnsReady, message, cloudflareListenerReadiness(compiled, tunnel, ready))
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -598,7 +598,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "Pending", err.Error()); demoteErr != nil {
 						return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
 					}
-					r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, err.Error())
+					r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, err.Error(), nil)
 					pending = true
 				case errors.Is(err, errTunnelGateObservation):
 					// Real observation failure: demote while still
@@ -1333,7 +1333,7 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 ) error {
 	r.clearSnapshot(key)
 	statuses.Gateway.Addresses = nil
-	r.setCloudflareProgrammedStatus(&statuses.Gateway, gateway, false, message)
+	r.setCloudflareProgrammedStatus(&statuses.Gateway, gateway, false, message, nil)
 	if retractDataplane {
 		if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
 			return err

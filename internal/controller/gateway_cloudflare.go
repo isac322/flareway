@@ -131,7 +131,7 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 			if !found && domain.AccessApplication != "" {
 				status, found = applicationGuards[host+"\x00"+domain.AccessApplication]
 			}
-			if found && status.Guard == v1alpha1.HostnameGuardBlocked && status.AccessBinding == accessBindingDigest(domain) {
+			if found && status.Guard == v1alpha1.HostnameGuardBlocked && (status.AccessBinding == "" || status.AccessBinding == accessBindingDigest(domain)) {
 				// The block-first handshake already completed for this domain;
 				// a public carve-out on the same hostname must not re-block it.
 				continue
@@ -1016,6 +1016,31 @@ func blockHostnamesForConflictedListeners(gateway *ir.Gateway, tunnel *v1alpha1.
 	}
 }
 
+func cloudflareListenerReadiness(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, converged bool) map[string]bool {
+	ready := make(map[string]bool, len(gateway.Listeners))
+	for _, listener := range gateway.Listeners {
+		ready[listener.Name] = converged
+	}
+	if tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
+		return ready
+	}
+	conflicted := make(map[string]struct{})
+	for _, record := range tunnel.Status.DNSRecords {
+		if record.State == dnsRecordStateConflict {
+			conflicted[strings.ToLower(record.Hostname)] = struct{}{}
+		}
+	}
+	for _, listener := range gateway.Listeners {
+		if listener.Exposure != ir.ExposurePublic {
+			continue
+		}
+		if _, ok := conflicted[strings.ToLower(listener.Hostname)]; ok {
+			ready[listener.Name] = false
+		}
+	}
+	return ready
+}
+
 func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha1.CloudflareTunnelHostnameStatus {
 	result := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0)
 	teardown := gateway.Cloudflare != nil && gateway.Cloudflare.Teardown
@@ -1340,7 +1365,11 @@ func (r *GatewayReconciler) gatewayNow() time.Time {
 	return time.Now()
 }
 
-func (r *GatewayReconciler) setCloudflareProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, programmed bool, message string) {
+func (r *GatewayReconciler) setCloudflareProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, programmed bool, message string, readiness ...map[string]bool) {
+	var listenerReady map[string]bool
+	if len(readiness) > 0 {
+		listenerReady = readiness[0]
+	}
 	now := metav1.Now()
 	if r.Now != nil {
 		now = metav1.NewTime(r.Now())
@@ -1364,7 +1393,12 @@ func (r *GatewayReconciler) setCloudflareProgrammedStatus(status *gatewayv1.Gate
 			listenerReason = string(gatewayv1.ListenerReasonInvalid)
 			listenerMessage = "Listener configuration is invalid"
 		case programmed:
-			listenerReason = string(gatewayv1.ListenerReasonProgrammed)
+			if listenerReady == nil || listenerReady[string(listener.Name)] {
+				listenerReason = string(gatewayv1.ListenerReasonProgrammed)
+			} else {
+				listenerStatus = metav1.ConditionFalse
+				listenerReason = string(gatewayv1.ListenerReasonPending)
+			}
 		default:
 			listenerReason = string(gatewayv1.ListenerReasonPending)
 		}
