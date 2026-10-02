@@ -994,11 +994,9 @@ func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool
 // blockHostnamesForConflictedListeners keeps only listeners with a conflicted
 // managed DNS record fail-closed while unrelated listeners can promote.
 func blockHostnamesForConflictedListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) {
-	conflicted := make(map[string]struct{})
+	readyRecords := make(map[string]bool, len(tunnel.Status.DNSRecords))
 	for _, record := range tunnel.Status.DNSRecords {
-		if record.State == dnsRecordStateConflict {
-			conflicted[strings.ToLower(record.Hostname)] = struct{}{}
-		}
+		readyRecords[strings.ToLower(record.Hostname)] = record.State != dnsRecordStateConflict
 	}
 	for i := range hostnames {
 		for _, domain := range gateway.Domains {
@@ -1007,7 +1005,7 @@ func blockHostnamesForConflictedListeners(gateway *ir.Gateway, tunnel *v1alpha1.
 			}
 			for _, listener := range gateway.Listeners {
 				if listener.Name == domain.ListenerName && listener.Exposure == ir.ExposurePublic {
-					if _, ok := conflicted[strings.ToLower(listener.Hostname)]; ok {
+					if !readyRecords[strings.ToLower(listener.Hostname)] {
 						hostnames[i].Guard = v1alpha1.HostnameGuardBlocked
 					}
 				}
@@ -1024,17 +1022,15 @@ func cloudflareListenerReadiness(gateway *ir.Gateway, tunnel *v1alpha1.Cloudflar
 	if tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
 		return ready
 	}
-	conflicted := make(map[string]struct{})
+	readyRecords := make(map[string]bool, len(tunnel.Status.DNSRecords))
 	for _, record := range tunnel.Status.DNSRecords {
-		if record.State == dnsRecordStateConflict {
-			conflicted[strings.ToLower(record.Hostname)] = struct{}{}
-		}
+		readyRecords[strings.ToLower(record.Hostname)] = record.State != dnsRecordStateConflict
 	}
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure != ir.ExposurePublic {
 			continue
 		}
-		if _, ok := conflicted[strings.ToLower(listener.Hostname)]; ok {
+		if !readyRecords[strings.ToLower(listener.Hostname)] {
 			ready[listener.Name] = false
 		}
 	}
