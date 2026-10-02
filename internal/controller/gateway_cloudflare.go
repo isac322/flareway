@@ -128,6 +128,14 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 		for _, virtualHost := range domain.VirtualHosts {
 			host := strings.ToLower(virtualHost.Hostname)
 			status, found := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
+			if !found {
+				for _, candidate := range tunnel.Status.Hostnames {
+					if strings.ToLower(candidate.Hostname) == host && candidate.Guard == v1alpha1.HostnameGuardBlocked {
+						status, found = candidate, true
+						break
+					}
+				}
+			}
 			if !found && domain.AccessApplication != "" {
 				status, found = applicationGuards[host+"\x00"+domain.AccessApplication]
 			}
