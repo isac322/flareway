@@ -13,3 +13,10 @@
   listener no longer fails the Gateway xDS snapshot with a duplicate bind
   (#141). Bind-collision errors now name both protection domains and say
   "cleartext" when neither side uses TLS.
+- Keep a host that a revoked AccessApplication's tombstone still blocks
+  blocked on its listener until the revocation is acknowledged. Another
+  AccessApplication claiming the host stays accepted, but its domain for that
+  host is held Blocked and its status names the revoked application; a route
+  left on a listener that permits unprotected traffic no longer serves the
+  host ahead of the tombstone's block. A private TLS listener no longer fails
+  the Gateway xDS snapshot with a duplicate SNI filter chain (#143).

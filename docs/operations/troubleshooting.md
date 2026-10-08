@@ -29,6 +29,8 @@ kubectl describe accessapplication -n <namespace> <name>
 
 Deleting an `AccessApplication` never makes a protected route public. The route remains blocked unless no Access application targets it and `CloudflareAccount.spec.grants[].unprotectedHostnames` explicitly permits the hostname.
 
+A hostname that a deleted or retargeted `AccessApplication` protected stays blocked on its listener until that revocation is acknowledged. If another `AccessApplication` protects the same hostname, it reports `Programmed=False`, reason `Pending`, with a message that names the revoked application. It starts forwarding once the revoked application finishes.
+
 Deleting an `AccessApplication` that never reached a Cloudflare write, such as one in a namespace its `CloudflareAccount` does not grant, skips remote cleanup and releases the finalizer. After Flareway has attempted a Cloudflare write for it, deletion needs the namespace grant. If the grant was removed, the object reports `CleanupBlocked=True` with `RefNotPermitted` until the grant is restored.
 
 ## xDS convergence after a controller restart

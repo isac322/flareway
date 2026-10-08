@@ -99,7 +99,7 @@ When Flareway cannot prove that the security and routing state has reached the d
 | Teardown cannot finish in order | The finalizer stays and the object reports `CleanupBlocked=True`. |
 | A service-token create was sent but the token is not yet visible | `Ready=False`, reason `RecoveryPending`; Flareway re-lists instead of creating a second token. |
 
-Deleting an `AccessApplication` never makes a protected route public. The route stays blocked unless no Access application targets it and the account grant lists the hostname in `unprotectedHostnames`. While an application is being deleted, Flareway keeps a blocked entry for every hostname it protected.
+Deleting an `AccessApplication` never makes a protected route public. The route stays blocked unless no Access application targets it and the account grant lists the hostname in `unprotectedHostnames`. While an application is being deleted, or after it stops targeting a listener, Flareway keeps a blocked entry for every hostname it protected until the revocation is acknowledged. Until then, nothing else serves that hostname on that listener: an attached route without Access stays blocked, and another `AccessApplication` that protects the same hostname reports `Programmed=False` with reason `Pending` and a message naming the revoked application.
 
 Access revocation is not instant. Cloudflare propagates a revoked session to its edge in about 20 to 30 seconds. `cloudflared` and Envoy validate JWT signatures without calling Cloudflare, so a signed token stays valid at the origin until its `exp` time.
 

@@ -79,28 +79,26 @@ type compiledRoute struct {
 //
 // Public Envoy ports are positional, but a revoked AccessApplication's
 // tombstone stays on the port the applied tunnel configuration still routes
-// its hosts to. When such tombstones exist, Translate allocates again with
-// their ports reserved so no live listener or Access host binds there. The
-// second pass also reserves the fixed ports of private listeners so shifting
-// the positional sequence cannot land a public bind on a private bind.
+// its hosts to, and keeps its hosts blocked until the revocation is
+// acknowledged. When such tombstones exist, Translate translates again with
+// what they hold: no live listener or Access host binds their ports, and
+// every domain for a host a tombstone holds on its listener is emitted
+// Blocked. The second pass also reserves the fixed ports of private listeners
+// so shifting the positional sequence cannot land a public bind on a private
+// bind.
 func Translate(in Inputs) (*ir.Gateway, Statuses) {
 	out, statuses := translate(in, nil)
 	if out == nil || out.ConformanceMode {
 		return out, statuses
 	}
-	reserved := accessRevocationEnvoyPorts(in, out.Domains)
-	if len(reserved) == 0 {
+	holds := newAccessRevocationHolds(in, out.Domains)
+	if holds == nil {
 		return out, statuses
 	}
-	for _, listener := range in.Gateway.Spec.Listeners {
-		if listenerExposure(in.CloudflareTunnel, listener.Name) == v1alpha1.ExposurePrivate {
-			reserved[int32(listener.Port)] = struct{}{}
-		}
-	}
-	return translate(in, reserved)
+	return translate(in, holds)
 }
 
-func translate(in Inputs, reserved map[int32]struct{}) (*ir.Gateway, Statuses) {
+func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) {
 	outStatuses := Statuses{
 		HTTPRoutes:         make(map[types.NamespacedName]gatewayv1.HTTPRouteStatus),
 		BackendTLSPolicies: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
@@ -157,7 +155,7 @@ func translate(in Inputs, reserved map[int32]struct{}) (*ir.Gateway, Statuses) {
 		}
 	}
 
-	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, reserved)
+	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, holds.reservedPorts())
 	globalInvalid := false
 	if len(in.Gateway.Spec.Addresses) > 0 {
 		globalInvalid = true
@@ -195,7 +193,7 @@ func translate(in Inputs, reserved map[int32]struct{}) (*ir.Gateway, Statuses) {
 	}
 
 	compileHTTPRoutes(in, out, listeners, &outStatuses, now)
-	applyAccessApplications(in, out, &outStatuses, now, reserved)
+	applyAccessApplications(in, out, &outStatuses, now, holds)
 	populateBackendTLSPolicyStatuses(in, out, &outStatuses, now)
 	out.Clusters = buildClusters(in, out)
 	finalizeIR(out)
