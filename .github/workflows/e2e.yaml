@@ -25,8 +25,10 @@ on:
 permissions:
   contents: read
 
+# Runs that select access-revocation share one queue: that spec publishes the
+# zone-wide `*.<zone>` record, which only one tunnel can own at a time.
 concurrency:
-  group: cloudflare-e2e-${{ github.ref }}
+  group: cloudflare-e2e-${{ contains(inputs.labels || '', 'access-revocation') && 'zone-wildcard' || github.ref }}
   cancel-in-progress: false
 
 jobs:

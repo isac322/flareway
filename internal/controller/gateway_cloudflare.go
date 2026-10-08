@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,6 +45,7 @@ import (
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/freshness"
+	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/observability"
 )
@@ -163,70 +163,41 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 	if gateway == nil || tunnel == nil {
 		return
 	}
-	existing := make(map[string]struct{}, len(gateway.Domains))
-	for _, domain := range gateway.Domains {
-		existing[domain.Name+"\x00"+domain.AccessApplication] = struct{}{}
-	}
+	tombstones := gatewayapi.AccessRevocationTombstones(tunnel, applications, gateway.Domains)
 	existingListeners := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
 		existingListeners[listener.Name] = struct{}{}
 	}
 	retainedListeners := make(map[string]ir.Listener)
-	type tombstone struct {
-		domain ir.ProtectionDomain
-		key    string
-	}
-	tombstones := make([]tombstone, 0)
-	for index := range applications {
-		application := &applications[index]
-		if application.DeletionTimestamp.IsZero() && application.Annotations[accessApplicationRevocationAnnotation] == "" {
-			continue
-		}
-		applicationKey := application.Namespace + "/" + application.Name
-		for _, dataPlane := range application.Status.DataPlanes {
-			if dataPlane.Tunnel != tunnel.Name || dataPlane.ProtectionDomain == "" {
-				continue
-			}
-			key := dataPlane.ProtectionDomain + "\x00" + applicationKey
-			if _, found := existing[key]; found {
-				continue
-			}
-			hostnames := retainedAccessHostnames(tunnel, application, dataPlane.ProtectionDomain, applicationKey)
-			if len(hostnames) == 0 {
-				continue
-			}
-			virtualHosts := make([]ir.VirtualHost, 0, len(hostnames))
-			for _, hostname := range hostnames {
-				virtualHosts = append(virtualHosts, ir.VirtualHost{
-					Name:     dataPlane.ProtectionDomain + "-revoked-" + strings.ReplaceAll(hostname, "*", "wildcard"),
-					Hostname: hostname,
-				})
-			}
-			listenerName := string(dataPlane.Listener)
-			if _, found := existingListeners[listenerName]; !found {
-				exposure := ir.ExposurePublic
-				for _, listener := range tunnel.Spec.Listeners {
-					if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
-						exposure = ir.ExposurePrivate
-						break
-					}
-				}
-				retainedListeners[listenerName] = ir.Listener{
-					Name: listenerName, Hostname: hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
-					Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
-				}
-			}
-			tombstones = append(tombstones, tombstone{
-				key: key,
-				domain: ir.ProtectionDomain{
-					Name: dataPlane.ProtectionDomain, ListenerName: string(dataPlane.Listener), EnvoyPort: dataPlane.EnvoyPort,
-					Protected: true, AccessApplication: applicationKey, Guard: ir.GuardBlocked, VirtualHosts: virtualHosts,
-				},
+	domains := make([]ir.ProtectionDomain, 0, len(tombstones))
+	for _, tombstone := range tombstones {
+		dataPlane := tombstone.DataPlane
+		virtualHosts := make([]ir.VirtualHost, 0, len(tombstone.Hostnames))
+		for _, hostname := range tombstone.Hostnames {
+			virtualHosts = append(virtualHosts, ir.VirtualHost{
+				Name:     dataPlane.ProtectionDomain + "-revoked-" + strings.ReplaceAll(hostname, "*", "wildcard"),
+				Hostname: hostname,
 			})
-			existing[key] = struct{}{}
 		}
+		listenerName := string(dataPlane.Listener)
+		if _, found := existingListeners[listenerName]; !found {
+			exposure := ir.ExposurePublic
+			for _, listener := range tunnel.Spec.Listeners {
+				if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
+					exposure = ir.ExposurePrivate
+					break
+				}
+			}
+			retainedListeners[listenerName] = ir.Listener{
+				Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
+				Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
+			}
+		}
+		domains = append(domains, ir.ProtectionDomain{
+			Name: dataPlane.ProtectionDomain, ListenerName: listenerName, EnvoyPort: dataPlane.EnvoyPort,
+			Protected: true, AccessApplication: tombstone.Application, Guard: ir.GuardBlocked, VirtualHosts: virtualHosts,
+		})
 	}
-	sort.Slice(tombstones, func(i, j int) bool { return tombstones[i].key < tombstones[j].key })
 	listenerNames := make([]string, 0, len(retainedListeners))
 	for name := range retainedListeners {
 		listenerNames = append(listenerNames, name)
@@ -235,32 +206,7 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 	for _, name := range listenerNames {
 		gateway.Listeners = append(gateway.Listeners, retainedListeners[name])
 	}
-	for _, retained := range tombstones {
-		gateway.Domains = append(gateway.Domains, retained.domain)
-	}
-}
-
-func retainedAccessHostnames(tunnel *v1alpha1.CloudflareTunnel, application *v1alpha1.AccessApplication, protectionDomain, applicationKey string) []string {
-	hostnames := make([]string, 0)
-	for _, status := range tunnel.Status.Hostnames {
-		if status.ProtectionDomain == protectionDomain && status.AccessApplication == applicationKey && status.Hostname != "" {
-			hostnames = append(hostnames, strings.ToLower(strings.TrimSuffix(status.Hostname, ".")))
-		}
-	}
-	if len(hostnames) == 0 {
-		for _, destination := range application.Status.Destinations {
-			hostname := destination.Hostname
-			if hostname == "" && destination.URI != "" {
-				hostname, _, _ = strings.Cut(destination.URI, "/")
-			}
-			hostname = strings.ToLower(strings.TrimSuffix(hostname, "."))
-			if hostname != "" {
-				hostnames = append(hostnames, hostname)
-			}
-		}
-	}
-	sort.Strings(hostnames)
-	return slices.Compact(hostnames)
+	gateway.Domains = append(gateway.Domains, domains...)
 }
 
 // tunnelProgrammingBlock explains why the resolved CloudflareTunnel cannot be

@@ -62,7 +62,7 @@ const (
 	accessApplicationAccountIndex         = "flareway.accessApplication.account"
 	accessApplicationHandoffOwnerIndex    = "flareway.accessApplication.handoffOwner"
 	accessApplicationAUDNamespace         = "flareway-system"
-	accessApplicationRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
+	accessApplicationRevocationAnnotation = gatewayapi.AccessRevocationAnnotation
 	// accessApplicationRemoteAttemptAnnotation is stamped before the first
 	// Cloudflare write for a Managed application. With status evidence it tells
 	// deletion whether a remote object may exist even if status never recorded

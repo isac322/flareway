@@ -64,6 +64,7 @@ const (
 
 type routeGroup struct {
 	key                string
+	name               string // first protection domain in the group; names it in bind collision errors
 	routeName          string
 	address            string
 	port               int32
@@ -265,6 +266,7 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 		if group == nil {
 			group = &routeGroup{
 				key:                key,
+				name:               domain.Name,
 				routeName:          resourceName(domain.Name, "routes"),
 				address:            address,
 				port:               port,
@@ -292,9 +294,28 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 	return groups, nil
 }
 
+type bindOccupant struct {
+	name string
+	tls  bool
+}
+
+func bindCollisionError(occupant bindOccupant, name string, tls bool, bindKey string) error {
+	if !occupant.tls && !tls {
+		return fmt.Errorf("cleartext protection domains %q and %q cannot share %s", occupant.name, name, bindKey)
+	}
+	cleartext, secure := occupant.name, name
+	if occupant.tls {
+		cleartext, secure = name, occupant.name
+	}
+	return fmt.Errorf("cleartext protection domain %q and TLS protection domain %q cannot share %s", cleartext, secure, bindKey)
+}
+
 func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*listenerv3.Listener, []*routev3.RouteConfiguration, []*clusterv3.Cluster, error) {
 	listenersByBind := make(map[string]*listenerv3.Listener)
-	cleartextChains := make(map[string]bool)
+	// occupants records the first group placed on each bind. A cleartext group
+	// only lands on an empty bind, so a cleartext occupant is the bind's only
+	// chain.
+	occupants := make(map[string]bindOccupant)
 	tlsNames := make(map[string]map[string]struct{})
 	routes := make([]*routev3.RouteConfiguration, 0, len(groups))
 	jwksByHost := make(map[string]*clusterv3.Cluster)
@@ -417,8 +438,13 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 			}
 			listenersByBind[bindKey] = listener
 		}
-		if group.tlsSecret != "" && cleartextChains[bindKey] {
-			return nil, nil, nil, fmt.Errorf("TLS and cleartext filter chains cannot share %s", bindKey)
+		isTLS := group.tlsSecret != ""
+		occupant, occupied := occupants[bindKey]
+		if occupied && (!isTLS || !occupant.tls) {
+			return nil, nil, nil, bindCollisionError(occupant, group.name, isTLS, bindKey)
+		}
+		if !occupied {
+			occupants[bindKey] = bindOccupant{name: group.name, tls: isTLS}
 		}
 		if group.tlsSecret != "" {
 			if err := ensureTLSInspector(listener); err != nil {
@@ -444,12 +470,6 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 				}
 				names[serverName] = struct{}{}
 			}
-		}
-		if group.tlsSecret == "" {
-			if len(listener.FilterChains) > 0 || listener.DefaultFilterChain != nil {
-				return nil, nil, nil, fmt.Errorf("cleartext and TLS protection domains cannot share %s", bindKey)
-			}
-			cleartextChains[bindKey] = true
 		}
 		listener.FilterChains = append(listener.FilterChains, chain)
 	}
