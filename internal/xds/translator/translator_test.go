@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -725,6 +726,97 @@ func TestBuildRejectsRouteTablesThatShareAName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Two protection domains that resolve to one Envoy bind but cannot share a
+// listener must be rejected with an error that names both domains and their
+// transport, so operators can tell which resources collided.
+func TestBuildBindCollisionErrorNamesDomains(t *testing.T) {
+	t.Run("two cleartext domains", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key:       types.NamespacedName{Namespace: "default", Name: "collision"},
+			Listeners: []ir.Listener{{Name: "http", Hostname: "*.example.com", EnvoyPort: 18080}},
+			Domains: []ir.ProtectionDomain{
+				{Name: "live", ListenerName: "http", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "live", Hostname: "live.example.com"}}},
+				{Name: "revoked", ListenerName: "http", EnvoyPort: 18082, Protected: true, Guard: ir.GuardBlocked, VirtualHosts: []ir.VirtualHost{{Name: "revoked", Hostname: "revoked.example.com"}}},
+			},
+		}
+		_, err := Build(gateway, nil)
+		if err == nil {
+			t.Fatal("Build() accepted two cleartext protection domains on one bind")
+		}
+		got := err.Error()
+		if !strings.Contains(got, "cleartext protection domains") || strings.Contains(got, "TLS") ||
+			!strings.Contains(got, `"live"`) || !strings.Contains(got, `"revoked"`) || !strings.Contains(got, "127.0.0.1:18082") {
+			t.Fatalf("Build() error = %q, want cleartext-only message naming both domains and the bind", got)
+		}
+	})
+
+	t.Run("cleartext and TLS domains", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key: types.NamespacedName{Namespace: "default", Name: "collision"},
+			Listeners: []ir.Listener{
+				{Name: "http", Hostname: "plain.example.com", EnvoyPort: 18080},
+				{Name: "https", Hostname: "secure.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "secure-cert"}},
+			},
+			Domains: []ir.ProtectionDomain{
+				{Name: "plain", ListenerName: "http", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "plain", Hostname: "plain.example.com"}}},
+				{Name: "secure", ListenerName: "https", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "secure", Hostname: "secure.example.com"}}},
+			},
+		}
+		_, err := Build(gateway, nil)
+		if err == nil {
+			t.Fatal("Build() accepted cleartext and TLS protection domains on one bind")
+		}
+		want := `cleartext protection domain "plain" and TLS protection domain "secure" cannot share 127.0.0.1:18082`
+		if got := err.Error(); got != want {
+			t.Fatalf("Build() error = %q, want %q", got, want)
+		}
+	})
+
+	// Build orders groups by key, which places a TLS group ahead of a
+	// cleartext group on the same bind; drive buildListeners directly to
+	// cover a cleartext occupant followed by a TLS arrival.
+	t.Run("TLS after cleartext occupant", func(t *testing.T) {
+		groups := []routeGroup{
+			{key: "a", name: "plain", routeName: "plain-routes", address: "127.0.0.1", port: 18082},
+			{key: "b", name: "secure", routeName: "secure-routes", address: "127.0.0.1", port: 18082, tlsSecret: "secure-cert", serverNames: []string{"secure.example.com"}},
+		}
+		_, _, _, err := buildListeners(groups, time.Hour)
+		if err == nil {
+			t.Fatal("buildListeners() accepted a TLS chain on a cleartext bind")
+		}
+		want := `cleartext protection domain "plain" and TLS protection domain "secure" cannot share 127.0.0.1:18082`
+		if got := err.Error(); got != want {
+			t.Fatalf("buildListeners() error = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("TLS domains with distinct server names share a bind", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key: types.NamespacedName{Namespace: "default", Name: "sni"},
+			Listeners: []ir.Listener{
+				{Name: "a", Hostname: "a.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "a-cert"}},
+				{Name: "b", Hostname: "b.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "b-cert"}},
+			},
+			Domains: []ir.ProtectionDomain{
+				{Name: "a", ListenerName: "a", EnvoyPort: 10443, VirtualHosts: []ir.VirtualHost{{Name: "a", Hostname: "a.example.com"}}},
+				{Name: "b", ListenerName: "b", EnvoyPort: 10443, VirtualHosts: []ir.VirtualHost{{Name: "b", Hostname: "b.example.com"}}},
+			},
+			Secrets: []ir.TLSSecret{
+				{Name: "a-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")},
+				{Name: "b-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")},
+			},
+		}
+		snapshot, err := Build(gateway, nil)
+		if err != nil {
+			t.Fatalf("Build() rejected TLS domains with distinct server names: %v", err)
+		}
+		listener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-10443"].(*listenerv3.Listener)
+		if len(listener.FilterChains) != 2 {
+			t.Fatalf("filter chains = %d, want 2", len(listener.FilterChains))
+		}
+	})
 }
 
 func TestBuildBlockedProtectionDomainReturns403WithoutJWTConfig(t *testing.T) {
