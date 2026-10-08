@@ -61,6 +61,13 @@ var _ = Describe("Access revocation tombstone port", Label("access-revocation"),
 	)
 
 	BeforeAll(func(ctx SpecContext) {
+		// The spec publishes the zone-wide `*.<zone>` record, which only one
+		// tunnel can own. e2e.yaml queues runs that name `access-revocation`
+		// together, so the spec runs only when the label filter names it
+		// explicitly; a broader expression such as `!public` skips it.
+		if !strings.Contains(GinkgoLabelFilter(), "access-revocation") {
+			Skip("publishes the zone-wide wildcard record; select it explicitly with the access-revocation label")
+		}
 		serviceToken = object("flareway.bhyoo.com/v1alpha1", "ServiceToken", namespace, "revocation-e2e", map[string]any{
 			"accountRef": map[string]any{"name": accountName},
 			"name":       namespace + "/revocation-e2e", "duration": "24h",
