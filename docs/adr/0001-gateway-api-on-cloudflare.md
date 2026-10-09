@@ -131,7 +131,7 @@ in one kind would leave most fields meaningless for each use.
 team name derived from the account's `auth_domain`. Envoy also validates the
 `Cf-Access-Jwt-Assertion` header or `CF_Authorization` cookie with
 `jwt_authn` against the team JWKS on every protected domain
-(`internal/gatewayapi/access.go:689-703`, `internal/xds/translator/translator.go:484-539`).
+(`internal/gatewayapi/access.go:689-703`, `internal/xds/translator/translator.go:735-794`).
 Private listeners rely on the Envoy check alone because no `cloudflared`
 middleware runs on the WARP path. `originJWT.mode: Disabled` is accepted only
 when the namespace carries `flareway.bhyoo.com/allow-origin-jwt-disable: "true"`
