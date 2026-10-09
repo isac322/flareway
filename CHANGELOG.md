@@ -24,3 +24,11 @@
   fails the Gateway xDS snapshot with a duplicate SNI filter chain (#143).
 - Shadow a protected exact host at any subdomain depth inside a covering
   wildcard's Envoy route table, matching how the edge routes it.
+- Serve every host of a private TLS listener from one SNI filter chain, with
+  each host enforcing its own guard: a blocked host answers 403 and is never
+  forwarded, and each Access host requires its own application's JWT. A
+  private wildcard listener whose hosts mix guards, such as the listener's
+  own blocked wildcard host next to an Access host, two AccessApplications
+  with different AUDs, or an Access host whose AUD is not ready yet, no
+  longer fails the Gateway xDS snapshot with a duplicate SNI filter chain
+  (#145).
