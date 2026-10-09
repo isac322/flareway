@@ -1,6 +1,6 @@
 # Gateway API conformance report (v1.6.3)
 
-A local development run on September 28, 2026 passed GatewayHTTP Core 37/37 and the claimed Extended tests 31/31, with zero skips and zero failures.
+A local development run on October 9, 2026 passed GatewayHTTP Core 36/36 and the claimed Extended tests 32/32, with zero skips and zero failures.
 
 ## Results
 
@@ -8,8 +8,8 @@ A local development run on September 28, 2026 passed GatewayHTTP Core 37/37 and 
 
 | Profile | Passed | Failed | Skipped |
 |---|---|---|---|
-| GatewayHTTP Core | 37 | 0 | 0 |
-| GatewayHTTP Extended (claimed features) | 31 | 0 | 0 |
+| GatewayHTTP Core | 36 | 0 | 0 |
+| GatewayHTTP Extended (claimed features) | 32 | 0 | 0 |
 
 ## What the run covered
 

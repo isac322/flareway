@@ -209,6 +209,15 @@ Silent adoption could delete or rewrite objects that belong to someone
 else. See
 [Ownership and adoption](../concepts/ownership-and-adoption.md).
 
+The same ownership rule applies field by field. A mutable Cloudflare field
+that a kind owns becomes a typed `spec` field, and server-owned values become
+bounded `status`. A mutable field that belongs to a concern no Flareway kind
+models, such as Access destination path overrides, rule-format target
+selectors, or account-wide service-token policy, is excluded: Flareway never
+sends or reads it, leaves it to other tooling, and does not detect drift on
+it. The parity ledger records each such field
+([API reference](../reference/api.md#parity-ledger-and-intentional-exclusions)).
+
 **D11. `CloudflareAccount.spec.grants[]` defines the tenant boundary.** A
 cluster-scoped `CloudflareAccount` holds the API token reference. Each grant
 matches namespaces by label selector and lists allowed hostnames (exact,
@@ -304,7 +313,7 @@ analysis.
 The supported features below are the list the controller publishes in
 `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go:29-59`).
 The [conformance report](../conformance/v1.6.3/flareway/README.md) for Gateway
-API v1.6.3 (standard channel, GATEWAY-HTTP profile: Core 37/37, Extended 31/31)
+API v1.6.3 (standard channel, GATEWAY-HTTP profile: Core 36/36, Extended 32/32)
 covers every one of them.
 
 | Area | Status |

@@ -11701,7 +11701,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppCommonAudit::request/response::destinations[].overrides[].behavior",
@@ -11714,7 +11714,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides[].behavior; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides[].behavior was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides[].behavior belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppCommonAudit::request/response::destinations[].overrides[].path_pattern",
@@ -11727,7 +11727,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides[].path_pattern; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides[].path_pattern was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides[].path_pattern belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppCommonAudit::request/response::destinations[].port_range",
@@ -12312,7 +12312,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].exclude.tags",
@@ -12325,7 +12325,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.tags belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].exclude.target_attributes",
@@ -12338,7 +12338,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.target_attributes belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].exclude.target_attributes.hostname",
@@ -12351,7 +12351,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.target_attributes.hostname belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].include",
@@ -12364,7 +12364,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].include.tags",
@@ -12377,7 +12377,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.tags belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].include.target_attributes",
@@ -12390,7 +12390,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.target_attributes belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].include.target_attributes.hostname",
@@ -12403,7 +12403,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.target_attributes.hostname belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].require",
@@ -12416,7 +12416,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].require.tags",
@@ -12429,7 +12429,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.tags belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].require.target_attributes",
@@ -12442,7 +12442,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.target_attributes belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppCommonAudit::response::target_criteria[].require.target_attributes.hostname",
@@ -12455,7 +12455,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.target_attributes.hostname belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::allow_authenticate_via_warp",
@@ -12767,7 +12767,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppUnionAudit::both::destinations[].overrides[].behavior",
@@ -12780,7 +12780,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides[].behavior; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides[].behavior was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides[].behavior belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppUnionAudit::both::destinations[].overrides[].path_pattern",
@@ -12793,7 +12793,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessDestinationValues for official destinations[].overrides[].path_pattern; the request writer never emits it and internal/cloudflare/access_application.go:AccessApplicationDestination has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. destinations[].overrides[].path_pattern was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. destinations[].overrides[].path_pattern belongs to Access per-path override rules on public and Worker destinations that can make a matching path public without Access authentication; Flareway's AccessApplication model does not own them because it represents public carve-outs as separate bypass Access applications proven against the protected region and the grant's unprotectedHostnames (ADR 0001 D6), not as destination overrides."
     },
     {
       "key": "AccessAppUnionAudit::both::destinations[].port_range",
@@ -13651,7 +13651,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].exclude.tags",
@@ -13664,7 +13664,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.tags belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].exclude.target_attributes",
@@ -13677,7 +13677,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.target_attributes belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].exclude.target_attributes.hostname",
@@ -13690,7 +13690,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].exclude.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].exclude.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].exclude.target_attributes.hostname belongs to the exclude selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].include",
@@ -13703,7 +13703,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].include.tags",
@@ -13716,7 +13716,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.tags belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].include.target_attributes",
@@ -13729,7 +13729,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.target_attributes belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].include.target_attributes.hostname",
@@ -13742,7 +13742,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].include.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].include.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].include.target_attributes.hostname belongs to the include selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].port",
@@ -13781,7 +13781,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].require.tags",
@@ -13794,7 +13794,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.tags; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.tags was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.tags belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].require.target_attributes",
@@ -13807,7 +13807,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.target_attributes; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.target_attributes was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.target_attributes belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].require.target_attributes.hostname",
@@ -13820,7 +13820,7 @@
       "owner": "access-application",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:newInfrastructureTargetCriteria for official target_criteria[].require.target_attributes.hostname; Flareway builds target criteria from port, protocol, and target_attributes only, and internal/cloudflare/access_application.go:AccessApplicationTargetCriterion has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. target_criteria[].require.target_attributes.hostname was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. target_criteria[].require.target_attributes.hostname belongs to the require selector of Cloudflare's rule-format infrastructure target selection (include/require/exclude by tags or hostname), which Cloudflare documents as an alternative to, not combinable with, the legacy target_attributes format; Flareway's target-criteria model owns port, protocol, and the target_attributes map from spec, so the rule-format selectors are not part of its resource model. It is distinct from the deprecated top-level target_criteria[].target_attributes map that Flareway still sends."
     },
     {
       "key": "AccessAppUnionAudit::both::target_criteria[].target_attributes",
@@ -18422,7 +18422,7 @@
       "owner": "identity-provider",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderGoogleAppsConfig for official config.google-apps.use_login_hint; the request config never sets it and internal/cloudflare/identity_provider.go:identityProviderWireConfig has no field to read it.",
-      "rationale": "Not a Flareway resource-schema requirement. config.google-apps.use_login_hint was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. use_login_hint is a Google Workspace sign-in UX option (reuse a previously authenticated Access email as a Google login hint); IdentityProviderConfig owns the provider's OAuth client, claims, apps domain, and prompt, not login-hint behavior."
     },
     {
       "key": "IdentityProviderAudit::both::config.google.claims",
@@ -19813,7 +19813,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:applyOrganizationNewInput and internal/cloudflare/organization.go:applyOrganizationUpdateInput for official service_token_inactivity; neither request builder sets it, and internal/cloudflare/organization.go:organizationFromSDK and internal/cloudflare/organization.go:organizationListFromSDK do not read it.",
-      "rationale": "Not a Flareway resource-schema requirement. service_token_inactivity was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. service_token_inactivity is part of the inactive-service-token enforcement policy (disable or delete tokens after an inactivity threshold) that applies to every service token in the Zero Trust account; ZeroTrustOrganizationSpec owns organization identity, session, WARP-auth, unmatched-request, custom-page, login-design, MFA/PIV, user-revocation, and DoH settings, and Flareway does not model account-wide service-token lifecycle policy."
     },
     {
       "key": "OrganizationAudit::request/response::service_token_inactivity.action",
@@ -19826,7 +19826,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:applyOrganizationNewInput and internal/cloudflare/organization.go:applyOrganizationUpdateInput for official service_token_inactivity.action; neither request builder sets it, and internal/cloudflare/organization.go:organizationFromSDK and internal/cloudflare/organization.go:organizationListFromSDK do not read it.",
-      "rationale": "Not a Flareway resource-schema requirement. service_token_inactivity.action was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. service_token_inactivity.action is part of the inactive-service-token enforcement policy (disable or delete tokens after an inactivity threshold) that applies to every service token in the Zero Trust account; ZeroTrustOrganizationSpec owns organization identity, session, WARP-auth, unmatched-request, custom-page, login-design, MFA/PIV, user-revocation, and DoH settings, and Flareway does not model account-wide service-token lifecycle policy."
     },
     {
       "key": "OrganizationAudit::request/response::service_token_inactivity.enabled",
@@ -19839,7 +19839,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:applyOrganizationNewInput and internal/cloudflare/organization.go:applyOrganizationUpdateInput for official service_token_inactivity.enabled; neither request builder sets it, and internal/cloudflare/organization.go:organizationFromSDK and internal/cloudflare/organization.go:organizationListFromSDK do not read it.",
-      "rationale": "Not a Flareway resource-schema requirement. service_token_inactivity.enabled was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. service_token_inactivity.enabled is part of the inactive-service-token enforcement policy (disable or delete tokens after an inactivity threshold) that applies to every service token in the Zero Trust account; ZeroTrustOrganizationSpec owns organization identity, session, WARP-auth, unmatched-request, custom-page, login-design, MFA/PIV, user-revocation, and DoH settings, and Flareway does not model account-wide service-token lifecycle policy."
     },
     {
       "key": "OrganizationAudit::request/response::service_token_inactivity.inactivity_threshold_days",
@@ -19852,7 +19852,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:applyOrganizationNewInput and internal/cloudflare/organization.go:applyOrganizationUpdateInput for official service_token_inactivity.inactivity_threshold_days; neither request builder sets it, and internal/cloudflare/organization.go:organizationFromSDK and internal/cloudflare/organization.go:organizationListFromSDK do not read it.",
-      "rationale": "Not a Flareway resource-schema requirement. service_token_inactivity.inactivity_threshold_days was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. service_token_inactivity.inactivity_threshold_days is part of the inactive-service-token enforcement policy (disable or delete tokens after an inactivity threshold) that applies to every service token in the Zero Trust account; ZeroTrustOrganizationSpec owns organization identity, session, WARP-auth, unmatched-request, custom-page, login-design, MFA/PIV, user-revocation, and DoH settings, and Flareway does not model account-wide service-token lifecycle policy."
     },
     {
       "key": "OrganizationAudit::request/response::session_duration",
@@ -19878,7 +19878,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:applyOrganizationNewInput and internal/cloudflare/organization.go:applyOrganizationUpdateInput for official strict_service_token_auth; neither request builder sets it, and internal/cloudflare/organization.go:organizationFromSDK and internal/cloudflare/organization.go:organizationListFromSDK do not read it.",
-      "rationale": "Not a Flareway resource-schema requirement. strict_service_token_auth was added in cloudflare-go v7.12.0; Flareway does not send or read it, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Mutable Cloudflare field outside Flareway's resource model (added in cloudflare-go v7.12.0): Flareway never sends it in create or update requests and never reads it back, so Cloudflare-side values are left to other tooling or the dashboard and are outside Flareway's drift detection. strict_service_token_auth switches account-wide service-token request handling (401/403 and audit logs instead of login redirects, no CF_Authorization cookie); ZeroTrustOrganizationSpec owns organization identity, session, WARP-auth, unmatched-request, custom-page, login-design, MFA/PIV, user-revocation, and DoH settings, and Flareway does not model account-wide service-token authentication policy."
     },
     {
       "key": "OrganizationAudit::request/response::ui_read_only_toggle_reason",
@@ -20255,7 +20255,7 @@
       "owner": "access-organization",
       "disposition": "excluded",
       "currentMapping": "Architectural exclusion recorded at internal/cloudflare/organization.go:organizationListFromSDK for official trusted_accounts; the Organizations.List response mapper drops it and api/v1alpha1/zerotrustorganization_types.go:ZeroTrustOrganizationStatus has no field for it.",
-      "rationale": "Not a Flareway resource-schema requirement. trusted_accounts is a read-only Organizations.List response value added in cloudflare-go v7.12.0; Flareway does not read it or surface it in status, so its behavior is unchanged."
+      "rationale": "Not a Flareway resource-schema requirement. Read-only value outside Flareway's resource model (added in cloudflare-go v7.12.0): trusted_accounts is the Organizations.List output listing account tags of organizations trusted for policy and device-posture sharing. Flareway does not model cross-organization trust, so it never reads the list or surfaces it in ZeroTrustOrganizationStatus, and it is outside Flareway's drift detection."
     },
     {
       "key": "OriginRequestAudit::request::accounts/{account_id}/cf_tunnel/{tunnel_id}/configurations:account_id",

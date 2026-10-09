@@ -41,7 +41,7 @@ Evaluated through: `helm template` rendering of the published chart `oci://ghcr.
 - `CloudflareTunnel` Direct mode for non-Gateway TCP/SSH/RDP/bastion origins.
 - Security: two authorization layers (Kubernetes RBAC + `CloudflareAccount.spec.grants`), fail-closed, explicit `AdoptById` adoption, credentials only in Secrets, `Programmed` only after DNS, tunnel, xDS, and Envoy converge.
 - Status: API group `flareway.bhyoo.com/v1alpha1`, single-replica controller. The maintainer runs it in production; the site carries no "experimental" / "not production" status messaging (owner decision, 2026-09-28). Do not add production-grade, HA, or adoption claims either.
-- Conformance: local `dev` run on kind in `conformanceMode` (Cloudflare paths disabled): GatewayHTTP Core 37/37, claimed Extended 30/30, 13 unsupported features listed. These numbers are evidence for the conformance report page only.
+- Conformance: local `dev` run on kind in `conformanceMode` (Cloudflare paths disabled): GatewayHTTP Core 36/36, claimed Extended 32/32, 12 unsupported features listed. These numbers are evidence for the conformance report page only.
 
 ## Brand Commitments
 

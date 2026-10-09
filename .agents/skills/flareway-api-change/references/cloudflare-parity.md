@@ -44,7 +44,7 @@ disposition by ownership, not by whether a feature exists:
 | Disposition | Meaning | Requirements |
 |---|---|---|
 | `mapped` | The field/operation is covered by a typed Flareway path: a `spec` field, a `status` observation, a Secret capture, or a client call. | `currentMapping` cites the implementing `file.go:Symbol` evidence; `sourceVerdict` is `EXACT`. |
-| `excluded` | The field is deliberately not represented: deprecated wire aliases, UI-only toggles, server-computed values that are not desired state. | Non-empty `rationale` stating why it is not a Flareway resource-schema requirement; `currentMapping` still cites where the decision is anchored. |
+| `excluded` | The field is deliberately not represented: deprecated wire aliases, UI-only toggles, server-computed values that are not desired state, and mutable fields outside Flareway's resource model (fields that belong to a concern no Flareway kind owns, so Flareway never sends or reads them and leaves them to other tooling). | Non-empty `rationale` stating why it is not a Flareway resource-schema requirement; for a mutable field outside the resource model, the rationale must name why the owning kind's model does not own the field (which concern it belongs to and what the kind models instead). `currentMapping` still cites where the decision is anchored, i.e. the request builder that omits it and the read path that drops it. |
 | `transport` | Envelope, paging, or request-traversal data (`success`, `errors`, `messages`, `result_info`, `page`, `cursor`, …) handled by the SDK transport, never CRD state. | Non-empty `rationale`; `currentMapping` cites the Flareway boundary symbol. |
 | `actionable` | A real gap that still needs an owner and implementation. | Only valid while `complete` is `false`; must have an owner. |
 
@@ -83,6 +83,11 @@ The ledger is hand-maintained; there is no generator. Typical flows:
    transport-only.
 5. Recompute the key-set digest and row count if rows changed; rerun
    `make parity` until clean.
+6. New upstream mutable fields that the bump does not adopt into a kind's
+   `spec` are `excluded` as mutable fields outside Flareway's resource model,
+   with an ownership rationale per row. List them in the "Parity ledger and
+   intentional exclusions" section of `docs/reference/api.md` so the docs
+   name the same members as the ledger.
 
 ### Adding a new Cloudflare API surface (new owner)
 
@@ -113,5 +118,7 @@ The ledger is hand-maintained; there is no generator. Typical flows:
 `docs/reference/api.md` ("Parity ledger and intentional exclusions") and
 `docs/adr/0001-gateway-api-on-cloudflare.md` record the same ownership
 boundary in prose: mutable fields become typed spec, server-owned values
-become bounded status, envelope and deprecated wire fields are excluded. Keep
-those documents consistent with ledger dispositions when the boundary moves.
+become bounded status, envelope and deprecated wire fields are excluded, and
+mutable fields outside Flareway's resource model are excluded and never sent or
+read. Keep those documents consistent with ledger dispositions when the
+boundary moves.
