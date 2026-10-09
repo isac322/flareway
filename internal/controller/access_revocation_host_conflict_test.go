@@ -18,6 +18,7 @@ package controller
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -31,6 +32,10 @@ import (
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
+	"github.com/isac322/flareway/internal/xds/translator"
+
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 )
 
 const (
@@ -302,8 +307,11 @@ func TestRevokedAccessTombstoneKeepsOtherHostsProtected(t *testing.T) {
 	}
 }
 
-// A tombstone holds only its own hostnames on its own listener: app-b may
-// forward another host on that listener or the same host on another listener.
+// A private tombstone holds only its own hostnames on its own listener, so
+// app-b may forward another host on that listener. A public tombstone holds
+// its host on the whole tunnel: a public hostname forwards the same way from
+// every listener's ingress rule, so moving the claim to another listener does
+// not release it.
 func TestRevokedAccessTombstoneLeavesOtherHostsForwarding(t *testing.T) {
 	t.Run("other host on the tombstone listener", func(t *testing.T) {
 		inputs := hostConflictInputs(t, false, 18081)
@@ -314,12 +322,17 @@ func TestRevokedAccessTombstoneLeavesOtherHostsForwarding(t *testing.T) {
 		assertTombstoneOnHost(t, gateway)
 		assertAppBForwarding(t, gateway, statuses)
 	})
-	t.Run("same host on another listener", func(t *testing.T) {
+	t.Run("same host on another public listener stays blocked", func(t *testing.T) {
 		inputs := hostConflictInputs(t, false, 18081)
 		inputs.AccessApplications[0].Status.DataPlanes[0].Listener = "old"
 		gateway, statuses := buildRevokedGateway(t, inputs)
-		assertTombstoneOnHost(t, gateway)
-		assertAppBForwarding(t, gateway, statuses)
+		if tombstone := domainOf(gateway, "default/app-a"); tombstone == nil || tombstone.Guard != ir.GuardBlocked {
+			t.Fatalf("revocation tombstone = %#v, want Blocked", tombstone)
+		}
+		assertAppBHeldOff(t, gateway, statuses, 18081)
+		if service := firstEdgeService(t, gateway, conflictHost); service != "http_status:403" {
+			t.Fatalf("first edge rule for %s = %s, want http_status:403", conflictHost, service)
+		}
 	})
 }
 
@@ -353,5 +366,143 @@ func assertTombstoneOnHost(t *testing.T, gateway *ir.Gateway) {
 	tombstone := domainOf(gateway, "default/app-a")
 	if tombstone == nil || tombstone.Guard != ir.GuardBlocked || len(tombstone.VirtualHosts) != 1 || tombstone.VirtualHosts[0].Hostname != conflictHost {
 		t.Fatalf("revocation tombstone = %#v, want Blocked on %s", tombstone, conflictHost)
+	}
+}
+
+// A tombstone holding a wildcard hostname holds every host under it: an exact
+// host would otherwise beat the wildcard block at the edge and in Envoy.
+func TestRevokedAccessWildcardTombstoneHoldsHostsUnderIt(t *testing.T) {
+	inputs := wildcardHostConflictInputs(t)
+	inputs.CloudflareTunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+		Hostname: "*.example.com", ProtectionDomain: conflictTombstoneName, AccessApplication: "default/app-a",
+		Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 3,
+	}}
+	gateway, _ := buildRevokedGateway(t, inputs)
+	for _, host := range []string{conflictHost, "b.example.com"} {
+		for _, domain := range hostDomains(gateway, host) {
+			if domain.Guard != ir.GuardBlocked {
+				t.Fatalf("%s served by %s domain %s while a wildcard tombstone holds it", host, domain.Guard, domain.Name)
+			}
+		}
+		if service := firstEdgeService(t, gateway, host); service != "http_status:403" {
+			t.Fatalf("first edge rule for %s = %s, want http_status:403", host, service)
+		}
+	}
+}
+
+// An exact tombstone holds only its own host, not the wildcard covering it:
+// the edge resolves the exact host to the tombstone's block first, so a
+// wildcard route on the same listener keeps serving every other host under it.
+func TestRevokedAccessExactTombstoneLeavesCoveringWildcardServed(t *testing.T) {
+	inputs := wildcardHostConflictInputs(t)
+	inputs.AccessApplications = inputs.AccessApplications[:1]
+	inputs.HTTPRoutes = inputs.HTTPRoutes[:1]
+	inputs.HTTPRoutes[0].Spec.Hostnames = []gatewayv1.Hostname{"*.example.com"}
+	gateway, _ := buildRevokedGateway(t, inputs)
+	assertTombstoneOnHost(t, gateway)
+	if service := firstEdgeService(t, gateway, conflictHost); service != "http_status:403" {
+		t.Fatalf("first edge rule for %s = %s, want http_status:403", conflictHost, service)
+	}
+	if service := firstEdgeService(t, gateway, "*.example.com"); service == "http_status:403" {
+		t.Fatalf("*.example.com is blocked by a tombstone that only holds %s", conflictHost)
+	}
+}
+
+// A public tombstone does not hold a private listener's domain for the same
+// host: private destinations are host:port over WARP behind the claiming
+// application's own JWT, so they never served the public host. The same host
+// stays held on every public listener of the tunnel.
+func TestRevokedAccessPublicTombstoneDoesNotHoldPrivateListenerHosts(t *testing.T) {
+	inputs := hostConflictInputs(t, false, 18081)
+	gomega.RegisterTestingT(t)
+	inputs.Gateway.Spec.Listeners = append(inputs.Gateway.Spec.Listeners, gatewayv1.Listener{
+		Name: "private", Hostname: new(gatewayv1.Hostname(conflictHost)), Port: 8443, Protocol: gatewayv1.HTTPSProtocolType,
+		TLS: &gatewayv1.ListenerTLSConfig{CertificateRefs: []gatewayv1.SecretObjectReference{{Name: "private-cert"}}},
+	})
+	inputs.Secrets = []corev1.Secret{{
+		ObjectMeta: metav1.ObjectMeta{Name: "private-cert", Namespace: "default"},
+		Type:       corev1.SecretTypeTLS,
+		Data:       qa92TLSSecretData(t),
+	}}
+	inputs.CloudflareTunnel.Spec.Listeners = append(inputs.CloudflareTunnel.Spec.Listeners, v1alpha1.CloudflareTunnelListener{
+		Name: "private", Exposure: v1alpha1.ExposurePrivate, VirtualNetworkRef: &corev1.LocalObjectReference{Name: "private"},
+	})
+	inputs.CloudflareTunnel.Spec.AccountRef = corev1.LocalObjectReference{Name: "account"}
+	inputs.VirtualNetworks = []v1alpha1.VirtualNetwork{{
+		ObjectMeta: metav1.ObjectMeta{Name: "private", Namespace: "default"},
+		Spec:       v1alpha1.VirtualNetworkSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+		Status: v1alpha1.VirtualNetworkStatus{
+			VirtualNetworkID: "vnet-private",
+			Conditions:       []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}},
+		},
+	}}
+	inputs.CloudflareAccount.Spec.Grants[0].Exposures = append(inputs.CloudflareAccount.Spec.Grants[0].Exposures, v1alpha1.ExposurePrivate)
+	privateRoute := *inputs.HTTPRoutes[0].DeepCopy()
+	privateRoute.Name = "private-route"
+	privateRoute.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("private"))
+	privateRoute.Spec.Hostnames = []gatewayv1.Hostname{conflictHost}
+	inputs.HTTPRoutes = append(inputs.HTTPRoutes, privateRoute)
+	appB := &inputs.AccessApplications[1]
+	appB.Spec.TargetRefs = append(appB.Spec.TargetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+		LocalPolicyTargetReference: appB.Spec.TargetRefs[0].LocalPolicyTargetReference,
+		SectionName:                new(gatewayv1.SectionName("private")),
+	})
+	gateway, statuses := buildRevokedGateway(t, inputs)
+	compiled := appBCompilation(statuses)
+	if !compiled.Accepted || !strings.Contains(compiled.Message, "default/app-a") || !strings.Contains(compiled.Message, conflictHost) {
+		t.Fatalf("app-b compilation = accepted %t %q %q, want Accepted naming default/app-a and %s", compiled.Accepted, compiled.Reason, compiled.Message, conflictHost)
+	}
+	for _, domain := range hostDomains(gateway, conflictHost) {
+		if domain.ListenerName == "https" && domain.AccessApplication == "default/app-b" && domain.Guard != ir.GuardBlocked {
+			t.Fatalf("public %s served by %s domain %s while a tombstone holds it", conflictHost, domain.Guard, domain.Name)
+		}
+	}
+	private := false
+	for _, domain := range gateway.Domains {
+		if domain.ListenerName == "private" && domain.AccessApplication == "default/app-b" {
+			private = true
+			if domain.Guard != ir.GuardForwarding {
+				t.Fatalf("app-b private domain = %#v, want Forwarding: the public hold does not reach it", domain)
+			}
+		}
+	}
+	if !private {
+		t.Fatalf("app-b compiled no domain on the private listener: %#v", gateway.Domains)
+	}
+}
+
+// On a public listener the edge sorts the exact 403 rule for a held host
+// ahead of the covering wildcard's forwarding rule, including for multi-label
+// hosts like a.b.example.com: the wildcard keeps serving every other host.
+func TestRevokedAccessHeldHostUnderWildcardEdgeOrder(t *testing.T) {
+	inputs := wildcardHostConflictInputs(t)
+	inputs.AccessApplications = inputs.AccessApplications[:1]
+	inputs.HTTPRoutes = inputs.HTTPRoutes[:1]
+	inputs.HTTPRoutes[0].Spec.Hostnames = []gatewayv1.Hostname{"*.example.com"}
+	inputs.AccessApplications[0].Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{Hostname: "a.b.example.com"}}
+	inputs.CloudflareTunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+		Hostname: "a.b.example.com", ProtectionDomain: conflictTombstoneName, AccessApplication: "default/app-a",
+		Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 3,
+	}}
+	gateway, _ := buildRevokedGateway(t, inputs)
+	if service := firstEdgeService(t, gateway, "a.b.example.com"); service != "http_status:403" {
+		t.Fatalf("first edge rule for a.b.example.com = %s, want http_status:403", service)
+	}
+	if service := firstEdgeService(t, gateway, "*.example.com"); service == "http_status:403" {
+		t.Fatalf("*.example.com is blocked by a tombstone that only holds a.b.example.com")
+	}
+	snapshot, err := translator.Build(gateway, nil)
+	if err != nil {
+		t.Fatalf("translator build: %v", err)
+	}
+	for _, raw := range snapshot.GetResources(resourcev3.RouteType) {
+		routeConfig := raw.(*routev3.RouteConfiguration)
+		for _, virtualHost := range routeConfig.VirtualHosts {
+			for _, route := range virtualHost.Routes {
+				if route.GetRoute() != nil && slices.ContainsFunc(virtualHost.Domains, func(domain string) bool { return domain == "a.b.example.com" }) {
+					t.Fatalf("a.b.example.com has an upstream route in %s while a tombstone holds it", routeConfig.Name)
+				}
+			}
+		}
 	}
 }

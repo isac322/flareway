@@ -422,7 +422,7 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 			for _, claim := range compiled.claims {
 				acceptedClaims[claim.hostname] = append(acceptedClaims[claim.hostname], claim)
 			}
-			if note := holds.describe(compiled.claims, key.String()); note != "" {
+			if note := holds.describe(in, compiled.claims, key.String()); note != "" {
 				compiled.Message += "; " + note
 			}
 		}

@@ -601,8 +601,10 @@ func protectedExactClaims(current routeGroup, groups []routeGroup) []string {
 			}
 			for _, wildcard := range wildcards {
 				suffix := strings.TrimPrefix(wildcard, "*")
+				// Envoy's "*.example.com" matches any depth of subdomain,
+				// not only single-label prefixes.
 				prefix := strings.TrimSuffix(hostname, suffix)
-				if prefix != "" && !strings.Contains(prefix, ".") && strings.HasSuffix(hostname, suffix) {
+				if prefix != "" && strings.HasSuffix(hostname, suffix) {
 					claims = appendUnique(claims, hostname)
 					break
 				}

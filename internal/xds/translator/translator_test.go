@@ -878,6 +878,39 @@ func TestBuildPublicWildcardBlocksProtectedExactHostname(t *testing.T) {
 	}
 }
 
+// Envoy's "*.example.com" matches any depth of subdomain, so a protected
+// exact host several labels deep still gets a shadow vhost that denies it in
+// the wildcard's route table.
+func TestBuildPublicWildcardBlocksProtectedDeepExactHostname(t *testing.T) {
+	gateway := &ir.Gateway{
+		Key: types.NamespacedName{Namespace: "default", Name: "wildcard-isolation"},
+		Listeners: []ir.Listener{
+			{Name: "wildcard", Hostname: "*.example.com", EnvoyPort: 18080},
+			{Name: "exact", Hostname: "a.b.example.com", EnvoyPort: 18081},
+		},
+		Domains: []ir.ProtectionDomain{
+			{
+				Name: "wildcard-public", ListenerName: "wildcard", EnvoyPort: 18080, Guard: ir.GuardUnprotected, StripAccessHeaders: true,
+				VirtualHosts: []ir.VirtualHost{{Name: "wildcard", Hostname: "*.example.com"}},
+			},
+			{
+				Name: "exact-protected", ListenerName: "exact", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
+				Access:       &ir.AccessGuard{AUDs: []string{"aud"}, AuthDomain: "team.cloudflareaccess.com"},
+				VirtualHosts: []ir.VirtualHost{{Name: "exact", Hostname: "a.b.example.com"}},
+			},
+		},
+	}
+	snapshot, err := Build(gateway, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-18080"].(*listenerv3.Listener)
+	publicRoutes := routeConfigForChain(t, snapshot, publicListener.FilterChains[0])
+	if got := directStatusForDomain(t, publicRoutes, "a.b.example.com"); got != 403 {
+		t.Fatalf("protected exact hostname on public wildcard listener = %d, want 403", got)
+	}
+}
+
 func chainForServerName(t *testing.T, listener *listenerv3.Listener, serverName string) *listenerv3.FilterChain {
 	t.Helper()
 	for _, chain := range listener.FilterChains {
