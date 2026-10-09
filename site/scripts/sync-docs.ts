@@ -35,7 +35,7 @@ const PAGES: Page[] = [
 	{ source: 'docs/concepts/how-it-works.md', target: 'concepts/how-it-works.md', order: 1, label: 'How it works' },
 	{ source: 'docs/concepts/http-routing.md', target: 'concepts/http-routing.md', order: 2, label: 'HTTP routing' },
 	{
-		source: 'docs/conformance/v1.6.2/flareway/README.md',
+		source: 'docs/conformance/v1.6.3/flareway/README.md',
 		target: 'concepts/conformance.md',
 		order: 3,
 		label: 'Conformance report',

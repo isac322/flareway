@@ -1,7 +1,7 @@
 apiVersion: gateway.networking.k8s.io/v1
 date: "2026-09-28T09:20:41Z"
 gatewayAPIChannel: standard
-gatewayAPIVersion: v1.6.2
+gatewayAPIVersion: v1.6.3
 implementation:
   contact:
   - '@isac322'

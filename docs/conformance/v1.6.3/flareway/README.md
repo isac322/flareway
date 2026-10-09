@@ -1,10 +1,10 @@
-# Gateway API conformance report (v1.6.2)
+# Gateway API conformance report (v1.6.3)
 
 A local development run on September 28, 2026 passed GatewayHTTP Core 37/37 and the claimed Extended tests 31/31, with zero skips and zero failures.
 
 ## Results
 
-[`standard-dev-default-report.yaml`](standard-dev-default-report.yaml) is the report the Gateway API v1.6.2 conformance suite wrote for that run, on the standard channel in default mode:
+[`standard-dev-default-report.yaml`](standard-dev-default-report.yaml) is the report the Gateway API v1.6.3 conformance suite wrote for that run, on the standard channel in default mode:
 
 | Profile | Passed | Failed | Skipped |
 |---|---|---|---|

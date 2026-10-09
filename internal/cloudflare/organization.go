@@ -208,7 +208,7 @@ func (client *Client) GetAccessOrganization(ctx context.Context, scope AccessSco
 	if err != nil {
 		return Organization{}, fmt.Errorf("get Cloudflare Zero Trust organization: %w", err)
 	}
-	return organizationFromSDK(remote), nil
+	return organizationListFromSDK(remote), nil
 }
 
 // CreateAccessOrganization creates an absent account- or zone-scoped organization.
@@ -723,6 +723,59 @@ func organizationFromSDK(remote *zero_trust.Organization) Organization {
 		MFARequiredForAllApps: remote.MfaRequiredForAllApps,
 	}
 }
+
+// organizationListFromSDK maps the zero_trust.OrganizationListResponse returned
+// by Organizations.List since cloudflare-go v7.12.0; it carries the same wire
+// fields as zero_trust.Organization plus trusted_accounts, which Flareway does
+// not consume.
+func organizationListFromSDK(remote *zero_trust.OrganizationListResponse) Organization {
+	if remote == nil {
+		return Organization{}
+	}
+	authenticators := make([]OrganizationMFAAuthenticator, len(remote.MfaConfig.AllowedAuthenticators))
+	for i, item := range remote.MfaConfig.AllowedAuthenticators {
+		authenticators[i] = mfaAuthenticatorFromSDK(zero_trust.OrganizationMfaConfigAllowedAuthenticator(item))
+	}
+	keySizes := make([]int64, len(remote.MfaPivKeyRequirements.SSHKeySize))
+	for i, item := range remote.MfaPivKeyRequirements.SSHKeySize {
+		keySizes[i] = int64(item)
+	}
+	keyTypes := make([]OrganizationPIVSSHKeyType, len(remote.MfaPivKeyRequirements.SSHKeyType))
+	for i, item := range remote.MfaPivKeyRequirements.SSHKeyType {
+		keyTypes[i] = pivSSHKeyTypeFromSDK(zero_trust.OrganizationMfaPivKeyRequirementsSSHKeyType(item))
+	}
+	return Organization{
+		AuthDomain:                             remote.AuthDomain,
+		Name:                                   remote.Name,
+		SessionDuration:                        remote.SessionDuration,
+		WARPAuthSessionDuration:                remote.WARPAuthSessionDuration,
+		AllowAuthenticateViaWARP:               remote.AllowAuthenticateViaWARP,
+		AutoRedirectToIdentity:                 remote.AutoRedirectToIdentity,
+		IsUIReadOnly:                           remote.IsUIReadOnly,
+		UIReadOnlyToggleReason:                 remote.UIReadOnlyToggleReason,
+		DenyUnmatchedRequests:                  remote.DenyUnmatchedRequests,
+		DenyUnmatchedRequestsExemptedZoneNames: slices.Clone(remote.DenyUnmatchedRequestsExemptedZoneNames),
+		WARPAuthNonBrowser401:                  remote.WARPAuthNonBrowser401,
+		UserSeatExpirationInactiveTime:         remote.UserSeatExpirationInactiveTime,
+		CustomPages: OrganizationCustomPages{
+			Forbidden: remote.CustomPages.Forbidden, IdentityDenied: remote.CustomPages.IdentityDenied,
+		},
+		LoginDesign: OrganizationLoginDesign{
+			BackgroundColor: remote.LoginDesign.BackgroundColor, FooterText: remote.LoginDesign.FooterText,
+			HeaderText: remote.LoginDesign.HeaderText, LogoPath: remote.LoginDesign.LogoPath, TextColor: remote.LoginDesign.TextColor,
+		},
+		MFAConfig: OrganizationMFAConfig{
+			AllowedAuthenticators: authenticators, AMRMatchingSessionDuration: remote.MfaConfig.AmrMatchingSessionDuration,
+			RequiredAAGUIDs: remote.MfaConfig.RequiredAaguids, SessionDuration: remote.MfaConfig.SessionDuration,
+		},
+		MFAPIVKeyRequirements: OrganizationMFAPIVKeyRequirements{
+			PinPolicy: pivPinPolicyFromSDK(zero_trust.OrganizationMfaPivKeyRequirementsPinPolicy(remote.MfaPivKeyRequirements.PinPolicy)), RequireFIPSDevice: remote.MfaPivKeyRequirements.RequireFipsDevice,
+			SSHKeySizes: keySizes, SSHKeyTypes: keyTypes, TouchPolicy: pivTouchPolicyFromSDK(zero_trust.OrganizationMfaPivKeyRequirementsTouchPolicy(remote.MfaPivKeyRequirements.TouchPolicy)),
+		},
+		MFARequiredForAllApps: remote.MfaRequiredForAllApps,
+	}
+}
+
 
 func updateMFAAuthenticatorToSDK(value OrganizationMFAAuthenticator) zero_trust.OrganizationUpdateParamsMfaConfigAllowedAuthenticator {
 	return zero_trust.OrganizationUpdateParamsMfaConfigAllowedAuthenticator(mfaAuthenticatorWireValue(value))

@@ -303,15 +303,15 @@ analysis.
 
 The supported features below are the list the controller publishes in
 `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go:29-59`).
-The [conformance report](../conformance/v1.6.2/flareway/README.md) for Gateway
-API v1.6.2 (standard channel, GATEWAY-HTTP profile: Core 37/37, Extended 31/31)
+The [conformance report](../conformance/v1.6.3/flareway/README.md) for Gateway
+API v1.6.3 (standard channel, GATEWAY-HTTP profile: Core 37/37, Extended 31/31)
 covers every one of them.
 
 | Area | Status |
 |---|---|
 | Core: `Gateway`, `HTTPRoute`, `ReferenceGrant` | Supported |
 | `BackendTLSPolicy`, `BackendTLSPolicySANValidation` | Supported |
-| `GatewayHTTPListenerIsolation`, `GatewayHTTPSListenerDetectMisdirectedRequests`, `GatewayInfrastructurePropagation` | Supported |
+| `GatewayHTTPListenerIsolation`, `GatewayHTTPSListenerDetectMisdirectedRequests`, `GatewayInfrastructure` | Supported |
 | `HTTPRouteHostRewrite`, `HTTPRoutePathRewrite`, `HTTPRouteResponseHeaderModification` | Supported |
 | `HTTPRoutePathRedirect`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoute303/307/308RedirectStatusCode` | Supported |
 | `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteParentRefPort` | Supported |
@@ -442,4 +442,4 @@ about Cloudflare (D12).
 - [Limits](../concepts/limits.md)
 - [Install](../get-started/install.md) and [Protect with Access](../get-started/protect-with-access.md)
 - [API reference](../reference/api.md)
-- [Gateway API v1.6.2 conformance report](../conformance/v1.6.2/flareway/README.md)
+- [Gateway API v1.6.3 conformance report](../conformance/v1.6.3/flareway/README.md)

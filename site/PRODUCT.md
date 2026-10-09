@@ -31,7 +31,7 @@ The primary promise: your standard `Gateway` and `HTTPRoute` become a managed Cl
 
 ## Operating Context
 
-Evaluated through: `helm template` rendering of the published chart `oci://ghcr.io/isac322/charts/flareway` (no cluster or credentials needed), `config/samples/` manifests, `kubectl explain`, the Gateway API conformance report, and the design document. Installed only from that public OCI chart; user-facing docs never build from source, `go run`, or apply Kustomize overlays. Installed with Gateway API v1.6.2 Standard CRDs, a Cloudflare account with a scoped API token, a DNS zone for public listeners, and WARP prerequisites for private listeners.
+Evaluated through: `helm template` rendering of the published chart `oci://ghcr.io/isac322/charts/flareway` (no cluster or credentials needed), `config/samples/` manifests, `kubectl explain`, the Gateway API conformance report, and the design document. Installed only from that public OCI chart; user-facing docs never build from source, `go run`, or apply Kustomize overlays. Installed with Gateway API v1.6.3 Standard CRDs, a Cloudflare account with a scoped API token, a DNS zone for public listeners, and WARP prerequisites for private listeners.
 
 ## Capabilities and Constraints
 
@@ -52,7 +52,7 @@ Evaluated through: `helm template` rendering of the published chart `oci://ghcr.
 
 ## Evidence on Hand
 
-Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.svg`), social card, README, docs (`docs/operations/*`, `docs/reference/api.md`, `docs/reference/kubectl-explain.md`, `docs/adr/*`), conformance report (`docs/conformance/v1.6.2/flareway/README.md`), sample manifests. No users, testimonials, logos of adopters, benchmarks, pricing, or download counts exist; never fabricate them.
+Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.svg`), social card, README, docs (`docs/operations/*`, `docs/reference/api.md`, `docs/reference/kubectl-explain.md`, `docs/adr/*`), conformance report (`docs/conformance/v1.6.3/flareway/README.md`), sample manifests. No users, testimonials, logos of adopters, benchmarks, pricing, or download counts exist; never fabricate them.
 
 ## Product Principles
 

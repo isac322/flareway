@@ -52,7 +52,7 @@ func TestConformance(t *testing.T) {
 	}
 	if opts.ReportOutputPath == "" {
 		opts.ReportOutputPath = filepath.Join(
-			"..", "..", "docs", "conformance", "v1.6.2", "flareway",
+			"..", "..", "docs", "conformance", "v1.6.3", "flareway",
 			"standard-"+version+"-default-report.yaml",
 		)
 	}

@@ -58,10 +58,10 @@ jobs:
         run: |
           kubeconfig="${RUNNER_TEMP}/flareway-e2e.kubeconfig"
           node_args=()
-          if docker manifest inspect kindest/node:v1.35.0 >/dev/null 2>&1; then
-            node_args=(--image kindest/node:v1.35.0)
+          if docker manifest inspect kindest/node:v1.37.0 >/dev/null 2>&1; then
+            node_args=(--image kindest/node:v1.37.0)
           else
-            echo "kindest/node:v1.35.0 is unavailable; using the Kind default node image"
+            echo "kindest/node:v1.37.0 is unavailable; using the Kind default node image"
           fi
           bin/kind create cluster \
             --name "${KIND_CLUSTER_NAME}" \
@@ -75,7 +75,7 @@ jobs:
       - name: Install Gateway API
         run: |
           kubectl apply --server-side -f \
-            https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+            https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
           kubectl wait --for=condition=Established --timeout=2m \
             customresourcedefinition/gatewayclasses.gateway.networking.k8s.io \
             customresourcedefinition/gateways.gateway.networking.k8s.io \
@@ -241,7 +241,7 @@ jobs:
           PY
       - name: Upload end-to-end artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cloudflare-e2e-${{ github.sha }}
           path: artifacts

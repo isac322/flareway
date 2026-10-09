@@ -34,7 +34,7 @@ source markers or types and regenerate with `make manifests` or
 
 ## Gateway API conformance run
 
-The [conformance report](conformance/v1.6.2/flareway/README.md)
+The [conformance report](conformance/v1.6.3/flareway/README.md)
 comes from this workflow. Run it with Docker, Go, and `kubectl` installed:
 
 ```sh
@@ -42,7 +42,7 @@ make conformance
 ```
 
 The script creates or reuses the `flareway-conf` kind cluster, installs
-Gateway API v1.6.2 and Flareway, builds the controller image, and applies
+Gateway API v1.6.3 and Flareway, builds the controller image, and applies
 the conformance `GatewayClass`.
 
 On Linux, it starts cloud-provider-kind and verifies that it can assign a
@@ -50,7 +50,7 @@ LoadBalancer address before running the suite from the host. On macOS, or
 when the provider probe fails, it switches the conformance Service to
 `ClusterIP` and runs the compiled test binary in a Kubernetes Job. The Job
 writes the report to a shared volume, and the script copies it to
-`docs/conformance/v1.6.2/flareway/`.
+`docs/conformance/v1.6.3/flareway/`.
 
 The runner disables test parallelism because Flareway deliberately uses one
 controller replica and one Gateway reconciliation worker. This serializes
@@ -61,7 +61,7 @@ Useful overrides:
 ```sh
 KIND_CLUSTER_NAME=my-cluster \
 VERSION=dev \
-REPORT_OUTPUT="$PWD/docs/conformance/v1.6.2/flareway/standard-dev-default-report.yaml" \
+REPORT_OUTPUT="$PWD/docs/conformance/v1.6.3/flareway/standard-dev-default-report.yaml" \
 make conformance
 ```
 

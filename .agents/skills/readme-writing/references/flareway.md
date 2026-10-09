@@ -70,7 +70,7 @@ description (keep it ≤ 155 characters, plain prose, not a list or image).
   Cloudflare Tunnel, DNS, Access, and WARP; it validates Envoy behavior, not
   the edge path. Result numbers belong only on the conformance report page.
   Source:
-  [`docs/conformance/v1.6.2/flareway/README.md`](../../../../docs/conformance/v1.6.2/flareway/README.md).
+  [`docs/conformance/v1.6.3/flareway/README.md`](../../../../docs/conformance/v1.6.3/flareway/README.md).
 
 ## Architecture (smallest accurate model)
 
@@ -120,7 +120,7 @@ the table. Schema source of truth: `config/crd/bases/` and
 - Install and upgrade commands use `--version <chart-version>`; `helm show
   chart oci://ghcr.io/isac322/charts/flareway` prints the latest `version`.
   Do not hard-code a chart version.
-- Real install prerequisites: Gateway API **v1.6.2 Standard** CRDs applied
+- Real install prerequisites: Gateway API **v1.6.3 Standard** CRDs applied
   first (the chart does not install them), Helm 4.3 or a compatible Helm 3
   client, a Cloudflare account and scoped API token, a DNS zone for public
   listeners, WARP prerequisites for private listeners.
@@ -141,7 +141,7 @@ the table. Schema source of truth: `config/crd/bases/` and
 - Concepts:
   [`docs/concepts/how-it-works.md`](../../../../docs/concepts/how-it-works.md),
   [`docs/concepts/http-routing.md`](../../../../docs/concepts/http-routing.md),
-  [`docs/conformance/v1.6.2/flareway/README.md`](../../../../docs/conformance/v1.6.2/flareway/README.md),
+  [`docs/conformance/v1.6.3/flareway/README.md`](../../../../docs/conformance/v1.6.3/flareway/README.md),
   [`docs/concepts/security-model.md`](../../../../docs/concepts/security-model.md),
   [`docs/concepts/ownership-and-adoption.md`](../../../../docs/concepts/ownership-and-adoption.md),
   [`docs/concepts/limits.md`](../../../../docs/concepts/limits.md)
