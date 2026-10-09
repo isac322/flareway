@@ -20,5 +20,4 @@
   left on a listener that permits unprotected traffic no longer serves the
   host ahead of the tombstone's block. A private TLS listener for that host no
   longer fails the Gateway xDS snapshot with a duplicate SNI filter chain
-  (#143). Destinations a revoked application recorded for other listeners are
-  not held.
+  (#143).
