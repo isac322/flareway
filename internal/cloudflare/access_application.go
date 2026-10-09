@@ -539,7 +539,8 @@ type AccessApplicationPolicy struct {
 	SessionDuration              string                               `json:"session_duration,omitempty"`
 }
 
-// AccessApplicationInput contains every mutable application field supported by cloudflare-go v7.10.0.
+// AccessApplicationInput contains every mutable application field Flareway manages;
+// SDK fields excluded in hack/parity/ledger.json are intentionally absent.
 type AccessApplicationInput struct {
 	Type                                 AccessApplicationType
 	Domain                               string
