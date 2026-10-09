@@ -35,7 +35,8 @@ const AccessRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
 // that keeps serving its hosts as a Blocked protection domain. The applied
 // tunnel configuration still routes those hosts to EnvoyPort, so the
 // tombstone must stay bound there, no live listener or domain may take it, and
-// nothing else may serve its hosts on its listener except as Blocked.
+// nothing else may serve its hosts except as Blocked: on every public listener
+// for a public tombstone, or on its own listener for a private one.
 type AccessRevocationTombstone struct {
 	// Key identifies the tombstone as ProtectionDomain + "\x00" + Application.
 	Key string
