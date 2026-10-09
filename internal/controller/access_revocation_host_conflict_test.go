@@ -355,3 +355,44 @@ func assertTombstoneOnHost(t *testing.T, gateway *ir.Gateway) {
 		t.Fatalf("revocation tombstone = %#v, want Blocked on %s", tombstone, conflictHost)
 	}
 }
+
+// Before the tunnel reports a revoked application's hosts, its tombstone falls
+// back to the destinations the application recorded. Only destinations its
+// public data plane can have served are held there: a standalone private
+// destination of the same application never reached this listener, so another
+// application keeps forwarding that hostname on it.
+func TestRevokedAccessTombstoneFallbackHoldsOnlyItsListenerDestinations(t *testing.T) {
+	inputs := wildcardHostConflictInputs(t)
+	inputs.HTTPRoutes = inputs.HTTPRoutes[1:]
+	inputs.CloudflareTunnel.Status.Hostnames = nil
+	inputs.AccessApplications[0].Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{
+		{Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: "b.example.com", PortRange: "5432", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP), VNetID: "vnet-private"},
+		{Type: v1alpha1.AccessApplicationDestinationPublic, URI: conflictHost},
+	}
+	gateway, statuses := buildRevokedGateway(t, inputs)
+	assertTombstoneOnHost(t, gateway)
+	assertAppBForwarding(t, gateway, statuses)
+	other := hostDomains(gateway, "b.example.com")
+	if len(other) != 1 || other[0].AccessApplication != "default/app-b" || other[0].Guard != ir.GuardForwarding {
+		t.Fatalf("b.example.com domains = %#v, want app-b's Forwarding domain only", other)
+	}
+	if service := firstEdgeService(t, gateway, "b.example.com"); service == "http_status:403" {
+		t.Fatalf("b.example.com is blocked by a destination its tombstone never served")
+	}
+}
+
+// On a private listener the fallback holds the Private hostname destinations
+// compiled for that listener, which carry its port, and not another private
+// destination of the same application.
+func TestRevokedAccessTombstoneFallbackHoldsPrivateListenerDestinations(t *testing.T) {
+	inputs := hostConflictInputs(t, true, 443)
+	inputs.AccessApplications = inputs.AccessApplications[:1]
+	inputs.CloudflareTunnel.Status.Hostnames = nil
+	inputs.AccessApplications[0].Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{
+		{Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: conflictHost, PortRange: "443", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP), VNetID: "vnet-private"},
+		{Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: "db.example.com", PortRange: "5432", L4Protocol: new(v1alpha1.AccessL4ProtocolTCP), VNetID: "vnet-private"},
+		{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "www.example.com"},
+	}
+	gateway, _ := buildRevokedGateway(t, inputs)
+	assertTombstoneOnHost(t, gateway)
+}

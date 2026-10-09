@@ -19,6 +19,7 @@ package gatewayapi
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -73,7 +74,7 @@ func AccessRevocationTombstones(tunnel *v1alpha1.CloudflareTunnel, applications 
 			if _, found := existing[key]; found {
 				continue
 			}
-			hostnames := retainedAccessHostnames(tunnel, application, dataPlane.ProtectionDomain, applicationKey)
+			hostnames := retainedAccessHostnames(tunnel, application, dataPlane, applicationKey)
 			if len(hostnames) == 0 {
 				continue
 			}
@@ -235,15 +236,45 @@ func (ports *publicEnvoyPorts) take() int32 {
 	}
 }
 
-func retainedAccessHostnames(tunnel *v1alpha1.CloudflareTunnel, application *v1alpha1.AccessApplication, protectionDomain, applicationKey string) []string {
+// retainedAccessHostnames returns the hostnames a revoked application's data
+// plane blocks: the hosts the tunnel reports for its protection domain, or,
+// before the tunnel reported any, the application's recorded destinations
+// that the data plane can have served. A public listener's data plane serves
+// Public destinations. A private listener's data plane serves the Private
+// hostname destinations compiled for that listener, which carry the listener
+// port its protection domains bind as their port range. Other destinations,
+// such as a standalone private HostnameRoute or CIDR destination, never
+// reached this data plane and are not held on its listener. An untyped
+// destination predates the required type and is kept, as before.
+func retainedAccessHostnames(tunnel *v1alpha1.CloudflareTunnel, application *v1alpha1.AccessApplication, dataPlane v1alpha1.AccessApplicationDataPlaneStatus, applicationKey string) []string {
 	hostnames := make([]string, 0)
 	for _, status := range tunnel.Status.Hostnames {
-		if status.ProtectionDomain == protectionDomain && status.AccessApplication == applicationKey && status.Hostname != "" {
+		if status.ProtectionDomain == dataPlane.ProtectionDomain && status.AccessApplication == applicationKey && status.Hostname != "" {
 			hostnames = append(hostnames, strings.ToLower(strings.TrimSuffix(status.Hostname, ".")))
 		}
 	}
 	if len(hostnames) == 0 {
+		private := false
+		for _, listener := range tunnel.Spec.Listeners {
+			if listener.Name == dataPlane.Listener {
+				private = listener.Exposure == v1alpha1.ExposurePrivate
+				break
+			}
+		}
 		for _, destination := range application.Status.Destinations {
+			switch destination.Type {
+			case "":
+			case v1alpha1.AccessApplicationDestinationPublic:
+				if private {
+					continue
+				}
+			case v1alpha1.AccessApplicationDestinationPrivate:
+				if !private || destination.PortRange != strconv.Itoa(int(dataPlane.EnvoyPort)) {
+					continue
+				}
+			default:
+				continue
+			}
 			hostname := destination.Hostname
 			if hostname == "" && destination.URI != "" {
 				hostname, _, _ = strings.Cut(destination.URI, "/")
