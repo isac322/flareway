@@ -386,7 +386,7 @@ func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 	return result
 }
 
-func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, reserved map[int32]struct{}) {
+func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds) {
 	statuses.AccessApplications = make(map[types.NamespacedName]AccessApplicationCompilation)
 	if gateway == nil || gateway.ConformanceMode || len(in.AccessApplications) == 0 {
 		markPublicDomainsForHeaderStripping(gateway)
@@ -422,13 +422,16 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 			for _, claim := range compiled.claims {
 				acceptedClaims[claim.hostname] = append(acceptedClaims[claim.hostname], claim)
 			}
+			if note := holds.describe(in, compiled.claims, key.String()); note != "" {
+				compiled.Message += "; " + note
+			}
 		}
 		statuses.AccessApplications[key] = compiled
 	}
 
 	original := slices.Clone(gateway.Domains)
 	gateway.Domains = nil
-	publicPorts := publicEnvoyPorts{next: nextAccessEnvoyPort(original), reserved: reserved}
+	publicPorts := publicEnvoyPorts{next: nextAccessEnvoyPort(original), reserved: holds.reservedPorts()}
 	dropped := make(map[types.NamespacedName][]string)
 	remaining := make(map[types.NamespacedName]int)
 	for _, domain := range original {
@@ -445,6 +448,8 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 		}
 	}
 	disambiguateDerivedDomainNames(gateway, statuses)
+	// Names are settled first so holding a host never renames another domain.
+	holds.apply(gateway)
 	applyAccessRouteDrops(statuses, in, dropped, remaining, now)
 	for key, compiled := range statuses.AccessApplications {
 		sortAccessCompilation(&compiled)
