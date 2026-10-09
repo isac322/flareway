@@ -55,7 +55,7 @@ func schedulingGWCC(name string, scheduling map[string]any) *unstructured.Unstru
 // the scheduling fields verbatim, mirroring what the dataplane builder emits.
 func schedulingDeployment(namespace, name string, scheduling map[string]any) *unstructured.Unstructured {
 	podSpec := map[string]any{
-		"containers": []any{map[string]any{"name": "envoy", "image": "envoyproxy/envoy:distroless-v1.39.1"}},
+		"containers": []any{map[string]any{"name": "envoy", "image": "envoyproxy/envoy:distroless-v1.39.3"}},
 	}
 	for key, value := range scheduling {
 		podSpec[key] = value

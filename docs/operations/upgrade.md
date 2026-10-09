@@ -5,7 +5,7 @@ Upgrade CRDs before the controller. Helm installs files in a chart's `crds/` dir
 ## Before upgrading
 
 1. Read the GitHub release notes for every version you skip, and compare chart values.
-2. Confirm Gateway API v1.6.2 Standard CRDs are installed.
+2. Confirm Gateway API v1.6.3 Standard CRDs are installed.
 3. Back up Flareway custom resources and the values used for the current release.
 4. Check for resources with `CleanupBlocked`, `Conflict`, or `Programmed=False`; resolve them before changing controller ownership.
 5. Keep the old controller running until managed resource teardown or migration is complete.
@@ -55,7 +55,7 @@ image:
   digest: sha256:<release-digest>
 ```
 
-The installed `GatewayClassConfig` pins the Gateway data-plane images, each by digest: cloudflared `2026.9.1`, Envoy `distroless-v1.39.1`, and CoreDNS `1.14.7`. Changing chart defaults does not rewrite an independently managed `GatewayClassConfig` unless Helm owns that object.
+The installed `GatewayClassConfig` pins the Gateway data-plane images, each by digest: cloudflared `2026.10.0`, Envoy `distroless-v1.39.3`, and CoreDNS `1.14.7`. Changing chart defaults does not rewrite an independently managed `GatewayClassConfig` unless Helm owns that object.
 
 ## Rollback
 

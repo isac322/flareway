@@ -23,9 +23,9 @@ import (
 
 const (
 	// DefaultConnectorImage is the pinned cloudflared image used by GatewayClassConfig defaulting.
-	DefaultConnectorImage = "cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4"
+	DefaultConnectorImage = "cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07"
 	// DefaultProxyImage is the pinned Envoy image used by GatewayClassConfig defaulting.
-	DefaultProxyImage = "envoyproxy/envoy:distroless-v1.39.1"
+	DefaultProxyImage = "envoyproxy/envoy:distroless-v1.39.3"
 	// DefaultPrivateDNSImage is the pinned CoreDNS image used by GatewayClassConfig defaulting.
 	DefaultPrivateDNSImage = "coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
 )
@@ -67,7 +67,7 @@ const (
 
 // ConnectorSpec configures the cloudflared connector containers.
 type ConnectorSpec struct {
-	// +kubebuilder:default="cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4"
+	// +kubebuilder:default="cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07"
 	Image string `json:"image,omitempty"`
 	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=1
@@ -82,7 +82,7 @@ type ConnectorSpec struct {
 
 // ProxySpec configures the Envoy proxy containers.
 type ProxySpec struct {
-	// +kubebuilder:default="envoyproxy/envoy:distroless-v1.39.1"
+	// +kubebuilder:default="envoyproxy/envoy:distroless-v1.39.3"
 	Image     string                      `json:"image,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +kubebuilder:default="1h"

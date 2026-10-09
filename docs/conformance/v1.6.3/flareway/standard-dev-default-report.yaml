@@ -1,7 +1,7 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-09-28T09:20:41Z"
+date: "2026-10-09T13:20:01Z"
 gatewayAPIChannel: standard
-gatewayAPIVersion: v1.6.2
+gatewayAPIVersion: v1.6.3
 implementation:
   contact:
   - '@isac322'
@@ -16,20 +16,20 @@ profiles:
     result: success
     statistics:
       Failed: 0
-      Passed: 37
+      Passed: 36
       Skipped: 0
   extended:
     result: success
     statistics:
       Failed: 0
-      Passed: 31
+      Passed: 32
       Skipped: 0
     supportedFeatures:
     - BackendTLSPolicy
     - BackendTLSPolicySANValidation
     - GatewayHTTPListenerIsolation
     - GatewayHTTPSListenerDetectMisdirectedRequests
-    - GatewayInfrastructurePropagation
+    - GatewayInfrastructure
     - HTTPRoute303RedirectStatusCode
     - HTTPRoute307RedirectStatusCode
     - HTTPRoute308RedirectStatusCode
@@ -66,9 +66,3 @@ profiles:
     - ListenerSet
   name: GATEWAY-HTTP
   summary: Core tests succeeded. Extended tests succeeded.
-succeededProvisionalTests:
-- GatewayInfrastructure
-- HTTPRoute303Redirect
-- HTTPRoute307Redirect
-- HTTPRoute308Redirect
-- HTTPRouteRequestPercentageMirror

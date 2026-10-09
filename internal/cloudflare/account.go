@@ -113,5 +113,5 @@ func (client *Client) GetOrganization(ctx context.Context) (Organization, error)
 	if err != nil {
 		return Organization{}, fmt.Errorf("get Cloudflare Zero Trust organization: %w", err)
 	}
-	return organizationFromSDK(result), nil
+	return organizationListFromSDK(result), nil
 }

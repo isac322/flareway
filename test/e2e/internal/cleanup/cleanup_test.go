@@ -90,7 +90,7 @@ func discoveredResources(t *testing.T) []*metav1.APIResourceList {
 	return lists
 }
 
-// gatewayAPIResources mirrors the Gateway API v1.6.2 standard channel the e2e
+// gatewayAPIResources mirrors the Gateway API v1.6.3 standard channel the e2e
 // workflow installs. It is pinned to that release: update it when the
 // installed channel changes.
 func gatewayAPIResources() *metav1.APIResourceList {

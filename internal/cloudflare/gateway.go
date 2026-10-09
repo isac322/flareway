@@ -367,14 +367,17 @@ func (client *Client) listGatewayListItems(ctx context.Context, listID string) (
 	if err := client.waitGatewayList(ctx); err != nil {
 		return nil, err
 	}
-	pager := client.sdk.ZeroTrust.Gateway.Lists.Items.ListAutoPaging(ctx, listID, zero_trust.GatewayListItemListParams{AccountID: cloudflaresdk.F(client.accountID)})
-	result := make([]GatewayListItem, 0)
-	for pager.Next() {
-		item := pager.Current()
-		result = append(result, GatewayListItem{Value: item.Value, Description: item.Description})
-	}
-	if err := pager.Err(); err != nil {
+	// cloudflare-go v7.12.0 switched this endpoint to page-number pagination,
+	// whose auto-pager requests page N+1 until a page comes back empty. Keep the
+	// single request Flareway has always made so the call count and result stay
+	// the same as before the SDK upgrade.
+	page, err := client.sdk.ZeroTrust.Gateway.Lists.Items.List(ctx, listID, zero_trust.GatewayListItemListParams{AccountID: cloudflaresdk.F(client.accountID)})
+	if err != nil {
 		return nil, fmt.Errorf("list Cloudflare Gateway list items: %w", err)
+	}
+	result := make([]GatewayListItem, 0, len(page.Result))
+	for _, item := range page.Result {
+		result = append(result, GatewayListItem{Value: item.Value, Description: item.Description})
 	}
 	return result, nil
 }

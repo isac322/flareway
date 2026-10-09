@@ -539,7 +539,8 @@ type AccessApplicationPolicy struct {
 	SessionDuration              string                               `json:"session_duration,omitempty"`
 }
 
-// AccessApplicationInput contains every mutable application field supported by cloudflare-go v7.10.0.
+// AccessApplicationInput contains every mutable application field Flareway manages;
+// SDK fields excluded in hack/parity/ledger.json are intentionally absent.
 type AccessApplicationInput struct {
 	Type                                 AccessApplicationType
 	Domain                               string
@@ -853,10 +854,16 @@ func accessApplicationUpdateBody(input AccessApplicationInput) (zero_trust.Acces
 	}
 }
 
+// The target criteria helpers keep sending target_attributes. cloudflare-go
+// v7.12.0 deprecates the SDK field in favor of include/exclude/require
+// selectors, but AccessApplication.spec still models target attributes and
+// the API still accepts them; moving to selectors is an API change, not a
+// dependency bump.
+
 func newInfrastructureTargetCriteria(values []AccessApplicationTargetCriterion) []zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriterion {
 	result := make([]zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriterion, len(values))
 	for i, value := range values {
-		result[i] = zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)}
+		result[i] = zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationNewParamsBodyInfrastructureApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)} //nolint:staticcheck // SA1019: see target criteria note above.
 	}
 	return result
 }
@@ -864,7 +871,7 @@ func newInfrastructureTargetCriteria(values []AccessApplicationTargetCriterion) 
 func updateInfrastructureTargetCriteria(values []AccessApplicationTargetCriterion) []zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriterion {
 	result := make([]zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriterion, len(values))
 	for i, value := range values {
-		result[i] = zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)}
+		result[i] = zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationUpdateParamsBodyInfrastructureApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)} //nolint:staticcheck // SA1019: see target criteria note above.
 	}
 	return result
 }
@@ -872,7 +879,7 @@ func updateInfrastructureTargetCriteria(values []AccessApplicationTargetCriterio
 func newRDPTargetCriteria(values []AccessApplicationTargetCriterion) []zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriterion {
 	result := make([]zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriterion, len(values))
 	for i, value := range values {
-		result[i] = zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)}
+		result[i] = zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationNewParamsBodyBrowserRDPApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)} //nolint:staticcheck // SA1019: see target criteria note above.
 	}
 	return result
 }
@@ -880,7 +887,7 @@ func newRDPTargetCriteria(values []AccessApplicationTargetCriterion) []zero_trus
 func updateRDPTargetCriteria(values []AccessApplicationTargetCriterion) []zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriterion {
 	result := make([]zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriterion, len(values))
 	for i, value := range values {
-		result[i] = zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)}
+		result[i] = zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriterion{Port: cloudflaresdk.F(value.Port), Protocol: cloudflaresdk.F(zero_trust.AccessApplicationUpdateParamsBodyBrowserRDPApplicationTargetCriteriaProtocol(accessTargetProtocolToWire(value.Protocol))), TargetAttributes: cloudflaresdk.F(value.TargetAttributes)} //nolint:staticcheck // SA1019: see target criteria note above.
 	}
 	return result
 }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- Bump the default data-plane images to cloudflared `2026.10.0` and Envoy
+  `distroless-v1.39.3`, and build with Go 1.27.2.
+- Target Gateway API v1.6.3. The supported feature published in
+  `GatewayClass.status.supportedFeatures` as `GatewayInfrastructurePropagation`
+  is now `GatewayInfrastructure`, the name Gateway API v1.6.3 uses for it. The
+  conformance report moved to `docs/conformance/v1.6.3/`.
+- Update Go modules (including cloudflare-go v7.12.0, controller-runtime
+  v0.25.2, and Kubernetes v0.37.1), build tools (golangci-lint v2.14.0,
+  kustomize v5.8.3, cloud-provider-kind v0.12.0, cosign v3.1.3, envtest and
+  Kind node v1.37.0), GitHub Actions, and site dependencies. Release images
+  keep the same cosign signature format as earlier releases.
+
 ### Fixed
 
 - Preserve Envoy's initial resource-version proof when it reconnects before
