@@ -244,7 +244,17 @@ func (r *NetworkRouteReconciler) ensureManaged(ctx context.Context, api flareclo
 	if !networkRouteNeedsUpdate(input, remote) {
 		return remote, nil
 	}
-	return api.UpdateNetworkRoute(ctx, id, input)
+	updated, err := api.UpdateNetworkRoute(ctx, id, input)
+	if err != nil {
+		return flarecloudflare.NetworkRoute{}, err
+	}
+	// The update re-reads the route. A read-back that differs from what was
+	// written means another writer changed the route between the write and
+	// the read; recording it would claim a target this pass never applied.
+	if networkRouteNeedsUpdate(input, updated) {
+		return flarecloudflare.NetworkRoute{}, fmt.Errorf("remote network route %q changed while it was being updated; retrying", id)
+	}
+	return updated, nil
 }
 
 func findOwnedNetworkRoute(ctx context.Context, api flarecloudflare.NetworkRouteAPI, comment string) (flarecloudflare.NetworkRoute, bool, error) {

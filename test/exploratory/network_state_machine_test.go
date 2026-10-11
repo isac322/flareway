@@ -1056,10 +1056,20 @@ func (m *networkMachine) checkRemoteVNet(rt *rapid.T, account *networkAccount, r
 		}
 		return
 	}
+	// DeleteObject snapshots the remote ID before the delete, but a reconcile
+	// still in flight can create the remote afterwards. The owner comment
+	// binds the remote to its deleted object, so its deletion policy decides.
+	namespace, name, ok := parseOwnerComment(remote.Comment)
+	if ok && namespace == m.namespace {
+		if vnet, tracked := m.vnets[name]; tracked && vnet.deleted && vnet.account == account.name {
+			m.recordResidue("vnet", name, account.accountID, remote.ID,
+				vnet.policy == v1alpha1.ManagementPolicyObserveOnly, vnet.deletion)
+			return
+		}
+	}
 	if remote.DeletedAt != nil {
 		rt.Fatalf("remote vnet %s was deleted without a tracked deletion", remote.ID)
 	}
-	namespace, name, ok := parseOwnerComment(remote.Comment)
 	if !ok || namespace != m.namespace {
 		rt.Fatalf("remote vnet %s has unowned comment %q", remote.ID, remote.Comment)
 	}
@@ -1091,10 +1101,19 @@ func (m *networkMachine) checkRemoteRoute(rt *rapid.T, account *networkAccount, 
 		}
 		return
 	}
+	// See checkRemoteVNet: the owner comment, not the pre-delete snapshot,
+	// binds a remote to its deleted object.
+	namespace, name, ok := parseOwnerComment(remote.Comment)
+	if ok && namespace == m.namespace {
+		if route, tracked := m.routes[name]; tracked && route.deleted && route.account == account.name {
+			m.recordResidue("route", name, account.accountID, remote.ID,
+				route.policy == v1alpha1.ManagementPolicyObserveOnly, route.deletion)
+			return
+		}
+	}
 	if remote.DeletedAt != nil {
 		rt.Fatalf("remote route %s was deleted without a tracked deletion", remote.ID)
 	}
-	namespace, name, ok := parseOwnerComment(remote.Comment)
 	if !ok || namespace != m.namespace {
 		rt.Fatalf("remote route %s has unowned comment %q", remote.ID, remote.Comment)
 	}
