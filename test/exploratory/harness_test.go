@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -87,6 +89,8 @@ type explorationHarness struct {
 
 	// inflight counts Cloudflare HTTP requests the production client has
 	// started but not finished. Journal length alone cannot see those calls.
+	// It cannot see a reconcile parked between requests (SDK retry backoff,
+	// Kubernetes writes); activeReconciles covers those.
 	inflight atomic.Int64
 }
 
@@ -134,6 +138,9 @@ func newExplorationHarness(t *testing.T) *explorationHarness {
 	h.factory = flarecloudflare.NewFactory(
 		logr.Discard(),
 		flarecloudflare.WithBaseURL(h.stub.URL),
+		// Unlimited client-side rate: the production per-account limiter
+		// (3.5 req/s) would make polling reconciles queue behind each other
+		// and keep the system permanently busy.
 		flarecloudflare.WithLimiter(rate.NewLimiter(rate.Inf, 0)),
 		flarecloudflare.WithListLimiter(rate.NewLimiter(rate.Inf, 0)),
 		flarecloudflare.WithRequestOptions(
@@ -158,10 +165,11 @@ func (h *explorationHarness) resetIteration(t *testing.T) {
 }
 
 // waitStable polls every expectation plus the stub journal signature until all
-// expectations succeed, no Cloudflare HTTP call is in flight, and the combined
-// signature is unchanged for stabilityConsecutive consecutive observations, or
-// ctx times out. A context without a deadline is bounded by stabilityMaxWait.
-// Recorded stub contract violations fail immediately.
+// expectations succeed, no reconcile is running, no Cloudflare HTTP call is in
+// flight, and the combined signature is unchanged for stabilityConsecutive
+// consecutive observations, or ctx times out. A context without a deadline is
+// bounded by stabilityMaxWait. Recorded stub contract violations fail
+// immediately.
 func (h *explorationHarness) waitStable(ctx context.Context, expectations ...stabilityExpectation) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -183,6 +191,12 @@ func (h *explorationHarness) waitStable(ctx context.Context, expectations ...sta
 		if inflight := h.inflight.Load(); inflight > 0 {
 			errs = append(errs, fmt.Errorf("%d in-flight Cloudflare API calls", inflight))
 			fmt.Fprintf(&signature, "inflight=%d;", inflight)
+		}
+		if active, err := activeReconciles(); err != nil {
+			errs = append(errs, err)
+		} else if len(active) > 0 {
+			errs = append(errs, fmt.Errorf("reconciles running: %s", strings.Join(active, ", ")))
+			fmt.Fprintf(&signature, "active=%s;", strings.Join(active, ","))
 		}
 		for index, expectation := range expectations {
 			fingerprint, err := expectation(ctx, h)
@@ -214,6 +228,44 @@ func (h *explorationHarness) waitStable(ctx context.Context, expectations ...sta
 		case <-time.After(stabilityPollInterval):
 		}
 	}
+}
+
+// activeReconciles reports, as sorted "controller=count" entries, every
+// controller whose controller-runtime active worker gauge is non-zero. A
+// reconcile stays active while it sleeps through SDK retry backoff (up to
+// several seconds on 429/5xx faults) or writes Kubernetes status between
+// Cloudflare requests: gaps in which no HTTP call
+// is in flight and the journal does not move, yet the reconcile has not
+// finished. Without this signal waitStable can report a quiet system in such
+// a gap, and the next action races the reconcile's remaining requests.
+// Every manager in this process registers into the same global registry, and
+// a manager start resets its controllers' gauges to zero.
+func activeReconciles() ([]string, error) {
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		return nil, fmt.Errorf("gather controller-runtime metrics: %w", err)
+	}
+	var active []string
+	for _, family := range families {
+		if family.GetName() != "controller_runtime_active_workers" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			value := metric.GetGauge().GetValue()
+			if value == 0 {
+				continue
+			}
+			name := "unknown"
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "controller" {
+					name = label.GetValue()
+				}
+			}
+			active = append(active, fmt.Sprintf("%s=%g", name, value))
+		}
+	}
+	sort.Strings(active)
+	return active, nil
 }
 
 func (h *explorationHarness) trackCloudflareCalls(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {

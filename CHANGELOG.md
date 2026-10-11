@@ -46,3 +46,13 @@
   with different AUDs, or an Access host whose AUD is not ready yet, no
   longer fails the Gateway xDS snapshot with a duplicate SNI filter chain
   (#145).
+- Stop a CloudflareTunnel with a standing conflict, such as a DNS record it
+  does not own or an adoption mismatch, from reconciling in a tight loop. Each
+  pass cleared `Conflict` or promoted `Accepted` before reading Cloudflare,
+  then reverted them afterwards. The two status writes re-queued the Tunnel
+  through its own watch and kept spending Cloudflare API budget. Both now
+  change only after the remote reads confirm no conflict.
+- A NetworkRoute or HostnameRoute no longer records another writer's change
+  as `status.applied` or reports Ready when the route changed between the
+  controller's update and its read-back. The pass reports `CloudflareError`
+  and retries.

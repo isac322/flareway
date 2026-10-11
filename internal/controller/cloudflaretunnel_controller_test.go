@@ -1130,6 +1130,7 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			}
 			return nil
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+		expectTunnelStatusSettles(fixture.tunnelKey)
 
 		gomega.Expect(testTunnelCloudflare.Calls()).To(gomega.ContainElement("GetTunnel"))
 		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElements("CreateTunnel", "GetTunnelToken", "CreateCNAME"))
@@ -1497,6 +1498,8 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(conflict.Reason).To(gomega.Equal("DNSOwnership"))
 			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		expectTunnelStatusSettles(fixture.tunnelKey)
 
 		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
 		gomega.Expect(testClient.Delete(testContext, &tunnel)).To(gomega.Succeed())
@@ -2712,3 +2715,24 @@ func (f *fakeTunnelCloudflareFactory) DeleteDNSRecord(_ context.Context, zoneID,
 }
 
 var _ TunnelCloudflareClient = (*fakeTunnelCloudflareFactory)(nil)
+
+// expectTunnelStatusSettles requires a Tunnel under a standing conflict to
+// stop writing status. A pass that cleared or promoted a condition before the
+// remote reads and reverted it afterwards wrote status twice per pass and
+// re-enqueued the Tunnel through its own watch without end.
+func expectTunnelStatusSettles(key types.NamespacedName) {
+	ginkgo.GinkgoHelper()
+	var settled string
+	gomega.Eventually(func() bool {
+		var current v1alpha1.CloudflareTunnel
+		gomega.Expect(testClient.Get(testContext, key, &current)).To(gomega.Succeed())
+		stable := current.ResourceVersion == settled
+		settled = current.ResourceVersion
+		return stable
+	}).WithTimeout(10 * time.Second).WithPolling(500 * time.Millisecond).Should(gomega.BeTrue())
+	gomega.Consistently(func(g gomega.Gomega) {
+		var current v1alpha1.CloudflareTunnel
+		g.Expect(testClient.Get(testContext, key, &current)).To(gomega.Succeed())
+		g.Expect(current.ResourceVersion).To(gomega.Equal(settled))
+	}).WithTimeout(3 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+}

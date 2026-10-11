@@ -831,6 +831,22 @@ func TestFactorySharesLimiterByAccountWithoutCachingToken(t *testing.T) {
 	}
 }
 
+func TestFactoryHonorsExplicitLimiters(t *testing.T) {
+	limiter := rate.NewLimiter(rate.Inf, 0)
+	listLimiter := rate.NewLimiter(rate.Inf, 0)
+	factory := NewFactory(logr.Discard(), WithLimiter(limiter), WithListLimiter(listLimiter))
+	first := factory.Client("first-token", "account-1").(*Client)
+	other := factory.Client("other-token", "account-2").(*Client)
+	for _, client := range []*Client{first, other} {
+		if client.limiter != limiter || client.listLimiter != listLimiter {
+			t.Fatalf("client for %s ignored the factory's explicit limiters", client.accountID)
+		}
+	}
+	if first.locks != other.locks {
+		t.Fatal("explicit limiters detached clients from the factory's shared tunnel locks")
+	}
+}
+
 func TestClientRetriesThreeTimes(t *testing.T) {
 	server := cfstub.New(t)
 	server.Fault(http.MethodGet, `/user/tokens/verify$`, cfstub.Fault{

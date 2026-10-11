@@ -1021,7 +1021,7 @@ func (m *accessMachine) policyResolved(ctx context.Context, application *v1alpha
 	}
 	reference := application.Spec.Policies[0]
 	if reference.ExternalRef != nil {
-		for _, remote := range m.world.h.stub.State.AccessPolicies("accounts/" + accessAccountID) {
+		for _, remote := range m.world.h.stub.State.AccessPolicies(accessAccountID) {
 			if remote["id"] == reference.ExternalRef.PolicyID {
 				return true
 			}

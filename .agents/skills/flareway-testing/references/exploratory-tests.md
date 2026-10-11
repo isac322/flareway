@@ -37,13 +37,17 @@ separate processes so one family's timeout cannot swallow another.
 ## Harness
 
 `explorationHarness` starts envtest with Flareway and Gateway API CRDs, starts
-cfstub, points `flarecloudflare.DefaultFactory` at the stub URL, and registers
-the controller set used by these families. Each Rapid check iteration resets
-stub state and uses fresh Kubernetes names.
+cfstub, points `flarecloudflare.DefaultFactory` at the stub URL with unlimited
+client-side rate limiters, and registers the controller set used by these
+families. Each Rapid check iteration resets stub state and uses fresh
+Kubernetes names.
 
 `waitStable` polls caller expectations plus the stub journal. It also counts
-Cloudflare HTTP calls the production client has started but not finished, so
-a drain does not return while a request is still in flight.
+Cloudflare HTTP calls the production client has started but not finished, and
+requires every controller's `controller_runtime_active_workers` gauge to be
+zero. A reconcile sleeping through SDK retry backoff or writing status between
+requests has no call in flight, so without the worker gauge a drain could
+return mid-reconcile and the next action would race it.
 
 Traces persist HMAC-projected identifiers and Secret metadata (existence, key
 count, total bytes), not Secret values.

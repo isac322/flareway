@@ -99,13 +99,15 @@ func WithRequestOptions(requestOptions ...option.RequestOption) ClientOption {
 }
 
 // WithLimiter supplies a limiter, primarily for deterministic unit tests.
+// Passed to NewFactory, it replaces the per-account limiter for every client.
 func WithLimiter(limiter *rate.Limiter) ClientOption {
 	return func(options *clientOptions) {
 		options.limiter = limiter
 	}
 }
 
-// WithListLimiter supplies the dedicated Gateway Lists limiter.
+// WithListLimiter supplies the dedicated Gateway Lists limiter. Passed to
+// NewFactory, it replaces the per-account list limiter for every client.
 func WithListLimiter(limiter *rate.Limiter) ClientOption {
 	return func(options *clientOptions) {
 		options.listLimiter = limiter
@@ -163,8 +165,10 @@ func (factory *DefaultFactory) Client(token, accountID string) API {
 	}
 	factory.mu.Unlock()
 
-	opts := append([]ClientOption(nil), factory.opts...)
-	opts = append(opts, WithLimiter(limiter), WithListLimiter(listLimiter), func(options *clientOptions) { options.locks = factory.locks })
+	// Factory options come last so an explicit WithLimiter or WithListLimiter
+	// overrides the per-account defaults instead of being silently dropped.
+	opts := []ClientOption{WithLimiter(limiter), WithListLimiter(listLimiter), func(options *clientOptions) { options.locks = factory.locks }}
+	opts = append(opts, factory.opts...)
 	return New(token, accountID, factory.logger, opts...)
 }
 
