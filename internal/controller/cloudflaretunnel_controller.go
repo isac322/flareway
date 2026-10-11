@@ -438,7 +438,9 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	// status subresource exists for the identity checkpoint below, migrates
 	// legacy condition ownership ahead of every data write this pass, and may
 	// veto a stale observation before a non-idempotent CreateTunnel executes.
-	if err := r.commitTunnelConditions(ctx, tunnel, ownedConditions, true); err != nil {
+	// It withholds a Conflict clear: only the remote reads below can show that
+	// an adoption, DNS ownership, or configuration conflict has gone away.
+	if err := r.commitTunnelConditions(ctx, tunnel, withoutConflictClear(ownedConditions), true); err != nil {
 		return ctrl.Result{}, err
 	}
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
@@ -2681,6 +2683,18 @@ func tunnelAuthoredPromotion(authored []metav1.Condition) bool {
 		}
 	}
 	return false
+}
+
+// withoutConflictClear drops an authored Conflict=False from a commit that
+// runs before this pass has read the remote. Clearing a persisted conflict
+// there would demote it on every pass only for the remote reads to raise it
+// again, so a standing conflict would cost two status writes per pass and
+// re-enqueue the Tunnel through its own watch indefinitely. A raised
+// conflict is still committed early; the clear lands with the terminal write.
+func withoutConflictClear(authored []metav1.Condition) []metav1.Condition {
+	return slices.DeleteFunc(slices.Clone(authored), func(condition metav1.Condition) bool {
+		return condition.Type == v1alpha1.CloudflareTunnelConditionConflict && condition.Status == metav1.ConditionFalse
+	})
 }
 
 // tunnelReadyInputConditions are the condition types whose True value asserts

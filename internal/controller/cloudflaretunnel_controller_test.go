@@ -1498,6 +1498,23 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
+		// A standing conflict must settle: a pass that cleared Conflict before
+		// the DNS read raised it again wrote status twice per pass and
+		// re-enqueued the Tunnel through its own watch without end.
+		var settled string
+		gomega.Eventually(func() bool {
+			var current v1alpha1.CloudflareTunnel
+			gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			stable := current.ResourceVersion == settled
+			settled = current.ResourceVersion
+			return stable
+		}).WithTimeout(10 * time.Second).WithPolling(500 * time.Millisecond).Should(gomega.BeTrue())
+		gomega.Consistently(func(g gomega.Gomega) {
+			var current v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &current)).To(gomega.Succeed())
+			g.Expect(current.ResourceVersion).To(gomega.Equal(settled))
+		}).WithTimeout(3 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
 		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
 		gomega.Expect(testClient.Delete(testContext, &tunnel)).To(gomega.Succeed())
 		gomega.Eventually(func() bool {
