@@ -83,11 +83,7 @@ Before every merge:
 
 ## Website design and copy
 
-`site/PRODUCT.md` owns the site's positioning, selling points, status messaging, and install path; `site/DESIGN.md` owns the visual system. Read both before changing `site/`, landing copy, or SEO pages, and update them in the same pull request when a decision changes. Do not restate their rules elsewhere.
-
-- Before writing or restructuring site content, agree on the site map and what each page must convey (core problem, mechanism, selling points, order) through a multi-agent discussion, then write each page with a writing skill (`writing-clearly-and-concisely`, `humanizer`). Use `impeccable` for visual work.
-- Landing and SEO copy sells the project: short, scannable, one point per sentence, no filler. Counts (CRDs, tests, cores) are evidence, not selling points.
-- The GitHub star call to action stays prominent without breaking `site/DESIGN.md`.
+`site/PRODUCT.md` owns the site's positioning, selling points, voice, status messaging, and install path; `site/DESIGN.md` owns the visual system. Together they are the project context for the `impeccable` skill; use `impeccable` for visual work. Read both before changing `site/`, landing copy, or SEO pages, and update them in the same pull request when a decision changes. Do not restate their rules elsewhere.
 
 ## Skills
 

@@ -49,6 +49,7 @@ Evaluated through: `helm template` rendering of the published chart `oci://ghcr.
 - Logo (orange cloud with an open doorway, `assets/cloud-gateway/d2/logo-t3.svg`) and the navy serif lowercase wordmark are fixed (`assets/social-card.svg`). Everything else (extended palette, type system, motion) may expand around them.
 - English only.
 - Not affiliated with Cloudflare or the Kubernetes project; do not combine the Kubernetes Gateway API and Cloudflare logos.
+- The GitHub star call to action stays prominent; its styling follows site/DESIGN.md.
 
 ## Evidence on Hand
 
@@ -60,6 +61,7 @@ Architecture diagrams (`assets/architecture/layers-{light,dark}.svg`, `topology.
 2. Show the mechanism: outbound-only tunnel + Envoy routing is the story.
 3. Kubernetes-native first: standard Gateway API objects, zero annotations.
 4. Fail closed: security posture is a feature, not fine print.
+5. Short and scannable: landing and SEO copy makes one point per sentence, with no filler.
 
 ## Accessibility & Inclusion
 
