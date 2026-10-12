@@ -30,7 +30,7 @@ authorization), `internal/dataplane` (Envoy fleet management),
 
 Repository documentation rules:
 
-- Project documents live under `docs/` in a topic folder (`adr/`, `concepts/`, `get-started/`, `operations/`, `reference/`, `conformance/`). Exceptions: community files at the `docs/` root (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`), root `README.md`, `CHANGELOG.md`, and `AGENTS.md`, `charts/flareway/README.md`, `site/PRODUCT.md`, `site/DESIGN.md`, `.agents/**`, and `.github/**`.
+- Project documents live under `docs/` in a topic folder (`adr/`, `concepts/`, `get-started/`, `operations/`, `reference/`, `conformance/`). Exceptions: community files at the `docs/` root (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`), root `README.md`, `CHANGELOG.md`, and `AGENTS.md`, `charts/flareway/README.md`, `site/PRODUCT.md`, `site/DESIGN.md`, Impeccable's site metadata under `site/.impeccable/**`, `.agents/**`, and `.github/**`.
 - Planning and design documents use ADR, RFC, or PRD format. Do not commit ideation notes or implementation plans; convert one into an ADR, RFC, or PRD, or delete it.
 - Every document is written in English.
 
