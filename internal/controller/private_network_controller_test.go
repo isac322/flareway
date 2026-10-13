@@ -302,10 +302,12 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		networkAppliedGeneration := firstNetwork.Status.Applied.ObservedGeneration
 		hostnameAppliedGeneration := firstHostname.Status.Applied.ObservedGeneration
 
+		networkBase := client.MergeFrom(firstNetwork.DeepCopy())
 		firstNetwork.Spec.Network = "10.1.128.0/17"
-		gomega.Expect(testClient.Update(testContext, firstNetwork)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, firstNetwork, networkBase)).To(gomega.Succeed())
+		hostnameBase := client.MergeFrom(firstHostname.DeepCopy())
 		firstHostname.Spec.Hostname = "*.private.internal"
-		gomega.Expect(testClient.Update(testContext, firstHostname)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, firstHostname, hostnameBase)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(firstNetwork), firstNetwork)).To(gomega.Succeed())
 			networkCondition := statusutil.FindCondition(firstNetwork.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted)
@@ -347,8 +349,9 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		fixture.create()
 		var account v1alpha1.CloudflareAccount
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		base := client.MergeFrom(account.DeepCopy())
 		account.Spec.Grants[1].Hostnames = []string{"allowed.private.internal"}
-		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &account, base)).To(gomega.Succeed())
 		route := fixture.hostnameRoute("denied-hostname", "denied.private.internal")
 		gomega.Expect(testClient.Create(testContext, route)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -387,9 +390,10 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		fixture.create()
 		var account v1alpha1.CloudflareAccount
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		base := client.MergeFrom(account.DeepCopy())
 		account.Spec.Grants[0].PlatformObjects = v1alpha1.GrantPermissionDenied
 		account.Spec.Grants[1].PlatformObjects = v1alpha1.GrantPermissionAllowed
-		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &account, base)).To(gomega.Succeed())
 
 		var sourceGateway gatewayv1.Gateway
 		gomega.Expect(testClient.Get(testContext, fixture.gatewayKey, &sourceGateway)).To(gomega.Succeed())
@@ -423,8 +427,9 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		fixture.create()
 		var account v1alpha1.CloudflareAccount
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		base := client.MergeFrom(account.DeepCopy())
 		account.Spec.Grants[1].PlatformObjects = v1alpha1.GrantPermissionAllowed
-		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &account, base)).To(gomega.Succeed())
 		var sourceGateway gatewayv1.Gateway
 		gomega.Expect(testClient.Get(testContext, fixture.gatewayKey, &sourceGateway)).To(gomega.Succeed())
 		sourceGateway.Spec.Infrastructure = nil
@@ -470,8 +475,9 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		fixture.create()
 		var account v1alpha1.CloudflareAccount
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		base := client.MergeFrom(account.DeepCopy())
 		account.Spec.Grants[1].PlatformObjects = v1alpha1.GrantPermissionAllowed
-		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &account, base)).To(gomega.Succeed())
 		listenerName := "private"
 		route := fixture.hostnameRoute(privateHostnameRouteName(fixture.tunnelKey.Namespace, fixture.tunnelKey.Name, listenerName), "admin.private.internal")
 		route.Namespace = "flareway-system"
@@ -700,11 +706,12 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 			}
 		}).WithTimeout(15 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
 
+		base := client.MergeFrom(route.DeepCopy())
 		route.Spec.IPLookup = &v1alpha1.NetworkRouteIPLookupSpec{
 			IP:                "10.0.1.5",
 			VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
 		}
-		gomega.Expect(testClient.Update(testContext, route)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, route, base)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(route), route)).To(gomega.Succeed())
 			condition := statusutil.FindCondition(route.Status.Conditions, v1alpha1.PrivateNetworkConditionReady)
@@ -1199,8 +1206,9 @@ var _ = ginkgo.Describe("Private network controllers", ginkgo.Ordered, func() {
 		fixture.create()
 		var account v1alpha1.CloudflareAccount
 		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		base := client.MergeFrom(account.DeepCopy())
 		account.Spec.Grants[1].Hostnames = []string{"allowed.private.internal"}
-		gomega.Expect(testClient.Update(testContext, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &account, base)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(testClient.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
 			g.Expect(account.Spec.Grants[1].Hostnames).To(gomega.Equal([]string{"allowed.private.internal"}))

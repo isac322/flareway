@@ -974,8 +974,9 @@ var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 		staleRequest := metav1.NewTime(requestedAt.Add(-time.Second))
 		var current v1alpha1.ZeroTrustOrganization
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &current)).To(gomega.Succeed())
+		before := current.DeepCopy()
 		current.Spec.UserRevocation.RequestedAt = &staleRequest
-		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &current, client.MergeFrom(before))).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var reconciled v1alpha1.ZeroTrustOrganization
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(organization), &reconciled)).To(gomega.Succeed())
@@ -1057,8 +1058,9 @@ var _ = ginkgo.Describe("M5 global controllers", ginkgo.Ordered, func() {
 		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Equal("Conflict"))
 		var observedContender v1alpha1.DeviceSettings
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(contender), &observedContender)).To(gomega.Succeed())
+		before := observedContender.DeepCopy()
 		observedContender.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
-		gomega.Expect(testClient.Update(testContext, &observedContender)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &observedContender, client.MergeFrom(before))).To(gomega.Succeed())
 		gomega.Eventually(func() string {
 			var direct v1alpha1.DeviceSettings
 			if err := testClient.Get(testContext, client.ObjectKeyFromObject(currentWriter), &direct); err != nil {
@@ -1335,8 +1337,9 @@ func updateZeroTrustList(object *v1alpha1.ZeroTrustList, mutate func(*v1alpha1.Z
 	if err := testClient.Get(testContext, client.ObjectKeyFromObject(object), &current); err != nil {
 		return err
 	}
+	before := current.DeepCopy()
 	mutate(&current)
-	return testClient.Update(testContext, &current)
+	return testClient.Patch(testContext, &current, client.MergeFrom(before))
 }
 
 func updateZeroTrustGatewayPolicy(object *v1alpha1.ZeroTrustGatewayPolicy, mutate func(*v1alpha1.ZeroTrustGatewayPolicy)) error {
@@ -1344,8 +1347,9 @@ func updateZeroTrustGatewayPolicy(object *v1alpha1.ZeroTrustGatewayPolicy, mutat
 	if err := testClient.Get(testContext, client.ObjectKeyFromObject(object), &current); err != nil {
 		return err
 	}
+	before := current.DeepCopy()
 	mutate(&current)
-	return testClient.Update(testContext, &current)
+	return testClient.Patch(testContext, &current, client.MergeFrom(before))
 }
 
 func statusReason(conditions []metav1.Condition, conditionType string) string {
