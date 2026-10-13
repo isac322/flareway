@@ -172,6 +172,22 @@ func revokedTombstoneInputs(tombstonePort int32) gatewayapi.Inputs {
 	}
 }
 
+// checkpointLiveAppB models the already-applied binding of app-b's unaffected
+// hosts. Revocation isolation tests must not accidentally exercise an initial
+// or legacy Access binding handshake instead of the tombstone they target.
+func checkpointLiveAppB(t *testing.T, inputs gatewayapi.Inputs) {
+	t.Helper()
+	compiled, _ := gatewayapi.Translate(inputs)
+	if compiled == nil {
+		t.Fatal("Translate returned nil Gateway for app-b binding checkpoint")
+	}
+	for _, hostname := range desiredTunnelHostnames(compiled, inputs.CloudflareTunnel.Status.ConfigVersion.Applied) {
+		if hostname.AccessApplication == "default/app-b" && hostname.Guard == v1alpha1.HostnameGuardForwarding {
+			inputs.CloudflareTunnel.Status.Hostnames = append(inputs.CloudflareTunnel.Status.Hostnames, hostname)
+		}
+	}
+}
+
 // buildRevokedGateway runs the Gateway reconcile pipeline on inputs —
 // Translate, tombstone retention, the block-first transition, and the xDS
 // build — and returns the IR the snapshot was built from.
@@ -246,7 +262,9 @@ func assertLiveAppBAvoids(t *testing.T, gateway *ir.Gateway, statuses gatewayapi
 // (isac322/flareway#141).
 func TestRevokedAccessTombstoneKeepsItsPortFromLiveAccessHosts(t *testing.T) {
 	const tombstonePort = int32(18082)
-	gateway, statuses := buildRevokedGateway(t, revokedTombstoneInputs(tombstonePort))
+	inputs := revokedTombstoneInputs(tombstonePort)
+	checkpointLiveAppB(t, inputs)
+	gateway, statuses := buildRevokedGateway(t, inputs)
 	if got := statuses.AccessApplications[types.NamespacedName{Namespace: "default", Name: "app-a"}]; got.Accepted || got.Reason != "TargetNotFound" {
 		t.Fatalf("app-a after route deletion = %#v, want rejected TargetNotFound", got)
 	}
@@ -275,6 +293,7 @@ func TestRevokedAccessTombstoneKeepsItsPortFromShiftedListeners(t *testing.T) {
 	inputs.HTTPRoutes = append(inputs.HTTPRoutes, apiRoute)
 	inputs.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{string(hostAPI)}
 
+	checkpointLiveAppB(t, inputs)
 	gateway, statuses := buildRevokedGateway(t, inputs)
 	for listener, want := range map[string]int32{"preview": 18080, "api": 18082, "web": 18083} {
 		if port := listenerPort(t, gateway, listener); port != want {
@@ -338,6 +357,7 @@ func TestRevokedAccessTombstoneShiftKeepsPublicPortsOffPrivateListener(t *testin
 func TestRevokedAccessDataPlaneOnOtherTunnelReservesNoPort(t *testing.T) {
 	inputs := revokedTombstoneInputs(18081)
 	inputs.AccessApplications[0].Status.DataPlanes[0].Tunnel = "other"
+	checkpointLiveAppB(t, inputs)
 	gateway, statuses := buildRevokedGateway(t, inputs)
 	if tombstone := domainOf(gateway, "default/app-a"); tombstone != nil {
 		t.Fatalf("tombstone for another tunnel retained: %#v", tombstone)
