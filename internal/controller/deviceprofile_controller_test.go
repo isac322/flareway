@@ -440,9 +440,10 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 
 		var current v1alpha1.DeviceProfile
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+		before := current.DeepCopy()
 		current.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
 		current.Spec.Adoption = v1alpha1.AdoptionSpec{Mode: v1alpha1.AdoptionModeAdoptByID, Expect: v1alpha1.AdoptionExpect{Name: remote.Name}}
-		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &current, client.MergeFrom(before))).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var adopted v1alpha1.DeviceProfile
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &adopted)).To(gomega.Succeed())
@@ -472,8 +473,9 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 
 		var observed v1alpha1.DeviceProfile
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &observed)).To(gomega.Succeed())
+		beforeObserve := observed.DeepCopy()
 		observed.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
-		gomega.Expect(testClient.Update(testContext, &observed)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &observed, client.MergeFrom(beforeObserve))).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.DeviceProfile
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
@@ -485,8 +487,9 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 
 		var managed v1alpha1.DeviceProfile
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &managed)).To(gomega.Succeed())
+		beforeManage := managed.DeepCopy()
 		managed.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
-		gomega.Expect(testClient.Update(testContext, &managed)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &managed, client.MergeFrom(beforeManage))).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.DeviceProfile
 			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
@@ -574,11 +577,12 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 
 		var current v1alpha1.DeviceProfile
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+		before := current.DeepCopy()
 		current.Spec.Profile.Fields = &v1alpha1.DeviceProfileFields{VirtualNetworks: &v1alpha1.DeviceProfileVirtualNetworks{
 			DefaultRef:  corev1.LocalObjectReference{Name: "missing-vnet"},
 			AllowedRefs: []corev1.LocalObjectReference{{Name: "missing-vnet"}},
 		}}
-		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &current, client.MergeFrom(before))).To(gomega.Succeed())
 
 		gomega.Eventually(func(g gomega.Gomega) {
 			var failed v1alpha1.DeviceProfile
@@ -615,8 +619,9 @@ var _ = ginkgo.Describe("DeviceProfile controller", ginkgo.Ordered, func() {
 		testDeviceProfileCloudflare.fail("ReplaceInclude", errors.New("injected replace failure"))
 		var current v1alpha1.DeviceProfile
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(profile), &current)).To(gomega.Succeed())
+		before := current.DeepCopy()
 		current.Spec.SplitTunnel.Static = append(current.Spec.SplitTunnel.Static, v1alpha1.DeviceProfileSplitTunnelEntry{Host: new("extra.example.com")})
-		gomega.Expect(testClient.Update(testContext, &current)).To(gomega.Succeed())
+		gomega.Expect(testClient.Patch(testContext, &current, client.MergeFrom(before))).To(gomega.Succeed())
 
 		gomega.Eventually(func(g gomega.Gomega) {
 			var failed v1alpha1.DeviceProfile
