@@ -64,7 +64,9 @@ The Gateway reconciler re-runs `gatewayTunnelConditionGuard` against the fresh t
 
 - the live `configVersion` still records this pass's desired version, desired hash, and remote version;
 - the exact compiled xDS snapshot identity is ACKed;
-- when the full gate applies, every active cloudflared Pod reports the desired Cloudflare configuration version and managed DNS is ready.
+- when the data-plane convergence gate applies, every active cloudflared Pod reports the desired Cloudflare configuration version.
+
+Managed DNS readiness is independent of this `ConfigApplied` checkpoint. Gateway `Programmed` still requires all public listeners' managed DNS records to be present and non-conflicting. Each listener's `Programmed` condition uses its own record; a missing or conflicted record blocks that listener's hostname configuration without delaying the applied-configuration checkpoint or another listener's DNS readiness. See [Applied hostname status and Access transitions](../reference/api.md#applied-hostname-status-and-access-transitions).
 
 The xDS snapshot identity is a string and the Cloudflare configuration version is an int64. They are never compared with each other. If convergence evidence is lost between the gate and the commit, the pass demotes `ConfigApplied` and reports the Gateway pending. A provenance mismatch aborts without demoting, so a pass never writes to another owner's or another generation's object.
 
@@ -72,11 +74,11 @@ The tunnel reconciler has no ownership guard because it is the authority that se
 
 ### Steady state
 
-The Gateway reconciler writes `ConfigApplied=False` before the programming gate only when the Cloudflare configuration step reports pending, drift, or a drift hold. A converged pass authors the same conditions it finds, so the conditions commits skip and the object keeps its `resourceVersion`.
+The Gateway reconciler writes `ConfigApplied=False` before the data-plane convergence gate only when the Cloudflare configuration step reports pending, drift, or a drift hold. A converged pass authors the same conditions it finds, so the conditions commits skip and the object keeps its `resourceVersion`.
 
 ### Invalidation around the configuration push
 
-`reconcileCloudflaredConfiguration` takes the tunnel lock and reads the remote configuration. If the persisted `desiredHash` matches the compiled hash and the remote version equals the persisted desired version, the pass confirms the recorded version without a push. Otherwise, immediately before `UpdateTunnelConfiguration`, it commits `ConfigApplied=False` (reason `Applying`) through the conditions transaction. The derived `Ready` drops to `False` in the same document. The intended hash appears only in the message; `configVersion.desiredHash` keeps the hash of the last successful push until the push succeeds. After a successful push, one data apply records the provider-assigned version, hash, remote version, and `appliedAt`, and the programming gate decides promotion. A remote error demotes `ConfigApplied` before the error returns.
+`reconcileCloudflaredConfiguration` takes the tunnel lock and reads the remote configuration. If the persisted `desiredHash` matches the compiled hash and the remote version equals the persisted desired version, the pass confirms the recorded version without a push. Otherwise, immediately before `UpdateTunnelConfiguration`, it commits `ConfigApplied=False` (reason `Applying`) through the conditions transaction. The derived `Ready` drops to `False` in the same document. The intended hash appears only in the message; `configVersion.desiredHash` keeps the hash of the last successful push until the push succeeds. After a successful push, one data apply records the provider-assigned version, hash, remote version, and `appliedAt`, and the data-plane convergence gate decides `ConfigApplied` promotion. A remote error demotes `ConfigApplied` before the error returns.
 
 ### Remote identity capture
 

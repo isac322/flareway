@@ -399,6 +399,8 @@ When an Access binding changes, Flareway first applies a blocked configuration f
 
 The same Pod-version and xDS evidence advances `status.configVersion.applied`, `status.hostnames[].appliedVersion`, and `ConfigApplied` independently of managed DNS. Gateway `Programmed` still requires all public listener DNS records to be present and non-conflicting. Each public listener requires its own record: a missing record keeps it pending, and a conflicted record reports `Programmed=False` with reason `DNSConflict`. Both cases block that listener's hostname configuration before publication; another listener whose record is ready can forward and report `Programmed=True`. `dns.mode: External` skips the managed-DNS gate.
 
+`status.dnsRecords[]` also reports newly discovered foreign or ambiguous records as `state: Conflict`. These entries carry the required hostname and zone, with an empty `recordId` and no `ownershipComment`, so reporting a conflict does not claim or modify the foreign record. A previously managed record retains its ownership checkpoint for safe cleanup.
+
 ### Direct mode
 
 `Direct` is an explicit whole-object alternative. It cannot be combined with Gateway-owned `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, or `listeners`.
