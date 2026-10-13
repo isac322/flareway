@@ -49,7 +49,11 @@ of the pipeline is stuck, in this order:
 
 `Gateway` `Programmed` requires the full Cloudflare gate: Envoy xDS ACK,
 every active cloudflared Pod on the desired config version, and managed DNS
-present. The condition message lists the lagging items verbatim.
+present without conflicts. The condition message lists the lagging items
+verbatim. Listener `Programmed` uses that listener's required DNS record;
+missing or conflicted records block only its hostname configuration, and a
+conflict reports `DNSConflict`. `ConfigApplied` and applied hostname guards
+advance after Pod-version and xDS convergence independently of managed DNS.
 
 ## Direct vs Gateway tunnel writer
 

@@ -283,6 +283,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("prepare Access block-first transition: %w", err)
 	}
+	blockDomainsForUnreadyDNS(compiled, tunnel)
 	privateState := privatePrerequisiteResult{}
 	if !compiled.ConformanceMode && block == nil {
 		privateState, err = r.reconcilePrivatePrerequisites(ctx, compiled, tunnel, account, privateInputsView(
@@ -527,15 +528,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			ready = false
 			lagging = append(lagging, privateState.Pending)
 		}
-		message := "Gateway configuration is acknowledged by Envoy, active in every cloudflared Pod, and present in DNS"
-		if !ready {
+		message := "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
+		if !ready || !dnsReady {
+			if !dnsReady {
+				lagging = append(lagging, "managed DNS records")
+			}
 			message = "Waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
 			if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && r.gatewayNow().Sub(condition.LastTransitionTime.Time) >= cloudflareConvergenceTimeout {
 				message = "Timed out after 30s waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
 			}
 			pending = true
 		}
-		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready && dnsReady, message, cloudflareListenerReadiness(compiled, tunnel, ready))
+		r.setCloudflareDNSProgrammedStatus(&statuses.Gateway, &gateway, compiled, tunnel, ready, message)
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -553,9 +557,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if ready || denySnapshotApplied {
 			config.Applied = cloudflareResult.version
 			hostnames = desiredTunnelHostnames(compiled, cloudflareResult.version)
-			if !dnsReady {
-				blockHostnamesForConflictedListeners(compiled, tunnel, hostnames)
-			}
 			conditionStatus = metav1.ConditionTrue
 			reason = "Applied"
 			if denySnapshotApplied && !ready {
@@ -563,12 +564,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 		now := metav1.NewTime(r.gatewayNow())
+		configMessage := message
+		if ready {
+			configMessage = "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
+		}
 		driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
 		if cloudflareResult.drift {
 			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
 		}
 		conditions := []metav1.Condition{
-			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, message, now),
+			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, configMessage, now),
 			privateListenerCondition(compiled, privateState, now),
 			driftCondition,
 		}

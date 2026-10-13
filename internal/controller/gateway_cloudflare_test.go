@@ -444,7 +444,7 @@ func TestAccessBlockFirstGateway(t *testing.T) {
 		t.Fatal("block-first transition mutated desired Gateway")
 	}
 
-	tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+	tunnel.Status.Hostnames = desiredTunnelHostnames(blocked, 2)
 	desired, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
 	if err != nil {
 		t.Fatal(err)
@@ -481,6 +481,7 @@ func TestAccessBlockFirstGatewayMixedPublicCarveOut(t *testing.T) {
 
 	// The protected domain already completed block-first: the public carve-out
 	// on the same hostname must not pin it in Blocked forever.
+	tunnel.Status.Hostnames[1].AccessBinding = accessBindingDigest(gateway.Domains[1])
 	desired, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
 	if err != nil {
 		t.Fatal(err)
@@ -492,6 +493,7 @@ func TestAccessBlockFirstGatewayMixedPublicCarveOut(t *testing.T) {
 	// The initial Forwarding -> Blocked security gate still applies: a protected
 	// domain observed Forwarding must block before the new config is pushed.
 	tunnel.Status.Hostnames[1].Guard = v1alpha1.HostnameGuardForwarding
+	tunnel.Status.Hostnames[1].AccessBinding = "old-binding"
 	blocked, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
 	if err != nil {
 		t.Fatal(err)
@@ -516,9 +518,8 @@ func TestAccessBlockFirstGatewayMixedPublicCarveOut(t *testing.T) {
 }
 
 // Protection domain names can change between releases while the host, its
-// port, and its application stay the same. A host the tunnel still reports as
-// Forwarding under the previous name must go through block-first like any
-// other forwarding host, or a config change would reach it unblocked.
+// port, and its application stay the same. A renamed domain needs an applied
+// denial under its new identity before it can begin forwarding.
 func TestAccessBlockFirstGatewayFollowsRenamedProtectionDomain(t *testing.T) {
 	gateway := &ir.Gateway{
 		Cloudflare: &ir.Cloudflare{AccountID: "account-id"},
@@ -544,13 +545,13 @@ func TestAccessBlockFirstGatewayFollowsRenamedProtectionDomain(t *testing.T) {
 		t.Fatalf("renamed forwarding domain skipped block-first: transitioning %v, gateway %#v", transitioning, blocked)
 	}
 
-	tunnel.Status.Hostnames[0].Guard = v1alpha1.HostnameGuardBlocked
+	tunnel.Status.Hostnames = desiredTunnelHostnames(blocked, 2)
 	desired, transitioning, err := accessBlockFirstGateway(gateway, tunnel)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if transitioning || desired != gateway {
-		t.Fatalf("blocked host under the previous name did not release desired config: transitioning %v", transitioning)
+		t.Fatalf("applied denial under the new domain name did not release desired config: transitioning %v", transitioning)
 	}
 }
 

@@ -93,98 +93,57 @@ func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTun
 	if gateway == nil || tunnel == nil || gateway.Cloudflare == nil {
 		return gateway, false, nil
 	}
-	_, desiredHash, err := cloudflaredconfig.Compile(gateway)
-	if err != nil {
-		return nil, false, err
-	}
-	if desiredHash == tunnel.Status.ConfigVersion.DesiredHash {
-		return gateway, false, nil
-	}
-
 	currentGuards := make(map[string]v1alpha1.CloudflareTunnelHostnameStatus, len(tunnel.Status.Hostnames))
-	// applicationGuards records each host's guard per Access application
-	// regardless of protection domain name, so a domain renamed across
-	// releases still sees the guard the tunnel reports for its host.
-	applicationGuards := make(map[string]v1alpha1.CloudflareTunnelHostnameStatus, len(tunnel.Status.Hostnames))
-	unprotectedHosts := make(map[string]bool)
 	for _, hostname := range tunnel.Status.Hostnames {
 		host := strings.ToLower(hostname.Hostname)
 		currentGuards[strings.Join([]string{host, hostname.ProtectionDomain, hostname.AccessApplication}, "\x00")] = hostname
-		if hostname.AccessApplication != "" {
-			applicationKey := host + "\x00" + hostname.AccessApplication
-			if applicationGuards[applicationKey].Guard != v1alpha1.HostnameGuardForwarding {
-				applicationGuards[applicationKey] = hostname
-			}
-		}
-		if hostname.Guard == v1alpha1.HostnameGuardUnprotected {
-			unprotectedHosts[host] = true
-		}
 	}
-	requiresBlock := false
+	changedDomains := make(map[string]bool)
 	for _, domain := range gateway.Domains {
 		if !domain.Protected || domain.Guard != ir.GuardForwarding {
 			continue
 		}
+		binding := accessBindingDigest(domain)
 		for _, virtualHost := range domain.VirtualHosts {
 			host := strings.ToLower(virtualHost.Hostname)
 			status, found := currentGuards[strings.Join([]string{host, domain.Name, domain.AccessApplication}, "\x00")]
-			if !found {
-				for _, candidate := range tunnel.Status.Hostnames {
-					if strings.ToLower(candidate.Hostname) == host && candidate.Guard == v1alpha1.HostnameGuardBlocked {
-						status, found = candidate, true
-						break
-					}
-				}
-			}
-			if !found && domain.AccessApplication != "" {
-				status, found = applicationGuards[host+"\x00"+domain.AccessApplication]
-			}
-			if found && status.Guard == v1alpha1.HostnameGuardBlocked && (status.AccessBinding == "" || status.AccessBinding == accessBindingDigest(domain)) {
-				// The block-first handshake already completed for this domain;
-				// a public carve-out on the same hostname must not re-block it.
-				continue
-			}
-			if !found || status.AccessBinding != accessBindingDigest(domain) || status.Guard == v1alpha1.HostnameGuardForwarding || unprotectedHosts[host] {
-				requiresBlock = true
+			if !found || binding == "" || status.AccessBinding != binding ||
+				(status.Guard != v1alpha1.HostnameGuardForwarding && status.Guard != v1alpha1.HostnameGuardBlocked) {
+				changedDomains[domain.ListenerName+"\x00"+domain.Name] = true
 				break
 			}
 		}
-		if requiresBlock {
-			break
-		}
 	}
-	if !requiresBlock {
+	if len(changedDomains) == 0 {
 		return gateway, false, nil
 	}
-
 	blocked := *gateway
 	blocked.Domains = append([]ir.ProtectionDomain(nil), gateway.Domains...)
 	for index := range blocked.Domains {
-		if blocked.Domains[index].Protected {
-			// Only changed bindings enter the block-first handshake.
-			keep := true
-			for _, vh := range blocked.Domains[index].VirtualHosts {
-				if st, ok := currentGuards[strings.Join([]string{strings.ToLower(vh.Hostname), blocked.Domains[index].Name, blocked.Domains[index].AccessApplication}, "\x00")]; ok && st.AccessBinding == accessBindingDigest(blocked.Domains[index]) && st.Guard == v1alpha1.HostnameGuardForwarding {
-					keep = false
-					break
-				}
-			}
-			if !keep {
-				continue
-			}
-			blocked.Domains[index].Guard = ir.GuardBlocked
-			blocked.Domains[index].Access = nil
+		domain := &blocked.Domains[index]
+		if domain.Protected && changedDomains[domain.ListenerName+"\x00"+domain.Name] {
+			// A domain shares one Envoy route table and guard across its hosts.
+			// Keep that table intact during the binding handshake.
+			domain.AccessBinding = accessBindingDigest(*domain)
+			domain.Guard = ir.GuardBlocked
+			domain.Access = nil
 		}
 	}
+
 	return &blocked, true, nil
 }
 
 func accessBindingDigest(domain ir.ProtectionDomain) string {
 	if domain.Access == nil {
-		return ""
+		if domain.AccessBinding != "" || !domain.OriginJWTDisabled {
+			return domain.AccessBinding
+		}
+		// Disabled origin enforcement has no AUD handoff, but still needs
+		// binding identity to finish its initial block-first transition.
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(domain.AccessApplication+"\x00origin-jwt-disabled")))
 	}
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t", domain.AccessApplication, domain.Access.AuthDomain, domain.Access.TeamName, domain.Access.OptionsPreflightBypass)
+	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%t\x00%t", domain.AccessApplication, domain.Access.AuthDomain, domain.Access.TeamName, domain.Access.OptionsPreflightBypass, domain.OriginJWTDisabled)
 	for _, aud := range domain.Access.CanonicalAUDs() {
 		_, _ = fmt.Fprintf(h, "\x00%s", aud)
 	}
@@ -850,7 +809,7 @@ func (r *GatewayReconciler) cloudflareClient(ctx context.Context, account *v1alp
 	return api, nil
 }
 
-func (r *GatewayReconciler) cloudflareGate(
+func (r *GatewayReconciler) cloudflareConverged(
 	ctx context.Context,
 	gateway *ir.Gateway,
 	tunnel *v1alpha1.CloudflareTunnel,
@@ -916,25 +875,15 @@ func (r *GatewayReconciler) cloudflareGate(
 	}
 
 	dnsReady = tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(gateway, tunnel)
-	if !dnsReady {
-		lagging = append(lagging, "managed DNS records")
-	}
 	return len(lagging) == 0, lagging, dnsReady, nil
 }
 
-func (r *GatewayReconciler) cloudflareConverged(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, version, snapshot string) (bool, []string, bool, error) {
-	ready, lagging, dnsReady, err := r.cloudflareGate(ctx, gateway, tunnel, version, snapshot)
-	if !dnsReady {
-		filtered := lagging[:0]
-		for _, item := range lagging {
-			if item != "managed DNS records" {
-				filtered = append(filtered, item)
-			}
-		}
-		lagging = filtered
-		ready = len(lagging) == 0
+func (r *GatewayReconciler) cloudflareGate(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, version, snapshot string) (bool, []string, bool, error) {
+	ready, lagging, dnsReady, err := r.cloudflareConverged(ctx, gateway, tunnel, version, snapshot)
+	if err == nil && version != "" && version != "0" && !dnsReady {
+		lagging = append(lagging, "managed DNS records")
 	}
-	return ready, lagging, dnsReady, err
+	return ready && dnsReady, lagging, dnsReady, err
 }
 
 func parseVersion(version string) (int64, error) {
@@ -963,25 +912,19 @@ func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool
 	return len(wanted) == 0
 }
 
-// blockHostnamesForConflictedListeners keeps only listeners with a conflicted
-// managed DNS record fail-closed while unrelated listeners can promote.
-func blockHostnamesForConflictedListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) {
-	readyRecords := make(map[string]bool, len(tunnel.Status.DNSRecords))
-	for _, record := range tunnel.Status.DNSRecords {
-		readyRecords[strings.ToLower(record.Hostname)] = record.State != dnsRecordStateConflict
+// blockDomainsForUnreadyDNS denies the actual ingress and xDS configuration,
+// so the hostname status projection describes what the data plane applies.
+func blockDomainsForUnreadyDNS(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) {
+	if gateway.Cloudflare == nil || tunnel == nil || tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
+		return
 	}
-	for i := range hostnames {
-		for _, domain := range gateway.Domains {
-			if domain.Name != hostnames[i].ProtectionDomain {
-				continue
-			}
-			for _, listener := range gateway.Listeners {
-				if listener.Name == domain.ListenerName && listener.Exposure == ir.ExposurePublic {
-					if !readyRecords[strings.ToLower(listener.Hostname)] {
-						hostnames[i].Guard = v1alpha1.HostnameGuardBlocked
-					}
-				}
-			}
+	ready := cloudflareListenerReadiness(gateway, tunnel, true)
+	for index := range gateway.Domains {
+		domain := &gateway.Domains[index]
+		if !ready[domain.ListenerName] {
+			domain.AccessBinding = accessBindingDigest(*domain)
+			domain.Guard = ir.GuardBlocked
+			domain.Access = nil
 		}
 	}
 }
@@ -999,7 +942,7 @@ func cloudflareListenerReadiness(gateway *ir.Gateway, tunnel *v1alpha1.Cloudflar
 		readyRecords[strings.ToLower(record.Hostname)] = record.State != dnsRecordStateConflict
 	}
 	for _, listener := range gateway.Listeners {
-		if listener.Exposure != ir.ExposurePublic {
+		if listener.Exposure != ir.ExposurePublic || listener.Hostname == "" {
 			continue
 		}
 		if !readyRecords[strings.ToLower(listener.Hostname)] {
@@ -1214,8 +1157,8 @@ func (r *GatewayReconciler) gatewayTunnelConditionGuard(ctx context.Context, gat
 // commit attempt. The three domains are judged in their own units: the exact
 // compiled xDS snapshot identity must be ACKed, the live configVersion must
 // still record this pass's desired version/hash and observed remote version,
-// and — when requireGate is set — the full Cloudflare programming gate
-// (cloudflared Pod versions and managed DNS) must still hold. The xDS string
+// and — when requireGate is set — cloudflared Pod versions must still hold.
+// DNS readiness is independent of this applied-configuration checkpoint. The xDS string
 // identity and the Cloudflare int64 version are never equated.
 func (r *GatewayReconciler) gatewayPromotionGuard(
 	ctx context.Context,
@@ -1360,17 +1303,41 @@ func (r *GatewayReconciler) setCloudflareProgrammedStatus(status *gatewayv1.Gate
 			listenerStatus = metav1.ConditionFalse
 			listenerReason = string(gatewayv1.ListenerReasonInvalid)
 			listenerMessage = "Listener configuration is invalid"
-		case programmed:
-			if listenerReady == nil || listenerReady[string(listener.Name)] {
-				listenerReason = string(gatewayv1.ListenerReasonProgrammed)
-			} else {
-				listenerStatus = metav1.ConditionFalse
-				listenerReason = string(gatewayv1.ListenerReasonPending)
-			}
+		case listenerReady != nil && listenerReady[string(listener.Name)] || listenerReady == nil && programmed:
+			listenerStatus = metav1.ConditionTrue
+			listenerReason = string(gatewayv1.ListenerReasonProgrammed)
+			listenerMessage = "Listener configuration is acknowledged, active, and DNS is ready"
 		default:
+			listenerStatus = metav1.ConditionFalse
 			listenerReason = string(gatewayv1.ListenerReasonPending)
 		}
 		meta.SetStatusCondition(&listener.Conditions, metav1.Condition{Type: string(gatewayv1.ListenerConditionProgrammed), Status: listenerStatus, Reason: listenerReason, Message: listenerMessage, ObservedGeneration: gateway.Generation, LastTransitionTime: now})
+	}
+}
+
+func (r *GatewayReconciler) setCloudflareDNSProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, compiled *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, converged bool, message string) {
+	r.setCloudflareProgrammedStatus(status, gateway, converged && (tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(compiled, tunnel)), message, cloudflareListenerReadiness(compiled, tunnel, converged))
+	if !converged || tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
+		return
+	}
+	for index := range status.Listeners {
+		listener := &status.Listeners[index]
+		condition := meta.FindStatusCondition(listener.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		if condition == nil || condition.Reason == string(gatewayv1.ListenerReasonInvalid) || condition.Status == metav1.ConditionTrue {
+			continue
+		}
+		condition.Message = "Waiting for the listener's managed DNS record"
+		for _, compiledListener := range compiled.Listeners {
+			if compiledListener.Name != string(listener.Name) {
+				continue
+			}
+			for _, record := range tunnel.Status.DNSRecords {
+				if strings.EqualFold(record.Hostname, compiledListener.Hostname) && record.State == dnsRecordStateConflict {
+					condition.Reason = "DNSConflict"
+					condition.Message = "The listener's managed DNS record conflicts with a foreign record"
+				}
+			}
+		}
 	}
 }
 

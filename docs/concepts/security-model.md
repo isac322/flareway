@@ -116,6 +116,8 @@ Access revocation is not instant. Cloudflare propagates a revoked session to its
 
 A Gateway reports `Programmed=True` only after the tunnel is healthy, Envoy has applied the configuration in every active data-plane Pod, `cloudflared` has applied the desired tunnel configuration, and, with managed DNS, the DNS record exists. A listener waiting for its Access application reports `Programmed=False` with reason `Pending`.
 
+Managed DNS readiness is checked per public listener. A missing or conflicted record blocks that listener's hostnames; a conflict reports listener `Programmed=False` with reason `DNSConflict`. Healthy listeners can forward and report `Programmed=True` once the shared data plane converges, while Gateway `Programmed` stays false until all required records are ready. Access binding changes block the affected protection domain until its blocked configuration is applied. Public protected hostnames have separate domains; private hostnames sharing a route table transition together. Independent domains with unchanged bindings keep forwarding. See [Applied hostname status and Access transitions](../reference/api.md#applied-hostname-status-and-access-transitions).
+
 ## Controller RBAC and tenant duties
 
 The Helm chart grants the controller access to:

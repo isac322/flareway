@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- Scope Access block-first transitions to protection domains whose Access
+  binding changed, preserving forwarding for unchanged independent domains.
+  Each public protected hostname has its own domain; private hostnames
+  sharing a route table transition together. Record the
+  binding digest after the blocked configuration converges, including a
+  one-time handshake for older status without a digest. A missing or
+  conflicted managed DNS record blocks only its listener's hostnames;
+  healthy listeners can forward and report `Programmed=True` while Gateway
+  `Programmed` remains false until all required records are ready (#135).
+
 ## v0.3.3 - 2026-10-11
 
 ### Changed

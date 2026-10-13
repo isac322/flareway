@@ -211,13 +211,15 @@ type TLSRef struct {
 
 // ProtectionDomain is an independently isolated Envoy listener/route table.
 type ProtectionDomain struct {
-	Name               string        `json:"name"`
-	ListenerName       string        `json:"listenerName"`
-	EnvoyPort          int32         `json:"envoyPort"`
-	Protected          bool          `json:"protected"`
-	OriginJWTDisabled  bool          `json:"originJWTDisabled,omitempty"`
-	Access             *AccessGuard  `json:"access,omitempty"`
-	AccessApplication  string        `json:"accessApplication,omitempty"`
+	Name              string       `json:"name"`
+	ListenerName      string       `json:"listenerName"`
+	EnvoyPort         int32        `json:"envoyPort"`
+	Protected         bool         `json:"protected"`
+	OriginJWTDisabled bool         `json:"originJWTDisabled,omitempty"`
+	Access            *AccessGuard `json:"access,omitempty"`
+	AccessApplication string       `json:"accessApplication,omitempty"`
+	// AccessBinding retains the desired binding digest while its guard is blocked.
+	AccessBinding      string        `json:"accessBinding,omitempty"`
 	Guard              string        `json:"guard,omitempty"`
 	StripAccessHeaders bool          `json:"stripAccessHeaders,omitempty"`
 	IngressPaths       []PathMatch   `json:"ingressPaths,omitempty"`

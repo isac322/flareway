@@ -391,6 +391,14 @@ While a Gateway cannot program its Tunnel (not yet owned, owned by another Gatew
 
 The Tunnel controller and the `AccessApplication` controller check the namespace grant before they resolve zones or targets, so a namespace that no grant selects reports `Accepted=False/RefNotPermitted`.
 
+#### Applied hostname status and Access transitions
+
+`status.hostnames[]` records each applied hostname's `protectionDomain`, `accessApplication`, `guard` (`Forwarding`, `Blocked`, or `Unprotected`), and `appliedVersion`. Its optional `accessBinding` is a SHA-256 digest of the application's namespaced key, canonical AUD set, team name and auth domain, preflight-bypass setting, and origin-JWT mode. Disabled origin-JWT enforcement uses an application-and-mode digest without an AUD handoff. Status exposes the digest, never the AUD values.
+
+When an Access binding changes, Flareway first applies a blocked configuration for the affected protection domain. Each public protected hostname has its own domain; private hostnames sharing a route table transition together. Once every active cloudflared Pod reports that configuration version and Envoy acknowledges its snapshot, the controller records the blocked guards and new digests, then publishes the forwarding configuration. Independent protection domains with unchanged bindings keep their guards through unrelated configuration changes. A missing digest in older status counts as a changed binding, including when the old guard is already `Blocked`; the blocked configuration records the new digest so the transition completes once.
+
+The same Pod-version and xDS evidence advances `status.configVersion.applied`, `status.hostnames[].appliedVersion`, and `ConfigApplied` independently of managed DNS. Gateway `Programmed` still requires all public listener DNS records to be present and non-conflicting. Each public listener requires its own record: a missing record keeps it pending, and a conflicted record reports `Programmed=False` with reason `DNSConflict`. Both cases block that listener's hostname configuration before publication; another listener whose record is ready can forward and report `Programmed=True`. `dns.mode: External` skips the managed-DNS gate.
+
 ### Direct mode
 
 `Direct` is an explicit whole-object alternative. It cannot be combined with Gateway-owned `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, or `listeners`.
