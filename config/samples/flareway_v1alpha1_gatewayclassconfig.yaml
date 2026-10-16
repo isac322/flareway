@@ -11,7 +11,7 @@ spec:
     protocol: Auto
     gracePeriod: 60s
   proxy:
-    image: envoyproxy/envoy:distroless-v1.39.3
+    image: envoyproxy/envoy:distroless-v1.39.4
     streamIdleTimeout: 1h
     concurrency: 1
   privateDNS:
