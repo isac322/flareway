@@ -37,8 +37,10 @@ Deleting an `AccessApplication` that never reached a Cloudflare write, such as o
 ## A DNS conflict blocks one listener
 
 Compare the listener's hostname with `CloudflareTunnel.status.dnsRecords`.
-A missing record keeps that listener pending; a record with `state: Conflict`
-reports listener `Programmed=False` with reason `DNSConflict`. Both cases
+Readiness requires exactly one `state: Ready` entry per case-insensitive hostname.
+Missing records, empty or unknown states, and duplicates keep that listener
+pending; a record with `state: Conflict` reports listener `Programmed=False`
+with reason `DNSConflict`. These cases
 block the listener's hostname configuration in cloudflared and Envoy. Fix
 the zone grant or foreign ownership conflict rather than editing status.
 With `dns.mode: External`, Flareway skips this managed-record check.

@@ -895,21 +895,27 @@ func parseVersion(version string) (int64, error) {
 }
 
 func publicDNSReady(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool {
-	wanted := make(map[string]struct{})
+	ready := managedDNSReadiness(tunnel.Status.DNSRecords)
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure == ir.ExposurePublic && listener.Hostname != "" {
-			wanted[strings.ToLower(listener.Hostname)] = struct{}{}
+			if !ready[strings.ToLower(listener.Hostname)] {
+				return false
+			}
 		}
 	}
-	if len(wanted) == 0 {
-		return true
+	return true
+}
+
+// managedDNSReadiness requires an unambiguous, explicitly ready record. A
+// duplicate remains unready regardless of its state or position in the list.
+func managedDNSReadiness(records []v1alpha1.CloudflareTunnelDNSRecordStatus) map[string]bool {
+	ready := make(map[string]bool, len(records))
+	for _, record := range records {
+		hostname := strings.ToLower(record.Hostname)
+		_, duplicate := ready[hostname]
+		ready[hostname] = !duplicate && record.State == dnsRecordStateReady
 	}
-	for _, record := range tunnel.Status.DNSRecords {
-		if record.State != dnsRecordStateConflict {
-			delete(wanted, strings.ToLower(record.Hostname))
-		}
-	}
-	return len(wanted) == 0
+	return ready
 }
 
 // blockDomainsForUnreadyDNS denies the actual ingress and xDS configuration,
@@ -937,10 +943,7 @@ func cloudflareListenerReadiness(gateway *ir.Gateway, tunnel *v1alpha1.Cloudflar
 	if tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
 		return ready
 	}
-	readyRecords := make(map[string]bool, len(tunnel.Status.DNSRecords))
-	for _, record := range tunnel.Status.DNSRecords {
-		readyRecords[strings.ToLower(record.Hostname)] = record.State != dnsRecordStateConflict
-	}
+	readyRecords := managedDNSReadiness(tunnel.Status.DNSRecords)
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure != ir.ExposurePublic || listener.Hostname == "" {
 			continue

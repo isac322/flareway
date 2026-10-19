@@ -195,7 +195,7 @@ func TestDisabledOriginJWTBindingCompletesHandshake(t *testing.T) {
 }
 
 func TestManagedDNSFailureDeniesOnlyAffectedListener(t *testing.T) {
-	for _, state := range []string{"missing", dnsRecordStateConflict} {
+	for _, state := range []string{"missing", dnsRecordStateConflict, "Unknown"} {
 		t.Run(state, func(t *testing.T) {
 			gateway := listenerConvergenceGateway()
 			// Listener A is already serving when listener B is added with

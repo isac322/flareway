@@ -9,8 +9,9 @@
   Each public protected hostname has its own domain; private hostnames
   sharing a route table transition together. Record the
   binding digest after the blocked configuration converges, including a
-  one-time handshake for older status without a digest. A missing or
-  conflicted managed DNS record blocks only its listener's hostnames;
+  one-time handshake for older status without a digest. Managed DNS requires
+  exactly one explicit `Ready` record per case-insensitive hostname. Missing,
+  empty, unknown, duplicate, or conflicted records block only their listener's hostnames;
   healthy listeners can forward and report `Programmed=True` while Gateway
   `Programmed` remains false until all required records are ready. Private
   VNet, HostnameRoute, and TLS-decryption prerequisites also block only their

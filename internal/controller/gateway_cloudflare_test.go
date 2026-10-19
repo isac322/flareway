@@ -412,6 +412,10 @@ func TestGatewayCloudflareDNSGate(t *testing.T) {
 	if publicDNSReady(gateway, tunnel) {
 		t.Fatal("active DNS conflict incorrectly opened the programming gate")
 	}
+	tunnel.Status.DNSRecords[0].State = "Unknown"
+	if publicDNSReady(gateway, tunnel) {
+		t.Fatal("unknown DNS state incorrectly opened the programming gate")
+	}
 	tunnel.Status.DNSRecords[0].State = dnsRecordStateReady
 	tunnel.Spec.DNS.Mode = v1alpha1.DNSModeExternal
 	if !publicDNSReady(&ir.Gateway{}, tunnel) {

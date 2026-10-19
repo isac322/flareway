@@ -107,7 +107,9 @@ the Access binding digest so the applied blocked snapshot can release after
 the prerequisite recovers.
 
 Managed DNS is a separate readiness result: every public listener's required
-hostname must appear in `status.dnsRecords` without `state: Conflict`. This
+hostname must have exactly one `state: Ready` entry in `status.dnsRecords`,
+matching case-insensitively. Missing, empty, unknown, or duplicate entries
+remain unready. This
 check is skipped for `dns.mode: External`. `cloudflareGate` combines it with
 data-plane convergence for callers that need the full Gateway gate.
 
