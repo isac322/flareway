@@ -156,7 +156,7 @@ func TestOrganizationAdapterRejectsMissingCreateIdentityBeforeHTTP(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var requests atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 				requests.Add(1)
 				response.Header().Set("Content-Type", "application/json")
 				_, _ = fmt.Fprint(response, organizationResponseJSON)
