@@ -38,10 +38,10 @@ import (
 
 const (
 	expectedFormatVersion   = 1
-	expectedLedgerRows      = 1168
+	expectedLedgerRows      = 1173
 	expectedSDKModule       = "github.com/cloudflare/cloudflare-go/v7"
-	expectedSDKVersion      = "v7.12.0"
-	expectedLedgerKeySHA256 = "1a6aaf4037226d275a8de998a38239558a982fa63bbc9c7626b15bd1964b7c2f"
+	expectedSDKVersion      = "v7.13.0"
+	expectedLedgerKeySHA256 = "b6de0217dcafc924a82d729139288c850070b189cab1c8ceb9b1a9913a02b262"
 )
 
 type ledger struct {
