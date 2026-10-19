@@ -1315,15 +1315,26 @@ func (r *GatewayReconciler) setCloudflareProgrammedStatus(status *gatewayv1.Gate
 	}
 }
 
-func (r *GatewayReconciler) setCloudflareDNSProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, compiled *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, converged bool, message string) {
-	r.setCloudflareProgrammedStatus(status, gateway, converged && (tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(compiled, tunnel)), message, cloudflareListenerReadiness(compiled, tunnel, converged))
-	if !converged || tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
+func (r *GatewayReconciler) setCloudflareDNSProgrammedStatus(status *gatewayv1.GatewayStatus, gateway *gatewayv1.Gateway, compiled *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, converged bool, message string, privateState privatePrerequisiteResult) {
+	readiness := cloudflareListenerReadiness(compiled, tunnel, converged)
+	for listener := range privateState.Listeners {
+		readiness[listener] = false
+	}
+	r.setCloudflareProgrammedStatus(status, gateway, converged && privateState.Pending == "" && (tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal || publicDNSReady(compiled, tunnel)), message, readiness)
+	if !converged {
 		return
 	}
 	for index := range status.Listeners {
 		listener := &status.Listeners[index]
 		condition := meta.FindStatusCondition(listener.Conditions, string(gatewayv1.ListenerConditionProgrammed))
 		if condition == nil || condition.Reason == string(gatewayv1.ListenerReasonInvalid) || condition.Status == metav1.ConditionTrue {
+			continue
+		}
+		if pending := privateState.Listeners[string(listener.Name)]; pending != "" {
+			condition.Message = pending
+			continue
+		}
+		if tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
 			continue
 		}
 		condition.Message = "Waiting for the listener's managed DNS record"

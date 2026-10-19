@@ -191,7 +191,7 @@ func TestEnsureDNSFreshConflictReportsListenerWithoutAdoptingForeignRecord(t *te
 				{Name: "b", Hostname: "b.example.com", Exposure: ir.ExposurePublic},
 			}}
 			status := gatewayv1.GatewayStatus{Listeners: []gatewayv1.ListenerStatus{{Name: "a"}, {Name: "b"}}}
-			new(GatewayReconciler).setCloudflareDNSProgrammedStatus(&status, &gatewayv1.Gateway{}, compiled, tunnel, true, "Waiting for managed DNS")
+			new(GatewayReconciler).setCloudflareDNSProgrammedStatus(&status, &gatewayv1.Gateway{}, compiled, tunnel, true, "Waiting for managed DNS", privatePrerequisiteResult{})
 			global := meta.FindStatusCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 			healthy := meta.FindStatusCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
 			blocked := meta.FindStatusCondition(status.Listeners[1].Conditions, string(gatewayv1.ListenerConditionProgrammed))

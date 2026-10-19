@@ -97,19 +97,21 @@ Its checks run in order:
    a stale version is listed by name in the gate message.
 4. `Snapshots.IsACKed(gatewayKey, snapshotVersion)` — the Envoy ACK gate,
    annotated with `ACKDetails` when available.
-5. The caller also gates promotion on private prerequisites
-   (`reconcilePrivatePrerequisites`): verified tunnel
-   + account, `DeviceSettings` `gatewayProxyEnabled` and
-   `gatewayUdpProxyEnabled`, a ready `VirtualNetwork` per private listener,
-   a ready `HostnameRoute`, and the origin-JWT TLS-decryption contract. Any
-   miss blocks the private domains and adds a `Pending` message.
+
+Private prerequisites (`reconcilePrivatePrerequisites`) control listener
+readiness independently of this applied-configuration checkpoint. A missing
+VirtualNetwork, HostnameRoute, or origin-JWT TLS-decryption contract blocks
+only its private listener's domains. Shared account ownership or
+DeviceSettings proxy failures block all private listeners. Denial retains
+the Access binding digest so the applied blocked snapshot can release after
+the prerequisite recovers.
 
 Managed DNS is a separate readiness result: every public listener's required
 hostname must appear in `status.dnsRecords` without `state: Conflict`. This
 check is skipped for `dns.mode: External`. `cloudflareGate` combines it with
 data-plane convergence for callers that need the full Gateway gate.
 
-Gateway `Programmed=True` requires both results. Each listener uses its own
+Gateway `Programmed=True` requires both results and private readiness. Each public listener uses its own
 DNS record, so a healthy listener can report `Programmed=True` while another
 keeps the Gateway pending. A missing record leaves that listener pending;
 a conflict reports `DNSConflict`. `blockDomainsForUnreadyDNS` blocks the
@@ -120,8 +122,10 @@ When a gate fails, `Programmed=False`/`Pending` lists the lagging items;
 after the convergence timeout the message switches to "Timed out".
 Data-plane convergence (or a teardown deny snapshot that Envoy ACKed) sets
 `ConfigApplied=True`/`Applied` and stamps `hostnames[].appliedVersion`, even
-while managed DNS is pending. Applied hostname guards describe the published
-configuration, including listener-local DNS blocks.
+while managed DNS or private prerequisites are pending. Applied hostname
+guards describe the published configuration, including listener-local
+blocks. Tunnel `Ready` retains its three-condition formula; use listener
+`Programmed` to check private routing availability.
 
 ## Block-first handoff
 

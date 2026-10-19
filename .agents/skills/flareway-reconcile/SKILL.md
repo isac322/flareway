@@ -53,7 +53,11 @@ present without conflicts. The condition message lists the lagging items
 verbatim. Listener `Programmed` uses that listener's required DNS record;
 missing or conflicted records block only its hostname configuration, and a
 conflict reports `DNSConflict`. `ConfigApplied` and applied hostname guards
-advance after Pod-version and xDS convergence independently of managed DNS.
+advance after Pod-version and xDS convergence independently of managed DNS
+and private routing readiness. Private VNet, HostnameRoute, and TLS-decryption
+prerequisites block only their listener; shared account and DeviceSettings
+failures block all private listeners. Tunnel `Ready` retains its formula,
+while Gateway/listener `Programmed` reports private routing availability.
 
 ## Direct vs Gateway tunnel writer
 

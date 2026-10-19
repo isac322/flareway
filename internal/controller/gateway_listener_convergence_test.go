@@ -264,7 +264,7 @@ func TestCloudflareListenerProgrammedIndependentOfGlobalDNS(t *testing.T) {
 		{Hostname: "a.example.com", State: dnsRecordStateReady},
 		{Hostname: "b.example.com", State: dnsRecordStateConflict},
 	}}}
-	reconciler.setCloudflareDNSProgrammedStatus(&status, &gatewayv1.Gateway{}, compiled, tunnel, true, "Waiting for managed DNS records")
+	reconciler.setCloudflareDNSProgrammedStatus(&status, &gatewayv1.Gateway{}, compiled, tunnel, true, "Waiting for managed DNS records", privatePrerequisiteResult{})
 	if got := meta.FindStatusCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); got == nil || got.Status != metav1.ConditionFalse {
 		t.Fatal("Gateway should remain unprogrammed until every required DNS record is ready")
 	}

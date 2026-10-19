@@ -525,11 +525,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		if privateState.Pending != "" {
-			ready = false
 			lagging = append(lagging, privateState.Pending)
 		}
 		message := "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
-		if !ready || !dnsReady {
+		if !ready || !dnsReady || privateState.Pending != "" {
 			if !dnsReady {
 				lagging = append(lagging, "managed DNS records")
 			}
@@ -539,7 +538,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			pending = true
 		}
-		r.setCloudflareDNSProgrammedStatus(&statuses.Gateway, &gateway, compiled, tunnel, ready, message)
+		r.setCloudflareDNSProgrammedStatus(&statuses.Gateway, &gateway, compiled, tunnel, ready, message, privateState)
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version

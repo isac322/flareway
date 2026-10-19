@@ -12,7 +12,10 @@
   one-time handshake for older status without a digest. A missing or
   conflicted managed DNS record blocks only its listener's hostnames;
   healthy listeners can forward and report `Programmed=True` while Gateway
-  `Programmed` remains false until all required records are ready (#135).
+  `Programmed` remains false until all required records are ready. Private
+  VNet, HostnameRoute, and TLS-decryption prerequisites also block only their
+  listener. Applied hostname checkpoints advance after Pod/xDS convergence
+  independently of DNS and private readiness (#135).
 
 ## v0.3.3 - 2026-10-11
 

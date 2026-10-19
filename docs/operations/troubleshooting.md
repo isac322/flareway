@@ -47,7 +47,13 @@ Gateway `Programmed` stays false until every required managed record is ready.
 Listeners whose records are ready can still forward after cloudflared and
 Envoy converge. `ConfigApplied=True` and matching desired/applied versions
 prove the published configuration reached the data plane, including its
-blocked rules; they do not prove all managed DNS records are ready.
+blocked rules; they do not prove all managed DNS records or private routing
+prerequisites are ready. A missing private VirtualNetwork, HostnameRoute, or
+origin-JWT TLS-decryption contract blocks its listener, while healthy
+listeners can still converge. Shared account and DeviceSettings failures
+affect all private listeners. Inspect each listener's `Programmed` condition
+for its prerequisite message; Tunnel `Ready` alone does not prove private
+routing availability.
 
 An Access binding change first blocks its protection domain. Public
 protected hostnames have separate domains; private hosts sharing a route

@@ -118,6 +118,8 @@ A Gateway reports `Programmed=True` only after the tunnel is healthy, Envoy has 
 
 Managed DNS readiness is checked per public listener. A missing or conflicted record blocks that listener's hostnames; a conflict reports listener `Programmed=False` with reason `DNSConflict`. Healthy listeners can forward and report `Programmed=True` once the shared data plane converges, while Gateway `Programmed` stays false until all required records are ready. Access binding changes block the affected protection domain until its blocked configuration is applied. Public protected hostnames have separate domains; private hostnames sharing a route table transition together. Independent domains with unchanged bindings keep forwarding. See [Applied hostname status and Access transitions](../reference/api.md#applied-hostname-status-and-access-transitions).
 
+Private VNet, HostnameRoute, and origin-JWT TLS-decryption prerequisites are also checked per listener. A failed prerequisite denies that listener before publication. Shared account or DeviceSettings failures deny all private listeners. Applied configuration status can advance for a snapshot containing these denied rules; Gateway and listener `Programmed` conditions report routing availability.
+
 ## Controller RBAC and tenant duties
 
 The Helm chart grants the controller access to:
