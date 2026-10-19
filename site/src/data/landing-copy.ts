@@ -6,7 +6,7 @@
 //   with `set:html`: use only <code>, <sup>, <em>, <strong>, and <a>.
 // - Every other field is plain text and is escaped.
 // - Every claim must trace to the repository (README.md, config/samples/,
-//   docs/conformance/v1.6.2/flareway/). ™/® marks go on first use only.
+//   docs/conformance/v1.6.3/flareway/). ™/® marks go on first use only.
 // - `lines` on demo outputs reference YAML lines as `<file>:<from>-<to>` where
 //   file is `g` (gateway_v1_gateway.yaml) or `r` (gateway_v1_httproute.yaml).
 

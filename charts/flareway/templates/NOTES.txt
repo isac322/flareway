@@ -1,8 +1,8 @@
 Flareway {{ .Chart.AppVersion }} is installed in {{ include "flareway.namespace" . }}.
 
-Prerequisite: install the Gateway API v1.6.2 standard CRDs before creating a GatewayClass or Gateway:
+Prerequisite: install the Gateway API v1.6.3 standard CRDs before creating a GatewayClass or Gateway:
 
-  kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+  kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 
 {{- if not .Values.gatewayClass.create }}
 The chart did not create a GatewayClass. After you create a CloudflareAccount, create it with:

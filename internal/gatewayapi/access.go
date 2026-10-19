@@ -386,7 +386,7 @@ func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 	return result
 }
 
-func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time) {
+func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds) {
 	statuses.AccessApplications = make(map[types.NamespacedName]AccessApplicationCompilation)
 	if gateway == nil || gateway.ConformanceMode || len(in.AccessApplications) == 0 {
 		markPublicDomainsForHeaderStripping(gateway)
@@ -422,13 +422,16 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 			for _, claim := range compiled.claims {
 				acceptedClaims[claim.hostname] = append(acceptedClaims[claim.hostname], claim)
 			}
+			if note := holds.describe(in, compiled.claims, key.String()); note != "" {
+				compiled.Message += "; " + note
+			}
 		}
 		statuses.AccessApplications[key] = compiled
 	}
 
 	original := slices.Clone(gateway.Domains)
 	gateway.Domains = nil
-	nextPublicPort := nextAccessEnvoyPort(original)
+	publicPorts := publicEnvoyPorts{next: nextAccessEnvoyPort(original), reserved: holds.reservedPorts()}
 	dropped := make(map[types.NamespacedName][]string)
 	remaining := make(map[types.NamespacedName]int)
 	for _, domain := range original {
@@ -441,10 +444,12 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 
 	for _, domain := range original {
 		for _, virtualHost := range domain.VirtualHosts {
-			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, &nextPublicPort, dropped, remaining)
+			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, &publicPorts, dropped, remaining)
 		}
 	}
 	disambiguateDerivedDomainNames(gateway, statuses)
+	// Names are settled first so holding a host never renames another domain.
+	holds.apply(gateway)
 	applyAccessRouteDrops(statuses, in, dropped, remaining, now)
 	for key, compiled := range statuses.AccessApplications {
 		sortAccessCompilation(&compiled)
@@ -495,7 +500,7 @@ func disambiguateDerivedDomainNames(gateway *ir.Gateway, statuses *Statuses) {
 	}
 }
 
-func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, nextPublicPort *int32, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int) {
+func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, publicPorts *publicEnvoyPorts, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int) {
 	claimed := make(map[string][]ir.Route)
 	public := make([]ir.Route, 0, len(host.Routes))
 	wholeHost := make(map[string]bool)
@@ -664,8 +669,7 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			// table. The name identifies that table in xDS and status, so it
 			// must differ per host too.
 			protected.Name += "-" + accessHostSuffix(owner, host.Hostname)
-			protected.EnvoyPort = *nextPublicPort
-			(*nextPublicPort)++
+			protected.EnvoyPort = publicPorts.take()
 		}
 		protected.Protected = true
 		protected.AccessApplication = owner

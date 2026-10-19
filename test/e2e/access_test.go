@@ -357,10 +357,13 @@ func rewrittenRule(name, path string) map[string]any {
 }
 
 func waitForServiceTokenHeaders(ctx context.Context, token *unstructured.Unstructured) map[string]string {
+	secretName, found, err := unstructured.NestedString(token.Object, "spec", "secretRef", "name")
+	Expect(err).NotTo(HaveOccurred(), "read secretRef of ServiceToken %s", token.GetName())
+	Expect(found).To(BeTrue(), "ServiceToken %s must name its one-time Secret", token.GetName())
 	var values map[string]string
-	_, err := poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
+	_, err = poll.Until(ctx, 2*time.Second, func(checkCtx context.Context) (bool, error) {
 		current := &corev1.Secret{}
-		err := kubeClient.Get(checkCtx, client.ObjectKey{Namespace: namespace, Name: "access-e2e-token"}, current)
+		err := kubeClient.Get(checkCtx, client.ObjectKey{Namespace: namespace, Name: secretName}, current)
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}

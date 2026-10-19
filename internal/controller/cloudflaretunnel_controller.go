@@ -438,7 +438,10 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	// status subresource exists for the identity checkpoint below, migrates
 	// legacy condition ownership ahead of every data write this pass, and may
 	// veto a stale observation before a non-idempotent CreateTunnel executes.
-	if err := r.commitTunnelConditions(ctx, tunnel, ownedConditions, true); err != nil {
+	// It withholds a Conflict clear and an Accepted promotion: only the remote
+	// reads below can show that no adoption, DNS ownership, or configuration
+	// conflict revokes them.
+	if err := r.commitTunnelConditions(ctx, tunnel, withoutRemoteVerdicts(ownedConditions), true); err != nil {
 		return ctrl.Result{}, err
 	}
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
@@ -2681,6 +2684,26 @@ func tunnelAuthoredPromotion(authored []metav1.Condition) bool {
 		}
 	}
 	return false
+}
+
+// withoutRemoteVerdicts drops the authored Conflict=False and Accepted=True
+// from a commit that runs before this pass has read the remote. The remote
+// reads can still raise an adoption, DNS ownership, or configuration conflict
+// that demotes both. Writing them early would flip a standing conflict back
+// and forth on every pass. That costs two status writes per pass and
+// re-enqueues the Tunnel through its own watch indefinitely. A raised
+// conflict or a demotion is still committed early. The clear and the
+// promotion land with the terminal write.
+func withoutRemoteVerdicts(authored []metav1.Condition) []metav1.Condition {
+	return slices.DeleteFunc(slices.Clone(authored), func(condition metav1.Condition) bool {
+		switch condition.Type {
+		case v1alpha1.CloudflareTunnelConditionConflict:
+			return condition.Status == metav1.ConditionFalse
+		case v1alpha1.CloudflareTunnelConditionAccepted:
+			return condition.Status == metav1.ConditionTrue
+		}
+		return false
+	})
 }
 
 // tunnelReadyInputConditions are the condition types whose True value asserts

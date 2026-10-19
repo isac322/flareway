@@ -29,7 +29,7 @@ import (
 
 // WARPConnectorAPI is the complete Cloudflare WARP Connector surface. It covers
 // the eleven official lifecycle, configuration, token, connection, connector,
-// and failover endpoints in cloudflare-go v7.10.0.
+// and failover endpoints in cloudflare-go v7.12.0.
 // The SDK consumes response envelopes and page metadata; callers receive only
 // typed results. Opaque metadata remains transport/read-only.
 type WARPConnectorAPI interface {

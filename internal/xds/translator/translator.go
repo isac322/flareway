@@ -48,6 +48,7 @@ import (
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -64,12 +65,15 @@ const (
 
 type routeGroup struct {
 	key                string
+	name               string // first protection domain in the group; names it in bind collision errors
 	routeName          string
 	address            string
 	port               int32
 	tlsSecret          string
+	isolationKey       string
 	serverNames        []string
 	access             *ir.AccessGuard
+	accessKey          string
 	protected          bool
 	guard              string
 	stripAccessHeaders bool
@@ -265,11 +269,14 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 		if group == nil {
 			group = &routeGroup{
 				key:                key,
+				name:               domain.Name,
 				routeName:          resourceName(domain.Name, "routes"),
 				address:            address,
 				port:               port,
 				tlsSecret:          tlsSecret,
+				isolationKey:       isolationKey,
 				access:             domain.Access,
+				accessKey:          string(accessKey),
 				protected:          domain.Protected,
 				guard:              domain.Guard,
 				stripAccessHeaders: domain.StripAccessHeaders,
@@ -292,71 +299,68 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 	return groups, nil
 }
 
+type bindOccupant struct {
+	name string
+	tls  bool
+}
+
+func bindCollisionError(occupant bindOccupant, name string, tls bool, bindKey string) error {
+	if !occupant.tls && !tls {
+		return fmt.Errorf("cleartext protection domains %q and %q cannot share %s", occupant.name, name, bindKey)
+	}
+	cleartext, secure := occupant.name, name
+	if occupant.tls {
+		cleartext, secure = name, occupant.name
+	}
+	return fmt.Errorf("cleartext protection domain %q and TLS protection domain %q cannot share %s", cleartext, secure, bindKey)
+}
+
 func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*listenerv3.Listener, []*routev3.RouteConfiguration, []*clusterv3.Cluster, error) {
 	listenersByBind := make(map[string]*listenerv3.Listener)
-	cleartextChains := make(map[string]bool)
+	// occupants records the first group placed on each bind. A cleartext group
+	// only lands on an empty bind, so a cleartext occupant is the bind's only
+	// chain.
+	occupants := make(map[string]bindOccupant)
 	tlsNames := make(map[string]map[string]struct{})
 	routes := make([]*routev3.RouteConfiguration, 0, len(groups))
 	jwksByHost := make(map[string]*clusterv3.Cluster)
 
-	for _, group := range groups {
-		routeConfig := &routev3.RouteConfiguration{
-			Name:                     group.routeName,
-			IgnorePortInHostMatching: true,
-		}
-		misdirectedNames, misdirectedCatchAll := otherTLSClaims(group, groups)
-		blockedDomains := make(map[string]struct{}, len(misdirectedNames)+1)
-		for _, hostname := range misdirectedNames {
-			blockedDomains[hostname] = struct{}{}
-		}
-		if misdirectedCatchAll {
-			blockedDomains["*"] = struct{}{}
-		}
-		for _, virtualHost := range group.virtualHosts {
-			hostname := virtualHost.Hostname
-			if hostname == "" {
-				hostname = "*"
-			}
-			if _, blocked := blockedDomains[hostname]; blocked {
-				continue
-			}
-			translated, err := buildDomainVirtualHost(virtualHost, group.guard, group.stripAccessHeaders)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, translated)
-		}
-		for _, hostname := range protectedExactClaims(group, groups) {
-			if _, alreadyClaimed := group.virtualHostIndex[hostname]; alreadyClaimed {
-				continue
-			}
-			blocked, err := buildDomainVirtualHost(ir.VirtualHost{
-				Name: resourceName("protected-"+hostname, "protected-host"), Hostname: hostname,
-			}, ir.GuardBlocked, true)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, blocked)
-		}
-		for _, hostname := range misdirectedNames {
-			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, misdirectedVirtualHost(hostname))
-		}
-		if misdirectedCatchAll {
-			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, misdirectedVirtualHost("*"))
-		}
-		routes = append(routes, routeConfig)
-
-		filters, jwksHost, jwksName, err := buildHTTPFilters(group.access)
+	for _, members := range filterChainMembers(groups) {
+		group := members[0]
+		guards, err := newChainGuards(members)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if jwksHost != "" {
-			if _, ok := jwksByHost[jwksHost]; !ok {
-				cluster, err := buildJWKCluster(jwksHost, jwksName)
+		routeConfig, err := buildChainRouteConfig(members, groups, guards)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		routes = append(routes, routeConfig)
+
+		var filters []*hcmv3.HttpFilter
+		var jwks []jwksSource
+		enforcesJWT := false
+		if guards == nil {
+			var jwksHost, jwksName string
+			filters, jwksHost, jwksName, err = buildHTTPFilters(group.access)
+			if jwksHost != "" {
+				jwks = []jwksSource{{host: jwksHost, name: jwksName}}
+			}
+			enforcesJWT = group.access != nil
+		} else {
+			filters, jwks, err = guards.httpFilters()
+			enforcesJWT = len(guards.providers) > 0
+		}
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, source := range jwks {
+			if _, ok := jwksByHost[source.host]; !ok {
+				cluster, err := buildJWKCluster(source.host, source.name)
 				if err != nil {
 					return nil, nil, nil, err
 				}
-				jwksByHost[jwksHost] = cluster
+				jwksByHost[source.host] = cluster
 			}
 		}
 
@@ -374,7 +378,7 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 			PathWithEscapedSlashesAction: hcmv3.HttpConnectionManager_UNESCAPE_AND_REDIRECT,
 			UpgradeConfigs:               []*hcmv3.HttpConnectionManager_UpgradeConfig{{UpgradeType: "websocket"}},
 		}
-		if group.access != nil {
+		if enforcesJWT {
 			hcm.LocalReplyConfig = jwtFailureLocalReplyConfig()
 		}
 		typedHCM, err := anypb.New(hcm)
@@ -417,8 +421,13 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 			}
 			listenersByBind[bindKey] = listener
 		}
-		if group.tlsSecret != "" && cleartextChains[bindKey] {
-			return nil, nil, nil, fmt.Errorf("TLS and cleartext filter chains cannot share %s", bindKey)
+		isTLS := group.tlsSecret != ""
+		occupant, occupied := occupants[bindKey]
+		if occupied && (!isTLS || !occupant.tls) {
+			return nil, nil, nil, bindCollisionError(occupant, group.name, isTLS, bindKey)
+		}
+		if !occupied {
+			occupants[bindKey] = bindOccupant{name: group.name, tls: isTLS}
 		}
 		if group.tlsSecret != "" {
 			if err := ensureTLSInspector(listener); err != nil {
@@ -445,12 +454,6 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 				names[serverName] = struct{}{}
 			}
 		}
-		if group.tlsSecret == "" {
-			if len(listener.FilterChains) > 0 || listener.DefaultFilterChain != nil {
-				return nil, nil, nil, fmt.Errorf("cleartext and TLS protection domains cannot share %s", bindKey)
-			}
-			cleartextChains[bindKey] = true
-		}
 		listener.FilterChains = append(listener.FilterChains, chain)
 	}
 
@@ -464,6 +467,254 @@ func buildListeners(groups []routeGroup, streamIdleTimeout time.Duration) ([]*li
 	}
 	return listeners, routes, jwksClusters, nil
 }
+
+// filterChainMembers partitions groups into the sets that share one filter
+// chain. Route groups on one TLS bind with the same listener, certificate, and
+// server names are reached by the same handshakes: a private listener's SNI is
+// the listener hostname, not the requested host, so Envoy can only tell them
+// apart by Host. Such groups share one chain and route table, and each virtual
+// host enforces its own group's guard. Every other group has a chain of its
+// own.
+func filterChainMembers(groups []routeGroup) [][]routeGroup {
+	chains := make([][]routeGroup, 0, len(groups))
+	byKey := make(map[string]int)
+	for _, group := range groups {
+		if group.tlsSecret == "" {
+			chains = append(chains, []routeGroup{group})
+			continue
+		}
+		key := net.JoinHostPort(group.address, strconv.Itoa(int(group.port))) + "|" + group.tlsSecret + "|" +
+			group.isolationKey + "|" + strings.Join(group.serverNames, ",")
+		if index, ok := byKey[key]; ok {
+			chains[index] = append(chains[index], group)
+			continue
+		}
+		byKey[key] = len(chains)
+		chains = append(chains, []routeGroup{group})
+	}
+	return chains
+}
+
+// buildChainRouteConfig builds the route table one filter chain serves.
+// Members of a shared chain must serve disjoint hosts: one host has one
+// virtual host and so one guard.
+func buildChainRouteConfig(members, groups []routeGroup, guards *chainGuards) (*routev3.RouteConfiguration, error) {
+	routeConfig := &routev3.RouteConfiguration{
+		Name:                     members[0].routeName,
+		IgnorePortInHostMatching: true,
+	}
+	misdirectedNames, misdirectedCatchAll := otherTLSClaims(members, groups)
+	blockedDomains := make(map[string]struct{}, len(misdirectedNames)+1)
+	for _, hostname := range misdirectedNames {
+		blockedDomains[hostname] = struct{}{}
+	}
+	if misdirectedCatchAll {
+		blockedDomains["*"] = struct{}{}
+	}
+	servedBy := make(map[string]string)
+	for _, member := range members {
+		for _, virtualHost := range member.virtualHosts {
+			hostname := virtualHost.Hostname
+			if hostname == "" {
+				hostname = "*"
+			}
+			if _, blocked := blockedDomains[hostname]; blocked {
+				continue
+			}
+			if other, served := servedBy[hostname]; served {
+				return nil, fmt.Errorf("protection domains %q and %q serve host %q with different guards on one TLS filter chain", other, member.name, hostname)
+			}
+			servedBy[hostname] = member.name
+			translated, err := buildDomainVirtualHost(virtualHost, member.guard, member.stripAccessHeaders)
+			if err != nil {
+				return nil, err
+			}
+			if err := guards.enforce(translated, member); err != nil {
+				return nil, err
+			}
+			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, translated)
+		}
+	}
+	claimed := func(hostname string) bool {
+		for _, member := range members {
+			if _, ok := member.virtualHostIndex[hostname]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	shadowed := make(map[string]struct{})
+	for _, member := range members {
+		for _, hostname := range protectedExactClaims(member, groups) {
+			if _, done := shadowed[hostname]; done || claimed(hostname) {
+				continue
+			}
+			shadowed[hostname] = struct{}{}
+			blocked, err := buildDomainVirtualHost(ir.VirtualHost{
+				Name: resourceName("protected-"+hostname, "protected-host"), Hostname: hostname,
+			}, ir.GuardBlocked, true)
+			if err != nil {
+				return nil, err
+			}
+			if err := guards.disable(blocked); err != nil {
+				return nil, err
+			}
+			routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, blocked)
+		}
+	}
+	if misdirectedCatchAll {
+		misdirectedNames = append(misdirectedNames, "*")
+	}
+	for _, hostname := range misdirectedNames {
+		misdirected := misdirectedVirtualHost(hostname)
+		if err := guards.disable(misdirected); err != nil {
+			return nil, err
+		}
+		routeConfig.VirtualHosts = append(routeConfig.VirtualHosts, misdirected)
+	}
+	return routeConfig, nil
+}
+
+// chainGuards enforces each member's guard per virtual host when route groups
+// with different guards share one filter chain. One jwt_authn filter carries a
+// requirement per Access guard, and every virtual host names its own: a
+// Forwarding Access host requires its JWT, while Blocked, unprotected, and
+// misdirected hosts answer locally or forward without one, exactly as they do
+// on a chain of their own. A nil *chainGuards is a chain of one group, whose
+// filter enforces the group's guard on every host.
+type chainGuards struct {
+	// providers maps a requirement name to the Access guard it verifies.
+	providers map[string]*ir.AccessGuard
+	// requirements maps a member key to its requirement name; a member that
+	// verifies no JWT has none.
+	requirements map[string]string
+}
+
+type jwksSource struct {
+	host string
+	name string
+}
+
+func newChainGuards(members []routeGroup) (*chainGuards, error) {
+	if len(members) < 2 {
+		return nil, nil
+	}
+	guards := &chainGuards{providers: make(map[string]*ir.AccessGuard), requirements: make(map[string]string)}
+	accessKeys := make(map[string]string)
+	for _, member := range members {
+		if member.guard == ir.GuardBlocked || member.access == nil {
+			continue
+		}
+		name := "cloudflare-access-" + shortHash(member.accessKey)
+		if existing, ok := accessKeys[name]; ok && existing != member.accessKey {
+			return nil, fmt.Errorf("access guards of protection domain %q collide on JWT requirement %q", member.name, name)
+		}
+		accessKeys[name] = member.accessKey
+		guards.providers[name] = member.access
+		guards.requirements[member.key] = name
+	}
+	return guards, nil
+}
+
+// httpFilters returns the shared chain's HTTP filters and the JWKS sources
+// its providers fetch.
+func (guards *chainGuards) httpFilters() ([]*hcmv3.HttpFilter, []jwksSource, error) {
+	if len(guards.providers) == 0 {
+		filters, err := httpFiltersWithJWT(nil)
+		return filters, nil, err
+	}
+	names := make([]string, 0, len(guards.providers))
+	for name := range guards.providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	jwt := &jwtauthnv3.JwtAuthentication{
+		Providers:      make(map[string]*jwtauthnv3.JwtProvider, len(names)),
+		RequirementMap: make(map[string]*jwtauthnv3.JwtRequirement, len(names)),
+		// Every virtual host names its requirement. A request that resolves
+		// none still has to present a JWT rather than pass unverified.
+		Rules: []*jwtauthnv3.RequirementRule{{
+			Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+			RequirementType: &jwtauthnv3.RequirementRule_Requires{Requires: &jwtauthnv3.JwtRequirement{
+				RequiresType: &jwtauthnv3.JwtRequirement_ProviderName{ProviderName: names[0]},
+			}},
+		}},
+	}
+	sources := make([]jwksSource, 0, len(names))
+	for _, name := range names {
+		provider, jwksHost, jwksName, err := accessJWTProvider(guards.providers[name])
+		if err != nil {
+			return nil, nil, err
+		}
+		jwt.Providers[name] = provider
+		jwt.RequirementMap[name] = &jwtauthnv3.JwtRequirement{
+			RequiresType: &jwtauthnv3.JwtRequirement_ProviderName{ProviderName: name},
+		}
+		sources = append(sources, jwksSource{host: jwksHost, name: jwksName})
+	}
+	filters, err := httpFiltersWithJWT(jwt)
+	return filters, sources, err
+}
+
+// enforce applies member's guard to its virtual host on a shared chain. An
+// OPTIONS preflight bypass becomes an OPTIONS twin ahead of every route that
+// skips JWT verification, so preflights route exactly as the original
+// requests would.
+func (guards *chainGuards) enforce(virtualHost *routev3.VirtualHost, member routeGroup) error {
+	if guards == nil || len(guards.providers) == 0 {
+		return nil
+	}
+	requirement := guards.requirements[member.key]
+	if err := setJWTRequirement(&virtualHost.TypedPerFilterConfig, requirement); err != nil {
+		return err
+	}
+	if requirement == "" || !member.access.OptionsPreflightBypass {
+		return nil
+	}
+	routes := make([]*routev3.Route, 0, 2*len(virtualHost.Routes))
+	for _, route := range virtualHost.Routes {
+		preflight := proto.Clone(route).(*routev3.Route)
+		preflight.Name = route.Name + "-options-preflight"
+		preflight.Match.Headers = append(preflight.Match.Headers, &routev3.HeaderMatcher{
+			Name:                 ":method",
+			HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{StringMatch: exactStringMatcher("OPTIONS")},
+		})
+		if err := setJWTRequirement(&preflight.TypedPerFilterConfig, ""); err != nil {
+			return err
+		}
+		routes = append(routes, preflight, route)
+	}
+	virtualHost.Routes = routes
+	return nil
+}
+
+// disable exempts a locally answered virtual host on a shared chain from JWT
+// verification.
+func (guards *chainGuards) disable(virtualHost *routev3.VirtualHost) error {
+	if guards == nil || len(guards.providers) == 0 {
+		return nil
+	}
+	return setJWTRequirement(&virtualHost.TypedPerFilterConfig, "")
+}
+
+// setJWTRequirement sets the jwt_authn per-route config: verify requirement,
+// or skip verification when requirement is empty.
+func setJWTRequirement(configs *map[string]*anypb.Any, requirement string) error {
+	config := &jwtauthnv3.PerRouteConfig{RequirementSpecifier: &jwtauthnv3.PerRouteConfig_Disabled{Disabled: true}}
+	if requirement != "" {
+		config.RequirementSpecifier = &jwtauthnv3.PerRouteConfig_RequirementName{RequirementName: requirement}
+	}
+	typed, err := anypb.New(config)
+	if err != nil {
+		return fmt.Errorf("marshal JWT per-route config: %w", err)
+	}
+	if *configs == nil {
+		*configs = make(map[string]*anypb.Any, 1)
+	}
+	(*configs)[jwtFilterName] = typed
+	return nil
+}
+
 func ensureTLSInspector(listener *listenerv3.Listener) error {
 	for _, filter := range listener.ListenerFilters {
 		if filter.Name == "envoy.filters.listener.tls_inspector" {
@@ -482,55 +733,76 @@ func ensureTLSInspector(listener *listenerv3.Listener) error {
 }
 
 func buildHTTPFilters(access *ir.AccessGuard) ([]*hcmv3.HttpFilter, string, string, error) {
-	filters := make([]*hcmv3.HttpFilter, 0, 3)
-
-	jwksHost := ""
-	jwksName := ""
-	if access != nil {
-		jwksHost = normalizeAuthDomain(access.AuthDomain)
-		audiences := access.AUDs
-		if jwksHost == "" || len(audiences) == 0 {
-			return nil, "", "", errors.New("protected domain requires authDomain and at least one AUD")
-		}
-		jwksName = "flareway-jwks-" + shortHash(jwksHost)
-		jwt := &jwtauthnv3.JwtAuthentication{
-			Providers: map[string]*jwtauthnv3.JwtProvider{
-				"cloudflare-access": {
-					Issuer:    "https://" + jwksHost,
-					Audiences: audiences,
-					JwksSourceSpecifier: &jwtauthnv3.JwtProvider_RemoteJwks{RemoteJwks: &jwtauthnv3.RemoteJwks{
-						HttpUri: &corev3.HttpUri{
-							Uri:              "https://" + jwksHost + "/cdn-cgi/access/certs",
-							HttpUpstreamType: &corev3.HttpUri_Cluster{Cluster: jwksName},
-							Timeout:          durationpb.New(10 * time.Second),
-						},
-						CacheDuration: durationpb.New(5 * time.Minute),
-					}},
-					FromHeaders:            []*jwtauthnv3.JwtHeader{{Name: "Cf-Access-Jwt-Assertion"}},
-					FromCookies:            []string{"CF_Authorization"},
-					Forward:                true,
-					FailedStatusInMetadata: "flareway_auth_failure",
-				},
-			},
-		}
-		if access.OptionsPreflightBypass {
-			jwt.Rules = append(jwt.Rules, &jwtauthnv3.RequirementRule{Match: &routev3.RouteMatch{
-				PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
-				Headers: []*routev3.HeaderMatcher{{
-					Name:                 ":method",
-					HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{StringMatch: exactStringMatcher("OPTIONS")},
-				}},
-			}})
-		}
-		jwt.Rules = append(jwt.Rules, &jwtauthnv3.RequirementRule{
-			Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
-			RequirementType: &jwtauthnv3.RequirementRule_Requires{Requires: &jwtauthnv3.JwtRequirement{
-				RequiresType: &jwtauthnv3.JwtRequirement_ProviderName{ProviderName: "cloudflare-access"},
+	if access == nil {
+		filters, err := httpFiltersWithJWT(nil)
+		return filters, "", "", err
+	}
+	provider, jwksHost, jwksName, err := accessJWTProvider(access)
+	if err != nil {
+		return nil, "", "", err
+	}
+	jwt := &jwtauthnv3.JwtAuthentication{
+		Providers: map[string]*jwtauthnv3.JwtProvider{"cloudflare-access": provider},
+	}
+	if access.OptionsPreflightBypass {
+		jwt.Rules = append(jwt.Rules, &jwtauthnv3.RequirementRule{Match: &routev3.RouteMatch{
+			PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+			Headers: []*routev3.HeaderMatcher{{
+				Name:                 ":method",
+				HeaderMatchSpecifier: &routev3.HeaderMatcher_StringMatch{StringMatch: exactStringMatcher("OPTIONS")},
 			}},
-		})
-		typedJWT, err := anypb.New(jwt)
-		if err != nil {
-			return nil, "", "", fmt.Errorf("marshal JWT filter: %w", err)
+		}})
+	}
+	jwt.Rules = append(jwt.Rules, &jwtauthnv3.RequirementRule{
+		Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
+		RequirementType: &jwtauthnv3.RequirementRule_Requires{Requires: &jwtauthnv3.JwtRequirement{
+			RequiresType: &jwtauthnv3.JwtRequirement_ProviderName{ProviderName: "cloudflare-access"},
+		}},
+	})
+	filters, err := httpFiltersWithJWT(jwt)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return filters, jwksHost, jwksName, nil
+}
+
+// accessJWTProvider returns the jwt_authn provider verifying access, the
+// Access team domain it fetches JWKS from, and that JWKS cluster's name.
+func accessJWTProvider(access *ir.AccessGuard) (*jwtauthnv3.JwtProvider, string, string, error) {
+	jwksHost := normalizeAuthDomain(access.AuthDomain)
+	audiences := access.AUDs
+	if jwksHost == "" || len(audiences) == 0 {
+		return nil, "", "", errors.New("protected domain requires authDomain and at least one AUD")
+	}
+	jwksName := "flareway-jwks-" + shortHash(jwksHost)
+	return &jwtauthnv3.JwtProvider{
+		Issuer:    "https://" + jwksHost,
+		Audiences: audiences,
+		JwksSourceSpecifier: &jwtauthnv3.JwtProvider_RemoteJwks{RemoteJwks: &jwtauthnv3.RemoteJwks{
+			HttpUri: &corev3.HttpUri{
+				Uri:              "https://" + jwksHost + "/cdn-cgi/access/certs",
+				HttpUpstreamType: &corev3.HttpUri_Cluster{Cluster: jwksName},
+				Timeout:          durationpb.New(10 * time.Second),
+			},
+			CacheDuration: durationpb.New(5 * time.Minute),
+		}},
+		FromHeaders:            []*jwtauthnv3.JwtHeader{{Name: "Cf-Access-Jwt-Assertion"}},
+		FromCookies:            []string{"CF_Authorization"},
+		Forward:                true,
+		FailedStatusInMetadata: "flareway_auth_failure",
+	}, jwksHost, jwksName, nil
+}
+
+// httpFiltersWithJWT returns the HTTP filter chain: jwt_authn when jwt is
+// set, then CORS and the router.
+func httpFiltersWithJWT(jwt *jwtauthnv3.JwtAuthentication) ([]*hcmv3.HttpFilter, error) {
+	filters := make([]*hcmv3.HttpFilter, 0, 3)
+	if jwt != nil {
+		// Providers and requirement_map are maps: marshal deterministically so
+		// identical input hashes to the same Listener resource version.
+		typedJWT := &anypb.Any{}
+		if err := anypb.MarshalFrom(typedJWT, jwt, proto.MarshalOptions{Deterministic: true}); err != nil {
+			return nil, fmt.Errorf("marshal JWT filter: %w", err)
 		}
 		filters = append(filters, &hcmv3.HttpFilter{
 			Name:       jwtFilterName,
@@ -539,7 +811,7 @@ func buildHTTPFilters(access *ir.AccessGuard) ([]*hcmv3.HttpFilter, string, stri
 	}
 	typedCORS, err := anypb.New(&corsv3.Cors{})
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	filters = append(filters, &hcmv3.HttpFilter{
 		Name:       corsFilterName,
@@ -547,14 +819,14 @@ func buildHTTPFilters(access *ir.AccessGuard) ([]*hcmv3.HttpFilter, string, stri
 	})
 	typedRouter, err := anypb.New(&routerv3.Router{})
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 
 	filters = append(filters, &hcmv3.HttpFilter{
 		Name:       routerFilterName,
 		ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: typedRouter},
 	})
-	return filters, jwksHost, jwksName, nil
+	return filters, nil
 }
 func protectedExactClaims(current routeGroup, groups []routeGroup) []string {
 	if current.protected || !current.stripAccessHeaders {
@@ -581,8 +853,10 @@ func protectedExactClaims(current routeGroup, groups []routeGroup) []string {
 			}
 			for _, wildcard := range wildcards {
 				suffix := strings.TrimPrefix(wildcard, "*")
+				// Envoy's "*.example.com" matches any depth of subdomain,
+				// not only single-label prefixes.
 				prefix := strings.TrimSuffix(hostname, suffix)
-				if prefix != "" && !strings.Contains(prefix, ".") && strings.HasSuffix(hostname, suffix) {
+				if prefix != "" && strings.HasSuffix(hostname, suffix) {
 					claims = appendUnique(claims, hostname)
 					break
 				}
@@ -592,15 +866,19 @@ func protectedExactClaims(current routeGroup, groups []routeGroup) []string {
 	sort.Strings(claims)
 	return claims
 }
-func otherTLSClaims(current routeGroup, groups []routeGroup) ([]string, bool) {
+
+// otherTLSClaims returns the server names other filter chains on the bind of
+// members claim, and whether one of them is the bind's catch-all chain.
+func otherTLSClaims(members, groups []routeGroup) ([]string, bool) {
+	current := members[0]
 	if current.tlsSecret == "" {
 		return nil, false
 	}
 	names := make([]string, 0)
 	catchAll := false
 	for _, candidate := range groups {
-		if candidate.key == current.key || candidate.tlsSecret == "" ||
-			candidate.address != current.address || candidate.port != current.port {
+		if candidate.tlsSecret == "" || candidate.address != current.address || candidate.port != current.port ||
+			slices.ContainsFunc(members, func(member routeGroup) bool { return member.key == candidate.key }) {
 			continue
 		}
 		if len(candidate.serverNames) == 0 {

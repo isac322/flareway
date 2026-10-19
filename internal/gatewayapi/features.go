@@ -32,7 +32,7 @@ var supportedFeatures = []features.FeatureName{
 	features.SupportGateway,
 	features.SupportGatewayHTTPListenerIsolation,
 	features.SupportGatewayHTTPSListenerDetectMisdirectedRequests,
-	features.SupportGatewayInfrastructurePropagation,
+	features.SupportGatewayInfrastructure,
 	features.SupportHTTPRoute,
 	features.SupportHTTPRoute303RedirectStatusCode,
 	features.SupportHTTPRoute307RedirectStatusCode,

@@ -76,7 +76,29 @@ type compiledRoute struct {
 
 // Translate deterministically converts cached Kubernetes objects into the
 // Flareway IR and desired statuses. It returns nil IR only when Gateway is nil.
+//
+// Public Envoy ports are positional, but a revoked AccessApplication's
+// tombstone stays on the port the applied tunnel configuration still routes
+// its hosts to, and keeps its hosts blocked until the revocation is
+// acknowledged. When such tombstones exist, Translate translates again with
+// what they hold: no live listener or Access host binds their ports, and
+// every domain for a host a tombstone holds on its listener is emitted
+// Blocked. The second pass also reserves the fixed ports of private listeners
+// so shifting the positional sequence cannot land a public bind on a private
+// bind.
 func Translate(in Inputs) (*ir.Gateway, Statuses) {
+	out, statuses := translate(in, nil)
+	if out == nil || out.ConformanceMode {
+		return out, statuses
+	}
+	holds := newAccessRevocationHolds(in, out.Domains)
+	if holds == nil {
+		return out, statuses
+	}
+	return translate(in, holds)
+}
+
+func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) {
 	outStatuses := Statuses{
 		HTTPRoutes:         make(map[types.NamespacedName]gatewayv1.HTTPRouteStatus),
 		BackendTLSPolicies: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
@@ -133,7 +155,7 @@ func Translate(in Inputs) (*ir.Gateway, Statuses) {
 		}
 	}
 
-	listeners, gatewayReason, gatewayMessage := translateListeners(in, out)
+	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, holds.reservedPorts())
 	globalInvalid := false
 	if len(in.Gateway.Spec.Addresses) > 0 {
 		globalInvalid = true
@@ -171,7 +193,7 @@ func Translate(in Inputs) (*ir.Gateway, Statuses) {
 	}
 
 	compileHTTPRoutes(in, out, listeners, &outStatuses, now)
-	applyAccessApplications(in, out, &outStatuses, now)
+	applyAccessApplications(in, out, &outStatuses, now, holds)
 	populateBackendTLSPolicyStatuses(in, out, &outStatuses, now)
 	out.Clusters = buildClusters(in, out)
 	finalizeIR(out)
@@ -308,8 +330,8 @@ func namespaceByName(namespaces []corev1.Namespace, name string) *corev1.Namespa
 	return nil
 }
 
-func translateListeners(in Inputs, out *ir.Gateway) ([]*listenerTranslation, gatewayv1.GatewayConditionReason, string) {
-	publicPort := int32(18080)
+func translateListeners(in Inputs, out *ir.Gateway, reserved map[int32]struct{}) ([]*listenerTranslation, gatewayv1.GatewayConditionReason, string) {
+	publicPorts := publicEnvoyPorts{next: 18080, reserved: reserved}
 	listeners := make([]*listenerTranslation, 0, len(in.Gateway.Spec.Listeners))
 	conformance := out.ConformanceMode
 	for i := range in.Gateway.Spec.Listeners {
@@ -327,11 +349,11 @@ func translateListeners(in Inputs, out *ir.Gateway) ([]*listenerTranslation, gat
 			attachedRoutes:  make(map[types.NamespacedName]struct{}),
 			exposure:        exposure,
 		}
-		envoyPort := publicPort
+		var envoyPort int32
 		if exposure == v1alpha1.ExposurePrivate {
 			envoyPort = int32(spec.Port)
 		} else {
-			publicPort++
+			envoyPort = publicPorts.take()
 		}
 		validateListener(in, translated, conformance, envoyPort, out)
 		listeners = append(listeners, translated)

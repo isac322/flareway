@@ -13,11 +13,11 @@ CLOUD_PROVIDER_KIND_BIN="${CLOUD_PROVIDER_KIND:-${BIN_DIR}/cloud-provider-kind}"
 
 KIND_VERSION="${KIND_VERSION:-v0.33.0}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-flareway-conf}"
-KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.35.0}"
-GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.2}"
+KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.37.0}"
+GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.3}"
 KO_VERSION="${KO_VERSION:-v0.19.1}"
-KUSTOMIZE_VERSION="${KUSTOMIZE_VERSION:-v5.8.1}"
-CLOUD_PROVIDER_KIND_VERSION="${CLOUD_PROVIDER_KIND_VERSION:-v0.11.1}"
+KUSTOMIZE_VERSION="${KUSTOMIZE_VERSION:-v5.8.3}"
+CLOUD_PROVIDER_KIND_VERSION="${CLOUD_PROVIDER_KIND_VERSION:-v0.12.0}"
 TARGET_ARCH="${TARGET_ARCH:-$(go env GOARCH)}"
 VERSION="${VERSION:-}"
 RUN_TEST="${CONFORMANCE_RUN_TEST:-}"
@@ -27,7 +27,7 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="${VERSION:-dev}"
 fi
 
-REPORT_OUTPUT="${REPORT_OUTPUT:-docs/conformance/v1.6.2/flareway/standard-${VERSION}-default-report.yaml}"
+REPORT_OUTPUT="${REPORT_OUTPUT:-docs/conformance/v1.6.3/flareway/standard-${VERSION}-default-report.yaml}"
 if [[ "${REPORT_OUTPUT}" != /* ]]; then
   REPORT_OUTPUT="${ROOT_DIR}/${REPORT_OUTPUT}"
 fi
@@ -135,7 +135,7 @@ else
   CGO_ENABLED=0 GOOS=linux GOARCH="${TARGET_ARCH}" \
     go build -o "${TMP_DIR}/manager" ./cmd
   cat > "${TMP_DIR}/ControllerDockerfile" <<'EOF'
-FROM cgr.dev/chainguard/static:latest@sha256:bf639cba19ba56329e6907ac26a7afcdde57a80b6aa66d5100da6883196e6b82
+FROM cgr.dev/chainguard/static:latest@sha256:fe55470f22d3259488d9d3739168d8f04da67755f0b69382bc26eda4a7d3d327
 COPY manager /manager
 USER 65532:65532
 ENTRYPOINT ["/manager"]
@@ -248,7 +248,7 @@ fi
 exit "${status}"
 EOF
 cat > "${TMP_DIR}/Dockerfile" <<'EOF'
-FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 COPY conformance.test /usr/local/bin/conformance.test
 COPY runner-entrypoint.sh /usr/local/bin/runner-entrypoint.sh
 ENTRYPOINT ["/bin/sh", "/usr/local/bin/runner-entrypoint.sh"]

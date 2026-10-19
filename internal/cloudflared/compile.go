@@ -88,7 +88,7 @@ func compileRequest(accountID string, config configBody) (zero_trust.TunnelCloud
 
 	return zero_trust.TunnelCloudflaredConfigurationUpdateParams{
 		AccountID: cloudflare.F(accountID),
-		// cloudflare-go v7.10.0 omits fields accepted by the configuration API,
+		// cloudflare-go v7.12.0 omits fields accepted by the configuration API,
 		// including warp-routing and parts of originRequest. Raw preserves the
 		// real SDK request type and the complete whole-object JSON contract.
 		Config: cloudflare.Raw[zero_trust.TunnelCloudflaredConfigurationUpdateParamsConfig](rawConfig),

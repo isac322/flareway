@@ -38,7 +38,7 @@ and they cannot rewrite, redirect, mirror, or split traffic by weight.
 
 The routing features Flareway claims passed the Gateway API conformance suite
 in a local run through Envoy; the
-[conformance report](docs/conformance/v1.6.2/flareway/README.md) states what
+[conformance report](docs/conformance/v1.6.3/flareway/README.md) states what
 that run covered.
 
 ## How it works
@@ -83,7 +83,7 @@ install cannot silently take ownership of an existing `GatewayClass`.
 
 ## Start here
 
-You need a Kubernetes cluster with the Gateway API v1.6.2 Standard CRDs, Helm,
+You need a Kubernetes cluster with the Gateway API v1.6.3 Standard CRDs, Helm,
 a Cloudflare account with a scoped API token, and a DNS zone in that account
 for public hostnames. Then follow the guides in order:
 
@@ -120,7 +120,7 @@ verified.
 
 - **Concepts:** [How it works](docs/concepts/how-it-works.md),
   [HTTP routing](docs/concepts/http-routing.md),
-  [Conformance report](docs/conformance/v1.6.2/flareway/README.md),
+  [Conformance report](docs/conformance/v1.6.3/flareway/README.md),
   [Security model](docs/concepts/security-model.md),
   [Ownership and adoption](docs/concepts/ownership-and-adoption.md),
   [Limits](docs/concepts/limits.md)

@@ -549,5 +549,8 @@ The remote ownership ledger uses tags where Cloudflare supports tags, determinis
 | HTTP `success`, `errors`, `messages`, `result` envelope | excluded |
 | pagination and result-info | excluded |
 | deprecated wire aliases | excluded; canonical fields only |
+| mutable field outside Flareway's resource model | excluded; never sent or read, left to other tooling, outside drift detection |
 
 Envelope and read-only exclusions define ownership; they are not feature-availability statements. The controllers consume the envelope internally, surface actionable failures as conditions, and keep response metadata out of desired state.
+
+A field in the "outside Flareway's resource model" class is mutable on Cloudflare but belongs to a concern no Flareway kind owns, so Flareway neither sends it on create or update nor reads it back, and does not detect drift on it. The current members are the Access application `destinations[].overrides` (per-path Access overrides; Flareway models public carve-outs as bypass applications instead) and the rule-format `target_criteria[].include`, `.require`, and `.exclude` selectors with their `tags` and `target_attributes.hostname` children; `IdentityProvider` `config.google-apps.use_login_hint`; and `ZeroTrustOrganization` `service_token_inactivity` (with `action`, `enabled`, `inactivity_threshold_days`) and `strict_service_token_auth`. The read-only `trusted_accounts` organization list output belongs to the same out-of-model concern and is likewise neither read nor surfaced in status.

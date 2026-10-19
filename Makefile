@@ -2,7 +2,7 @@
 IMG ?= controller:latest
 KO_DOCKER_REPO ?= ghcr.io/isac322/flareway
 KIND_CLUSTER_NAME ?= flareway-conf
-KIND_NODE_IMAGE ?= kindest/node:v1.35.0
+KIND_NODE_IMAGE ?= kindest/node:v1.37.0
 FLAREWAY_E2E_LABELS ?= public,access
 EXPLORATORY_CHECKS ?= 25
 EXPLORATORY_STEPS ?= 8
@@ -358,15 +358,15 @@ COSIGN ?= $(LOCALBIN)/cosign
 CLOUD_PROVIDER_KIND ?= $(LOCALBIN)/cloud-provider-kind
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v5.8.1
+KUSTOMIZE_VERSION ?= v5.8.3
 CONTROLLER_TOOLS_VERSION ?= v0.22.0
-ENVTEST_K8S_VERSION ?= 1.35.0
-GOLANGCI_LINT_VERSION ?= v2.13.2
+ENVTEST_K8S_VERSION ?= 1.37.0
+GOLANGCI_LINT_VERSION ?= v2.14.0
 KIND_VERSION ?= v0.33.0
-GATEWAY_API_VERSION ?= v1.6.2
+GATEWAY_API_VERSION ?= v1.6.3
 KO_VERSION ?= v0.19.1
-COSIGN_VERSION ?= v2.6.5
-CLOUD_PROVIDER_KIND_VERSION ?= v0.11.1
+COSIGN_VERSION ?= v3.1.3
+CLOUD_PROVIDER_KIND_VERSION ?= v0.12.0
 HELM_VERSION ?= v4.3.0
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -401,7 +401,7 @@ $(HELM): $(LOCALBIN)
 .PHONY: cosign
 cosign: $(COSIGN) ## Download cosign locally if necessary.
 $(COSIGN): $(LOCALBIN)
-	$(call go-install-tool,$(COSIGN),github.com/sigstore/cosign/v2/cmd/cosign,$(COSIGN_VERSION))
+	$(call go-install-tool,$(COSIGN),github.com/sigstore/cosign/v3/cmd/cosign,$(COSIGN_VERSION))
 
 .PHONY: cloud-provider-kind
 cloud-provider-kind: $(CLOUD_PROVIDER_KIND) ## Download cloud-provider-kind locally if necessary.
@@ -427,7 +427,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 	@test -f .custom-gcl.yml && { \
 		echo "Building custom golangci-lint with plugins..." && \
-		GOTOOLCHAIN=go1.27.1 $(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		GOTOOLCHAIN=go1.27.2 $(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
 
@@ -441,7 +441,7 @@ set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
 rm -f "$(1)" ;\
-GOTOOLCHAIN=go1.27.1 GOBIN="$(LOCALBIN)" go install $${package} ;\
+GOTOOLCHAIN=go1.27.2 GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"

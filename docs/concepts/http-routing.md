@@ -99,7 +99,7 @@ A rule cannot combine `RequestRedirect` and `URLRewrite`; Flareway drops that ru
 |---|---|
 | `GatewayHTTPListenerIsolation` | A request reaches only the routes of the listener with the most specific matching hostname. |
 | `GatewayHTTPSListenerDetectMisdirectedRequests` | Envoy answers 421 when an HTTPS request's `Host` does not match the listener chosen by the TLS server name. |
-| `GatewayInfrastructurePropagation` | Labels and annotations in `spec.infrastructure` are copied to the data-plane Deployment and pods. |
+| `GatewayInfrastructure` | Labels and annotations in `spec.infrastructure` are copied to the data-plane Deployment and pods, and a Gateway whose `parametersRef` is invalid or missing reports `Accepted=False` with reason `InvalidParameters`. |
 
 The two listener features were verified in conformance mode, where clients connect to Envoy directly. They do not apply on the Cloudflare edge path.
 
@@ -132,4 +132,4 @@ See [Limits](limits.md) for the rest of Flareway's boundaries.
 
 ## Evidence
 
-The supported feature names on this page are the list the controller publishes in `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go`). A local Gateway API conformance run tested every one of them; the [conformance report](../conformance/v1.6.2/flareway/README.md) gives the results and what the run did not cover.
+The supported feature names on this page are the list the controller publishes in `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go`). A local Gateway API conformance run tested every one of them; the [conformance report](../conformance/v1.6.3/flareway/README.md) gives the results and what the run did not cover.

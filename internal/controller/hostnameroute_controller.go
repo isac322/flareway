@@ -338,7 +338,17 @@ func (r *HostnameRouteReconciler) ensureManaged(ctx context.Context, api flarecl
 	if !hostnameRouteNeedsUpdate(input, remote) {
 		return remote, nil
 	}
-	return api.UpdateHostnameRoute(ctx, id, input)
+	updated, err := api.UpdateHostnameRoute(ctx, id, input)
+	if err != nil {
+		return flarecloudflare.HostnameRoute{}, err
+	}
+	// A result that differs from what was written means another writer
+	// changed the route concurrently; recording it would claim a target this
+	// pass never applied.
+	if hostnameRouteNeedsUpdate(input, updated) {
+		return flarecloudflare.HostnameRoute{}, fmt.Errorf("remote hostname route %q changed while it was being updated; retrying", id)
+	}
+	return updated, nil
 }
 
 func findOwnedHostnameRoute(ctx context.Context, api flarecloudflare.HostnameRouteAPI, comment string) (flarecloudflare.HostnameRoute, bool, error) {

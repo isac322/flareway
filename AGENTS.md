@@ -28,6 +28,12 @@ authorization), `internal/dataplane` (Envoy fleet management),
 - `docs/adr/` — Architecture Decision Records; `docs/adr/0001-gateway-api-on-cloudflare.md` is the core design.
 - `Makefile` and `.github/workflows/` — build, test, and release commands.
 
+Repository documentation rules:
+
+- Project documents live under `docs/` in a topic folder (`adr/`, `concepts/`, `get-started/`, `operations/`, `reference/`, `conformance/`). Exceptions: community files at the `docs/` root (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`), root `README.md`, `CHANGELOG.md`, and `AGENTS.md`, `charts/flareway/README.md`, `site/PRODUCT.md`, `site/DESIGN.md`, Impeccable's site metadata under `site/.impeccable/**`, `.agents/**`, and `.github/**`.
+- Planning and design documents use ADR, RFC, or PRD format. Do not commit ideation notes or implementation plans; convert one into an ADR, RFC, or PRD, or delete it.
+- Every document is written in English.
+
 ## Code, docs, and website must match (mandatory)
 
 The code, the repository documentation, and the website
@@ -74,6 +80,10 @@ Before every merge:
 3. Any mismatch found between code, docs, and website blocks the merge until
    it is fixed in the same pull request. Reviewers treat a missing doc or site
    update as a blocking finding, not a suggestion.
+
+## Website design and copy
+
+`site/PRODUCT.md` owns the site's positioning, selling points, voice, status messaging, and install path; `site/DESIGN.md` owns the visual system. Together they are the project context for the `impeccable` skill; use `impeccable` for visual work. Read both before changing `site/`, landing copy, or SEO pages, and update them in the same pull request when a decision changes. Do not restate their rules elsewhere.
 
 ## Skills
 

@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COSIGN_VERSION: v2.6.5
+  COSIGN_VERSION: v3.1.3
   HELM_VERSION: v4.3.0
 
 jobs:
@@ -240,16 +240,16 @@ jobs:
       - name: Run Gateway API conformance
         env:
           LOCALBIN: ${{ runner.temp }}/bin
-          REPORT_OUTPUT: ${{ github.workspace }}/docs/conformance/v1.6.2/flareway/standard-${{ needs.metadata.outputs.tag }}-default-report.yaml
+          REPORT_OUTPUT: ${{ github.workspace }}/docs/conformance/v1.6.3/flareway/standard-${{ needs.metadata.outputs.tag }}-default-report.yaml
           VERSION: ${{ needs.metadata.outputs.tag }}
         run: hack/run-conformance.sh
       - name: Upload conformance report and diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gateway-api-conformance-${{ needs.metadata.outputs.tag }}
           path: |
-            docs/conformance/v1.6.2/flareway/
+            docs/conformance/v1.6.3/flareway/
             artifacts/conformance/
           if-no-files-found: error
           retention-days: 14
@@ -361,7 +361,12 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: |
-          bin/cosign sign --yes --recursive "${IMAGE_REF}"
+          # cosign v3 defaults to the Sigstore bundle format stored as an OCI
+          # referrer. Keep publishing the legacy `.sig` signature that every
+          # earlier release used, so existing verifiers keep working unchanged.
+          bin/cosign sign --yes --recursive \
+            --new-bundle-format=false --use-signing-config=false \
+            "${IMAGE_REF}"
           bin/cosign verify \
             --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -395,7 +400,7 @@ jobs:
             sha256sum --check SHA256SUMS
           )
       - name: Upload release artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: flareway-${{ needs.metadata.outputs.version }}
           path: dist/

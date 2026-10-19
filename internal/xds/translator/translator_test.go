@@ -19,11 +19,13 @@ package translator
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +40,7 @@ import (
 	upstreamhttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	"google.golang.org/protobuf/types/known/anypb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -727,6 +730,97 @@ func TestBuildRejectsRouteTablesThatShareAName(t *testing.T) {
 	}
 }
 
+// Two protection domains that resolve to one Envoy bind but cannot share a
+// listener must be rejected with an error that names both domains and their
+// transport, so operators can tell which resources collided.
+func TestBuildBindCollisionErrorNamesDomains(t *testing.T) {
+	t.Run("two cleartext domains", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key:       types.NamespacedName{Namespace: "default", Name: "collision"},
+			Listeners: []ir.Listener{{Name: "http", Hostname: "*.example.com", EnvoyPort: 18080}},
+			Domains: []ir.ProtectionDomain{
+				{Name: "live", ListenerName: "http", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "live", Hostname: "live.example.com"}}},
+				{Name: "revoked", ListenerName: "http", EnvoyPort: 18082, Protected: true, Guard: ir.GuardBlocked, VirtualHosts: []ir.VirtualHost{{Name: "revoked", Hostname: "revoked.example.com"}}},
+			},
+		}
+		_, err := Build(gateway, nil)
+		if err == nil {
+			t.Fatal("Build() accepted two cleartext protection domains on one bind")
+		}
+		got := err.Error()
+		if !strings.Contains(got, "cleartext protection domains") || strings.Contains(got, "TLS") ||
+			!strings.Contains(got, `"live"`) || !strings.Contains(got, `"revoked"`) || !strings.Contains(got, "127.0.0.1:18082") {
+			t.Fatalf("Build() error = %q, want cleartext-only message naming both domains and the bind", got)
+		}
+	})
+
+	t.Run("cleartext and TLS domains", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key: types.NamespacedName{Namespace: "default", Name: "collision"},
+			Listeners: []ir.Listener{
+				{Name: "http", Hostname: "plain.example.com", EnvoyPort: 18080},
+				{Name: "https", Hostname: "secure.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "secure-cert"}},
+			},
+			Domains: []ir.ProtectionDomain{
+				{Name: "plain", ListenerName: "http", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "plain", Hostname: "plain.example.com"}}},
+				{Name: "secure", ListenerName: "https", EnvoyPort: 18082, VirtualHosts: []ir.VirtualHost{{Name: "secure", Hostname: "secure.example.com"}}},
+			},
+		}
+		_, err := Build(gateway, nil)
+		if err == nil {
+			t.Fatal("Build() accepted cleartext and TLS protection domains on one bind")
+		}
+		want := `cleartext protection domain "plain" and TLS protection domain "secure" cannot share 127.0.0.1:18082`
+		if got := err.Error(); got != want {
+			t.Fatalf("Build() error = %q, want %q", got, want)
+		}
+	})
+
+	// Build orders groups by key, which places a TLS group ahead of a
+	// cleartext group on the same bind; drive buildListeners directly to
+	// cover a cleartext occupant followed by a TLS arrival.
+	t.Run("TLS after cleartext occupant", func(t *testing.T) {
+		groups := []routeGroup{
+			{key: "a", name: "plain", routeName: "plain-routes", address: "127.0.0.1", port: 18082},
+			{key: "b", name: "secure", routeName: "secure-routes", address: "127.0.0.1", port: 18082, tlsSecret: "secure-cert", serverNames: []string{"secure.example.com"}},
+		}
+		_, _, _, err := buildListeners(groups, time.Hour)
+		if err == nil {
+			t.Fatal("buildListeners() accepted a TLS chain on a cleartext bind")
+		}
+		want := `cleartext protection domain "plain" and TLS protection domain "secure" cannot share 127.0.0.1:18082`
+		if got := err.Error(); got != want {
+			t.Fatalf("buildListeners() error = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("TLS domains with distinct server names share a bind", func(t *testing.T) {
+		gateway := &ir.Gateway{
+			Key: types.NamespacedName{Namespace: "default", Name: "sni"},
+			Listeners: []ir.Listener{
+				{Name: "a", Hostname: "a.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "a-cert"}},
+				{Name: "b", Hostname: "b.example.com", EnvoyPort: 10443, Protocol: "HTTPS", TLS: &ir.TLSRef{Secret: "b-cert"}},
+			},
+			Domains: []ir.ProtectionDomain{
+				{Name: "a", ListenerName: "a", EnvoyPort: 10443, VirtualHosts: []ir.VirtualHost{{Name: "a", Hostname: "a.example.com"}}},
+				{Name: "b", ListenerName: "b", EnvoyPort: 10443, VirtualHosts: []ir.VirtualHost{{Name: "b", Hostname: "b.example.com"}}},
+			},
+			Secrets: []ir.TLSSecret{
+				{Name: "a-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")},
+				{Name: "b-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")},
+			},
+		}
+		snapshot, err := Build(gateway, nil)
+		if err != nil {
+			t.Fatalf("Build() rejected TLS domains with distinct server names: %v", err)
+		}
+		listener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-10443"].(*listenerv3.Listener)
+		if len(listener.FilterChains) != 2 {
+			t.Fatalf("filter chains = %d, want 2", len(listener.FilterChains))
+		}
+	})
+}
+
 func TestBuildBlockedProtectionDomainReturns403WithoutJWTConfig(t *testing.T) {
 	gateway := &ir.Gateway{
 		Key:       types.NamespacedName{Namespace: "default", Name: "blocked-access"},
@@ -786,6 +880,222 @@ func TestBuildPublicWildcardBlocksProtectedExactHostname(t *testing.T) {
 	}
 }
 
+// Envoy's "*.example.com" matches any depth of subdomain, so a protected
+// exact host several labels deep still gets a shadow vhost that denies it in
+// the wildcard's route table.
+func TestBuildPublicWildcardBlocksProtectedDeepExactHostname(t *testing.T) {
+	gateway := &ir.Gateway{
+		Key: types.NamespacedName{Namespace: "default", Name: "wildcard-isolation"},
+		Listeners: []ir.Listener{
+			{Name: "wildcard", Hostname: "*.example.com", EnvoyPort: 18080},
+			{Name: "exact", Hostname: "a.b.example.com", EnvoyPort: 18081},
+		},
+		Domains: []ir.ProtectionDomain{
+			{
+				Name: "wildcard-public", ListenerName: "wildcard", EnvoyPort: 18080, Guard: ir.GuardUnprotected, StripAccessHeaders: true,
+				VirtualHosts: []ir.VirtualHost{{Name: "wildcard", Hostname: "*.example.com"}},
+			},
+			{
+				Name: "exact-protected", ListenerName: "exact", EnvoyPort: 18081, Protected: true, Guard: ir.GuardForwarding,
+				Access:       &ir.AccessGuard{AUDs: []string{"aud"}, AuthDomain: "team.cloudflareaccess.com"},
+				VirtualHosts: []ir.VirtualHost{{Name: "exact", Hostname: "a.b.example.com"}},
+			},
+		},
+	}
+	snapshot, err := Build(gateway, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicListener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-18080"].(*listenerv3.Listener)
+	publicRoutes := routeConfigForChain(t, snapshot, publicListener.FilterChains[0])
+	if got := directStatusForDomain(t, publicRoutes, "a.b.example.com"); got != 403 {
+		t.Fatalf("protected exact hostname on public wildcard listener = %d, want 403", got)
+	}
+}
+
+// sharedPrivateChainGateway serves one private TLS listener for
+// *.example.com. Every host on it shares the listener's SNI, so its domains
+// share one filter chain whatever their guards: the listener's own Blocked
+// domain, a Blocked application domain held for api.example.com, and two
+// Access applications forwarding b.example.com and c.example.com behind
+// different AUDs, c with an OPTIONS preflight bypass.
+func sharedPrivateChainGateway() *ir.Gateway {
+	backend := []ir.Route{{
+		Name: "backend", Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+		Backends: []ir.BackendRef{{Name: "backend", ClusterName: "backend", Weight: 1}},
+	}}
+	return &ir.Gateway{
+		Key: types.NamespacedName{Namespace: "default", Name: "shared"},
+		Listeners: []ir.Listener{{
+			Name: "https", Hostname: "*.example.com", Port: 443, EnvoyPort: 443,
+			Protocol: "HTTPS", Exposure: ir.ExposurePrivate, TLS: &ir.TLSRef{Secret: "private-cert"},
+		}},
+		Domains: []ir.ProtectionDomain{
+			{
+				Name: "https", ListenerName: "https", Protected: true, Guard: ir.GuardBlocked,
+				VirtualHosts: []ir.VirtualHost{{Name: "wildcard", Hostname: "*.example.com"}},
+			},
+			{
+				Name: "app-a", ListenerName: "https", Protected: true, Guard: ir.GuardBlocked, AccessApplication: "default/app-a",
+				VirtualHosts: []ir.VirtualHost{{Name: "api", Hostname: "api.example.com", Routes: backend}},
+			},
+			{
+				Name: "app-b", ListenerName: "https", Protected: true, Guard: ir.GuardForwarding, AccessApplication: "default/app-b",
+				Access:       &ir.AccessGuard{AUDs: []string{"aud-b"}, AuthDomain: "team.cloudflareaccess.com"},
+				VirtualHosts: []ir.VirtualHost{{Name: "b", Hostname: "b.example.com", Routes: backend}},
+			},
+			{
+				Name: "app-c", ListenerName: "https", Protected: true, Guard: ir.GuardForwarding, AccessApplication: "default/app-c",
+				Access:       &ir.AccessGuard{AUDs: []string{"aud-c"}, AuthDomain: "team.cloudflareaccess.com", OptionsPreflightBypass: true},
+				VirtualHosts: []ir.VirtualHost{{Name: "c", Hostname: "c.example.com", Routes: backend}},
+			},
+		},
+		Clusters: []ir.Cluster{{Name: "backend", Port: 8080, Endpoints: []ir.Endpoint{{Address: "10.0.0.2", Port: 8080}}}},
+		Secrets:  []ir.TLSSecret{{Name: "private-cert", Certificate: []byte("cert"), PrivateKey: []byte("key")}},
+	}
+}
+
+// Domains with different guards on one private listener share its filter
+// chain, and each virtual host enforces its own domain's guard: Blocked hosts
+// answer 403 without a JWT check and never forward, and each Access host
+// requires its own application's JWT.
+func TestBuildSharedPrivateChainEnforcesEachHostGuard(t *testing.T) {
+	snapshot, err := Build(sharedPrivateChainGateway(), nil)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	listener := snapshot.GetResources(resourcev3.ListenerType)["127.0.0.1-443"].(*listenerv3.Listener)
+	if len(listener.FilterChains) != 1 || listener.DefaultFilterChain != nil {
+		t.Fatalf("private listener chains = %d (default %v), want one shared chain", len(listener.FilterChains), listener.DefaultFilterChain != nil)
+	}
+	chain := chainForServerName(t, listener, "*.example.com")
+	hcm := &hcmv3.HttpConnectionManager{}
+	if err := chain.Filters[0].GetTypedConfig().UnmarshalTo(hcm); err != nil {
+		t.Fatal(err)
+	}
+	if hcm.LocalReplyConfig == nil || len(hcm.HttpFilters) != 3 || hcm.HttpFilters[0].Name != jwtFilterName {
+		t.Fatalf("shared chain HTTP filters = %#v, local reply %v", hcm.HttpFilters, hcm.LocalReplyConfig != nil)
+	}
+	jwt := &jwtauthnv3.JwtAuthentication{}
+	if err := hcm.HttpFilters[0].GetTypedConfig().UnmarshalTo(jwt); err != nil {
+		t.Fatal(err)
+	}
+	if len(jwt.Providers) != 2 || len(jwt.RequirementMap) != 2 {
+		t.Fatalf("shared chain JWT providers = %d, requirements = %d, want 2 each", len(jwt.Providers), len(jwt.RequirementMap))
+	}
+	if len(jwt.Rules) != 1 || jwt.Rules[0].GetRequires().GetProviderName() == "" {
+		t.Fatalf("shared chain JWT fallback rules = %#v, want one rule requiring a JWT", jwt.Rules)
+	}
+	if len(snapshot.GetResources(resourcev3.ClusterType)) != 2 {
+		t.Fatalf("clusters = %d, want backend and one JWKS cluster", len(snapshot.GetResources(resourcev3.ClusterType)))
+	}
+
+	routes := routeConfigForChain(t, snapshot, chain)
+	audiences := func(virtualHost *routev3.VirtualHost) []string {
+		t.Helper()
+		requirement := jwtPerRoute(t, virtualHost.TypedPerFilterConfig).GetRequirementName()
+		if requirement == "" {
+			return nil
+		}
+		provider := jwt.Providers[jwt.RequirementMap[requirement].GetProviderName()]
+		if provider == nil {
+			t.Fatalf("%s requirement %q names no provider", virtualHost.Domains[0], requirement)
+		}
+		return provider.Audiences
+	}
+	seen := make(map[string]*routev3.VirtualHost)
+	for _, virtualHost := range routes.VirtualHosts {
+		seen[virtualHost.Domains[0]] = virtualHost
+	}
+	for _, host := range []string{"*.example.com", "api.example.com"} {
+		virtualHost := seen[host]
+		if virtualHost == nil {
+			t.Fatalf("no virtual host for %s", host)
+		}
+		if !jwtPerRoute(t, virtualHost.TypedPerFilterConfig).GetDisabled() {
+			t.Fatalf("%s must answer locally without a JWT check", host)
+		}
+		for _, route := range virtualHost.Routes {
+			if route.GetDirectResponse().GetStatus() != 403 {
+				t.Fatalf("%s route %q = %v, want a direct 403", host, route.Name, route.Action)
+			}
+		}
+	}
+	if got := audiences(seen["b.example.com"]); !slices.Equal(got, []string{"aud-b"}) {
+		t.Fatalf("b.example.com JWT audiences = %v, want [aud-b]", got)
+	}
+	if got := seen["b.example.com"].Routes; len(got) != 2 || got[0].GetRoute() == nil {
+		t.Fatalf("b.example.com routes = %#v, want its backend route and not-found", got)
+	}
+	if got := audiences(seen["c.example.com"]); !slices.Equal(got, []string{"aud-c"}) {
+		t.Fatalf("c.example.com JWT audiences = %v, want [aud-c]", got)
+	}
+	cRoutes := seen["c.example.com"].Routes
+	if len(cRoutes) != 4 {
+		t.Fatalf("c.example.com routes = %d, want an OPTIONS twin ahead of each route", len(cRoutes))
+	}
+	for index := 0; index < len(cRoutes); index += 2 {
+		preflight, original := cRoutes[index], cRoutes[index+1]
+		headers := preflight.Match.Headers
+		if len(headers) == 0 || headers[len(headers)-1].Name != ":method" ||
+			headers[len(headers)-1].GetStringMatch().GetExact() != "OPTIONS" ||
+			!jwtPerRoute(t, preflight.TypedPerFilterConfig).GetDisabled() {
+			t.Fatalf("c.example.com route %d = %#v, want an OPTIONS preflight bypass", index, preflight)
+		}
+		if _, ok := original.TypedPerFilterConfig[jwtFilterName]; ok {
+			t.Fatalf("c.example.com route %q overrides the host's JWT requirement", original.Name)
+		}
+	}
+}
+
+// One host on a shared chain has one virtual host, so it cannot take two
+// guards.
+func TestBuildSharedChainRejectsHostWithTwoGuards(t *testing.T) {
+	gateway := sharedPrivateChainGateway()
+	gateway.Domains[1].VirtualHosts[0].Hostname = "b.example.com"
+	if _, err := Build(gateway, nil); err == nil || !strings.Contains(err.Error(), `serve host "b.example.com" with different guards`) {
+		t.Fatalf("Build error = %v, want a guard conflict on b.example.com", err)
+	}
+}
+
+// Rebuilding the same Gateway must produce the same resource versions:
+// ConstructVersionMap hashes each resource's deterministic marshal, and the
+// shared chain's jwt_authn packs several providers and requirements as map
+// fields. A non-deterministic inner marshal flips an ACKed snapshot back to
+// unACKed on every no-op rebuild.
+func TestBuildSharedPrivateChainKeepsStableResourceVersions(t *testing.T) {
+	baseline, err := Build(sharedPrivateChainGateway(), nil)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wantListeners := baseline.GetVersionMap(resourcev3.ListenerType)
+	wantRoutes := baseline.GetVersionMap(resourcev3.RouteType)
+	for range 40 {
+		snapshot, err := Build(sharedPrivateChainGateway(), nil)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if got := snapshot.GetVersionMap(resourcev3.ListenerType); !maps.Equal(got, wantListeners) {
+			t.Fatalf("rebuilt listener versions %v differ from %v", got, wantListeners)
+		}
+		if got := snapshot.GetVersionMap(resourcev3.RouteType); !maps.Equal(got, wantRoutes) {
+			t.Fatalf("rebuilt route versions %v differ from %v", got, wantRoutes)
+		}
+	}
+}
+
+func jwtPerRoute(t *testing.T, configs map[string]*anypb.Any) *jwtauthnv3.PerRouteConfig {
+	t.Helper()
+	typed := configs[jwtFilterName]
+	if typed == nil {
+		t.Fatal("virtual host on a shared chain has no jwt_authn per-route config")
+	}
+	config := &jwtauthnv3.PerRouteConfig{}
+	if err := typed.UnmarshalTo(config); err != nil {
+		t.Fatal(err)
+	}
+	return config
+}
 func chainForServerName(t *testing.T, listener *listenerv3.Listener, serverName string) *listenerv3.FilterChain {
 	t.Helper()
 	for _, chain := range listener.FilterChains {

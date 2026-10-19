@@ -86,6 +86,15 @@ var (
 	latencies       = map[string]time.Duration{}
 )
 
+// Hostnames of the access-revocation spec: a wildcard public listener one DNS
+// label under the zone (so Universal SSL covers the hosts it serves), the
+// concrete preview host served under it, and the specific web host.
+var (
+	revocationWildcardHostname string
+	revocationPreviewHostname  string
+	revocationWebHostname      string
+)
+
 func TestE2E(t *testing.T) {
 	configuration = suiteConfig{
 		Token:                     os.Getenv("FLAREWAY_E2E_CF_API_TOKEN"),
@@ -130,6 +139,9 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	accessHostname = names.Hostname(runID, 2, configuration.Zone)
 	mixedHostname = names.Hostname(runID, 3, configuration.Zone)
 	privateHostname = fmt.Sprintf("private-%s.flareway.internal", runID)
+	revocationWildcardHostname = "*." + configuration.Zone
+	revocationWebHostname = names.Hostname(runID, 4, configuration.Zone)
+	revocationPreviewHostname = names.Hostname(runID, 5, configuration.Zone)
 	className = names.Resource(runID, "class")
 	classConfig = names.Resource(runID, "class-config")
 
@@ -195,6 +207,13 @@ func createSuiteFixtures(ctx context.Context) error {
 		return fmt.Errorf("create Cloudflare API token Secret: %w", err)
 	}
 
+	// The access-revocation spec needs a wildcard listener. Its preview host is
+	// covered by the wildcard grant, and neither is granted as unprotected, so
+	// both stay block-first until an AccessApplication claims them.
+	granted := []any{
+		hostname, accessHostname, mixedHostname, privateHostname,
+		revocationWildcardHostname, revocationWebHostname,
+	}
 	account := object("flareway.bhyoo.com/v1alpha1", "CloudflareAccount", "", accountName, map[string]any{
 		"accountId": configuration.AccountID,
 		"credentials": map[string]any{"apiTokenSecretRef": map[string]any{
@@ -202,7 +221,7 @@ func createSuiteFixtures(ctx context.Context) error {
 		}},
 		"grants": []any{map[string]any{
 			"namespaceSelector": map[string]any{"matchLabels": map[string]any{runLabelKey: runID}},
-			"hostnames":         []any{hostname, accessHostname, mixedHostname, privateHostname},
+			"hostnames":         granted,
 			"zones":             []any{configuration.Zone}, "exposures": []any{"Public", "Private"},
 			"unprotectedHostnames": []any{hostname, mixedHostname},
 			"privateRoutes": map[string]any{

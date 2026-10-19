@@ -1,6 +1,6 @@
 # Install Flareway from the OCI Helm chart
 
-Install Flareway from `oci://ghcr.io/isac322/charts/flareway` on a cluster with Gateway API v1.6.2 CRDs, then add a Cloudflare account, token, and zone.
+Install Flareway from `oci://ghcr.io/isac322/charts/flareway` on a cluster with Gateway API v1.6.3 CRDs, then add a Cloudflare account, token, and zone.
 
 ## Preview the manifests without a cluster
 
@@ -17,7 +17,7 @@ The output contains the controller Deployment and its ServiceAccount, the RBAC o
 
 ## Prerequisites
 
-- A Kubernetes cluster supported by Gateway API v1.6.2.
+- A Kubernetes cluster supported by Gateway API v1.6.3.
 - Helm 4.3 or a compatible Helm 3 client.
 - A Cloudflare account and a scoped API token. [Connect a Cloudflare account](connect-cloudflare.md) lists the token capabilities.
 - A DNS zone in that account for public listeners.
@@ -25,11 +25,11 @@ The output contains the controller Deployment and its ServiceAccount, the RBAC o
 
 ## Install the Gateway API CRDs
 
-The Flareway chart does not bundle Gateway API CRDs. Install the v1.6.2 Standard channel first:
+The Flareway chart does not bundle Gateway API CRDs. Install the v1.6.3 Standard channel first:
 
 ```sh
 kubectl apply --server-side \
-  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/standard-install.yaml
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 ```
 
 ## Install the chart
