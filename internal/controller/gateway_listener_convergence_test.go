@@ -198,7 +198,12 @@ func TestManagedDNSFailureDeniesOnlyAffectedListener(t *testing.T) {
 	for _, state := range []string{"missing", dnsRecordStateConflict} {
 		t.Run(state, func(t *testing.T) {
 			gateway := listenerConvergenceGateway()
-			tunnel := persistListenerConvergence(t, gateway)
+			// Listener A is already serving when listener B is added with
+			// a missing or foreign managed record, as in issue #135.
+			existing := *gateway
+			existing.Listeners = gateway.Listeners[:1]
+			existing.Domains = gateway.Domains[:1]
+			tunnel := persistListenerConvergence(t, &existing)
 			tunnel.Spec.DNS.Mode = v1alpha1.DNSModeManaged
 			tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "a.example.com", State: dnsRecordStateReady}}
 			if state != "missing" {
