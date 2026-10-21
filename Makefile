@@ -359,15 +359,15 @@ CLOUD_PROVIDER_KIND ?= $(LOCALBIN)/cloud-provider-kind
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.3
-CONTROLLER_TOOLS_VERSION ?= v0.22.0
+CONTROLLER_TOOLS_VERSION ?= v0.23.0
 ENVTEST_K8S_VERSION ?= 1.37.0
-GOLANGCI_LINT_VERSION ?= v2.14.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 KIND_VERSION ?= v0.33.0
 GATEWAY_API_VERSION ?= v1.6.3
 KO_VERSION ?= v0.19.1
-COSIGN_VERSION ?= v3.1.3
+COSIGN_VERSION ?= v3.1.4
 CLOUD_PROVIDER_KIND_VERSION ?= v0.12.0
-HELM_VERSION ?= v4.3.0
+HELM_VERSION ?= v4.3.1
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
@@ -427,7 +427,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 	@test -f .custom-gcl.yml && { \
 		echo "Building custom golangci-lint with plugins..." && \
-		GOTOOLCHAIN=go1.27.2 $(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		GOTOOLCHAIN=go1.27.3 $(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
 
@@ -441,7 +441,7 @@ set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
 rm -f "$(1)" ;\
-GOTOOLCHAIN=go1.27.2 GOBIN="$(LOCALBIN)" go install $${package} ;\
+GOTOOLCHAIN=go1.27.3 GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"

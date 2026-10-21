@@ -55,7 +55,7 @@ image:
   digest: sha256:<release-digest>
 ```
 
-The installed `GatewayClassConfig` pins the Gateway data-plane images, each by digest: cloudflared `2026.10.0`, Envoy `distroless-v1.39.3`, and CoreDNS `1.14.7`. Changing chart defaults does not rewrite an independently managed `GatewayClassConfig` unless Helm owns that object.
+The `GatewayClassConfig` API defaults use cloudflared `2026.10.2` and CoreDNS `1.15.0` with digests, plus Envoy `distroless-v1.40.0` as a tag-only default. The chart's data-plane image references are digest-pinned, including Envoy's multi-arch index. Changing chart defaults does not rewrite an independently managed `GatewayClassConfig` unless Helm owns that object.
 
 ## Rollback
 

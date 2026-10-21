@@ -23,11 +23,11 @@ import (
 
 const (
 	// DefaultConnectorImage is the pinned cloudflared image used by GatewayClassConfig defaulting.
-	DefaultConnectorImage = "cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07"
+	DefaultConnectorImage = "cloudflare/cloudflared:2026.10.2@sha256:0e56c13c7058fcef9c4f0e7d83372f82330548dbf8f8b366f3d8b506526d93b2"
 	// DefaultProxyImage is the pinned Envoy image used by GatewayClassConfig defaulting.
-	DefaultProxyImage = "envoyproxy/envoy:distroless-v1.39.3"
+	DefaultProxyImage = "envoyproxy/envoy:distroless-v1.40.0"
 	// DefaultPrivateDNSImage is the pinned CoreDNS image used by GatewayClassConfig defaulting.
-	DefaultPrivateDNSImage = "coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
+	DefaultPrivateDNSImage = "coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26"
 )
 
 // ConnectorProtocol selects the transport protocol used by cloudflared.
@@ -67,7 +67,7 @@ const (
 
 // ConnectorSpec configures the cloudflared connector containers.
 type ConnectorSpec struct {
-	// +kubebuilder:default="cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07"
+	// +kubebuilder:default="cloudflare/cloudflared:2026.10.2@sha256:0e56c13c7058fcef9c4f0e7d83372f82330548dbf8f8b366f3d8b506526d93b2"
 	Image string `json:"image,omitempty"`
 	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=1
@@ -82,7 +82,7 @@ type ConnectorSpec struct {
 
 // ProxySpec configures the Envoy proxy containers.
 type ProxySpec struct {
-	// +kubebuilder:default="envoyproxy/envoy:distroless-v1.39.3"
+	// +kubebuilder:default="envoyproxy/envoy:distroless-v1.40.0"
 	Image     string                      `json:"image,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +kubebuilder:default="1h"
@@ -94,7 +94,7 @@ type ProxySpec struct {
 
 // PrivateDNSSpec configures the CoreDNS sidecar used by private listeners.
 type PrivateDNSSpec struct {
-	// +kubebuilder:default="coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286"
+	// +kubebuilder:default="coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26"
 	Image     string                      `json:"image,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
@@ -152,12 +152,12 @@ type ConformanceSpec struct {
 // The CRD validates the common rules below; remaining Pod API validation (for
 // example label key and value syntax) happens when the dataplane Deployment is
 // admitted.
-// +kubebuilder:validation:XValidation:rule="!has(self.tolerations) || self.tolerations.all(t, (!has(t.operator) || t.operator in ['', 'Equal', 'Exists']) && (!has(t.effect) || t.effect in ['', 'NoSchedule', 'PreferNoSchedule', 'NoExecute']) && (!has(t.operator) || t.operator != 'Exists' || !has(t.value) || t.value == '') && ((has(t.key) && t.key != '') || (has(t.operator) && t.operator == 'Exists')) && (!has(t.tolerationSeconds) || (has(t.effect) && t.effect == 'NoExecute')))",message="tolerations must be valid pod tolerations"
-// +kubebuilder:validation:XValidation:rule="!has(self.topologySpreadConstraints) || self.topologySpreadConstraints.all(t, t.maxSkew > 0 && t.topologyKey != '' && t.whenUnsatisfiable in ['DoNotSchedule', 'ScheduleAnyway'] && (!has(t.minDomains) || (t.minDomains > 0 && t.whenUnsatisfiable == 'DoNotSchedule')) && (!has(t.nodeAffinityPolicy) || t.nodeAffinityPolicy in ['Honor', 'Ignore']) && (!has(t.nodeTaintsPolicy) || t.nodeTaintsPolicy in ['Honor', 'Ignore']) && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || (has(t.labelSelector) && !t.matchLabelKeys.exists(k, has(t.labelSelector.matchLabels) && k in t.labelSelector.matchLabels))))",message="topologySpreadConstraints must be valid pod topology spread constraints"
+// +kubebuilder:validation:XValidation:rule="!has(self.tolerations) || self.tolerations.all(t, (!has(t.operator) || t.operator in [\"\", 'Equal', 'Exists']) && (!has(t.effect) || t.effect in [\"\", 'NoSchedule', 'PreferNoSchedule', 'NoExecute']) && (!has(t.operator) || t.operator != 'Exists' || !has(t.value) || t.value == \"\") && ((has(t.key) && t.key != \"\") || (has(t.operator) && t.operator == 'Exists')) && (!has(t.tolerationSeconds) || (has(t.effect) && t.effect == 'NoExecute')))",message="tolerations must be valid pod tolerations"
+// +kubebuilder:validation:XValidation:rule="!has(self.topologySpreadConstraints) || self.topologySpreadConstraints.all(t, t.maxSkew > 0 && t.topologyKey != \"\" && t.whenUnsatisfiable in ['DoNotSchedule', 'ScheduleAnyway'] && (!has(t.minDomains) || (t.minDomains > 0 && t.whenUnsatisfiable == 'DoNotSchedule')) && (!has(t.nodeAffinityPolicy) || t.nodeAffinityPolicy in ['Honor', 'Ignore']) && (!has(t.nodeTaintsPolicy) || t.nodeTaintsPolicy in ['Honor', 'Ignore']) && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || (has(t.labelSelector) && !t.matchLabelKeys.exists(k, has(t.labelSelector.matchLabels) && k in t.labelSelector.matchLabels))))",message="topologySpreadConstraints must be valid pod topology spread constraints"
 // +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.nodeAffinity) || !has(self.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.size() > 0",message="requiredDuringSchedulingIgnoredDuringExecution must have at least one nodeSelectorTerm"
 // +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.nodeAffinity) || !has(self.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(t, t.weight >= 1 && t.weight <= 100)",message="nodeAffinity preferred term weights must be in the range 1-100"
-// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAffinity) || ((!has(self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != '' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != '' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAffinity terms must be valid pod affinity terms"
-// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAntiAffinity) || ((!has(self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != '' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != '' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAntiAffinity terms must be valid pod affinity terms"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAffinity) || ((!has(self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != \"\" && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != \"\" && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAffinity terms must be valid pod affinity terms"
+// +kubebuilder:validation:XValidation:rule="!has(self.affinity) || !has(self.affinity.podAntiAffinity) || ((!has(self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, t.topologyKey != \"\" && (!has(t.matchLabelKeys) || t.matchLabelKeys.size() == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) || t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) && (!has(self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey != \"\" && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys) || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))",message="podAntiAffinity terms must be valid pod affinity terms"
 type DataplaneSchedulingSpec struct {
 	// NodeSelector limits dataplane pods to nodes carrying all of these labels.
 	// +kubebuilder:validation:MaxProperties=64

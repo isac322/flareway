@@ -284,7 +284,7 @@ func createBackend(ctx context.Context) error {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name: "echo", Image: "registry.k8s.io/e2e-test-images/agnhost:2.53",
+					Name: "echo", Image: "registry.k8s.io/e2e-test-images/agnhost:2.61",
 					Args:  []string{"netexec", "--http-port=8080"},
 					Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}},
 					ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
