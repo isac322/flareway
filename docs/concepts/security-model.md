@@ -114,7 +114,11 @@ Access revocation is not instant. Cloudflare propagates a revoked session to its
 
 ## `Programmed` means converged
 
-A Gateway reports `Programmed=True` only after the tunnel is healthy, Envoy has applied the configuration in every active data-plane Pod, `cloudflared` has applied the desired tunnel configuration, and, with managed DNS, the DNS record exists. A listener waiting for its Access application reports `Programmed=False` with reason `Pending`.
+A Gateway reports `Programmed=True` only after the tunnel is healthy, Envoy has applied the configuration in every active data-plane Pod, `cloudflared` has applied the desired tunnel configuration, and, with managed DNS, each required hostname has exactly one `state: Ready` record, matching case-insensitively. A listener waiting for its Access application reports `Programmed=False` with reason `Pending`.
+
+Managed DNS readiness is checked per public listener. A missing, empty, unknown, duplicate, or conflicted record blocks that listener's hostnames; a conflict reports listener `Programmed=False` with reason `DNSConflict`. Healthy listeners can forward and report `Programmed=True` once the shared data plane converges, while Gateway `Programmed` stays false until all required records are ready. Access binding changes block the affected protection domain until its blocked configuration is applied. Public protected hostnames have separate domains; private hostnames sharing a route table transition together. Independent domains with unchanged bindings keep forwarding. See [Applied hostname status and Access transitions](../reference/api.md#applied-hostname-status-and-access-transitions).
+
+Private VNet, HostnameRoute, and origin-JWT TLS-decryption prerequisites are also checked per listener. A failed prerequisite denies that listener before publication. Shared account or DeviceSettings failures deny all private listeners. Applied configuration status can advance for a snapshot containing these denied rules; Gateway and listener `Programmed` conditions report routing availability.
 
 ## Controller RBAC and tenant duties
 

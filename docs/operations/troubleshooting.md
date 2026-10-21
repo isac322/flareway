@@ -21,6 +21,7 @@ kubectl describe accessapplication -n <namespace> <name>
 | `Accepted=False`, reason `RefNotPermitted` | A namespace grant, `ReferenceGrant`, backend grant, policy reference grant, or private-route namespace rule denied the reference. Fix authorization; do not widen unrelated grants. |
 | `Accepted=False`, reason `Conflict` | The remote object's ownership marker, expected adoption attributes, DNS record owner, or another policy writer conflicts. Identify the current owner before changing `managementPolicy` or adoption. |
 | `Programmed=False`, reason `Pending` | xDS has not been acknowledged, the data plane is not ready, cloudflared has not applied the desired version, DNS is absent, an Access AUD is unavailable, or a private prerequisite is missing. Read the condition message for the exact gate. |
+| Listener `Programmed=False`, reason `DNSConflict` | This listener's required managed DNS record is conflicted. Flareway blocks its hostname configuration and leaves the foreign record alone. Other listeners with ready records can continue forwarding after data-plane convergence. |
 | `ConfigApplied=False` | Compare `CloudflareTunnel.status.configVersion.desired` and `.applied`; inspect data-plane Pods and cloudflared `/config` reachability. Flareway does not mark the Gateway programmed until every active Pod converges. |
 | `DNSReady=False` | The zone is not granted, the zone was not discovered, or an existing record has a foreign ownership comment. Flareway omits DNS tags and will not overwrite a foreign record. |
 | `CleanupBlocked=True` | A finalizer is preserving teardown order. Remove remaining `NetworkRoute`/`HostnameRoute` references or restore the Cloudflare permission needed for deletion. Do not strip the finalizer unless you accept remote leaks or exposed traffic. If you strip an `AccessApplication` finalizer, the controller still removes that application's AUD handoff and private-tunnel ledger Secrets from the operator namespace, but the remote Cloudflare objects are left behind. |
@@ -32,6 +33,44 @@ Deleting an `AccessApplication` never makes a protected route public. The route 
 A hostname that a deleted or retargeted `AccessApplication` protected stays blocked until that revocation is acknowledged: a public hostname on every public listener of the tunnel, a private hostname on its own listener, and a wildcard hostname together with every hostname under it. If another `AccessApplication` protects a held hostname, it reports `Programmed=False`, reason `Pending`, with a message that names the revoked application. It starts forwarding once the revoked application finishes. If the application is revoked before the tunnel reports its hostnames, Flareway can't tell which listener served which destination. It then holds every hostname the application recorded as a destination, so the block can briefly cover more hostnames than the application served.
 
 Deleting an `AccessApplication` that never reached a Cloudflare write, such as one in a namespace its `CloudflareAccount` does not grant, skips remote cleanup and releases the finalizer. After Flareway has attempted a Cloudflare write for it, deletion needs the namespace grant. If the grant was removed, the object reports `CleanupBlocked=True` with `RefNotPermitted` until the grant is restored.
+
+## A DNS conflict blocks one listener
+
+Compare the listener's hostname with `CloudflareTunnel.status.dnsRecords`.
+Readiness requires exactly one `state: Ready` entry per case-insensitive hostname.
+Missing records, empty or unknown states, and duplicates keep that listener
+pending; a record with `state: Conflict` reports listener `Programmed=False`
+with reason `DNSConflict`. These cases
+block the listener's hostname configuration in cloudflared and Envoy. Fix
+the zone grant or foreign ownership conflict rather than editing status.
+With `dns.mode: External`, Flareway skips this managed-record check.
+
+Gateway `Programmed` stays false until every required managed record is ready.
+Listeners whose records are ready can still forward after cloudflared and
+Envoy converge. `ConfigApplied=True` and matching desired/applied versions
+prove the published configuration reached the data plane, including its
+blocked rules; they do not prove all managed DNS records or private routing
+prerequisites are ready. A missing private VirtualNetwork, HostnameRoute, or
+origin-JWT TLS-decryption contract blocks its listener, while healthy
+listeners can still converge. Shared account and DeviceSettings failures
+affect all private listeners. Inspect each listener's `Programmed` condition
+for its prerequisite message; Tunnel `Ready` alone does not prove private
+routing availability.
+
+After renaming a private listener, its old generated HostnameRoute may still
+be retiring. Active listeners that could reuse that route stay blocked and
+`Programmed=False` until a current route is Applied. This includes unprotected
+hostnames and listeners with automatic route creation disabled. Healthy
+listeners with unrelated hostnames continue forwarding.
+
+An Access binding change first blocks its protection domain. Public
+protected hostnames have separate domains; private hosts sharing a route
+table transition together. Inspect
+`status.hostnames[].guard`, `appliedVersion`, and `accessBinding` to follow
+that handoff. Older status without `accessBinding` completes one blocked
+configuration carrying the digest before forwarding resumes. Unchanged
+bindings in independent domains continue forwarding through an unrelated
+domain's transition.
 
 ## xDS convergence after a controller restart
 

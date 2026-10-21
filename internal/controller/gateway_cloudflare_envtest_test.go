@@ -259,7 +259,7 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		statusWriter.Snapshots = gateSnapshots
 		statusWriter.Prober = &staticGatewayProber{version: 6, ready: true}
 		observed.Spec.DNS.Mode = v1alpha1.DNSModeManaged
-		observed.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "edge.example.com", RecordID: "record"}}
+		observed.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{{Hostname: "edge.example.com", RecordID: "record", State: dnsRecordStateReady}}
 		gomega.Eventually(func(g gomega.Gomega) {
 			ready, lagging, dnsReady, err := statusWriter.cloudflareGate(testContext, compiled, &observed, "6", "snapshot-1")
 			g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1025,6 +1025,17 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 			current.Status.ApplicationID = "application-id"
 			g.Expect(testClient.Status().Update(testContext, &current)).To(gomega.Succeed())
 			*application = current
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
+
+		// Status writes reach the API server before the mapper's cache. Wait
+		// for its identity inputs before asserting the mapping synchronously.
+		gomega.Eventually(func(g gomega.Gomega) {
+			var cachedApplication v1alpha1.AccessApplication
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(application), &cachedApplication)).To(gomega.Succeed())
+			g.Expect(cachedApplication.Status.ApplicationID).To(gomega.Equal(application.Status.ApplicationID))
+			var cachedGateway gatewayv1.Gateway
+			g.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(gateway), &cachedGateway)).To(gomega.Succeed())
+			g.Expect(cachedGateway.UID).To(gomega.Equal(gateway.UID))
 		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 
 		audSecret := boundAUDSecret(

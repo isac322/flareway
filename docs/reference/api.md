@@ -391,6 +391,20 @@ While a Gateway cannot program its Tunnel (not yet owned, owned by another Gatew
 
 The Tunnel controller and the `AccessApplication` controller check the namespace grant before they resolve zones or targets, so a namespace that no grant selects reports `Accepted=False/RefNotPermitted`.
 
+#### Applied hostname status and Access transitions
+
+`status.hostnames[]` records each applied hostname's `protectionDomain`, `accessApplication`, `guard` (`Forwarding`, `Blocked`, or `Unprotected`), and `appliedVersion`. Its optional `accessBinding` is a SHA-256 digest of the application's namespaced key, canonical AUD set, team name and auth domain, preflight-bypass setting, and origin-JWT mode. Disabled origin-JWT enforcement uses an application-and-mode digest without an AUD handoff. Status exposes the digest, never the AUD values.
+
+When an Access binding changes, Flareway first applies a blocked configuration for the affected protection domain. Each public protected hostname has its own domain; private hostnames sharing a route table transition together. Once every active cloudflared Pod reports that configuration version and Envoy acknowledges its snapshot, the controller records the blocked guards and new digests, then publishes the forwarding configuration. Independent protection domains with unchanged bindings keep their guards through unrelated configuration changes. A missing digest in older status counts as a changed binding, including when the old guard is already `Blocked`; the blocked configuration records the new digest so the transition completes once.
+
+The same Pod-version and xDS evidence advances `status.configVersion.applied`, `status.hostnames[].appliedVersion`, and `ConfigApplied` independently of managed DNS and private routing prerequisites. These applied checkpoints describe the published configuration, including denied hostnames. Gateway `Programmed` still requires all listener prerequisites. Each public listener requires exactly one managed DNS record with `state: Ready`, matching its hostname case-insensitively. Missing records, empty or unknown states, and duplicates keep it pending; a conflicted record reports `Programmed=False` with reason `DNSConflict`. Each private listener requires its own ready VirtualNetwork, HostnameRoute, and origin-JWT TLS-decryption contract. A missing listener prerequisite blocks that listener's configuration before publication; healthy listeners can forward and report `Programmed=True`. Shared account and DeviceSettings prerequisites affect all private listeners. `dns.mode: External` skips the managed-DNS gate.
+
+When retiring an obsolete generated HostnameRoute, such as after a private listener rename, Flareway also blocks active listeners that could reuse that route. Those listeners remain pending until a current route is Applied, including when automatic route creation is disabled. Unrelated listeners keep forwarding.
+
+Tunnel `Ready` retains its `TunnelReady && ConfigApplied && DNSReady` definition. It can be true while a private listener is blocked; use Gateway and listener `Programmed` conditions to check private routing availability.
+
+`status.dnsRecords[]` also reports newly discovered foreign or ambiguous records as `state: Conflict`. These entries carry the required hostname and zone, with an empty `recordId` and no `ownershipComment`, so reporting a conflict does not claim or modify the foreign record. A previously managed record retains its ownership checkpoint for safe cleanup.
+
 ### Direct mode
 
 `Direct` is an explicit whole-object alternative. It cannot be combined with Gateway-owned `connector`, `proxy`, `privateDNS`, Gateway-mode `originRequest`, or `listeners`.
