@@ -57,6 +57,12 @@ affect all private listeners. Inspect each listener's `Programmed` condition
 for its prerequisite message; Tunnel `Ready` alone does not prove private
 routing availability.
 
+After renaming a private listener, its old generated HostnameRoute may still
+be retiring. Active listeners that could reuse that route stay blocked and
+`Programmed=False` until a current route is Applied. This includes unprotected
+hostnames and listeners with automatic route creation disabled. Healthy
+listeners with unrelated hostnames continue forwarding.
+
 An Access binding change first blocks its protection domain. Public
 protected hostnames have separate domains; private hosts sharing a route
 table transition together. Inspect

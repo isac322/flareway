@@ -33,7 +33,9 @@
   `Programmed` remains false until all required records are ready. Private
   VNet, HostnameRoute, and TLS-decryption prerequisites also block only their
   listener. Applied hostname checkpoints advance after Pod/xDS convergence
-  independently of DNS and private readiness (#135).
+  independently of DNS and private readiness. Retiring an obsolete generated
+  HostnameRoute also blocks matching active private listeners until a current
+  route is Applied, preserving unrelated listeners during renames (#135).
 
 ## v0.3.3 - 2026-10-11
 

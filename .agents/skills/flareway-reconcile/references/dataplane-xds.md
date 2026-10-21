@@ -106,6 +106,12 @@ DeviceSettings proxy failures block all private listeners. Denial retains
 the Access binding digest so the applied blocked snapshot can release after
 the prerequisite recovers.
 
+Retiring an obsolete generated HostnameRoute also blocks active private
+listeners with its hostname and account while cleanup rebinds the Gateway
+UID or removes the route. Pre-delete Applied inputs must not satisfy those
+listeners' prerequisites. This applies even with automatic creation disabled;
+unrelated listeners remain available.
+
 Managed DNS is a separate readiness result: every public listener's required
 hostname must have exactly one `state: Ready` entry in `status.dnsRecords`,
 matching case-insensitively. Missing, empty, unknown, or duplicate entries

@@ -367,6 +367,15 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 		key := client.ObjectKeyFromObject(route)
 		listener, retained := desired[key]
 		if !retained {
+			// Prerequisite evaluation still sees this pass's pre-delete inputs.
+			// Deny listeners that could otherwise reuse the retiring Applied route.
+			for _, active := range gateway.Listeners {
+				if active.Exposure == ir.ExposurePrivate &&
+					route.Spec.AccountRef.Name == account.Name &&
+					normalizePrivateName(active.Hostname) == normalizePrivateName(route.Spec.Hostname) {
+					changed.Listeners[active.Name] = true
+				}
+			}
 			if route.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
 				before := route.DeepCopy()
 				if route.Annotations == nil {
