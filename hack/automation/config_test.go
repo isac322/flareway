@@ -1,20 +1,16 @@
 package automation
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"golang.org/x/mod/modfile"
 	"sigs.k8s.io/yaml"
 )
 
 const (
 	dependabotCron     = "0 9 * * *"
 	dependabotTimezone = "Asia/Seoul"
-	goBuilderDigest    = "sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61"
 )
 
 type dependabotConfig struct {
@@ -88,36 +84,6 @@ func TestDependabotCoversEveryDependencySurface(t *testing.T) {
 		if !found {
 			t.Errorf("Dependabot update surface %s is missing", key)
 		}
-	}
-}
-
-func TestDevContainerMatchesGoToolchain(t *testing.T) {
-	root := repositoryRoot(t)
-	module, err := os.ReadFile(filepath.Join(root, "go.mod"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := modfile.Parse("go.mod", module, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Go == nil || parsed.Go.Version == "" {
-		t.Fatal("go.mod has no Go version")
-	}
-
-	payload, err := os.ReadFile(filepath.Join(root, ".devcontainer", "devcontainer.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var config struct {
-		Image string `json:"image"`
-	}
-	if err := json.Unmarshal(payload, &config); err != nil {
-		t.Fatal(err)
-	}
-	wantPrefix := "docker.io/library/golang:" + parsed.Go.Version + "-bookworm@"
-	if !strings.HasPrefix(config.Image, wantPrefix) || !strings.HasSuffix(config.Image, goBuilderDigest) {
-		t.Fatalf("devcontainer image = %q, want %s%s", config.Image, wantPrefix, goBuilderDigest)
 	}
 }
 

@@ -135,7 +135,7 @@ else
   CGO_ENABLED=0 GOOS=linux GOARCH="${TARGET_ARCH}" \
     go build -o "${TMP_DIR}/manager" ./cmd
   cat > "${TMP_DIR}/ControllerDockerfile" <<'EOF'
-FROM cgr.dev/chainguard/static:latest@sha256:fe55470f22d3259488d9d3739168d8f04da67755f0b69382bc26eda4a7d3d327
+FROM cgr.dev/chainguard/static:latest@sha256:17367e4d3ae2b46c3290858e483fac09be085c92b372360fe3bf6a6150848fde
 COPY manager /manager
 USER 65532:65532
 ENTRYPOINT ["/manager"]

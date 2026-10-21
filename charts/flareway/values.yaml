@@ -149,18 +149,18 @@ gatewayClass:
     accountRefName: ""
     conformanceMode: false
     connector:
-      image: cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+      image: cloudflare/cloudflared:2026.10.2@sha256:0e56c13c7058fcef9c4f0e7d83372f82330548dbf8f8b366f3d8b506526d93b2
       replicas: 2
       protocol: Auto
       gracePeriod: 60s
       resources: {}
     proxy:
-      image: envoyproxy/envoy:distroless-v1.39.3@sha256:7369b033550a14997e5d698677b7b51f0210a80754f5d084c5caa1a78268267b
+      image: envoyproxy/envoy:distroless-v1.40.0@sha256:23b72ac1fa94908b2ca7ebf194cc6083cd0d4913210c7d7453e4b2008ca26c84
       concurrency: 1
       streamIdleTimeout: 1h
       resources: {}
     privateDNS:
-      image: coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+      image: coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26
       resources: {}
     dns:
       mode: Managed

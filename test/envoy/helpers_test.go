@@ -46,7 +46,7 @@ import (
 )
 
 const (
-	envoyImage        = "envoyproxy/envoy:v1.39.3"
+	envoyImage        = "envoyproxy/envoy:v1.40.0"
 	envoyListenerPort = 10080
 	envoyAdminPort    = 19000
 )

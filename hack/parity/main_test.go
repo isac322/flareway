@@ -129,6 +129,16 @@ func TestValidateSDKFileRejectsNewOfficialField(t *testing.T) {
 	assertProblemContains(t, problems, "official SDK struct changed without a ledger update")
 }
 
+func TestValidateSDKFileRejectsNewOfficialStruct(t *testing.T) {
+	const relative = "zero_trust/example.go"
+	content := []byte("package sdk\ntype NewApplication struct { UserPopulations []string }\n")
+
+	var problems problemList
+	validateSDKFile(relative, relative, content, nil, nil, make(map[string]struct{}), &problems)
+
+	assertProblemContains(t, problems, "unmapped newly added official SDK struct zero_trust/example.go::NewApplication")
+}
+
 func TestIgnoredSDKType(t *testing.T) {
 	rules := []ignoredTypeRule{
 		{Contains: "ResponseEnvelope", Rationale: "transport"},

@@ -116,16 +116,26 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 		writerGateway := &ir.Gateway{Key: key, UID: currentGateway.UID}
 		statusWriter := &GatewayReconciler{Client: directClient}
-		condition := gatewayTunnelCondition(&observed, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, "Pending", "waiting for probes", metav1.Now())
-		gomega.Expect(statusWriter.patchTunnelGatewayStatus(
-			testContext,
-			writerGateway,
-			&observed,
-			v1alpha1.CloudflareTunnelConfigVersion{Desired: 3, DesiredHash: "hash"},
-			[]v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "edge.example.com", ProtectionDomain: "http", Guard: v1alpha1.HostnameGuardBlocked}},
-			[]v1alpha1.CloudflareTunnelListenerStatus{{Name: "http", Exposure: v1alpha1.ExposurePublic}},
-			condition,
-		)).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			var freshObserved v1alpha1.CloudflareTunnel
+			if err := directClient.Get(testContext, key, &freshObserved); err != nil {
+				return gomega.StopTrying("get CloudflareTunnel before status patch").Wrap(err)
+			}
+			err := statusWriter.patchTunnelGatewayStatus(
+				testContext,
+				writerGateway,
+				&freshObserved,
+				v1alpha1.CloudflareTunnelConfigVersion{Desired: 3, DesiredHash: "hash"},
+				[]v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "edge.example.com", ProtectionDomain: "http", Guard: v1alpha1.HostnameGuardBlocked}},
+				[]v1alpha1.CloudflareTunnelListenerStatus{{Name: "http", Exposure: v1alpha1.ExposurePublic}},
+				gatewayTunnelCondition(&freshObserved, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, "Pending", "waiting for probes", metav1.Now()),
+			)
+			if err != nil && !apierrors.IsConflict(err) {
+				return gomega.StopTrying("patch CloudflareTunnel status").Wrap(err)
+			}
+			return err
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
+
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, key, &current)).To(gomega.Succeed())
@@ -135,16 +145,25 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 			g.Expect(current.Status.Listeners).To(gomega.HaveLen(1))
 		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 
-		gomega.Expect(directClient.Get(testContext, key, &observed)).To(gomega.Succeed())
-		gomega.Expect(statusWriter.patchTunnelGatewayStatus(
-			testContext,
-			writerGateway,
-			&observed,
-			observed.Status.ConfigVersion,
-			nil,
-			nil,
-			gatewayTunnelCondition(&observed, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionTrue, "Applied", "applied", metav1.Now()),
-		)).To(gomega.Succeed())
+		gomega.Eventually(func() error {
+			var freshObserved v1alpha1.CloudflareTunnel
+			if err := directClient.Get(testContext, key, &freshObserved); err != nil {
+				return gomega.StopTrying("get CloudflareTunnel before status patch").Wrap(err)
+			}
+			err := statusWriter.patchTunnelGatewayStatus(
+				testContext,
+				writerGateway,
+				&freshObserved,
+				freshObserved.Status.ConfigVersion,
+				nil,
+				nil,
+				gatewayTunnelCondition(&freshObserved, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionTrue, "Applied", "applied", metav1.Now()),
+			)
+			if err != nil && !apierrors.IsConflict(err) {
+				return gomega.StopTrying("patch CloudflareTunnel status").Wrap(err)
+			}
+			return err
+		}, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.CloudflareTunnel
 			g.Expect(testClient.Get(testContext, key, &current)).To(gomega.Succeed())
