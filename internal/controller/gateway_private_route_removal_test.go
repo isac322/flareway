@@ -23,6 +23,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,6 +37,83 @@ import (
 	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/xds/translator"
 )
+
+func TestGeneratedRouteCleanupWithoutAccount(t *testing.T) {
+	for _, mode := range []string{"no listeners", "public listener", "private listener"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			gateway := listenerConvergenceGateway()
+			gateway.UID = "gateway-uid"
+			if mode == "no listeners" {
+				gateway.Listeners = nil
+				gateway.Domains = nil
+			} else if mode == "private listener" {
+				gateway.Listeners[1].Exposure = ir.ExposurePrivate
+			}
+			tunnel := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: "tenant"},
+				Status:     v1alpha1.CloudflareTunnelStatus{TunnelID: "tunnel-id", OwnershipVerified: true},
+			}
+			route := &v1alpha1.HostnameRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: privateHostnameRouteName(tunnel.Namespace, tunnel.Name, "old"), Namespace: dataplane.DefaultOperatorNamespace,
+					Labels:      map[string]string{generatedPlatformObjectLabel: "true", generatedSourceNamespaceLabel: tunnel.Namespace, generatedGatewayLabel: tunnel.Namespace + "--" + tunnel.Name},
+					Annotations: map[string]string{sourceGatewayUIDAnnotation: "previous-gateway-uid"},
+				},
+				Spec: v1alpha1.HostnameRouteSpec{
+					AccountRef: corev1.LocalObjectReference{Name: "absent-account"}, Hostname: "b.example.com",
+					TunnelRef: v1alpha1.TunnelReference{Name: tunnel.Name, Namespace: tunnel.Namespace},
+				},
+			}
+			scheme := runtime.NewScheme()
+			if err := v1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(route).Build()
+			r := &GatewayReconciler{Client: kube}
+			inputs := gatewayInputsView{HostnameRoutes: []v1alpha1.HostnameRoute{*route.DeepCopy()}}
+			state, err := r.reconcilePrivatePrerequisites(ctx, gateway, tunnel, nil, inputs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stored v1alpha1.HostnameRoute
+			if err := kube.Get(ctx, client.ObjectKeyFromObject(route), &stored); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "private listener" {
+				if state.Pending == "" || state.Listeners["b"] == "" || state.Listeners["a"] != "" ||
+					gateway.Domains[1].Guard != ir.GuardBlocked || gateway.Domains[1].Access != nil {
+					t.Fatalf("missing account did not isolate the private listener: %#v", state)
+				}
+				if stored.Annotations[sourceGatewayUIDAnnotation] != "previous-gateway-uid" || !stored.DeletionTimestamp.IsZero() {
+					t.Fatal("missing account changed a route still required by an active private listener")
+				}
+			} else {
+				if state.Pending == "" || len(state.Listeners) != 0 || stored.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
+					t.Fatalf("obsolete route did not bind the current Gateway UID without an account: %#v", state)
+				}
+				inputs.HostnameRoutes[0] = stored
+				state, err = r.reconcilePrivatePrerequisites(ctx, gateway, tunnel, nil, inputs)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.Pending == "" || len(state.Listeners) != 0 {
+					t.Fatalf("route removal incorrectly blocked a listener: %#v", state)
+				}
+				if err := kube.Get(ctx, client.ObjectKeyFromObject(route), &stored); !apierrors.IsNotFound(err) {
+					t.Fatalf("obsolete route was not deleted without an account: %v", err)
+				}
+				state, err = r.reconcilePrivatePrerequisites(ctx, gateway, tunnel, nil, gatewayInputsView{})
+				if err != nil || state.Pending != "" || len(state.Listeners) != 0 {
+					t.Fatalf("completed cleanup did not converge: %#v, %v", state, err)
+				}
+			}
+			if mode != "no listeners" && (gateway.Domains[0].Guard != ir.GuardForwarding || gateway.Domains[0].Access == nil) {
+				t.Fatal("absent account blocked the public listener")
+			}
+		})
+	}
+}
 
 func TestGeneratedRouteRemovalBlocksOnlyReplacementListener(t *testing.T) {
 	for _, test := range []struct {
