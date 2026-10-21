@@ -44,10 +44,11 @@ func TestGeneratedRouteCleanupWithoutAccount(t *testing.T) {
 			ctx := context.Background()
 			gateway := listenerConvergenceGateway()
 			gateway.UID = "gateway-uid"
-			if mode == "no listeners" {
+			switch mode {
+			case "no listeners":
 				gateway.Listeners = nil
 				gateway.Domains = nil
-			} else if mode == "private listener" {
+			case "private listener":
 				gateway.Listeners[1].Exposure = ir.ExposurePrivate
 			}
 			tunnel := &v1alpha1.CloudflareTunnel{
