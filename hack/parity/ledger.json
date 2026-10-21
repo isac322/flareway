@@ -13715,11 +13715,11 @@
       "officialPath": "id",
       "officialType": "string",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "access-application",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/access_application.go:accessApplicationNewBody and internal/cloudflare/access_application.go:accessApplicationUpdateBody, which never construct an end_user application; internal/cloudflare/access_application.go:AccessApplication has no user-population field.",
-      "rationale": "Not a Flareway resource-schema requirement. End-user applications bind an organization-owned user population to a canonical allow-everyone policy and mandatory managed OAuth. Flareway models policy-attached Access applications, not end-user population registration or its OAuth authorization-server lifecycle; it neither creates nor adopts the end_user variant, so these variant fields are left to other tooling and outside drift detection. Shared field names remain supported only for the existing application variants."
+      "disposition": "mapped",
+      "currentMapping": "Response id -> status.applicationId through the generic observation path in internal/controller/accessstandaloneapplication_controller.go:AccessStandaloneApplicationReconciler.patchStatus. A non-empty ID is persisted for a nameless end_user response, which skips the status.type projection; a named end_user response projects the unsupported type and the CRD rejects the status patch.",
+      "rationale": "Current implementation evidence for id is recorded in currentMapping. This limited identity observation does not support end_user desired configuration or ownership adoption; aud and the variant configuration remain excluded."
     },
     {
       "key": "AccessGroupAudit::both::exclude",
@@ -19377,19 +19377,6 @@
       "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
     },
     {
-      "key": "IdentityProviderPasskeysAudit::request/response::saml_certificate_set_id",
-      "audit": "IdentityProviderPasskeysAudit",
-      "direction": "request/response",
-      "officialPath": "saml_certificate_set_id",
-      "officialType": "string",
-      "required": "optional",
-      "sourceVerdict": "NOT_APPLICABLE",
-      "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
-    },
-    {
       "key": "IdentityProviderPasskeysAudit::request/response::scim_config",
       "audit": "IdentityProviderPasskeysAudit",
       "direction": "request/response",
@@ -19416,6 +19403,19 @@
       "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
     },
     {
+      "key": "IdentityProviderPasskeysAudit::request::saml_certificate_set_id",
+      "audit": "IdentityProviderPasskeysAudit",
+      "direction": "request",
+      "officialPath": "saml_certificate_set_id",
+      "officialType": "string",
+      "required": "optional",
+      "sourceVerdict": "NOT_APPLICABLE",
+      "owner": "identity-provider",
+      "disposition": "excluded",
+      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch and never sends a passkeys saml_certificate_set_id.",
+      "rationale": "Not a Flareway resource-schema requirement. Flareway does not create or adopt the passkeys variant or manage its SAML encryption configuration. Shared response metadata is observed separately."
+    },
+    {
       "key": "IdentityProviderPasskeysAudit::response::config.redirect_url",
       "audit": "IdentityProviderPasskeysAudit",
       "direction": "response",
@@ -19435,11 +19435,11 @@
       "officialPath": "id",
       "officialType": "string",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response id -> status.idpId when patchStatus receives Ready=True. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderFromValues; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderStatus.IDPID.",
+      "rationale": "Current implementation evidence for id is recorded in currentMapping. Generic ObserveOnly observation retains ownershipVerified=false and does not create or adopt a passkeys provider."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::read_only",
@@ -19448,11 +19448,11 @@
       "officialPath": "read_only",
       "officialType": "bool",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response read_only -> status.readOnly on the generic status path, including non-Ready observations; false is omitted by JSON serialization. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderFromValues; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderStatus.ReadOnly.",
+      "rationale": "Current implementation evidence for read_only is recorded in currentMapping. Shared response metadata does not support passkeys desired configuration or ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set",
@@ -19461,11 +19461,11 @@
       "officialPath": "saml_certificate_set",
       "officialType": "IdentityProviderAccessPasskeysSAMLCertificateSet",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set -> status.samlCertificateSet when saml_certificate_set_id or the set uid supplies a non-empty ID; patchStatus copies a present set even on non-Ready observations. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderFromValues; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderSAMLCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderStatus.SAMLCertificateSet.",
+      "rationale": "Current implementation evidence for saml_certificate_set is recorded in currentMapping. Public certificate metadata is observed without managing passkeys configuration or adopting ownership."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.created_at",
@@ -19474,11 +19474,11 @@
       "officialPath": "saml_certificate_set.created_at",
       "officialType": "time.Time",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.created_at -> status.samlCertificateSet.createdAt when the set has an ID and the timestamp is non-zero. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderSAMLCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.CreatedAt.",
+      "rationale": "Current implementation evidence for saml_certificate_set.created_at is recorded in currentMapping. Shared certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.current_certificate",
@@ -19487,11 +19487,11 @@
       "officialPath": "saml_certificate_set.current_certificate",
       "officialType": "IdentityProviderAccessPasskeysSAMLCertificateSetCurrentCertificate",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.current_certificate -> status.samlCertificateSet.current when the set has an ID and the current certificate has a uid. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.Current.",
+      "rationale": "Current implementation evidence for saml_certificate_set.current_certificate is recorded in currentMapping. Shared certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.current_certificate.is_current",
@@ -19500,11 +19500,11 @@
       "officialPath": "saml_certificate_set.current_certificate.is_current",
       "officialType": "bool",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.current_certificate.is_current -> status.samlCertificateSet.current.current when the set has an ID and the certificate has a uid; false is omitted by JSON serialization. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateStatus.Current.",
+      "rationale": "Current implementation evidence for saml_certificate_set.current_certificate.is_current is recorded in currentMapping. Shared certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.current_certificate.not_after",
@@ -19513,11 +19513,11 @@
       "officialPath": "saml_certificate_set.current_certificate.not_after",
       "officialType": "time.Time",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.current_certificate.not_after -> status.samlCertificateSet.current.notAfter when the set has an ID, the certificate has a uid, and the timestamp is non-zero. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateStatus.NotAfter.",
+      "rationale": "Current implementation evidence for saml_certificate_set.current_certificate.not_after is recorded in currentMapping. Shared certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.current_certificate.public_certificate",
@@ -19526,11 +19526,11 @@
       "officialPath": "saml_certificate_set.current_certificate.public_certificate",
       "officialType": "string",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.current_certificate.public_certificate -> status.samlCertificateSet.current.publicCertificate when the set has an ID and the certificate has a uid; an empty value is omitted by JSON serialization. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateStatus.PublicCertificate.",
+      "rationale": "Current implementation evidence for saml_certificate_set.current_certificate.public_certificate is recorded in currentMapping. Shared public certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.current_certificate.uid",
@@ -19539,11 +19539,11 @@
       "officialPath": "saml_certificate_set.current_certificate.uid",
       "officialType": "string",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.current_certificate.uid -> status.samlCertificateSet.current.id when the set has an ID and the certificate uid is non-empty. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateStatus.ID.",
+      "rationale": "Current implementation evidence for saml_certificate_set.current_certificate.uid is recorded in currentMapping. Shared certificate identity is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.previous_certificate",
@@ -19552,11 +19552,11 @@
       "officialPath": "saml_certificate_set.previous_certificate",
       "officialType": "interface{}",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.previous_certificate -> status.samlCertificateSet.previous when the set has an ID and the previous certificate has a uid; its uid, is_current, not_after, and public_certificate values populate the corresponding status fields when present. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/cloudflare/identity_provider.go:identityProviderCertificateFromWire; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.Previous.",
+      "rationale": "Current implementation evidence for saml_certificate_set.previous_certificate is recorded in currentMapping. Shared public certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.uid",
@@ -19565,11 +19565,11 @@
       "officialPath": "saml_certificate_set.uid",
       "officialType": "string",
       "required": "read-only",
-      "sourceVerdict": "NOT_APPLICABLE",
+      "sourceVerdict": "EXACT",
       "owner": "identity-provider",
-      "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.uid -> status.samlCertificateSet.id when saml_certificate_set_id is empty and the set uid is non-empty; an explicit saml_certificate_set_id takes precedence. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderSAMLCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.ID.",
+      "rationale": "Current implementation evidence for saml_certificate_set.uid is recorded in currentMapping. Shared certificate identity is observed when present, including non-Ready observations, without passkeys ownership adoption."
     },
     {
       "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set.updated_at",
@@ -19578,11 +19578,50 @@
       "officialPath": "saml_certificate_set.updated_at",
       "officialType": "time.Time",
       "required": "read-only",
+      "sourceVerdict": "EXACT",
+      "owner": "identity-provider",
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set.updated_at -> status.samlCertificateSet.updatedAt when the set has an ID and the timestamp is non-zero. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderSAMLCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.UpdatedAt.",
+      "rationale": "Current implementation evidence for saml_certificate_set.updated_at is recorded in currentMapping. Shared certificate metadata is observed when present, including non-Ready observations, without passkeys ownership adoption."
+    },
+    {
+      "key": "IdentityProviderPasskeysAudit::response::saml_certificate_set_id",
+      "audit": "IdentityProviderPasskeysAudit",
+      "direction": "response",
+      "officialPath": "saml_certificate_set_id",
+      "officialType": "string",
+      "required": "read-only",
+      "sourceVerdict": "EXACT",
+      "owner": "identity-provider",
+      "disposition": "mapped",
+      "currentMapping": "Response saml_certificate_set_id -> status.samlCertificateSet.id only when the value is non-empty, including non-Ready observations. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderFromValues; internal/cloudflare/identity_provider.go:identityProviderCertificateSetFromAny; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; internal/controller/identityprovider_controller.go:identityProviderSAMLCertificateStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSAMLCertificateSetStatus.ID.",
+      "rationale": "Current implementation evidence for saml_certificate_set_id is recorded in currentMapping. Shared certificate identity is observed without managing passkeys SAML encryption configuration or adopting ownership."
+    },
+    {
+      "key": "IdentityProviderPasskeysAudit::response::scim_config.scim_base_url",
+      "audit": "IdentityProviderPasskeysAudit",
+      "direction": "response",
+      "officialPath": "scim_config.scim_base_url",
+      "officialType": "string",
+      "required": "read-only",
+      "sourceVerdict": "PARTIAL",
+      "owner": "identity-provider",
+      "disposition": "mapped",
+      "currentMapping": "Response scim_config.scim_base_url -> status.scimDirectory.baseUrl only when remote SCIM is enabled and both users and groups list calls succeed. Either list failure prevents a new directory snapshot. Evidence: internal/cloudflare/identity_provider.go:Client.GetIdentityProvider; internal/cloudflare/identity_provider.go:identityProviderFromValues; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.readSCIMDirectory; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus; api/v1alpha1/identityprovider_types.go:IdentityProviderSCIMDirectoryStatus.BaseURL.",
+      "rationale": "The generic ObserveOnly path conditionally observes an already-enabled remote SCIM directory and retains ownershipVerified=false. This partial response mapping does not support passkeys desired scim_config, enablement, or behavior settings."
+    },
+    {
+      "key": "IdentityProviderPasskeysAudit::response::scim_config.secret",
+      "audit": "IdentityProviderPasskeysAudit",
+      "direction": "response",
+      "officialPath": "scim_config.secret",
+      "officialType": "string",
+      "required": "read-only",
       "sourceVerdict": "NOT_APPLICABLE",
       "owner": "identity-provider",
       "disposition": "excluded",
-      "currentMapping": "Architectural exclusion recorded at internal/cloudflare/identity_provider.go:identityProviderBody, which has no passkeys request branch; internal/cloudflare/identity_provider.go:identityProviderWireConfig does not read login_page_auto_prompt, and internal/cloudflare/identity_provider.go:identityProviderObservationFromRaw does not expose the passkeys redirect URL.",
-      "rationale": "Not a Flareway resource-schema requirement. The passkeys provider belongs to Access-managed end-user passkey enrollment and login-page behavior; IdentityProvider models the existing external federation and one-time-PIN/Cloudflare providers, not the organization-owned end-user credential lifecycle. Flareway does not create or adopt the passkeys variant or manage its login_page_auto_prompt setting. Shared provider metadata remains supported for the existing provider variants, not as passkeys support."
+      "currentMapping": "Response scim_config.secret is decoded into client memory by internal/cloudflare/identity_provider.go:identityProviderFromValues after internal/cloudflare/identity_provider.go:Client.GetIdentityProvider. The ObserveOnly branch in internal/controller/identityprovider_controller.go:IdentityProviderReconciler.Reconcile returns before credential capture; internal/controller/identityprovider_controller.go:IdentityProviderReconciler.patchStatus never copies the secret into status or a Kubernetes Secret.",
+      "rationale": "Not a Flareway resource-schema requirement for passkeys. ObserveOnly observation does not persist response credentials in status or Kubernetes Secrets and does not manage or adopt the passkeys provider."
     },
     {
       "key": "OrganizationAudit::request/response::allow_authenticate_via_warp",
