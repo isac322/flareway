@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -127,6 +128,49 @@ func TestOrganizationAdapterRoundTripsAllMutableFieldsAtZoneScope(t *testing.T) 
 		fmt.Sprint(piv["ssh_key_size"]) != "[256 2048]" ||
 		fmt.Sprint(piv["ssh_key_type"]) != "[ecdsa rsa]" || piv["touch_policy"] != "cached" {
 		t.Fatalf("mfa_piv_key_requirements = %#v", piv)
+	}
+}
+
+func TestOrganizationAdapterRejectsMissingCreateIdentityBeforeHTTP(t *testing.T) {
+	name, emptyName := "team", ""
+	tests := []struct {
+		name  string
+		input OrganizationCreateInput
+	}{
+		{
+			name:  "missing auth domain",
+			input: OrganizationCreateInput{OrganizationInput: OrganizationInput{Name: &name}},
+		},
+		{
+			name:  "nil name",
+			input: OrganizationCreateInput{AuthDomain: "team.cloudflareaccess.com"},
+		},
+		{
+			name: "empty name",
+			input: OrganizationCreateInput{
+				AuthDomain:        "team.cloudflareaccess.com",
+				OrganizationInput: OrganizationInput{Name: &emptyName},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(response, organizationResponseJSON)
+			}))
+			t.Cleanup(server.Close)
+			client := New("token", "account", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+			_, err := client.CreateAccessOrganization(context.Background(), AccessScope{}, test.input)
+			if err == nil {
+				t.Error("CreateAccessOrganization() unexpectedly succeeded")
+			}
+			if got := requests.Load(); got != 0 {
+				t.Errorf("CreateAccessOrganization() made %d HTTP requests, want none", got)
+			}
+		})
 	}
 }
 

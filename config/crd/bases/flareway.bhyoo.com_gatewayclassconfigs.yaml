@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.22.0
+    controller-gen.kubebuilder.io/version: v0.23.0
   name: gatewayclassconfigs.flareway.bhyoo.com
 spec:
   group: flareway.bhyoo.com
@@ -90,7 +90,7 @@ spec:
                     default: 60s
                     type: string
                   image:
-                    default: cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+                    default: cloudflare/cloudflared:2026.10.2@sha256:0e56c13c7058fcef9c4f0e7d83372f82330548dbf8f8b366f3d8b506526d93b2
                     type: string
                   protocol:
                     default: Auto
@@ -254,7 +254,7 @@ spec:
                   private listeners.
                 properties:
                   image:
-                    default: coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+                    default: coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26
                     type: string
                   resources:
                     description: ResourceRequirements describes the compute resource
@@ -327,7 +327,7 @@ spec:
                     minimum: 1
                     type: integer
                   image:
-                    default: envoyproxy/envoy:distroless-v1.39.3
+                    default: envoyproxy/envoy:distroless-v1.40.0
                     type: string
                   resources:
                     description: ResourceRequirements describes the compute resource
@@ -1561,17 +1561,17 @@ spec:
                 x-kubernetes-validations:
                 - message: tolerations must be valid pod tolerations
                   rule: '!has(self.tolerations) || self.tolerations.all(t, (!has(t.operator)
-                    || t.operator in ['''', ''Equal'', ''Exists'']) && (!has(t.effect)
-                    || t.effect in ['''', ''NoSchedule'', ''PreferNoSchedule'', ''NoExecute''])
+                    || t.operator in ["", ''Equal'', ''Exists'']) && (!has(t.effect)
+                    || t.effect in ["", ''NoSchedule'', ''PreferNoSchedule'', ''NoExecute''])
                     && (!has(t.operator) || t.operator != ''Exists'' || !has(t.value)
-                    || t.value == '''') && ((has(t.key) && t.key != '''') || (has(t.operator)
+                    || t.value == "") && ((has(t.key) && t.key != "") || (has(t.operator)
                     && t.operator == ''Exists'')) && (!has(t.tolerationSeconds) ||
                     (has(t.effect) && t.effect == ''NoExecute'')))'
                 - message: topologySpreadConstraints must be valid pod topology spread
                     constraints
                   rule: '!has(self.topologySpreadConstraints) || self.topologySpreadConstraints.all(t,
-                    t.maxSkew > 0 && t.topologyKey != '''' && t.whenUnsatisfiable
-                    in [''DoNotSchedule'', ''ScheduleAnyway''] && (!has(t.minDomains)
+                    t.maxSkew > 0 && t.topologyKey != "" && t.whenUnsatisfiable in
+                    [''DoNotSchedule'', ''ScheduleAnyway''] && (!has(t.minDomains)
                     || (t.minDomains > 0 && t.whenUnsatisfiable == ''DoNotSchedule''))
                     && (!has(t.nodeAffinityPolicy) || t.nodeAffinityPolicy in [''Honor'',
                     ''Ignore'']) && (!has(t.nodeTaintsPolicy) || t.nodeTaintsPolicy
@@ -1594,26 +1594,26 @@ spec:
                   rule: '!has(self.affinity) || !has(self.affinity.podAffinity) ||
                     ((!has(self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution)
                     || self.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t,
-                    t.topologyKey != '''' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size()
+                    t.topologyKey != "" && (!has(t.matchLabelKeys) || t.matchLabelKeys.size()
                     == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) ||
                     t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) &&
                     (!has(self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution)
                     || self.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w,
                     w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey
-                    != '''' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size()
+                    != "" && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size()
                     == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys)
                     || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))'
                 - message: podAntiAffinity terms must be valid pod affinity terms
                   rule: '!has(self.affinity) || !has(self.affinity.podAntiAffinity)
                     || ((!has(self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution)
                     || self.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t,
-                    t.topologyKey != '''' && (!has(t.matchLabelKeys) || t.matchLabelKeys.size()
+                    t.topologyKey != "" && (!has(t.matchLabelKeys) || t.matchLabelKeys.size()
                     == 0 || has(t.labelSelector)) && (!has(t.mismatchLabelKeys) ||
                     t.mismatchLabelKeys.size() == 0 || has(t.labelSelector)))) &&
                     (!has(self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution)
                     || self.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w,
                     w.weight >= 1 && w.weight <= 100 && w.podAffinityTerm.topologyKey
-                    != '''' && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size()
+                    != "" && (!has(w.podAffinityTerm.matchLabelKeys) || w.podAffinityTerm.matchLabelKeys.size()
                     == 0 || has(w.podAffinityTerm.labelSelector)) && (!has(w.podAffinityTerm.mismatchLabelKeys)
                     || w.podAffinityTerm.mismatchLabelKeys.size() == 0 || has(w.podAffinityTerm.labelSelector)))))'
             type: object

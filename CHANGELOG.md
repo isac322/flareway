@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- Upgrade the Go toolchain to 1.27.3 and refresh Go modules, including the
+  Cloudflare SDK v7.13.1 and Envoy API v1.40.0.
+- Update build tools and pinned builder images, including controller-tools
+  v0.23.0, golangci-lint v2.15.0, cosign v3.1.4, and Helm v4.3.1. Move the
+  Go builder and devcontainer base to Debian 13 (`trixie`).
+- Update data-plane and test images to cloudflared `2026.10.2`, Envoy
+  `distroless-v1.40.0`, CoreDNS `1.15.0`, and agnhost `2.61`.
+- Update site dependencies to Bun 1.4.3, Astro 7.4.1, Astro check 0.9.11,
+  and Bun types 1.4.3. Retain TypeScript 6.0.3 as the approved compatibility
+  exception: Astro check 0.9.11 supports TypeScript 5/6, not 7.
+- Use formatter-safe empty string literals in the scheduling CEL markers,
+  preserving the existing validation rules when Go formats the source.
+- Keep Gateway envtest status writes bounded while live controllers run:
+  retry only resource-version conflicts and fail immediately on other errors.
+
 ### Fixed
 
 - Scope Access block-first transitions to protection domains whose Access

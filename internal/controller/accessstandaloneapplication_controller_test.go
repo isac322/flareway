@@ -27,10 +27,13 @@ import (
 	"time"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
+	"github.com/go-logr/logr"
+	"golang.org/x/time/rate"
 
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +42,7 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	statusutil "github.com/isac322/flareway/internal/gatewayapi/status"
+	"github.com/isac322/flareway/test/cfstub"
 )
 
 var standaloneTestCounter atomic.Int64
@@ -256,6 +260,110 @@ var _ = ginkgo.Describe("AccessStandaloneApplication Controller", func() {
 			g.Expect(ready.Message).To(gomega.ContainSubstring("domain"))
 		})
 		gomega.Expect(fixture.remote.mutations()).To(gomega.BeZero())
+	})
+
+	ginkgo.It("observes only the ID of a nameless end-user application without adopting its unsupported configuration", func() {
+		fixture := newStandaloneControllerFixture("end-user-observe")
+		fixture.createPrerequisites()
+		var account v1alpha1.CloudflareAccount
+		gomega.Expect(testAPIReader.Get(testContext, types.NamespacedName{Name: fixture.accountName}, &account)).To(gomega.Succeed())
+		server := cfstub.New(ginkgo.GinkgoTB())
+		remote := cfstub.AccessResource{
+			"id": "a48c3f0a-20be-4d75-9a8a-071ab1472292", "type": "end_user",
+			"aud": "end-user-audience", "domain": "end-user.example.test",
+			"allowed_idps": []any{}, "self_hosted_domains": []any{},
+			"destinations":     []any{map[string]any{"type": "public", "uri": "end-user.example.test"}},
+			"user_populations": []any{"27dfbf38-3a88-482a-a6f9-6399b541ba76"},
+			"oauth_configuration": map[string]any{
+				"enabled": true,
+				"dynamic_client_registration": map[string]any{
+					"enabled": false, "allow_any_on_localhost": false, "allow_any_on_loopback": false,
+					"allowed_uris": []any{},
+				},
+				"grant": map[string]any{"access_token_lifetime": "15m", "session_duration": "24h"},
+			},
+		}
+		// SDK v7.13.1 AccessApplicationGetResponseEndUserApplication requires
+		// oauth_configuration, type, and user_populations, but not name.
+		server.State.AddAccessApplication(account.Spec.AccountID, remote)
+		remoteBefore := server.State.AccessApplications("accounts/" + account.Spec.AccountID)
+		api := flarecloudflare.New("api-token", account.Spec.AccountID, logr.Discard(),
+			flarecloudflare.WithBaseURL(server.URL), flarecloudflare.WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+		fixture.reconciler.NewCloudflareClient = func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }
+		observed := &v1alpha1.AccessStandaloneApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "observed", Namespace: fixture.namespace},
+			Spec: v1alpha1.AccessStandaloneApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: fixture.accountName},
+				Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+				Application: v1alpha1.AccessApplicationSettings{
+					Name: "desired-bookmark",
+				},
+				Bookmark:         &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://bookmark.example.test/"},
+				ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+				ExternalRef:      &v1alpha1.AccessApplicationExternalReference{ApplicationID: remote["id"].(string)},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, observed)).To(gomega.Succeed())
+		specBefore := observed.DeepCopy().Spec
+		var secretsBefore corev1.SecretList
+		gomega.Expect(testAPIReader.List(testContext, &secretsBefore, client.InNamespace(fixture.namespace))).To(gomega.Succeed())
+		fixture.reconcileUntil(observed, func(g gomega.Gomega, current *v1alpha1.AccessStandaloneApplication) {
+			g.Expect(current.Status.ApplicationID).To(gomega.Equal(remote["id"]))
+			g.Expect(current.Status.ObservedGeneration).To(gomega.Equal(current.Generation))
+			g.Expect(current.Status.Type).To(gomega.BeEmpty())
+			g.Expect(current.Status.Name).To(gomega.BeEmpty())
+			g.Expect(current.Status.Domain).To(gomega.BeEmpty())
+			g.Expect(current.Status.OwnershipVerified).To(gomega.BeFalse())
+			g.Expect(current.Status.AppliedHash).To(gomega.BeEmpty())
+			g.Expect(current.Status.SaaS).To(gomega.BeNil())
+			g.Expect(current.Status.Bookmark).To(gomega.BeNil())
+			g.Expect(current.Status.Infrastructure).To(gomega.BeNil())
+			g.Expect(current.Status.AppLauncher).To(gomega.BeNil())
+			g.Expect(current.Status.DashSSO).To(gomega.BeNil())
+			g.Expect(current.Status.MCPPortal).To(gomega.BeNil())
+			g.Expect(current.Spec).To(gomega.Equal(specBefore))
+			accepted := statusutil.FindCondition(current.Status.Conditions, "Accepted")
+			g.Expect(accepted).NotTo(gomega.BeNil())
+			g.Expect(accepted.Status).To(gomega.Equal(metav1.ConditionTrue))
+			ready := statusutil.FindCondition(current.Status.Conditions, "Ready")
+			g.Expect(ready).NotTo(gomega.BeNil())
+			g.Expect(ready.Status).To(gomega.Equal(metav1.ConditionFalse))
+			g.Expect(ready.Reason).To(gomega.Equal("Drifted"))
+		})
+		gomega.Expect(server.State.AccessApplications("accounts/" + account.Spec.AccountID)).To(gomega.Equal(remoteBefore))
+
+		unsupported := observed.DeepCopy()
+		unsupported.Spec.Type = v1alpha1.AccessStandaloneApplicationType("end_user")
+		unsupported.Spec.Bookmark = nil
+		gomega.Expect(apierrors.IsInvalid(testClient.Patch(testContext, unsupported, client.MergeFrom(observed.DeepCopy())))).To(gomega.BeTrue())
+
+		// Supplying the optional name enters the full status projection. The
+		// real API server rejects end_user as an unsupported status.type.
+		remote["name"] = "existing-end-user"
+		server.State.AddAccessApplication(account.Spec.AccountID, remote)
+		namedRemoteBefore := server.State.AccessApplications("accounts/" + account.Spec.AccountID)
+		gomega.Eventually(func() error {
+			_, err := fixture.reconciler.Reconcile(testContext, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(observed)})
+			return err
+		}).WithTimeout(10 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.SatisfyAll(
+			gomega.WithTransform(apierrors.IsInvalid, gomega.BeTrue()),
+			gomega.MatchError(gomega.ContainSubstring("status.type")),
+		))
+		var current v1alpha1.AccessStandaloneApplication
+		gomega.Expect(testAPIReader.Get(testContext, client.ObjectKeyFromObject(observed), &current)).To(gomega.Succeed())
+		gomega.Expect(current.Spec).To(gomega.Equal(specBefore))
+		gomega.Expect(current.Status.ApplicationID).To(gomega.Equal(remote["id"]))
+		gomega.Expect(current.Status.Type).To(gomega.BeEmpty())
+		gomega.Expect(current.Status.Name).To(gomega.BeEmpty())
+		gomega.Expect(server.State.AccessApplications("accounts/" + account.Spec.AccountID)).To(gomega.Equal(namedRemoteBefore))
+		var secretsAfter corev1.SecretList
+		gomega.Expect(testAPIReader.List(testContext, &secretsAfter, client.InNamespace(fixture.namespace))).To(gomega.Succeed())
+		gomega.Expect(secretsAfter.Items).To(gomega.Equal(secretsBefore.Items))
+		gomega.Expect(server.Journal()).NotTo(gomega.BeEmpty())
+		for _, call := range server.Journal() {
+			gomega.Expect(call.Method).To(gomega.Equal(http.MethodGet))
+			gomega.Expect(call.Path).To(gomega.Equal("/accounts/" + account.Spec.AccountID + "/access/apps/" + remote["id"].(string)))
+		}
 	})
 
 	ginkgo.It("creates missing supported tags before standalone application creates and updates", func() {

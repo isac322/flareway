@@ -2,7 +2,7 @@
   "name": "flareway-site",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.4.2",
+  "packageManager": "bun@1.4.3",
   "scripts": {
     "sync": "bun scripts/sync-docs.ts",
     "dev": "bun run sync && bun --bun astro dev",
@@ -16,11 +16,11 @@
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@fontsource-variable/schibsted-grotesk": "^5.3.0",
     "@fontsource/alegreya": "^5.3.0",
-    "astro": "^7.3.8"
+    "astro": "^7.4.1"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9.10",
-    "@types/bun": "^1.4.2",
+    "@astrojs/check": "^0.9.11",
+    "@types/bun": "^1.4.3",
     "typescript": "^6.0.3"
   }
 }

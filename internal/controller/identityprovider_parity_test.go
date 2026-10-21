@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -31,6 +33,7 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,9 +42,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/test/cfstub"
 )
 
 func TestIdentityProviderCloudflareProviderParity(t *testing.T) {
@@ -1751,6 +1756,390 @@ func TestIdentityProviderReconcilerRedirectURLStatus(t *testing.T) {
 	}
 	if listedURLs["otp"] != redirectURL || listedURLs["cloudflare"] != redirectURL || listedURLs["oidc"] != "" {
 		t.Fatalf("listed status redirect URLs = %#v", listedURLs)
+	}
+}
+
+func TestIdentityProviderReconcilerObserveOnlyPasskeysMetadata(t *testing.T) {
+	const accountID = "0123456789abcdef0123456789abcdef"
+	ctx := context.Background()
+	server := cfstub.New(t)
+	providersPath := "/accounts/" + accountID + "/access/identity_providers"
+	// Seed the stateful stub directly, not through Flareway's desired-state
+	// adapter: passkeys configuration is not a supported spec.type. The GET
+	// response includes common certificate metadata as well as passkeys-only
+	// config and redirect fields that must not become desired configuration.
+	seedRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+providersPath, strings.NewReader(`{
+		"name": "Passkeys",
+		"type": "passkeys",
+		"config": {
+			"login_page_auto_prompt": true,
+			"redirect_url": "https://example.cloudflareaccess.com/passkeys"
+		},
+		"read_only": true,
+		"saml_certificate_set_id": "11111111-1111-4111-8111-111111111111",
+		"saml_certificate_set": {
+			"uid": "11111111-1111-4111-8111-111111111111",
+			"created_at": "2026-01-01T00:00:00Z",
+			"updated_at": "2026-02-01T00:00:00Z",
+			"current_certificate": {
+				"uid": "22222222-2222-4222-8222-222222222222",
+				"is_current": true,
+				"not_after": "2027-02-01T00:00:00Z",
+				"public_certificate": "CURRENT-PUBLIC-CERTIFICATE"
+			},
+			"previous_certificate": {
+				"uid": "33333333-3333-4333-8333-333333333333",
+				"is_current": false,
+				"not_after": "2026-12-01T00:00:00Z",
+				"public_certificate": "PREVIOUS-PUBLIC-CERTIFICATE"
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRequest.Header.Set("Content-Type", "application/json")
+	seedResponse, err := http.DefaultClient.Do(seedRequest)
+	if err != nil {
+		t.Fatalf("seed passkeys provider: %v", err)
+	}
+	defer func() {
+		if err := seedResponse.Body.Close(); err != nil {
+			t.Errorf("close passkeys seed response: %v", err)
+		}
+	}()
+	if seedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("seed passkeys provider status = %d", seedResponse.StatusCode)
+	}
+	var seeded struct {
+		Result struct {
+			ID string `json:"id"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(seedResponse.Body).Decode(&seeded); err != nil {
+		t.Fatalf("decode seeded provider: %v", err)
+	}
+	if seeded.Result.ID == "" {
+		t.Fatal("seeded provider has no ID")
+	}
+	remoteBefore := server.State.IdentityProviders("accounts/" + accountID)
+	callsBefore := len(server.Journal())
+
+	// Admission and status persistence use the real CRD and API server; there
+	// is no manager that could interleave another controller's writes.
+	env := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+	}
+	if dir := managerEnvtestAssets(); dir != "" {
+		env.BinaryAssetsDirectory = dir
+	}
+	config, err := env.Start()
+	t.Cleanup(func() {
+		if err := env.Stop(); err != nil {
+			t.Errorf("stop envtest: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("start envtest: %v", err)
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	kube, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   accountID,
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: "tenant", Name: "api-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*.internal.example"},
+				Zones:             []string{"example.com"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	provider := &v1alpha1.IdentityProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "observe-passkeys", Namespace: "tenant"},
+		Spec: v1alpha1.IdentityProviderSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "Observed Passkeys",
+			Type:             v1alpha1.IdentityProviderTypeOneTimePIN,
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			ExternalRef:      &v1alpha1.IdentityProviderExternalReference{IDPID: seeded.Result.ID},
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	for _, object := range []client.Object{
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "api-token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("api-token")}},
+		account,
+		provider,
+	} {
+		if err := kube.Create(ctx, object); err != nil {
+			t.Fatalf("create %T: %v", object, err)
+		}
+	}
+	now := metav1.Now()
+	account.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", ObservedGeneration: account.Generation, LastTransitionTime: now},
+		{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Valid", ObservedGeneration: account.Generation, LastTransitionTime: now},
+	}
+	if err := kube.Status().Update(ctx, account); err != nil {
+		t.Fatalf("mark account ready: %v", err)
+	}
+	var secretsBefore corev1.SecretList
+	if err := kube.List(ctx, &secretsBefore, client.InNamespace(provider.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	api := flarecloudflare.New("api-token", accountID, logr.Discard(), flarecloudflare.WithBaseURL(server.URL), flarecloudflare.WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+	reconciler := &IdentityProviderReconciler{
+		Client: kube,
+		Scheme: scheme,
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) {
+			return api, nil
+		},
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	// First install the finalizer, then observe twice to cover an existing
+	// status without accidentally adopting the remote provider on a retry.
+	for range 3 {
+		if _, err := reconciler.Reconcile(ctx, request); err != nil {
+			t.Fatalf("reconcile ObserveOnly passkeys provider: %v", err)
+		}
+	}
+	var observed v1alpha1.IdentityProvider
+	if err := kube.Get(ctx, request.NamespacedName, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Status.IDPID != seeded.Result.ID || !observed.Status.ReadOnly || observed.Status.OwnershipVerified {
+		t.Fatalf("observed passkeys metadata = %#v", observed.Status)
+	}
+	if observed.Status.RedirectURL != "" {
+		t.Fatalf("passkeys redirect URL was projected: %q", observed.Status.RedirectURL)
+	}
+	createdAt := metav1.NewTime(time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC))
+	updatedAt := metav1.NewTime(time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC))
+	currentNotAfter := metav1.NewTime(time.Date(2027, time.February, 1, 0, 0, 0, 0, time.UTC))
+	previousNotAfter := metav1.NewTime(time.Date(2026, time.December, 1, 0, 0, 0, 0, time.UTC))
+	wantCertificates := &v1alpha1.IdentityProviderSAMLCertificateSetStatus{
+		ID:        "11111111-1111-4111-8111-111111111111",
+		CreatedAt: &createdAt,
+		UpdatedAt: &updatedAt,
+		Current: &v1alpha1.IdentityProviderSAMLCertificateStatus{
+			ID:                "22222222-2222-4222-8222-222222222222",
+			Current:           true,
+			NotAfter:          &currentNotAfter,
+			PublicCertificate: "CURRENT-PUBLIC-CERTIFICATE",
+		},
+		Previous: &v1alpha1.IdentityProviderSAMLCertificateStatus{
+			ID:                "33333333-3333-4333-8333-333333333333",
+			Current:           false,
+			NotAfter:          &previousNotAfter,
+			PublicCertificate: "PREVIOUS-PUBLIC-CERTIFICATE",
+		},
+	}
+	if !equality.Semantic.DeepEqual(observed.Status.SAMLCertificateSet, wantCertificates) {
+		t.Fatalf("observed passkeys certificate metadata = %#v, want %#v", observed.Status.SAMLCertificateSet, wantCertificates)
+	}
+	for _, conditionType := range []string{"Accepted", "Ready"} {
+		condition := identityProviderCondition(observed.Status.Conditions, conditionType)
+		if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Ready" || condition.ObservedGeneration != observed.Generation {
+			t.Fatalf("%s condition = %#v", conditionType, condition)
+		}
+	}
+	if observed.Status.ObservedGeneration != observed.Generation || observed.Status.AppliedHash != "" || observed.Status.AppliedAt != nil {
+		t.Fatalf("ObserveOnly recorded managed convergence: %#v", observed.Status)
+	}
+	if !reflect.DeepEqual(observed.Spec, provider.Spec) {
+		t.Fatalf("observation changed desired spec: got %#v, want %#v", observed.Spec, provider.Spec)
+	}
+	if !reflect.DeepEqual(server.State.IdentityProviders("accounts/"+accountID), remoteBefore) {
+		t.Fatal("observation changed remote provider state")
+	}
+	calls := server.Journal()[callsBefore:]
+	if len(calls) != 2 {
+		t.Fatalf("ObserveOnly Cloudflare calls = %#v, want two provider GETs", calls)
+	}
+	for _, call := range calls {
+		requestURL, err := url.Parse(call.Path)
+		if err != nil {
+			t.Fatalf("parse observed provider request URI: %v", err)
+		}
+		if call.Method != http.MethodGet || requestURL.Path != providersPath+"/"+seeded.Result.ID {
+			t.Fatalf("ObserveOnly made an unexpected remote call: %#v", call)
+		}
+	}
+	var secretsAfter corev1.SecretList
+	if err := kube.List(ctx, &secretsAfter, client.InNamespace(provider.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(secretsAfter.Items, secretsBefore.Items) {
+		t.Fatal("ObserveOnly created, changed, or adopted credentials")
+	}
+
+	for _, test := range []struct {
+		name         string
+		failEndpoint string
+	}{
+		{name: "scim-success"},
+		{name: "scim-users-denied", failEndpoint: "users"},
+		{name: "scim-groups-denied", failEndpoint: "groups"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const scimSecret = "synthetic-passkeys-scim-credential"
+			baseURL := "https://example.cloudflareaccess.com/scim/" + test.name
+			body := fmt.Sprintf(`{
+				"name": "%s",
+				"type": "passkeys",
+				"config": {},
+				"read_only": true,
+				"scim_config": {
+					"enabled": true,
+					"scim_base_url": "%s",
+					"secret": "%s"
+				}
+			}`, test.name, baseURL, scimSecret)
+			seedRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+providersPath, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedRequest.Header.Set("Content-Type", "application/json")
+			seedResponse, err := http.DefaultClient.Do(seedRequest)
+			if err != nil {
+				t.Fatalf("seed SCIM provider: %v", err)
+			}
+			defer func() {
+				if err := seedResponse.Body.Close(); err != nil {
+					t.Errorf("close SCIM seed response: %v", err)
+				}
+			}()
+			if seedResponse.StatusCode != http.StatusOK {
+				t.Fatalf("seed SCIM provider status = %d", seedResponse.StatusCode)
+			}
+			var seeded struct {
+				Result struct {
+					ID string `json:"id"`
+				} `json:"result"`
+			}
+			if err := json.NewDecoder(seedResponse.Body).Decode(&seeded); err != nil {
+				t.Fatalf("decode seeded SCIM provider: %v", err)
+			}
+			if seeded.Result.ID == "" {
+				t.Fatal("seeded SCIM provider has no ID")
+			}
+			providerPath := providersPath + "/" + seeded.Result.ID
+			for _, endpoint := range []string{"users", "groups"} {
+				server.Handle(http.MethodGet, "^"+providerPath+"/scim/"+endpoint+"$", func(response http.ResponseWriter, _ *http.Request) {
+					if endpoint == test.failEndpoint {
+						// A deterministic 403 must be observed once, not retried
+						// as a transient SDK or controller failure.
+						cfstub.WriteError(response, http.StatusForbidden, 10000, "SCIM listing denied")
+						return
+					}
+					response.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(response).Encode(map[string]any{
+						"success":  true,
+						"errors":   []any{},
+						"messages": []any{},
+						"result":   []any{},
+						"result_info": map[string]any{
+							"page": 1, "per_page": 50, "count": 0, "total_count": 0, "total_pages": 1,
+						},
+					})
+				})
+			}
+			remoteBefore := server.State.IdentityProviders("accounts/" + accountID)
+			callsBefore := len(server.Journal())
+			scimProvider := &v1alpha1.IdentityProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: test.name, Namespace: provider.Namespace},
+				Spec:       *provider.Spec.DeepCopy(),
+			}
+			scimProvider.Spec.ExternalRef = &v1alpha1.IdentityProviderExternalReference{IDPID: seeded.Result.ID}
+			if err := kube.Create(ctx, scimProvider); err != nil {
+				t.Fatalf("create fresh SCIM observer: %v", err)
+			}
+			scimRequest := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(scimProvider)}
+			if _, err := reconciler.Reconcile(ctx, scimRequest); err != nil {
+				t.Fatalf("install SCIM observer finalizer: %v", err)
+			}
+			_, reconcileErr := reconciler.Reconcile(ctx, scimRequest)
+			if (reconcileErr != nil) != (test.failEndpoint != "") {
+				t.Fatalf("SCIM observation error = %v, failed endpoint = %q", reconcileErr, test.failEndpoint)
+			}
+			var observed v1alpha1.IdentityProvider
+			if err := kube.Get(ctx, scimRequest.NamespacedName, &observed); err != nil {
+				t.Fatal(err)
+			}
+			if !observed.Status.ReadOnly || observed.Status.OwnershipVerified || observed.Status.AppliedHash != "" || observed.Status.AppliedAt != nil {
+				t.Fatalf("SCIM observer acquired managed ownership: %#v", observed.Status)
+			}
+			wantStatus, wantReason := metav1.ConditionTrue, "Ready"
+			if test.failEndpoint == "" {
+				if observed.Status.IDPID != seeded.Result.ID || observed.Status.SCIMDirectory == nil || observed.Status.SCIMDirectory.BaseURL != baseURL {
+					t.Fatalf("successful SCIM observation = %#v", observed.Status)
+				}
+			} else {
+				wantStatus, wantReason = metav1.ConditionFalse, "Pending"
+				// This resource has never published a SCIM snapshot. A failed
+				// users or groups listing cannot publish the new base URL.
+				if observed.Status.SCIMDirectory != nil || observed.Status.IDPID != "" {
+					t.Fatalf("failed SCIM listing published a new snapshot: %#v", observed.Status)
+				}
+			}
+			for _, conditionType := range []string{"Accepted", "Ready"} {
+				condition := identityProviderCondition(observed.Status.Conditions, conditionType)
+				if condition == nil || condition.Status != wantStatus || condition.Reason != wantReason || condition.ObservedGeneration != observed.Generation {
+					t.Fatalf("%s condition = %#v", conditionType, condition)
+				}
+			}
+			statusJSON, err := json.Marshal(observed.Status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(statusJSON), scimSecret) {
+				t.Fatal("SCIM observation exposed the credential in status")
+			}
+			if !reflect.DeepEqual(observed.Spec, scimProvider.Spec) {
+				t.Fatal("SCIM observation changed the desired spec")
+			}
+			if !reflect.DeepEqual(server.State.IdentityProviders("accounts/"+accountID), remoteBefore) {
+				t.Fatal("SCIM observation changed remote provider state")
+			}
+			wantPaths := []string{providerPath, providerPath + "/scim/users"}
+			if test.failEndpoint != "users" {
+				wantPaths = append(wantPaths, providerPath+"/scim/groups")
+			}
+			calls := server.Journal()[callsBefore:]
+			if len(calls) != len(wantPaths) {
+				t.Fatalf("SCIM observation calls = %#v, want paths %v", calls, wantPaths)
+			}
+			for index, call := range calls {
+				requestURL, err := url.Parse(call.Path)
+				if err != nil {
+					t.Fatalf("parse SCIM request URI: %v", err)
+				}
+				if call.Method != http.MethodGet || requestURL.Path != wantPaths[index] {
+					t.Fatalf("SCIM observation made an unexpected remote call: %#v", call)
+				}
+			}
+			var secretsAfter corev1.SecretList
+			if err := kube.List(ctx, &secretsAfter, client.InNamespace(provider.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(secretsAfter.Items, secretsBefore.Items) {
+				t.Fatal("SCIM observation created, changed, or adopted credentials")
+			}
+		})
 	}
 }
 
