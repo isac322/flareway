@@ -63,7 +63,7 @@ func TestGeneratedRouteCleanupWithoutAccount(t *testing.T) {
 				},
 				Spec: v1alpha1.HostnameRouteSpec{
 					AccountRef: corev1.LocalObjectReference{Name: "absent-account"}, Hostname: "b.example.com",
-					TunnelRef: v1alpha1.TunnelReference{Name: tunnel.Name, Namespace: tunnel.Namespace},
+					TunnelRef: v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: tunnel.Name, Namespace: tunnel.Namespace},
 				},
 			}
 			scheme := runtime.NewScheme()

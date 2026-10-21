@@ -371,7 +371,7 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 			// Deny listeners that could otherwise reuse the retiring Applied route.
 			for _, active := range gateway.Listeners {
 				if active.Exposure == ir.ExposurePrivate &&
-					route.Spec.AccountRef.Name == account.Name &&
+					(account == nil || route.Spec.AccountRef.Name == account.Name) &&
 					normalizePrivateName(active.Hostname) == normalizePrivateName(route.Spec.Hostname) {
 					changed.Listeners[active.Name] = true
 				}
