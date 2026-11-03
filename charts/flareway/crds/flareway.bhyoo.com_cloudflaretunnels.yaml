@@ -1326,6 +1326,11 @@ spec:
                   properties:
                     accessApplication:
                       type: string
+                    accessBinding:
+                      description: |-
+                        AccessBinding identifies the Access policy applied to this hostname.
+                        A missing value from an older status is treated as changed.
+                      type: string
                     appliedVersion:
                       format: int64
                       type: integer

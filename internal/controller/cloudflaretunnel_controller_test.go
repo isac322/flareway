@@ -1496,7 +1496,9 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(conflict).NotTo(gomega.BeNil())
 			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionTrue))
 			g.Expect(conflict.Reason).To(gomega.Equal("DNSOwnership"))
-			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord))
+			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord, v1alpha1.CloudflareTunnelDNSRecordStatus{
+				Hostname: collisionHostname, ZoneID: "zone-example", State: dnsRecordStateConflict,
+			}))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
 		expectTunnelStatusSettles(fixture.tunnelKey)

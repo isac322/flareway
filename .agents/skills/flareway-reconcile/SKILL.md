@@ -49,7 +49,16 @@ of the pipeline is stuck, in this order:
 
 `Gateway` `Programmed` requires the full Cloudflare gate: Envoy xDS ACK,
 every active cloudflared Pod on the desired config version, and managed DNS
-present. The condition message lists the lagging items verbatim.
+represented by exactly one `state: Ready` entry per case-insensitive hostname.
+Missing, empty, unknown, or duplicate entries remain unready. The condition message lists the lagging items
+verbatim. Listener `Programmed` uses that listener's required DNS record;
+missing or conflicted records block only its hostname configuration, and a
+conflict reports `DNSConflict`. `ConfigApplied` and applied hostname guards
+advance after Pod-version and xDS convergence independently of managed DNS
+and private routing readiness. Private VNet, HostnameRoute, and TLS-decryption
+prerequisites block only their listener; shared account and DeviceSettings
+failures block all private listeners. Tunnel `Ready` retains its formula,
+while Gateway/listener `Programmed` reports private routing availability.
 
 ## Direct vs Gateway tunnel writer
 
@@ -80,8 +89,8 @@ When `Programmed` stays `False`, work the gate in order — see
 2. Envoy: every live Delta ADS stream proves the current resource fingerprints
    through ACKs or matching initial versions. A current NACK or a missing
    stream blocks convergence.
-3. DNS: every public listener hostname has a record in
-   `status.dnsRecords` (skipped for `dns.mode: External`).
+3. DNS: every public listener hostname has exactly one `state: Ready` entry in
+   `status.dnsRecords`, matching case-insensitively (skipped for `dns.mode: External`).
 4. Private listeners: `DeviceSettings` proxy flags, ready `VirtualNetwork`,
    ready `HostnameRoute`, and the origin-JWT TLS contract.
 

@@ -23,10 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/ir"
 )
 
 func TestEnsureDNSProjectsBoundedCNAMEObservations(t *testing.T) {
@@ -91,8 +94,11 @@ func TestEnsureDNSNeverMutatesForeignUnicodeCollision(t *testing.T) {
 		context.Background(), cloudflareClient, dnsParityTunnel(true, 1, false, false),
 		gatewayName, clusterID, "tunnel", []publicHostname{{Hostname: hostname, ZoneID: zoneID, ZoneName: "example"}},
 	)
-	if err != nil || conflict == "" || !strings.Contains(conflict, "not owned") || len(status) != 0 {
+	if err != nil || conflict == "" || !strings.Contains(conflict, "not owned") || len(status) != 1 {
 		t.Fatalf("ensureDNS() status=%#v conflict=%q error=%v", status, conflict, err)
+	}
+	if record := status[0]; record.Hostname != punycode || record.State != dnsRecordStateConflict || record.RecordID != "" || record.OwnershipComment != "" {
+		t.Fatalf("foreign record was not reported as an unowned conflict: %#v", record)
 	}
 	if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords"}) {
 		t.Fatalf("foreign DNS calls = %v", calls)
@@ -125,8 +131,11 @@ func TestEnsureDNSPreservesMarkerCarryingNonCNAME(t *testing.T) {
 		context.Background(), cloudflareClient, tunnel, gatewayName, clusterID, tunnelID,
 		[]publicHostname{{Hostname: hostname, ZoneID: zoneID, ZoneName: "example"}},
 	)
-	if err != nil || conflict == "" || !strings.Contains(conflict, "not owned") || len(status) != 0 {
+	if err != nil || conflict == "" || !strings.Contains(conflict, "not owned") || len(status) != 1 {
 		t.Fatalf("ensureDNS() status=%#v conflict=%q error=%v", status, conflict, err)
+	}
+	if record := status[0]; record.Hostname != punycode || record.State != dnsRecordStateConflict || record.RecordID != "" || record.OwnershipComment != "" {
+		t.Fatalf("non-CNAME record was not reported as an unowned conflict: %#v", record)
 	}
 	record, ok := cloudflareClient.DNSRecord(zoneID, "owned-a")
 	if !ok || record.Type != "A" || record.Content != "192.0.2.1" {
@@ -134,6 +143,80 @@ func TestEnsureDNSPreservesMarkerCarryingNonCNAME(t *testing.T) {
 	}
 	if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords"}) {
 		t.Fatalf("marker-carrying A record calls = %v", calls)
+	}
+}
+
+func TestEnsureDNSFreshConflictReportsListenerWithoutAdoptingForeignRecord(t *testing.T) {
+	const (
+		zoneID      = "zone-example"
+		clusterID   = "cluster"
+		gatewayName = "gateway"
+		tunnelID    = "tunnel"
+	)
+	for _, ambiguous := range []bool{false, true} {
+		name := "foreign CNAME"
+		if ambiguous {
+			name = "multiple records"
+		}
+		t.Run(name, func(t *testing.T) {
+			tunnel := dnsParityTunnel(true, 1, false, false)
+			owner := flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, gatewayName)
+			ipv4Only, ipv6Only := false, false
+			cloudflareClient := newFakeTunnelCloudflareFactory()
+			cloudflareClient.PutDNS(zoneID, RemoteDNSRecord{
+				ID: "healthy", Name: "a.example.com", Type: "CNAME", Content: tunnelCNAMETarget(tunnelID),
+				Comment: owner, TTL: 1, Proxied: true,
+				Settings: &flarecloudflare.DNSRecordSettings{IPv4Only: &ipv4Only, IPv6Only: &ipv6Only},
+			})
+			foreign := RemoteDNSRecord{ID: "foreign", Name: "b.example.com", Type: "CNAME", Content: "other-tunnel.cfargotunnel.com", Comment: "terraform"}
+			cloudflareClient.PutDNS(zoneID, foreign)
+			if ambiguous {
+				cloudflareClient.PutDNS(zoneID, RemoteDNSRecord{ID: "second-foreign", Name: foreign.Name, Type: "A", Content: "192.0.2.1"})
+			}
+
+			records, conflict, err := new(CloudflareTunnelReconciler).ensureDNS(
+				context.Background(), cloudflareClient, tunnel, gatewayName, clusterID, tunnelID,
+				[]publicHostname{{Hostname: "a.example.com", ZoneID: zoneID}, {Hostname: "b.example.com", ZoneID: zoneID}},
+			)
+			if err != nil || conflict == "" || len(records) != 2 {
+				t.Fatalf("ensureDNS() records=%#v conflict=%q error=%v", records, conflict, err)
+			}
+			conflicted := records[1]
+			if conflicted.Hostname != foreign.Name || conflicted.ZoneID != zoneID || conflicted.State != dnsRecordStateConflict || conflicted.RecordID != "" || conflicted.OwnershipComment != "" {
+				t.Fatalf("fresh conflict claimed foreign ownership: %#v", conflicted)
+			}
+			tunnel.Status.DNSRecords = records
+			compiled := &ir.Gateway{Listeners: []ir.Listener{
+				{Name: "a", Hostname: "a.example.com", Exposure: ir.ExposurePublic},
+				{Name: "b", Hostname: "b.example.com", Exposure: ir.ExposurePublic},
+			}}
+			status := gatewayv1.GatewayStatus{Listeners: []gatewayv1.ListenerStatus{{Name: "a"}, {Name: "b"}}}
+			new(GatewayReconciler).setCloudflareDNSProgrammedStatus(&status, &gatewayv1.Gateway{}, compiled, tunnel, true, "Waiting for managed DNS", privatePrerequisiteResult{})
+			global := meta.FindStatusCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+			healthy := meta.FindStatusCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			blocked := meta.FindStatusCondition(status.Listeners[1].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			if global == nil || global.Status != metav1.ConditionFalse || healthy == nil || healthy.Status != metav1.ConditionTrue || blocked == nil || blocked.Status != metav1.ConditionFalse || blocked.Reason != "DNSConflict" {
+				t.Fatalf("DNS conflict readiness: Gateway=%#v healthy=%#v blocked=%#v", global, healthy, blocked)
+			}
+
+			// Removing the listener drops the unowned conflict projection;
+			// it must never turn the foreign record into a deletion target.
+			remaining, cleanupConflict, err := removeDNSRecords(context.Background(), cloudflareClient, []string{owner}, []string{tunnelCNAMETarget(tunnelID)}, []v1alpha1.CloudflareTunnelDNSRecordStatus{conflicted})
+			if err != nil || cleanupConflict != "" || len(remaining) != 0 {
+				t.Fatalf("unowned conflict cleanup: remaining=%#v conflict=%q error=%v", remaining, cleanupConflict, err)
+			}
+			if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords", "ListDNSRecords", "ListDNSRecords"}) {
+				t.Fatalf("foreign conflict triggered a DNS write: %v", calls)
+			}
+			if got, present := cloudflareClient.DNSRecord(zoneID, foreign.ID); !present || got.Content != foreign.Content || got.Comment != foreign.Comment || got.Type != foreign.Type {
+				t.Fatalf("foreign DNS record mutated: %#v, present=%t", got, present)
+			}
+			if ambiguous {
+				if got, present := cloudflareClient.DNSRecord(zoneID, "second-foreign"); !present || got.Type != "A" || got.Content != "192.0.2.1" {
+					t.Fatalf("ambiguous DNS record mutated: %#v, present=%t", got, present)
+				}
+			}
+		})
 	}
 }
 

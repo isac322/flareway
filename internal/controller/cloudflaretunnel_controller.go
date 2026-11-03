@@ -1078,6 +1078,16 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 		desiredHostnames[normalized] = true
 	}
 	conflicts := make([]string, 0)
+	appendConflict := func(host publicHostname) {
+		previous, found := previousByHostname[host.Hostname]
+		if !found {
+			// Project the conflict without claiming the foreign record's
+			// identity or ownership as a managed DNS checkpoint.
+			previous = v1alpha1.CloudflareTunnelDNSRecordStatus{Hostname: host.Hostname, ZoneID: host.ZoneID}
+		}
+		previous.State = dnsRecordStateConflict
+		result = append(result, previous)
+	}
 	for _, previous := range tunnel.Status.DNSRecords {
 		normalized, err := flarecloudflare.NormalizeDNSHostname(previous.Hostname)
 		if err != nil {
@@ -1116,10 +1126,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 		}
 		if len(records) > 1 {
 			conflicts = append(conflicts, fmt.Sprintf("multiple DNS records already exist for %s", host.Hostname))
-			if previous, ok := previousByHostname[host.Hostname]; ok {
-				previous.State = dnsRecordStateConflict
-				result = append(result, previous)
-			}
+			appendConflict(host)
 			continue
 		}
 
@@ -1134,10 +1141,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 			owned, reason := dnsRecordOwnedByGateway(record, ownershipMarkers)
 			if !owned {
 				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (%s)", host.Hostname, reason))
-				if previous, ok := previousByHostname[host.Hostname]; ok {
-					previous.State = dnsRecordStateConflict
-					result = append(result, previous)
-				}
+				appendConflict(host)
 				continue
 			}
 			if !dnsRecordMatches(record, desired) {

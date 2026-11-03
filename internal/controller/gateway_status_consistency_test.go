@@ -574,11 +574,11 @@ var _ = ginkgo.Describe("Gateway tunnel status consistency (issue 92)", func() {
 		gomega.Expect(f.condition(v1alpha1.CloudflareTunnelConditionConfigApplied).Status).To(gomega.Equal(metav1.ConditionTrue))
 	})
 
-	// QA-92-21: in managed DNS mode a missing record keeps the gate open until
-	// the tunnel controller creates it. The CreateCNAME failure is armed on
-	// the fixture's own tunnel Cloudflare fake before provisioning so the
-	// record is absent from the first pass.
-	ginkgo.It("QA-92-21 keeps ConfigApplied=False while managed DNS records are absent", func() {
+	// QA-92-21: managed DNS readiness gates Programmed independently of
+	// configuration convergence. The fixture steps the tunnel controller
+	// explicitly, so the missing record stays absent while xDS and the
+	// dataplane converge.
+	ginkgo.It("QA-92-21 converges ConfigApplied while absent managed DNS keeps Programmed=False", func() {
 		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{
 			dnsMode: v1alpha1.DNSModeManaged,
 			beforeProvision: func(f *qa92Fixture) {
@@ -588,14 +588,32 @@ var _ = ginkgo.Describe("Gateway tunnel status consistency (issue 92)", func() {
 
 		_, err := f.reconciler.Reconcile(f.ctx, f.request)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		condition := f.condition(v1alpha1.CloudflareTunnelConditionConfigApplied)
-		gomega.Expect(condition.Status).To(gomega.Equal(metav1.ConditionFalse))
-		gomega.Expect(condition.Message).To(gomega.ContainSubstring("DNS"))
+		gomega.Expect(f.tunnel().Status.DNSRecords).To(gomega.BeEmpty())
+
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+		f.prober.version = f.remote.remoteVersion
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.tunnel().Status.DNSRecords).To(gomega.BeEmpty())
+		gomega.Expect(f.condition(v1alpha1.CloudflareTunnelConditionConfigApplied).Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(f.tunnel().Status.ConfigVersion.Applied).To(gomega.Equal(f.remote.remoteVersion))
 		gomega.Expect(f.gatewayProgrammed().Status).To(gomega.Equal(metav1.ConditionFalse))
+		var current gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &current)).To(gomega.Succeed())
+		gomega.Expect(current.Status.Listeners).To(gomega.HaveLen(1))
+		listenerProgrammed := meta.FindStatusCondition(current.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		gomega.Expect(listenerProgrammed).NotTo(gomega.BeNil())
+		gomega.Expect(listenerProgrammed.Status).To(gomega.Equal(metav1.ConditionFalse))
 
 		f.tunnelRemote.ClearFailure("CreateCNAME")
 		f.converge()
+		gomega.Expect(f.tunnel().Status.DNSRecords).NotTo(gomega.BeEmpty())
 		gomega.Expect(f.condition(v1alpha1.CloudflareTunnelConditionConfigApplied).Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(f.gatewayProgrammed().Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &current)).To(gomega.Succeed())
+		listenerProgrammed = meta.FindStatusCondition(current.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		gomega.Expect(listenerProgrammed).NotTo(gomega.BeNil())
+		gomega.Expect(listenerProgrammed.Status).To(gomega.Equal(metav1.ConditionTrue))
 	})
 
 	// QA-92-22: a pending private listener blocks the gate and reports the
