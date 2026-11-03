@@ -44,7 +44,7 @@ Under the default profile, an externally deleted or replaced Flareway CNAME is a
 
 ## The drift sweep
 
-A single leader-elected worker lists each resource kind once per grade period and compares the result against cluster state. It classifies three cases:
+A single leader-elected worker lists each enabled sweep target once per grade period and compares the result against cluster state. It filters targets by controller group before starting the target loops.
 
 | Case | Meaning | Action |
 |---|---|---|
@@ -53,6 +53,20 @@ A single leader-elected worker lists each resource kind once per grade period an
 | Orphan | A remote object carries Flareway's ownership marker but no Kubernetes object claims it | Report only |
 
 The sweep reports orphans and never deletes them. Deleting a remote object is destructive and stays with the owning reconciler's teardown path, which re-reads the remote before acting.
+
+### Controller-group sweep selection
+
+The sweep target set follows the five controller group flags:
+
+| Group | Sweep targets |
+|---|---|
+| Gateway | `DNSRecord`, `CloudflareTunnel` |
+| Access | `AccessApplication`, `AccessStandaloneApplication`, `AccessInfrastructureTarget`, `AccessCustomPage`, `AccessPolicy`, `AccessGroup`, `IdentityProvider`, `DevicePostureRule`, `DevicePostureIntegration`, `ServiceToken` |
+| Private Network | `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, `WARPConnector` |
+| Device | `DeviceProfile` |
+| Organization | `ZeroTrustGatewayPolicy`, `ZeroTrustList` |
+
+`DeviceSettings` and `ZeroTrustOrganization` are singleton APIs, so they are not sweep targets. With every group enabled, the sweep retains all 19 targets. A disabled group stops its reconcilers, contributes no sweep targets, and makes no corresponding remote list calls; its objects remain unverified until the group is re-enabled. Re-enabling it restores the reconcilers and sweep targets. Explicitly disabling every group leaves the target set empty. The sweep API budget counts enabled targets only. `--disable-sweep` remains an all-or-nothing switch for the entire sweep.
 
 ### Content confirmation
 
@@ -95,9 +109,9 @@ Confirmations live in operator memory. After a restart or leader change, each ob
 
 ## API budget and DNS zone scope
 
-The sweep lists each resource kind once per period, regardless of how many objects exist. For kinds whose listing shows everything a reconciler checks, that listing also stands in for each object's own re-verify (see [Content confirmation](#content-confirmation)), so a converged object reads nothing until the sweep reports drift on it or the sweep stops. For those objects, steady-state Cloudflare API traffic does not grow with their number. Every other object reads its remote once per freshness TTL.
+The sweep lists each enabled resource kind once per period, regardless of how many objects exist. For kinds whose listing shows everything a reconciler checks, that listing also stands in for each object's own re-verify (see [Content confirmation](#content-confirmation)), so a converged object reads nothing until the sweep reports drift on it or the sweep stops. For those objects, steady-state Cloudflare API traffic does not grow with their number. Every other object reads its remote once per freshness TTL.
 
-The sweep runs on a dedicated `0.5 req/s` budget, separate from the `3.5 req/s` reconciler budget, so the two together stay inside Cloudflare's `4.0 req/s` account limit. It starts each kind on a staggered delay so a restart does not produce a burst.
+The sweep runs on a dedicated `0.5 req/s` budget for enabled targets, separate from the `3.5 req/s` reconciler budget, so the two together stay inside Cloudflare's `4.0 req/s` account limit. It starts each enabled kind on a staggered delay so a restart does not produce a burst.
 
 The sweep never treats a partial page as a complete list, because a partial list would make healthy objects look missing. For most kinds, a listing that fails partway through discards the whole pass.
 

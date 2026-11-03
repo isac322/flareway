@@ -138,7 +138,9 @@ type AccountSweeperOptions struct {
 	OperatorNamespace string
 	RateLimit         float64
 	RateBurst         int
-	Targets           []TargetDescriptor
+	// Targets defaults to all sweepable kinds only when nil. A non-nil empty
+	// selection starts no target loops.
+	Targets []TargetDescriptor
 	// Events is the shared wakeup channel owned by Sweeper.
 	Events chan event.GenericEvent
 	Logger logr.Logger
