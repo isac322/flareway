@@ -26,6 +26,20 @@ All controller groups default to enabled. The values map directly to the control
 
 Disabling a group changes which controller owns remote objects. Follow the [controller group steps](https://flareway.bhyoo.com/docs/operations/upgrade/#changing-controller-groups) before turning one off.
 
+### Drift sweep ownership
+
+The periodic drift sweep uses the same five group flags, but it lists only the remote objects owned by enabled groups:
+
+| Group | Sweep targets |
+|---|---|
+| Gateway | `DNSRecord`, `CloudflareTunnel` |
+| Access | `AccessApplication`, `AccessStandaloneApplication`, `AccessInfrastructureTarget`, `AccessCustomPage`, `AccessPolicy`, `AccessGroup`, `IdentityProvider`, `DevicePostureRule`, `DevicePostureIntegration`, `ServiceToken` |
+| Private Network | `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, `WARPConnector` |
+| Device | `DeviceProfile` |
+| Organization | `ZeroTrustGatewayPolicy`, `ZeroTrustList` |
+
+`DeviceSettings` and `ZeroTrustOrganization` are singleton APIs, so they are not sweep targets. With all groups enabled, the sweep has all 19 targets. Disabling a group stops its reconcilers, removes its targets and their remote list calls, and leaves those objects unverified until the group is enabled again. Re-enabling the group restores the reconcilers and sweep targets. Explicitly disabling every group leaves the sweep target set empty. The sweep API budget counts enabled targets, and `reconcile.disableSweep=true` remains an all-or-nothing switch that disables every sweep target.
+
 ## Tunnel runtime settings
 
 Tunnel configuration mode and management-token issuance are resource-level settings, not chart-level runtime defaults:

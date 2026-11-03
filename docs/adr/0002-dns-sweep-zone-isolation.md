@@ -6,7 +6,7 @@
 
 ## Context
 
-The account sweeper lists each Cloudflare resource kind once per period and compares the listing with local state to find drift: records that are missing, mismatched, or orphaned. See [Freshness and drift](../operations/freshness-and-drift.md) for the operator view.
+The account sweeper lists each enabled sweep target once per period and compares the listing with local state to find drift: records that are missing, mismatched, or orphaned. See [Freshness and drift](../operations/freshness-and-drift.md) for the operator view.
 
 For every kind the sweep follows one fail-closed rule. A listing that fails partway is never judged, because an incomplete list would make healthy objects look missing. A definitive client rejection (HTTP 4xx) records `result="error"`, and any other failure records `result="partial"`. Either way the pass dispatches nothing.
 

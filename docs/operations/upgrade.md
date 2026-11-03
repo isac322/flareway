@@ -35,12 +35,14 @@ Prefer a reviewed values file. Use `--reuse-values` instead only when the values
 
 ## Changing controller groups
 
-Controller groups are an ownership boundary. Before disabling a group:
+Controller groups are an ownership boundary and also select the sweep targets and remote list calls. Before disabling a group:
 
 1. Set affected remote objects to `managementPolicy: ObserveOnly`, or complete deletion while the controller still runs.
 2. Wait for status to reflect the intended observed or deleted state.
 3. Confirm no finalizer depends on that controller group.
 4. Disable the group in the Helm values.
+
+Disabling a group stops its reconcilers, removes its sweep targets and list calls, and leaves its objects unverified until the group is re-enabled. Re-enabling the group restores the reconcilers, sweep targets, and list calls. The sweep API budget counts only enabled targets. `DeviceSettings` and `ZeroTrustOrganization` are singleton APIs and are not sweep targets. No CRD or other schema migration is required for changing controller-group flags.
 
 Re-enable the group before changing an object back to `Managed`. Never run two Flareway installations that manage the same Cloudflare object. See [Ownership, adoption, and teardown](../concepts/ownership-and-adoption.md) for how Flareway proves ownership.
 

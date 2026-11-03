@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Scope periodic drift-sweep targets and remote list calls to enabled controller
+  groups, preserving Gateway DNS and Tunnel checks without requiring permissions
+  for disabled features (#163).
+
 ### Changed
 
 - Upgrade the Go toolchain to 1.27.3 and refresh Go modules, including the

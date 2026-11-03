@@ -41,42 +41,81 @@ const (
 	accessBypassTagPrefix = flarecloudflare.AccessBypassTagPrefix
 )
 
-// defaultTargets registers every sweepable kind. Kinds without a
-// list-capable remote API are documented in the package doc instead.
-//
-// Grades are not chosen here. They come from freshness.GradeForKind so the
-// sweep period and the reconciler gate TTL for a kind can never disagree: a
-// sweep slower than its gate would let the operator claim a drift-detection
-// bound it does not actually honour. A kind missing from that table is a
-// programming error and panics at startup rather than silently sweeping on
-// some invented period.
+// ControllerGroups selects the controller groups whose remote resources are
+// swept. SweeperOptions uses nil to retain the historical all-target default.
+type ControllerGroups struct {
+	Gateway        bool
+	Access         bool
+	PrivateNetwork bool
+	Device         bool
+	Organization   bool
+}
+
+type controllerGroup uint8
+
+const (
+	gatewayGroup controllerGroup = iota
+	accessGroup
+	privateNetworkGroup
+	deviceGroup
+	organizationGroup
+)
+
+type sweepTargetSpec struct {
+	kind  string
+	group controllerGroup
+	sweep func(ctx context.Context, runner *AccountSweeper) ([]DriftItem, error)
+}
+
+// sweepTargetRegistry is the single ordered registry of every sweepable kind.
+// DeviceSettings and ZeroTrustOrganization use singleton APIs and are not
+// sweepable. Keep the historical order when every group is enabled.
+var sweepTargetRegistry = []sweepTargetSpec{
+	{"AccessApplication", accessGroup, sweepAccessApplications},
+	{"AccessStandaloneApplication", accessGroup, sweepAccessStandaloneApplications},
+	{"AccessPolicy", accessGroup, sweepAccessPolicies},
+	{"AccessGroup", accessGroup, sweepAccessGroups},
+	{"ServiceToken", accessGroup, sweepServiceTokens},
+	{"IdentityProvider", accessGroup, sweepIdentityProviders},
+	{"AccessCustomPage", accessGroup, sweepAccessCustomPages},
+	{"AccessInfrastructureTarget", accessGroup, sweepAccessInfrastructureTargets},
+	{"DNSRecord", gatewayGroup, sweepDNSRecords},
+	{"CloudflareTunnel", gatewayGroup, sweepCloudflareTunnels},
+	{"ZeroTrustGatewayPolicy", organizationGroup, sweepZeroTrustGatewayPolicies},
+	{"ZeroTrustList", organizationGroup, sweepZeroTrustLists},
+	{"VirtualNetwork", privateNetworkGroup, sweepVirtualNetworks},
+	{"NetworkRoute", privateNetworkGroup, sweepNetworkRoutes},
+	{"HostnameRoute", privateNetworkGroup, sweepHostnameRoutes},
+	{"DeviceProfile", deviceGroup, sweepDeviceProfiles},
+	{"DevicePostureRule", accessGroup, sweepDevicePostureRules},
+	{"DevicePostureIntegration", accessGroup, sweepDevicePostureIntegrations},
+	{"WARPConnector", privateNetworkGroup, sweepWARPConnectors},
+}
+
+// defaultTargets returns every sweepable target in the historical order.
 func defaultTargets() []TargetDescriptor {
-	specs := []struct {
-		kind  string
-		sweep func(ctx context.Context, runner *AccountSweeper) ([]DriftItem, error)
-	}{
-		{"AccessApplication", sweepAccessApplications},
-		{"AccessStandaloneApplication", sweepAccessStandaloneApplications},
-		{"AccessPolicy", sweepAccessPolicies},
-		{"AccessGroup", sweepAccessGroups},
-		{"ServiceToken", sweepServiceTokens},
-		{"IdentityProvider", sweepIdentityProviders},
-		{"AccessCustomPage", sweepAccessCustomPages},
-		{"AccessInfrastructureTarget", sweepAccessInfrastructureTargets},
-		{"DNSRecord", sweepDNSRecords},
-		{"CloudflareTunnel", sweepCloudflareTunnels},
-		{"ZeroTrustGatewayPolicy", sweepZeroTrustGatewayPolicies},
-		{"ZeroTrustList", sweepZeroTrustLists},
-		{"VirtualNetwork", sweepVirtualNetworks},
-		{"NetworkRoute", sweepNetworkRoutes},
-		{"HostnameRoute", sweepHostnameRoutes},
-		{"DeviceProfile", sweepDeviceProfiles},
-		{"DevicePostureRule", sweepDevicePostureRules},
-		{"DevicePostureIntegration", sweepDevicePostureIntegrations},
-		{"WARPConnector", sweepWARPConnectors},
+	return targetsForGroups(ControllerGroups{
+		Gateway: true, Access: true, PrivateNetwork: true,
+		Device: true, Organization: true,
+	})
+}
+
+func targetsForGroups(groups ControllerGroups) []TargetDescriptor {
+	if !groups.Gateway && !groups.Access && !groups.PrivateNetwork && !groups.Device && !groups.Organization {
+		return []TargetDescriptor{}
 	}
-	targets := make([]TargetDescriptor, 0, len(specs))
-	for _, spec := range specs {
+	enabled := [...]bool{
+		gatewayGroup:        groups.Gateway,
+		accessGroup:         groups.Access,
+		privateNetworkGroup: groups.PrivateNetwork,
+		deviceGroup:         groups.Device,
+		organizationGroup:   groups.Organization,
+	}
+	targets := make([]TargetDescriptor, 0, len(sweepTargetRegistry))
+	for _, spec := range sweepTargetRegistry {
+		if !enabled[spec.group] {
+			continue
+		}
 		grade, found := freshness.GradeForKind(spec.kind)
 		if !found {
 			panic("sweep: no canonical freshness grade for kind " + spec.kind)

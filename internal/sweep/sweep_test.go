@@ -21,17 +21,399 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	"github.com/isac322/flareway/internal/observability"
+	"github.com/isac322/flareway/test/cfstub"
 )
+
+func TestGatewayOnlySweeperDoesNotListDisabledGroups(t *testing.T) {
+	f := newGroupSweepFixture(t, &ControllerGroups{Gateway: true}, nil)
+	// Model a Gateway-only token: every disabled group's endpoint rejects reads.
+	f.stub.Fault(http.MethodGet, `^/(accounts/[^/]+/(access|infrastructure|devices|gateway|teamnet|zerotrust|warp_connector)(/|$)|zones/[^/]+/access/)`,
+		cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+	findings := f.runSelected(t, []string{"DNSRecord", "CloudflareTunnel"})
+	requireGatewaySweepDrift(t, findings)
+}
+
+// These literals deliberately do not come from the production target registry.
+// The HTTP oracle rejects every extra call, including singleton reads and writes.
+var sweepListRequests = map[string][]string{
+	"AccessApplication":           {"/accounts/account-1/access/apps", "/zones/zone-1/access/apps"},
+	"AccessStandaloneApplication": {"/accounts/account-1/access/apps", "/zones/zone-1/access/apps"},
+	"AccessPolicy":                {"/accounts/account-1/access/policies"},
+	"AccessGroup":                 {"/accounts/account-1/access/groups", "/zones/zone-1/access/groups"},
+	"ServiceToken":                {"/accounts/account-1/access/service_tokens", "/zones/zone-1/access/service_tokens"},
+	"IdentityProvider":            {"/accounts/account-1/access/identity_providers"},
+	"AccessCustomPage":            {"/accounts/account-1/access/custom_pages"},
+	"AccessInfrastructureTarget":  {"/accounts/account-1/infrastructure/targets"},
+	"DNSRecord":                   {"/zones/zone-1/dns_records"},
+	"CloudflareTunnel":            {"/accounts/account-1/cfd_tunnel"},
+	"ZeroTrustGatewayPolicy":      {"/accounts/account-1/gateway/rules"},
+	"ZeroTrustList":               {"/accounts/account-1/gateway/lists"},
+	"VirtualNetwork":              {"/accounts/account-1/teamnet/virtual_networks"},
+	"NetworkRoute":                {"/accounts/account-1/teamnet/routes"},
+	"HostnameRoute":               {"/accounts/account-1/zerotrust/routes/hostname"},
+	"DeviceProfile":               {"/accounts/account-1/devices/policies"},
+	"DevicePostureRule":           {"/accounts/account-1/devices/posture"},
+	"DevicePostureIntegration":    {"/accounts/account-1/devices/posture/integration"},
+	"WARPConnector":               {"/accounts/account-1/warp_connector"},
+}
+
+var allSweepKinds = []string{
+	"AccessApplication", "AccessStandaloneApplication", "AccessPolicy", "AccessGroup",
+	"ServiceToken", "IdentityProvider", "AccessCustomPage", "AccessInfrastructureTarget",
+	"DNSRecord", "CloudflareTunnel", "ZeroTrustGatewayPolicy", "ZeroTrustList",
+	"VirtualNetwork", "NetworkRoute", "HostnameRoute", "DeviceProfile",
+	"DevicePostureRule", "DevicePostureIntegration", "WARPConnector",
+}
+
+type groupSweepFixture struct {
+	stub    *cfstub.Server
+	sweeper *Sweeper
+	account *v1alpha1.CloudflareAccount
+	runner  *AccountSweeper
+}
+
+func newGroupSweepFixture(t *testing.T, groups *ControllerGroups, targets []TargetDescriptor) *groupSweepFixture {
+	t.Helper()
+	stub := cfstub.New(t)
+	stub.State.Set("/accounts/account-1/devices/posture/integration", []cfstub.AccessResource{})
+	stub.State.AddZone(cfstub.Zone{ID: "zone-1", Name: "example.com", AccountID: "account-1"})
+	stub.State.AddTunnel(cfstub.Tunnel{
+		ID: "remote-tunnel", AccountID: "account-1", AccountTag: "account-1",
+		Name: "unexpected-name", Status: "inactive", TunType: "cfd_tunnel", ConfigSrc: "cloudflare",
+	})
+	// cfstub owns the stateful endpoints above; these list-only endpoints
+	// have no stored objects in this scenario and return the real empty envelope.
+	for _, path := range []string{
+		`^/accounts/[^/]+/access/custom_pages$`,
+		`^/accounts/[^/]+/infrastructure/targets$`,
+		`^/accounts/[^/]+/warp_connector$`,
+	} {
+		stub.Handle(http.MethodGet, path, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"success":true,"errors":[],"messages":[],"result":[],"result_info":{"page":1,"per_page":100,"count":0,"total_count":0,"total_pages":1}}`)
+		})
+	}
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	account := probeAccount([]string{"*"})
+	account.Spec.Credentials.APITokenSecretRef = v1alpha1.NamespacedSecretKeyReference{
+		Namespace: "operator", Name: "cloudflare-token", Key: "token",
+	}
+	account.Status.Conditions = []metav1.Condition{
+		{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue},
+		{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue},
+	}
+	tunnel := probeTunnel("gw", v1alpha1Checkpoint("app.example.com", "missing-record", "zone-1", probeMarker("gw")))
+	tunnel.Status.TunnelID = "remote-tunnel"
+	tunnel.UID = types.UID("tunnel-uid")
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(
+		account, tunnel,
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "operator", Name: "cloudflare-token"},
+			Data:       map[string][]byte{"token": []byte("token")},
+		},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID(probeClusterID)}},
+	).Build()
+	worker := NewSweeper(SweeperOptions{
+		Client:            kube,
+		APIReader:         kube,
+		CloudflareFactory: flarecloudflare.NewFactory(logr.Discard(), flarecloudflare.WithBaseURL(stub.URL)),
+		ControllerGroups:  groups,
+		Targets:           targets,
+		Logger:            logr.Discard(),
+		OperatorNamespace: probeOperatorNamespace,
+		SweepRateLimit:    1e9,
+	})
+	// Use real ready-account discovery and worker startup to exercise target
+	// propagation. Zero TTLs keep timer-driven passes disabled; after the Stop
+	// barrier each test drives the selected real targets deterministically.
+	worker.reconcileAccounts(context.Background())
+	runner, started := worker.accounts[account.Name]
+	if !started {
+		t.Fatal("ready account did not start a worker")
+	}
+	worker.stopAll()
+	return &groupSweepFixture{stub: stub, sweeper: worker, account: account, runner: runner}
+}
+
+func (f *groupSweepFixture) runSelected(t *testing.T, wantKinds []string) map[string][]DriftItem {
+	t.Helper()
+	findings := make(map[string][]DriftItem)
+	for _, target := range f.runner.targets {
+		if _, duplicate := findings[target.Kind]; duplicate {
+			t.Errorf("%s target executed more than once", target.Kind)
+		}
+		items, result, err := f.runner.RunTargetOnce(context.Background(), target)
+		if err != nil || result != observability.SweepResultOK {
+			t.Errorf("%s pass = (%#v, %q, %v), want complete pass", target.Kind, items, result, err)
+		}
+		findings[target.Kind] = items
+	}
+	if got := targetKinds(f.runner.targets); !slices.Equal(got, wantKinds) {
+		t.Errorf("executed targets = %v, want %v", got, wantKinds)
+	}
+	requireSweepRequests(t, f.stub.Journal(), wantKinds)
+	return findings
+}
+
+func requireSweepRequests(t *testing.T, calls []cfstub.Call, kinds []string, extraPaths ...string) {
+	t.Helper()
+	// Compare endpoint sets across the complete journal, not counts: setup,
+	// discovery and SDK pagination may legitimately repeat selected endpoints.
+	want := make(map[string]bool)
+	for _, kind := range kinds {
+		paths, known := sweepListRequests[kind]
+		if !known {
+			t.Fatalf("test has no independent request oracle for %s", kind)
+		}
+		for _, path := range paths {
+			want[path] = true
+		}
+		switch kind {
+		case "AccessApplication", "AccessStandaloneApplication", "AccessGroup", "ServiceToken", "DNSRecord":
+			want["/zones"] = true
+		}
+	}
+	for _, path := range extraPaths {
+		want[path] = true
+	}
+	seen := make(map[string]bool)
+	for _, call := range calls {
+		if call.Method != http.MethodGet {
+			t.Errorf("sweep mutated remote state: %s %s", call.Method, call.Path)
+		}
+		parsed, err := url.Parse(call.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := strings.TrimPrefix(parsed.Path, "/client/v4")
+		if !want[path] {
+			t.Errorf("unexpected endpoint in complete request journal: %s %s", call.Method, call.Path)
+		}
+		seen[path] = true
+	}
+	for path := range want {
+		if !seen[path] {
+			t.Errorf("required sweep endpoint %q was not called", path)
+		}
+	}
+}
+
+func requireGatewaySweepDrift(t *testing.T, findings map[string][]DriftItem) {
+	t.Helper()
+	requireItems(t, findings["DNSRecord"], DriftItem{
+		Case: DriftCaseMissing, RemoteID: "missing-record",
+		TargetKind: "CloudflareTunnel", NamespacedName: probeKey("gw"),
+	})
+	requireItems(t, findings["CloudflareTunnel"], DriftItem{
+		Case: DriftCaseMismatch, RemoteID: "remote-tunnel",
+		TargetKind: "CloudflareTunnel", NamespacedName: probeKey("gw"),
+	})
+}
+
+func TestSweeperControllerGroupOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		groups ControllerGroups
+		kinds  []string
+	}{
+		{"access", ControllerGroups{Access: true}, []string{
+			"AccessApplication", "AccessStandaloneApplication", "AccessPolicy", "AccessGroup",
+			"ServiceToken", "IdentityProvider", "AccessCustomPage", "AccessInfrastructureTarget",
+			"DevicePostureRule", "DevicePostureIntegration",
+		}},
+		{"private-network", ControllerGroups{PrivateNetwork: true}, []string{
+			"VirtualNetwork", "NetworkRoute", "HostnameRoute", "WARPConnector",
+		}},
+		{"device", ControllerGroups{Device: true}, []string{"DeviceProfile"}},
+		{"organization", ControllerGroups{Organization: true}, []string{"ZeroTrustGatewayPolicy", "ZeroTrustList"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGroupSweepFixture(t, &tc.groups, nil)
+			f.runSelected(t, tc.kinds)
+		})
+	}
+}
+
+func TestMixedControllerGroupsPreserveSelectedSweeps(t *testing.T) {
+	f := newGroupSweepFixture(t, &ControllerGroups{Gateway: true, PrivateNetwork: true, Device: true}, nil)
+	findings := f.runSelected(t, []string{
+		"DNSRecord", "CloudflareTunnel", "VirtualNetwork", "NetworkRoute", "HostnameRoute",
+		"DeviceProfile", "WARPConnector",
+	})
+	requireGatewaySweepDrift(t, findings)
+}
+
+func TestAllControllerGroupsPreserveSweepBehavior(t *testing.T) {
+	f := newGroupSweepFixture(t, &ControllerGroups{
+		Gateway: true, Access: true, PrivateNetwork: true, Device: true, Organization: true,
+	}, nil)
+	requireGatewaySweepDrift(t, f.runSelected(t, allSweepKinds))
+}
+
+func TestUnspecifiedSweepTargetsRetainDefaults(t *testing.T) {
+	t.Run("manager constructor", func(t *testing.T) {
+		f := newGroupSweepFixture(t, nil, nil)
+		requireGatewaySweepDrift(t, f.runSelected(t, allSweepKinds))
+	})
+	t.Run("account constructor", func(t *testing.T) {
+		f := newGroupSweepFixture(t, nil, []TargetDescriptor{})
+		f.runner = NewAccountSweeper(AccountSweeperOptions{
+			AccountName: f.account.Name, AccountID: f.account.Spec.AccountID, Token: "token",
+			Factory: f.sweeper.cloudflareFactory, Client: f.sweeper.client,
+			OperatorNamespace: probeOperatorNamespace, RateLimit: 1e9, Logger: logr.Discard(),
+		})
+		requireGatewaySweepDrift(t, f.runSelected(t, allSweepKinds))
+	})
+}
+
+func TestExplicitEmptySweepTargetsRemainEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		groups  *ControllerGroups
+		targets []TargetDescriptor
+	}{
+		{"explicit targets override enabled groups", &ControllerGroups{Gateway: true, Access: true, PrivateNetwork: true, Device: true, Organization: true}, []TargetDescriptor{}},
+		{"all groups disabled", &ControllerGroups{}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGroupSweepFixture(t, tc.groups, tc.targets)
+			f.stub.Fault(http.MethodGet, `.*`, cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+			if f.sweeper.targets == nil || len(f.sweeper.targets) != 0 {
+				t.Fatalf("manager target selection = %#v, want non-nil empty", f.sweeper.targets)
+			}
+			if f.runner.targets == nil || len(f.runner.targets) != 0 {
+				t.Fatalf("account constructor target selection = %#v, want non-nil empty", f.runner.targets)
+			}
+			f.runner.Start(context.Background())
+			f.runner.Stop()
+			f.sweeper.reconcileAccounts(context.Background())
+			worker, started := f.sweeper.accounts[f.account.Name]
+			if !started {
+				t.Fatal("ready account did not start a worker")
+			}
+			// Stop is the barrier: no target can make a request after this returns.
+			f.sweeper.stopAll()
+			if worker.targets == nil || len(worker.targets) != 0 {
+				t.Fatalf("started account worker targets = %#v, want non-nil empty", worker.targets)
+			}
+			requireSweepRequests(t, f.stub.Journal(), nil)
+		})
+	}
+}
+
+func TestReenablingControllerGroupsRestoresTheirSweeps(t *testing.T) {
+	disabled := newGroupSweepFixture(t, &ControllerGroups{Gateway: true}, nil)
+	requireGatewaySweepDrift(t, disabled.runSelected(t, []string{"DNSRecord", "CloudflareTunnel"}))
+	enabled := newGroupSweepFixture(t, &ControllerGroups{Gateway: true, Access: true}, nil)
+	requireGatewaySweepDrift(t, enabled.runSelected(t, []string{
+		"AccessApplication", "AccessStandaloneApplication", "AccessPolicy", "AccessGroup",
+		"ServiceToken", "IdentityProvider", "AccessCustomPage", "AccessInfrastructureTarget",
+		"DNSRecord", "CloudflareTunnel", "DevicePostureRule", "DevicePostureIntegration",
+	}))
+}
+
+func TestEnabledTargetForbiddenDoesNotStopHealthyTargets(t *testing.T) {
+	f := newGroupSweepFixture(t, &ControllerGroups{Gateway: true, Organization: true}, nil)
+	list := &v1alpha1.ZeroTrustList{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "missing-list"},
+		Spec: v1alpha1.ZeroTrustListSpec{
+			AccountRef: corev1.LocalObjectReference{Name: probeAccountName},
+			Name:       "list", ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+		Status: v1alpha1.ZeroTrustListStatus{ListID: "missing-list"},
+	}
+	if err := f.sweeper.client.Create(context.Background(), list); err != nil {
+		t.Fatal(err)
+	}
+	f.stub.Fault(http.MethodGet, `^/accounts/[^/]+/gateway/rules$`, cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+	findings := make(map[string][]DriftItem)
+	for _, target := range f.runner.targets {
+		items, result, err := f.runner.RunTargetOnce(context.Background(), target)
+		if target.Kind == "ZeroTrustGatewayPolicy" {
+			var apiError *cloudflaresdk.Error
+			if result != observability.SweepResultError || !errors.As(err, &apiError) || apiError.StatusCode != http.StatusForbidden || items != nil {
+				t.Fatalf("forbidden pass = (%#v, %q, %v), want error/403 and no unsafe findings", items, result, err)
+			}
+		} else if err != nil || result != observability.SweepResultOK {
+			t.Fatalf("healthy %s pass = (%#v, %q, %v)", target.Kind, items, result, err)
+		}
+		findings[target.Kind] = items
+	}
+	requireGatewaySweepDrift(t, findings)
+	requireItems(t, findings["ZeroTrustList"], DriftItem{
+		Case: DriftCaseMissing, RemoteID: "missing-list",
+		TargetKind: "ZeroTrustList", NamespacedName: probeKey("missing-list"),
+	})
+	requireSweepRequests(t, f.stub.Journal(), []string{"DNSRecord", "CloudflareTunnel", "ZeroTrustGatewayPolicy", "ZeroTrustList"})
+}
+
+func TestSelectedDNSSweepPreservesScopedPartialWithoutMutation(t *testing.T) {
+	f := newGroupSweepFixture(t, &ControllerGroups{Gateway: true}, nil)
+	f.stub.State.AddZone(cfstub.Zone{ID: "zone-2", Name: "denied.example.com", AccountID: "account-1"})
+	var tunnel v1alpha1.CloudflareTunnel
+	if err := f.sweeper.client.Get(context.Background(), probeKey("gw"), &tunnel); err != nil {
+		t.Fatal(err)
+	}
+	tunnel.Status.DNSRecords = append(tunnel.Status.DNSRecords,
+		v1alpha1Checkpoint("app.denied.example.com", "denied-record", "zone-2", probeMarker("gw")))
+	if err := f.sweeper.client.Update(context.Background(), &tunnel); err != nil {
+		t.Fatal(err)
+	}
+	f.stub.Fault(http.MethodGet, `^/zones/zone-2/dns_records$`, cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+	findings := make(map[string][]DriftItem)
+	for _, target := range f.runner.targets {
+		items, result, err := f.runner.RunTargetOnce(context.Background(), target)
+		if target.Kind == "DNSRecord" {
+			if result != observability.SweepResultPartial {
+				t.Fatalf("DNS result = %q, want scoped partial", result)
+			}
+			scoped := requireScopedError(t, err)
+			var apiError *cloudflaresdk.Error
+			if len(scoped.failures) != 1 || !errors.As(err, &apiError) || apiError.StatusCode != http.StatusForbidden {
+				t.Fatalf("DNS scoped error = %v, want one modeled 403", err)
+			}
+		} else if err != nil || result != observability.SweepResultOK {
+			t.Fatalf("healthy %s pass = (%#v, %q, %v)", target.Kind, items, result, err)
+		}
+		findings[target.Kind] = items
+	}
+	// The healthy zone's finding survives; the denied checkpoint is not judged.
+	requireGatewaySweepDrift(t, findings)
+	requireSweepRequests(t, f.stub.Journal(), []string{"DNSRecord", "CloudflareTunnel"}, "/zones/zone-2/dns_records")
+}
+
+func targetKinds(targets []TargetDescriptor) []string {
+	kinds := make([]string, 0, len(targets))
+	for _, target := range targets {
+		kinds = append(kinds, target.Kind)
+	}
+	return kinds
+}
 
 func TestInitialDelayBounds(t *testing.T) {
 	t.Parallel()

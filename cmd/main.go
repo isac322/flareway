@@ -83,6 +83,18 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+func controllerGroupsEnabled(groups sweep.ControllerGroups) bool {
+	return groups.Gateway || groups.Access || groups.PrivateNetwork || groups.Device || groups.Organization
+}
+
+func newProductionSweeper(controllerGroups sweep.ControllerGroups, options sweep.SweeperOptions) *sweep.Sweeper {
+	if !controllerGroupsEnabled(controllerGroups) {
+		return nil
+	}
+	options.ControllerGroups = &controllerGroups
+	return sweep.NewSweeper(options)
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -254,9 +266,16 @@ func main() {
 	}
 	cloudflareFactory := flarecloudflare.NewFactory(ctrl.Log.WithName("cloudflare"))
 	observedClient := observability.NewEventingClient(mgr.GetClient(), mgr.GetAPIReader(), eventRecorderAdapter{recorder: mgr.GetEventRecorder("flareway")})
-	if enableGatewayControllers || enableAccessControllers || enablePrivateNetworkControllers || enableDeviceControllers || enableOrganizationControllers {
+	controllerGroups := sweep.ControllerGroups{
+		Gateway:        enableGatewayControllers,
+		Access:         enableAccessControllers,
+		PrivateNetwork: enablePrivateNetworkControllers,
+		Device:         enableDeviceControllers,
+		Organization:   enableOrganizationControllers,
+	}
+	if controllerGroupsEnabled(controllerGroups) {
 		if !disableSweep {
-			sweeper := sweep.NewSweeper(sweep.SweeperOptions{
+			sweeper := newProductionSweeper(controllerGroups, sweep.SweeperOptions{
 				Client:            mgr.GetClient(),
 				APIReader:         mgr.GetAPIReader(),
 				Scheme:            mgr.GetScheme(),
