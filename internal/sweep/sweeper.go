@@ -82,6 +82,9 @@ type SweeperOptions struct {
 	EventBufferSize int
 	// AccountSyncInterval overrides the 30s account re-list period (tests).
 	AccountSyncInterval time.Duration
+	// ControllerGroups selects the production controller groups when Targets
+	// is nil. A non-nil empty Targets slice always wins and starts no loops.
+	ControllerGroups *ControllerGroups
 	// Targets overrides the default target registry (tests).
 	Targets []TargetDescriptor
 }
@@ -130,7 +133,11 @@ func NewSweeper(opts SweeperOptions) *Sweeper {
 		opts.OperatorNamespace = dataplane.DefaultOperatorNamespace
 	}
 	if opts.Targets == nil {
-		opts.Targets = defaultTargets()
+		if opts.ControllerGroups == nil {
+			opts.Targets = defaultTargets()
+		} else {
+			opts.Targets = targetsForGroups(*opts.ControllerGroups)
+		}
 	}
 	return &Sweeper{
 		client:            opts.Client,

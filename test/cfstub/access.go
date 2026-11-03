@@ -62,6 +62,9 @@ func (s *Server) registerAccessRoutes() {
 	s.Handle(http.MethodPut, `^/accounts/[^/]+/access/policies/[^/]+$`, s.updateAccessPolicy)
 	s.Handle(http.MethodDelete, `^/accounts/[^/]+/access/policies/[^/]+$`, s.deleteAccessPolicy)
 
+	// The integration collection must precede the posture-rule ID matcher.
+	s.Handle(http.MethodGet, `^/accounts/[^/]+/devices/posture/integration$`, s.listDevicePostureIntegrations)
+
 	s.Handle(http.MethodPost, `^/accounts/[^/]+/devices/posture$`, s.createDevicePostureRule)
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/devices/posture$`, s.listDevicePostureRules)
 	s.Handle(http.MethodGet, `^/accounts/[^/]+/devices/posture/[^/]+$`, s.getDevicePostureRule)
@@ -416,6 +419,15 @@ func (s *Server) listDevicePostureRules(w http.ResponseWriter, r *http.Request) 
 	s.State.mu.RLock()
 	items := sortedAccessResources(s.State.postureRules[accountID])
 	s.State.mu.RUnlock()
+	writeResult(w, http.StatusOK, items)
+}
+
+func (s *Server) listDevicePostureIntegrations(w http.ResponseWriter, r *http.Request) {
+	// Endpoint extensions can seed their collection through the generic state.
+	items, found := s.State.Get(r.URL.Path)
+	if !found {
+		items = []AccessResource{}
+	}
 	writeResult(w, http.StatusOK, items)
 }
 

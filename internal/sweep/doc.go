@@ -18,8 +18,8 @@ limitations under the License.
 //
 // The worker runs only on the elected leader replica (manager.Runnable +
 // manager.LeaderElectionRunnable, matching internal/xds/server). For every
-// ready CloudflareAccount it lists each sweepable resource kind once per
-// freshness grade period and compares the remote listing against the cached
+// ready CloudflareAccount it lists each selected target from the enabled
+// controller groups once per freshness grade period and compares the remote listing against the cached
 // Kubernetes objects. Detected drift closes the object's desired-hash gate
 // through the Invalidator latch and emits a GenericEvent on Events() so the
 // owning controller reconciles promptly.
