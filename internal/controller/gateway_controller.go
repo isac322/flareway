@@ -1627,66 +1627,50 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 			return err
 		}
 
-		merged := desired
-		merged.Conditions = append([]metav1.Condition(nil), desired.Conditions...)
-		if desired.Listeners != nil {
-			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
-			for i := range desired.Listeners {
-				merged.Listeners[i] = desired.Listeners[i]
-				merged.Listeners[i].Conditions = append([]metav1.Condition(nil), desired.Listeners[i].Conditions...)
-			}
-		}
 		ownedGatewayConditions := map[string]struct{}{
 			string(gatewayv1.GatewayConditionAccepted):   {},
 			string(gatewayv1.GatewayConditionProgrammed): {},
+		}
+		merged := desired
+		merged.Conditions = make([]metav1.Condition, 0, len(current.Status.Conditions)+len(desired.Conditions))
+		for _, condition := range desired.Conditions {
+			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				merged.Conditions = append(merged.Conditions, condition)
+			}
 		}
 		for _, condition := range current.Status.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
 				continue
 			}
-			found := false
-			for _, existing := range merged.Conditions {
-				if existing.Type == condition.Type {
-					found = true
-					break
-				}
-			}
-			if !found {
-				merged.Conditions = append(merged.Conditions, condition)
-			}
+			merged.Conditions = append(merged.Conditions, condition)
 		}
 		if desired.Listeners != nil {
 			ownedListenerConditions := map[string]struct{}{
-				string(gatewayv1.ListenerConditionAccepted):        {},
-				string(gatewayv1.ListenerConditionResolvedRefs):     {},
-				string(gatewayv1.ListenerConditionConflicted):       {},
-				string(gatewayv1.ListenerConditionProgrammed):       {},
+				string(gatewayv1.ListenerConditionAccepted):     {},
+				string(gatewayv1.ListenerConditionResolvedRefs): {},
+				string(gatewayv1.ListenerConditionConflicted):   {},
+				string(gatewayv1.ListenerConditionProgrammed):   {},
 			}
-			for i := range merged.Listeners {
-				var currentListener *gatewayv1.ListenerStatus
-				for j := range current.Status.Listeners {
-					if current.Status.Listeners[j].Name == merged.Listeners[i].Name {
-						currentListener = &current.Status.Listeners[j]
-						break
-					}
-				}
-				if currentListener == nil {
-					continue
-				}
-				for _, condition := range currentListener.Conditions {
+			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
+			for i := range desired.Listeners {
+				merged.Listeners[i] = desired.Listeners[i]
+				merged.Listeners[i].Conditions = make([]metav1.Condition, 0, len(desired.Listeners[i].Conditions))
+				for _, condition := range desired.Listeners[i].Conditions {
 					if _, owned := ownedListenerConditions[condition.Type]; owned {
-						continue
-					}
-					found := false
-					for _, existing := range merged.Listeners[i].Conditions {
-						if existing.Type == condition.Type {
-							found = true
-							break
-						}
-					}
-					if !found {
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
+				}
+				for j := range current.Status.Listeners {
+					if current.Status.Listeners[j].Name != merged.Listeners[i].Name {
+						continue
+					}
+					for _, condition := range current.Status.Listeners[j].Conditions {
+						if _, owned := ownedListenerConditions[condition.Type]; owned {
+							continue
+						}
+						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
+					}
+					break
 				}
 			}
 		}

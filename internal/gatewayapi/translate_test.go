@@ -391,6 +391,52 @@ func TestTranslateDroppedRules(t *testing.T) {
 	if accepted == nil || accepted.Status != metav1.ConditionFalse || partial != nil {
 		t.Fatalf("fully invalid conditions: Accepted=%#v PartiallyInvalid=%#v", accepted, partial)
 	}
+
+	replacePath := "/rewritten"
+	unresolvedCombined := routeWithMatch("unresolved-combined", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	unresolvedCombined.Spec.Rules[0].Filters = []gatewayv1.HTTPRouteFilter{{
+		Type: gatewayv1.HTTPRouteFilterURLRewrite,
+		URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+			Path: &gatewayv1.HTTPPathModifier{Type: gatewayv1.FullPathHTTPPathModifier, ReplaceFullPath: &replacePath},
+		},
+	}}
+	unresolvedCombined.Spec.Rules[0].BackendRefs = []gatewayv1.HTTPBackendRef{{
+		BackendObjectReference: gatewayv1.BackendObjectReference{Name: "missing", Port: new(gatewayv1.PortNumber(8080))},
+		Filters: []gatewayv1.HTTPRouteFilter{{
+			Type: gatewayv1.HTTPRouteFilterURLRewrite,
+			URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+				Hostname: new(gatewayv1.PreciseHostname("backend.example.com")),
+			},
+		}},
+	}}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{unresolvedCombined}
+	_, statuses = Translate(in)
+	accepted = findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "unresolved-combined"}], gatewayv1.RouteConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != string(gatewayv1.RouteReasonIncompatibleFilters) {
+		t.Fatalf("unresolved combined URLRewrite Accepted = %#v, want IncompatibleFilters", accepted)
+	}
+
+	mixedMultiBackend := routeWithMatch("mixed-multi-backend", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	mixedMultiBackend.Spec.Rules[0].BackendRefs = []gatewayv1.HTTPBackendRef{
+		{
+			BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: new(gatewayv1.PortNumber(8080))},
+			Filters: []gatewayv1.HTTPRouteFilter{{
+				Type: gatewayv1.HTTPRouteFilterURLRewrite,
+				URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+					Path: &gatewayv1.HTTPPathModifier{Type: gatewayv1.FullPathHTTPPathModifier, ReplaceFullPath: &replacePath},
+				},
+			}},
+		},
+		{
+			BackendObjectReference: gatewayv1.BackendObjectReference{Name: "missing", Port: new(gatewayv1.PortNumber(8080))},
+		},
+	}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{mixedMultiBackend}
+	_, statuses = Translate(in)
+	accepted = findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "mixed-multi-backend"}], gatewayv1.RouteConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Fatalf("mixed multi-backend path URLRewrite Accepted = %#v, want UnsupportedValue", accepted)
+	}
 }
 
 func TestTranslateRetryAndNamedRuleValidation(t *testing.T) {

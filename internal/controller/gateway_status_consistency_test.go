@@ -98,17 +98,29 @@ func TestGatewayStatusPreservesForeignConditionOnConflict(t *testing.T) {
 	}
 	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(gateway).Build()
 	reconciler := &GatewayReconciler{Client: kube}
+	staleForeignGateway := foreignGateway
+	staleForeignGateway.Status = metav1.ConditionFalse
+	staleForeignGateway.Reason = "StaleCopyFromSnapshot"
+	staleForeignListener := foreignListener
+	staleForeignListener.Status = metav1.ConditionFalse
+	staleForeignListener.Reason = "StaleCopyFromSnapshot"
 	desired := gatewayv1.GatewayStatus{
-		Conditions: []metav1.Condition{{
-			Type:   string(gatewayv1.GatewayConditionAccepted),
-			Status: metav1.ConditionTrue,
-		}},
+		Conditions: []metav1.Condition{
+			{
+				Type:   string(gatewayv1.GatewayConditionAccepted),
+				Status: metav1.ConditionTrue,
+			},
+			staleForeignGateway,
+		},
 		Listeners: []gatewayv1.ListenerStatus{{
 			Name: "https",
-			Conditions: []metav1.Condition{{
-				Type:   string(gatewayv1.ListenerConditionAccepted),
-				Status: metav1.ConditionTrue,
-			}},
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(gatewayv1.ListenerConditionAccepted),
+					Status: metav1.ConditionTrue,
+				},
+				staleForeignListener,
+			},
 		}},
 	}
 	key := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
@@ -119,12 +131,17 @@ func TestGatewayStatusPreservesForeignConditionOnConflict(t *testing.T) {
 	if err := kube.Get(context.Background(), key, &current); err != nil {
 		t.Fatal(err)
 	}
-	if meta.FindStatusCondition(current.Status.Conditions, foreignGateway.Type) == nil {
-		t.Fatal("Gateway-level foreign condition was not preserved")
+	gotGateway := meta.FindStatusCondition(current.Status.Conditions, foreignGateway.Type)
+	if gotGateway == nil || gotGateway.Status != metav1.ConditionTrue || gotGateway.Reason != "ExternalController" {
+		t.Fatalf("Gateway-level foreign condition = %#v, want fresh ExternalController condition", gotGateway)
 	}
-	if listener := listenerStatusByName(current.Status.Listeners, "https"); listener == nil ||
-		meta.FindStatusCondition(listener.Conditions, foreignListener.Type) == nil {
-		t.Fatal("Listener-level foreign condition was not preserved")
+	listener := listenerStatusByName(current.Status.Listeners, "https")
+	if listener == nil {
+		t.Fatal("Listener status missing")
+	}
+	gotListener := meta.FindStatusCondition(listener.Conditions, foreignListener.Type)
+	if gotListener == nil || gotListener.Status != metav1.ConditionTrue || gotListener.Reason != "ExternalController" {
+		t.Fatalf("Listener-level foreign condition = %#v, want fresh ExternalController condition", gotListener)
 	}
 }
 

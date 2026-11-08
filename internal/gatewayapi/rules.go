@@ -88,18 +88,15 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 				resolvedMessage = message
 			}
 		}
-		validBackendCount := 0
 		hasBackendRewrite := false
 		hasBackendPathRewrite := false
-		for _, backend := range backends {
-			if backend.Invalid != nil || backend.ClusterName == "" {
-				continue
-			}
-			validBackendCount++
-			if backend.Filters.URLRewrite != nil {
-				hasBackendRewrite = true
-				if backend.Filters.URLRewrite.Path != nil {
-					hasBackendPathRewrite = true
+		for _, ref := range rule.BackendRefs {
+			for _, filter := range ref.Filters {
+				if filter.Type == gatewayv1.HTTPRouteFilterURLRewrite && filter.URLRewrite != nil {
+					hasBackendRewrite = true
+					if filter.URLRewrite.Path != nil {
+						hasBackendPathRewrite = true
+					}
 				}
 			}
 		}
@@ -108,7 +105,7 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 			dropReason = gatewayv1.RouteReasonIncompatibleFilters
 			continue
 		}
-		if validBackendCount > 1 && hasBackendPathRewrite {
+		if len(rule.BackendRefs) > 1 && hasBackendPathRewrite {
 			dropped = append(dropped, ruleID+": per-backend path rewrite requires a single backend")
 			dropReason = gatewayv1.RouteReasonUnsupportedValue
 			continue
