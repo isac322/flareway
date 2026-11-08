@@ -1,6 +1,6 @@
 # Install Flareway from the OCI Helm chart
 
-Install Flareway from `oci://ghcr.io/isac322/charts/flareway` on a cluster with Gateway API v1.6.3 CRDs, then add a Cloudflare account, token, and zone.
+Install Flareway from `oci://ghcr.io/isac322/charts/flareway` on a cluster with Gateway API v1.7.0 CRDs, then add a Cloudflare account, token, and zone.
 
 ## Preview the manifests without a cluster
 
@@ -17,19 +17,29 @@ The output contains the controller Deployment and its ServiceAccount, the RBAC o
 
 ## Prerequisites
 
-- A Kubernetes cluster supported by Gateway API v1.6.3.
+- A Kubernetes cluster supported by Gateway API v1.7.0.
 - Helm 4.3 or a compatible Helm 3 client.
 - A Cloudflare account and a scoped API token. [Connect a Cloudflare account](connect-cloudflare.md) lists the token capabilities.
 - A DNS zone in that account for public listeners.
 - For private listeners, the WARP prerequisites in [Reach private Services over Cloudflare WARP](private-services-over-warp.md).
 
+### Version compatibility
+
+| Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
+|---|---|---|---|---|
+| `main` (unreleased) | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
+| `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
+
+A Flareway controller built for Gateway API v1.7.0 remains backward-compatible with clusters running Gateway API v1.6.x Standard CRDs for all v1.6.x resources and fields. Gateway API v1.7.0 Standard CRD features such as `HTTPRoute.spec.rules[].retry` require the v1.7.0 CRDs installed on the cluster.
+
 ## Install the Gateway API CRDs
 
-The Flareway chart does not bundle Gateway API CRDs. Install the v1.6.3 Standard channel first:
+The Flareway chart does not bundle Gateway API CRDs. Install the v1.7.0 Standard channel first:
 
 ```sh
 kubectl apply --server-side \
-  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
 
 ## Install the chart

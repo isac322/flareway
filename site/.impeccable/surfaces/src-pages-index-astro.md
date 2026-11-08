@@ -9,7 +9,7 @@ related_targets: []
 
 Scope: `site/src/pages/index.astro` (landing, Persuade mode). Shares chrome (header, tabs, tokens) with the Starlight docs under `/docs/`.
 Audience/job: platform & Kubernetes engineers deciding in ~60 s whether Flareway is real enough to install. Action: Get started (install guide); secondary GitHub; zero-credential `helm template`.
-Proof/content: README, conformance report (Core 37/37, Extended 30/30, local dev run, conformanceMode), 22 CRDs, Apache-2.0, real samples from `config/samples/`. No invented metrics.
+Proof/content: README, conformance report (Core 40/40, Extended 42/42, local dev run, conformanceMode), 22 CRDs, Apache-2.0, real samples from `config/samples/`. No invented metrics.
 Constraints: fixed mark + SVG wordmark; orange graphics-only on light; no experimental / not-production status messaging (owner runs it in production, 2026-09-28); deliberate but tasteful GitHub star nudge; non-affiliation footer; English.
 Decision history: A (Charted Fairway), B (Cross-Connect, the roll), C (category standard) previewed; user chose C's legibility plus A's chart elements, refined through D to E (locked).
 

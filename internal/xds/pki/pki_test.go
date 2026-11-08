@@ -110,6 +110,29 @@ func TestEnsureClientCertCreatesSecretWithOwner(t *testing.T) {
 		t.Fatal("created client Secret does not contain the expected certificate identity")
 	}
 }
+func TestEnsureClientCert253CharGatewayName(t *testing.T) {
+	gwKey := types.NamespacedName{Namespace: "tenant", Name: strings.Repeat("g", 253)}
+	owner := testGatewayOwner(gwKey, "gateway-long-uid")
+	kube := newTestClientWithCA(t)
+
+	secret, err := EnsureClientCert(context.Background(), kube, gwKey, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secret.Name) > 253 {
+		t.Fatalf("client Secret name length = %d, want at most 253", len(secret.Name))
+	}
+	cert, err := parseLeaf(secret.Data[corev1.TLSCertKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cert.Subject.CommonName) > 63 {
+		t.Fatalf("client certificate CommonName length = %d, want at most 63", len(cert.Subject.CommonName))
+	}
+	if len(cert.URIs) != 1 || cert.URIs[0].String() != SPIFFEURI(gwKey).String() {
+		t.Fatalf("client certificate URI SAN = %v, want %s", cert.URIs, SPIFFEURI(gwKey))
+	}
+}
 
 func TestEnsureClientCertRejectsUnownedOrForeignSecretBeforeRotation(t *testing.T) {
 	gwKey := types.NamespacedName{Namespace: "tenant", Name: "gateway"}

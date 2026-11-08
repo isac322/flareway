@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/test/envtesthelpers"
@@ -363,6 +365,28 @@ var _ = ginkgo.Describe("Gateway reconciler", ginkgo.Ordered, func() {
 			}
 			g.Expect(controllers[gatewayapi.ControllerName]).To(gomega.BeTrue())
 			g.Expect(controllers[gatewayv1.GatewayController("example.net/other-controller")]).To(gomega.BeTrue())
+		}).WithTimeout(15 * time.Second).WithPolling(250 * time.Millisecond).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("TestLongGatewayNameReconciles", func() {
+		longName := strings.Repeat("g", 253)
+		key := types.NamespacedName{Namespace: namespaceName, Name: longName}
+		gateway := httpGateway(key, className)
+		gomega.Expect(testClient.Create(testContext, gateway)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(func() {
+			gomega.Expect(client.IgnoreNotFound(testClient.Delete(context.Background(), gateway))).To(gomega.Succeed())
+		})
+		gomega.Eventually(func(g gomega.Gomega) {
+			var deployment appsv1.Deployment
+			g.Expect(testClient.Get(testContext, types.NamespacedName{
+				Namespace: namespaceName, Name: dataplane.ResourceName(&ir.Gateway{Key: key}),
+			}, &deployment)).To(gomega.Succeed())
+			g.Expect(len(deployment.Name)).To(gomega.BeNumerically("<=", 63))
+			var secret corev1.Secret
+			g.Expect(testClient.Get(testContext, types.NamespacedName{
+				Namespace: namespaceName, Name: dataplane.XDSClientSecretName(&ir.Gateway{Key: key}),
+			}, &secret)).To(gomega.Succeed())
+			g.Expect(len(secret.Name)).To(gomega.BeNumerically("<=", 253))
 		}).WithTimeout(15 * time.Second).WithPolling(250 * time.Millisecond).Should(gomega.Succeed())
 	})
 

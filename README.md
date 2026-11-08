@@ -37,9 +37,9 @@ and they cannot rewrite, redirect, mirror, or split traffic by weight.
   [Security model](docs/concepts/security-model.md)
 
 The routing features Flareway claims passed the Gateway API conformance suite
-in a local run through Envoy; the
-[conformance report](docs/conformance/v1.6.3/flareway/README.md) states what
-that run covered.
+in a local run through Envoy. `GatewayClass.status.supportedFeatures` lists 35
+features: 3 Core and 32 Extended. The [conformance report](docs/conformance/v1.7.0/flareway/README.md)
+states what that run covered.
 
 ## How it works
 
@@ -83,13 +83,23 @@ install cannot silently take ownership of an existing `GatewayClass`.
 
 ## Start here
 
-You need a Kubernetes cluster with the Gateway API v1.6.3 Standard CRDs, Helm,
+You need a Kubernetes cluster with the Gateway API v1.7.0 Standard CRDs, Helm,
 a Cloudflare account with a scoped API token, and a DNS zone in that account
 for public hostnames. Then follow the guides in order:
 
 1. [Install](docs/get-started/install.md)
 2. [Connect Cloudflare](docs/get-started/connect-cloudflare.md)
 3. [Expose a Service](docs/get-started/expose-a-service.md)
+
+## Version compatibility
+
+| Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
+|---|---|---|---|---|
+| `main` (unreleased) | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
+| `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
+
+A Flareway controller built for Gateway API v1.7.0 remains backward-compatible with clusters running Gateway API v1.6.x Standard CRDs for all v1.6.x resources and fields. Gateway API v1.7.0 Standard CRD features such as `HTTPRoute.spec.rules[].retry` require the v1.7.0 CRDs installed on the cluster.
 
 ## When it fits, and when it doesn't
 
@@ -105,9 +115,7 @@ Check these boundaries first:
   names `GRPCRoute`, `TLSRoute`, `TCPRoute`, or `UDPRoute` reports
   `ResolvedRefs=False` with reason `InvalidRouteKinds`. For TCP, SSH, or RDP
   origins, use a [Direct tunnel](docs/get-started/direct-tunnels.md).
-- Some Gateway API features are not supported, including `HTTPRouteRetry`,
-  `ListenerSet`, `GatewayStaticAddresses`, and
-  `HTTPRouteBackendRequestHeaderModification`.
+- The controller does not claim these 11 Extended features: `ClusterTrustBundle`, `GatewayAddressEmpty`, `GatewayAddressRoutability`, `GatewayAddressRoutabilityCluster`, `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback`, `GatewayListenerFilters`, `GatewayPort8080`, `GatewayStaticAddresses`, and `ListenerSet`.
 - Cloudflare's edge limits still apply: it waits 100 seconds for response
   headers (up to 6,000 on Enterprise), caps request bodies by plan, and closes
   WebSockets after 100 seconds idle. It does not serve redirects to ports
@@ -120,7 +128,7 @@ verified.
 
 - **Concepts:** [How it works](docs/concepts/how-it-works.md),
   [HTTP routing](docs/concepts/http-routing.md),
-  [Conformance report](docs/conformance/v1.6.3/flareway/README.md),
+  [Conformance report](docs/conformance/v1.7.0/flareway/README.md),
   [Security model](docs/concepts/security-model.md),
   [Ownership and adoption](docs/concepts/ownership-and-adoption.md),
   [Limits](docs/concepts/limits.md)

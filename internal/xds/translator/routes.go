@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -72,8 +73,49 @@ func buildDomainVirtualHost(in ir.VirtualHost, guard string, stripAccessHeaders 
 	}
 	if stripAccessHeaders {
 		out.RequestHeadersToRemove = append(out.RequestHeadersToRemove, accessIdentityHeaders...)
+		stripRouteAccessHeaders(out)
 	}
 	return out, nil
+}
+
+func stripRouteAccessHeaders(vhost *routev3.VirtualHost) {
+	for _, route := range vhost.Routes {
+		route.RequestHeadersToAdd = filterNonAccessHeaders(route.RequestHeadersToAdd)
+		action, ok := route.Action.(*routev3.Route_Route)
+		if !ok || action.Route == nil {
+			continue
+		}
+		weighted, ok := action.Route.ClusterSpecifier.(*routev3.RouteAction_WeightedClusters)
+		if !ok || weighted.WeightedClusters == nil {
+			continue
+		}
+		for _, cluster := range weighted.WeightedClusters.Clusters {
+			cluster.RequestHeadersToAdd = filterNonAccessHeaders(cluster.RequestHeadersToAdd)
+		}
+	}
+}
+
+func filterNonAccessHeaders(headers []*corev3.HeaderValueOption) []*corev3.HeaderValueOption {
+	if len(headers) == 0 {
+		return headers
+	}
+	out := headers[:0]
+	for _, option := range headers {
+		if option.GetHeader() != nil && isAccessIdentityHeader(option.GetHeader().GetKey()) {
+			continue
+		}
+		out = append(out, option)
+	}
+	return out
+}
+
+func isAccessIdentityHeader(name string) bool {
+	for _, header := range accessIdentityHeaders {
+		if strings.EqualFold(name, header) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildVirtualHost(in ir.VirtualHost) (*routev3.VirtualHost, error) {
@@ -254,7 +296,8 @@ func buildRouteAction(in ir.Route, valid []ir.BackendRef) (*routev3.RouteAction,
 		ClusterSpecifier:      &routev3.RouteAction_WeightedClusters{WeightedClusters: weighted},
 		RequestMirrorPolicies: buildMirrors(in.Filters.Mirrors),
 	}
-	applyTimeouts(action, in.Timeouts)
+	applyRetry(action, in.Retry, in.Timeouts)
+	applyTimeouts(action, in.Timeouts, in.Retry)
 	if in.Filters.URLRewrite != nil {
 		applyURLRewrite(action, in.Filters.URLRewrite, in.Match)
 	} else if len(valid) == 1 && valid[0].Filters.URLRewrite != nil {
@@ -330,26 +373,71 @@ func buildMirrors(in []ir.Mirror) []*routev3.RouteAction_RequestMirrorPolicy {
 	return out
 }
 
-func applyTimeouts(action *routev3.RouteAction, timeouts ir.Timeouts) {
-	switch {
-	case timeouts.Request != nil && timeouts.BackendRequest != nil:
-		action.Timeout = durationpb.New(*timeouts.BackendRequest)
-		action.MaxStreamDuration = &routev3.RouteAction_MaxStreamDuration{
-			MaxStreamDuration: durationpb.New(*timeouts.Request),
+func applyRetry(action *routev3.RouteAction, retry *ir.Retry, timeouts ir.Timeouts) {
+	if retry == nil || retry.Attempts <= 0 {
+		return
+	}
+	retryOn := "connect-failure,refused-stream"
+	if len(retry.Codes) > 0 {
+		retryOn += ",retriable-status-codes"
+	}
+	policy := &routev3.RetryPolicy{
+		RetryOn:              retryOn,
+		NumRetries:           wrapperspb.UInt32(uint32(retry.Attempts)),
+		RetriableStatusCodes: slices.Clone(retry.Codes),
+	}
+	if retry.Backoff != nil && *retry.Backoff > 0 {
+		policy.RetryBackOff = &routev3.RetryPolicy_RetryBackOff{
+			BaseInterval: durationpb.New(*retry.Backoff),
 		}
-	case timeouts.Request != nil:
+	}
+	if timeouts.BackendRequest != nil && *timeouts.BackendRequest > 0 {
+		policy.PerTryTimeout = durationpb.New(*timeouts.BackendRequest)
+	}
+	action.RetryPolicy = policy
+}
+
+func applyTimeouts(action *routev3.RouteAction, timeouts ir.Timeouts, retries ...*ir.Retry) {
+	var retry *ir.Retry
+	if len(retries) > 0 {
+		retry = retries[0]
+	}
+	if retry == nil || retry.Attempts <= 0 {
+		switch {
+		case timeouts.Request != nil && timeouts.BackendRequest != nil:
+			action.Timeout = durationpb.New(*timeouts.BackendRequest)
+			action.MaxStreamDuration = &routev3.RouteAction_MaxStreamDuration{
+				MaxStreamDuration: durationpb.New(*timeouts.Request),
+			}
+		case timeouts.Request != nil:
+			action.Timeout = durationpb.New(*timeouts.Request)
+			if *timeouts.Request == 0 {
+				action.MaxStreamDuration = &routev3.RouteAction_MaxStreamDuration{
+					MaxStreamDuration: durationpb.New(0),
+				}
+			}
+		case timeouts.BackendRequest != nil:
+			action.Timeout = durationpb.New(*timeouts.BackendRequest)
+		}
+		if (timeouts.Request != nil && *timeouts.Request == 0) ||
+			(timeouts.BackendRequest != nil && *timeouts.BackendRequest == 0) {
+			action.IdleTimeout = durationpb.New(0)
+		}
+		return
+	}
+	if timeouts.Request != nil {
 		action.Timeout = durationpb.New(*timeouts.Request)
 		if *timeouts.Request == 0 {
 			action.MaxStreamDuration = &routev3.RouteAction_MaxStreamDuration{
 				MaxStreamDuration: durationpb.New(0),
 			}
+			action.IdleTimeout = durationpb.New(0)
 		}
-	case timeouts.BackendRequest != nil:
-		action.Timeout = durationpb.New(*timeouts.BackendRequest)
-	}
-	if (timeouts.Request != nil && *timeouts.Request == 0) ||
-		(timeouts.BackendRequest != nil && *timeouts.BackendRequest == 0) {
-		action.IdleTimeout = durationpb.New(0)
+	} else if timeouts.BackendRequest != nil {
+		action.Timeout = durationpb.New(0)
+		if *timeouts.BackendRequest == 0 {
+			action.IdleTimeout = durationpb.New(0)
+		}
 	}
 }
 

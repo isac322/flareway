@@ -52,6 +52,7 @@ import (
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/freshness"
+	"github.com/isac322/flareway/internal/dataplane"
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 	"github.com/isac322/flareway/internal/ir"
 )
@@ -964,7 +965,7 @@ func validateRemoteTunnel(remote RemoteTunnel, accountID string) error {
 }
 
 func (r *CloudflareTunnelReconciler) ensureTokenSecret(ctx context.Context, cf TunnelCloudflareClient, tunnel *v1alpha1.CloudflareTunnel, tunnelID string) (*corev1.LocalObjectReference, error) {
-	name := "flareway-tunnel-" + tunnel.Name
+	name := dataplane.BoundedSecretName("flareway-tunnel-", tunnel.Name, "")
 	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: name}
 	var existing corev1.Secret
 	if err := r.Get(ctx, key, &existing); err == nil {
@@ -988,7 +989,7 @@ func (r *CloudflareTunnelReconciler) ensureTokenSecret(ctx context.Context, cf T
 }
 
 func (r *CloudflareTunnelReconciler) ensureManagementTokenSecret(ctx context.Context, cf TunnelCloudflareClient, tunnel *v1alpha1.CloudflareTunnel, tunnelID string) (*corev1.LocalObjectReference, error) {
-	name := "flareway-tunnel-" + tunnel.Name + "-management"
+	name := dataplane.BoundedSecretName("flareway-tunnel-", tunnel.Name, "-management")
 	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: name}
 	if tunnel.Spec.ManagementToken == nil {
 		var existing corev1.Secret
@@ -2092,7 +2093,7 @@ func (r *CloudflareTunnelReconciler) scaleDownRecordedGatewayDataplane(ctx conte
 	if tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "" {
 		return true, nil
 	}
-	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: "flareway-gw-" + tunnel.Status.GatewayRef.Name}
+	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: dataplane.ResourceName(&ir.Gateway{Key: types.NamespacedName{Namespace: tunnel.Namespace, Name: tunnel.Status.GatewayRef.Name}})}
 	var deployment appsv1.Deployment
 	if err := r.Get(ctx, key, &deployment); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -2114,7 +2115,7 @@ func tunnelGatewayDataplaneDrained(ctx context.Context, reader client.Reader, tu
 	if tunnel == nil || tunnel.Status.GatewayRef == nil || tunnel.Status.GatewayRef.Name == "" {
 		return true, nil
 	}
-	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: "flareway-gw-" + tunnel.Status.GatewayRef.Name}
+	key := types.NamespacedName{Namespace: tunnel.Namespace, Name: dataplane.ResourceName(&ir.Gateway{Key: types.NamespacedName{Namespace: tunnel.Namespace, Name: tunnel.Status.GatewayRef.Name}})}
 	var deployment appsv1.Deployment
 	deploymentRelevant := false
 	if err := reader.Get(ctx, key, &deployment); err != nil {
@@ -2129,7 +2130,7 @@ func tunnelGatewayDataplaneDrained(ctx context.Context, reader client.Reader, tu
 	}
 
 	var pods corev1.PodList
-	label := tunnel.Namespace + "--" + tunnel.Status.GatewayRef.Name
+	label := dataplane.GatewayLabelValueForKey(tunnel.Namespace, tunnel.Status.GatewayRef.Name)
 	if err := reader.List(ctx, &pods, client.InNamespace(tunnel.Namespace), client.MatchingLabels{dataplaneGatewayLabel: label}); err != nil {
 		return false, fmt.Errorf("list dataplane Pods: %w", err)
 	}
@@ -3152,18 +3153,26 @@ func (r *CloudflareTunnelReconciler) mapNamespaceToTunnels(ctx context.Context, 
 }
 
 func (r *CloudflareTunnelReconciler) mapDataplaneToTunnel(ctx context.Context, object client.Object) []reconcile.Request {
-	label := object.GetLabels()[dataplaneGatewayLabel]
-	parts := strings.SplitN(label, "--", 2)
-	if len(parts) != 2 {
-		return nil
+	gatewayNamespace, gatewayName := "", ""
+	if managed := object.GetAnnotations()[dataplane.ManagedByLabelKey]; managed != "" {
+		if namespace, name, ok := strings.Cut(managed, "/"); ok && namespace != "" && name != "" {
+			gatewayNamespace, gatewayName = namespace, name
+		}
+	}
+	if gatewayNamespace == "" || gatewayName == "" {
+		parts := strings.SplitN(object.GetLabels()[dataplaneGatewayLabel], "--", 2)
+		if len(parts) != 2 {
+			return nil
+		}
+		gatewayNamespace, gatewayName = parts[0], parts[1]
 	}
 	var tunnels v1alpha1.CloudflareTunnelList
-	if err := r.List(ctx, &tunnels, client.InNamespace(parts[0])); err != nil {
+	if err := r.List(ctx, &tunnels, client.InNamespace(gatewayNamespace)); err != nil {
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, 1)
 	for i := range tunnels.Items {
-		if tunnels.Items[i].Status.GatewayRef != nil && tunnels.Items[i].Status.GatewayRef.Name == parts[1] {
+		if tunnels.Items[i].Status.GatewayRef != nil && tunnels.Items[i].Status.GatewayRef.Name == gatewayName {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&tunnels.Items[i])})
 		}
 	}

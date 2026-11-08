@@ -1623,6 +1623,7 @@ func prepareConditions(
 
 func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
 	deleted := false
+	var patched gatewayv1.GatewayStatus
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current gatewayv1.Gateway
 		if err := r.Get(ctx, key, &current); err != nil {
@@ -1632,12 +1633,61 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 			}
 			return err
 		}
-		if reflect.DeepEqual(current.Status, desired) {
+
+		ownedGatewayConditions := map[string]struct{}{
+			string(gatewayv1.GatewayConditionAccepted):   {},
+			string(gatewayv1.GatewayConditionProgrammed): {},
+		}
+		merged := desired
+		merged.Conditions = make([]metav1.Condition, 0, len(current.Status.Conditions)+len(desired.Conditions))
+		for _, condition := range desired.Conditions {
+			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				merged.Conditions = append(merged.Conditions, condition)
+			}
+		}
+		for _, condition := range current.Status.Conditions {
+			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				continue
+			}
+			merged.Conditions = append(merged.Conditions, condition)
+		}
+		if desired.Listeners != nil {
+			ownedListenerConditions := map[string]struct{}{
+				string(gatewayv1.ListenerConditionAccepted):     {},
+				string(gatewayv1.ListenerConditionResolvedRefs): {},
+				string(gatewayv1.ListenerConditionConflicted):   {},
+				string(gatewayv1.ListenerConditionProgrammed):   {},
+			}
+			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
+			for i := range desired.Listeners {
+				merged.Listeners[i] = desired.Listeners[i]
+				merged.Listeners[i].Conditions = make([]metav1.Condition, 0, len(desired.Listeners[i].Conditions))
+				for _, condition := range desired.Listeners[i].Conditions {
+					if _, owned := ownedListenerConditions[condition.Type]; owned {
+						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
+					}
+				}
+				for j := range current.Status.Listeners {
+					if current.Status.Listeners[j].Name != merged.Listeners[i].Name {
+						continue
+					}
+					for _, condition := range current.Status.Listeners[j].Conditions {
+						if _, owned := ownedListenerConditions[condition.Type]; owned {
+							continue
+						}
+						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
+					}
+					break
+				}
+			}
+		}
+		patched = merged
+		if reflect.DeepEqual(current.Status, merged) {
 			return nil
 		}
 		before := current.DeepCopy()
-		current.Status = desired
-		if err := r.Status().Patch(ctx, &current, client.MergeFrom(before)); err != nil {
+		current.Status = merged
+		if err := r.Status().Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			if apierrors.IsNotFound(err) {
 				deleted = true
 				return nil
@@ -1653,7 +1703,7 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 		observability.Default.DeleteGateway(key.String())
 		return nil
 	}
-	condition := meta.FindStatusCondition(desired.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	condition := meta.FindStatusCondition(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	observability.Default.SetGatewayProgrammed(key.String(), condition != nil && condition.Status == metav1.ConditionTrue)
 	return nil
 }

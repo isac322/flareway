@@ -8,6 +8,26 @@
   groups, preserving Gateway DNS and Tunnel checks without requiring permissions
   for disabled features (#163).
 
+- Reject `Gateway.spec.tls` and `Gateway.spec.listeners[].filters` with
+  fail-closed status conditions, preserve foreign Gateway status conditions,
+  and handle 253-character Gateway and Tunnel names.
+
+- Scope Access block-first transitions to protection domains whose Access
+  binding changed, preserving forwarding for unchanged independent domains.
+  Each public protected hostname has its own domain; private hostnames
+  sharing a route table transition together. Record the binding digest after
+  the blocked configuration converges, including a one-time handshake for
+  older status without a digest. Managed DNS requires exactly one explicit
+  `Ready` record per case-insensitive hostname. Missing, empty, unknown,
+  duplicate, or conflicted records block only their listener's hostnames;
+  healthy listeners can forward and report `Programmed=True` while Gateway
+  `Programmed` remains false until all required records are ready. Private
+  VNet, HostnameRoute, and TLS-decryption prerequisites also block only their
+  listener. Applied hostname checkpoints advance after Pod/xDS convergence
+  independently of DNS and private readiness. Retiring an obsolete generated
+  HostnameRoute also blocks matching active private listeners until a current
+  route is Applied, preserving unrelated listeners during renames (#135).
+
 ### Changed
 
 - Upgrade the Go toolchain to 1.27.3 and refresh Go modules, including the
@@ -25,23 +45,12 @@
 - Keep Gateway envtest status writes bounded while live controllers run:
   retry only resource-version conflicts and fail immediately on other errors.
 
-### Fixed
-
-- Scope Access block-first transitions to protection domains whose Access
-  binding changed, preserving forwarding for unchanged independent domains.
-  Each public protected hostname has its own domain; private hostnames
-  sharing a route table transition together. Record the
-  binding digest after the blocked configuration converges, including a
-  one-time handshake for older status without a digest. Managed DNS requires
-  exactly one explicit `Ready` record per case-insensitive hostname. Missing,
-  empty, unknown, duplicate, or conflicted records block only their listener's hostnames;
-  healthy listeners can forward and report `Programmed=True` while Gateway
-  `Programmed` remains false until all required records are ready. Private
-  VNet, HostnameRoute, and TLS-decryption prerequisites also block only their
-  listener. Applied hostname checkpoints advance after Pod/xDS convergence
-  independently of DNS and private readiness. Retiring an obsolete generated
-  HostnameRoute also blocks matching active private listeners until a current
-  route is Applied, preserving unrelated listeners during renames (#135).
+- Upgrade Gateway API to v1.7.0. Controllers remain backward-compatible with
+  Gateway API v1.6.x Standard CRDs for v1.6.x resources and fields.
+- Add support for `HTTPRouteRetryCodes`, `HTTPRouteRetryConnectionError`,
+  `HTTPRouteBackendURLRewrite`,
+  `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteNamedRouteRule`, and
+  `GatewayRouteHostnameIntersectionPrecedence`.
 
 ## v0.3.3 - 2026-10-11
 

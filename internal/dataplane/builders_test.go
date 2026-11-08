@@ -34,6 +34,31 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+func TestLongGatewayAndTunnelNamesFitBounds(t *testing.T) {
+	gw := testGateway(true)
+	gw.Key.Name = strings.Repeat("g", 253)
+
+	for name, value := range map[string]string{
+		"dataplane Deployment":     ResourceName(gw),
+		"Envoy bootstrap ConfigMap": BootstrapConfigMapName(gw),
+		"xDS client Secret":        XDSClientSecretName(gw),
+		"Tunnel token Secret":      TunnelTokenSecretName(gw),
+	} {
+		if len(value) > 253 {
+			t.Errorf("%s name length = %d, want at most 253: %q", name, len(value), value)
+		}
+	}
+	if value := StandardGatewayLabelValue(gw.Key.Name); len(value) > 63 {
+		t.Fatalf("standard Gateway label length = %d, want at most 63", len(value))
+	}
+	if value := GatewayLabelValueForKey(gw.Key.Namespace, gw.Key.Name); len(value) > 63 {
+		t.Fatalf("namespaced Gateway label length = %d, want at most 63", len(value))
+	}
+	if value := BoundedSecretName("flareway-tunnel-", gw.Key.Name, "-management"); len(value) > 253 {
+		t.Fatalf("management Secret name length = %d, want at most 253", len(value))
+	}
+}
+
 func TestBuildDeploymentConformanceContract(t *testing.T) {
 	gw := testGateway(true)
 	cfg := testConfig(true)

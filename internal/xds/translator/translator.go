@@ -1048,6 +1048,9 @@ func mergeVirtualHosts(group *routeGroup, incoming []ir.VirtualHost) {
 }
 
 func routePrecedes(left, right ir.Route) bool {
+	if cmp := compareRouteHostnameSpecificity(left.Source.RouteHostname, right.Source.RouteHostname); cmp != 0 {
+		return cmp < 0
+	}
 	leftRank := pathMatchRank(left.Match.Type)
 	rightRank := pathMatchRank(right.Match.Type)
 	if leftRank != rightRank {
@@ -1065,9 +1068,46 @@ func routePrecedes(left, right ir.Route) bool {
 	if len(left.Query) != len(right.Query) {
 		return len(left.Query) > len(right.Query)
 	}
+	if left.Source.CreationTimestamp != right.Source.CreationTimestamp {
+		return left.Source.CreationTimestamp < right.Source.CreationTimestamp
+	}
+	leftKey := left.Source.Namespace + "/" + left.Source.Name
+	rightKey := right.Source.Namespace + "/" + right.Source.Name
+	if leftKey != rightKey {
+		return leftKey < rightKey
+	}
+	if left.Source.RuleIndex != right.Source.RuleIndex {
+		return left.Source.RuleIndex < right.Source.RuleIndex
+	}
+	if left.Source.MatchIndex != right.Source.MatchIndex {
+		return left.Source.MatchIndex < right.Source.MatchIndex
+	}
 	return left.Name < right.Name
 }
 
+func routeHostnameSpecificity(hostname string) int {
+	hostname = strings.ToLower(hostname)
+	if hostname == "" || hostname == "*" {
+		return 2
+	}
+	if strings.HasPrefix(hostname, "*.") {
+		return 1
+	}
+	return 0
+}
+
+func compareRouteHostnameSpecificity(a, b string) int {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	aRank, bRank := routeHostnameSpecificity(a), routeHostnameSpecificity(b)
+	if aRank != bRank {
+		return aRank - bRank
+	}
+	if aRank == 1 && len(a) != len(b) {
+		return len(b) - len(a)
+	}
+	return 0
+}
 func pathMatchRank(matchType string) int {
 	switch matchType {
 	case ir.PathMatchExact:

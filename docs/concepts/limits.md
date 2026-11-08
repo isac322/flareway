@@ -12,27 +12,29 @@ The controller runs as one replica with leader election enabled, and Gateways ar
 
 Flareway implements `HTTPRoute`. `GRPCRoute`, `TLSRoute`, `TCPRoute`, and `UDPRoute` are not implemented. A listener whose `allowedRoutes.kinds` names any kind other than `HTTPRoute` reports `ResolvedRefs=False` with reason `InvalidRouteKinds`. To reach private TCP services, use a `NetworkRoute` or a [Direct tunnel](../get-started/direct-tunnels.md).
 
-The controller does not claim these Gateway API features in `GatewayClass.status.supportedFeatures`:
+The controller does not claim these Gateway API Extended features in `GatewayClass.status.supportedFeatures`:
 
+- `ClusterTrustBundle`
 - `GatewayAddressEmpty`
+- `GatewayAddressRoutability`
+- `GatewayAddressRoutabilityCluster`
 - `GatewayBackendClientCertificate`
 - `GatewayFrontendClientCertificateValidation`
 - `GatewayFrontendClientCertificateValidationInsecureFallback`
+- `GatewayListenerFilters`
 - `GatewayPort8080`
 - `GatewayStaticAddresses`
-- `HTTPRouteBackendRequestHeaderModification`
-- `HTTPRouteNamedRouteRule`
-- `HTTPRouteRetry`
-- `HTTPRouteRetryBackendTimeout`
-- `HTTPRouteRetryConnectionError`
 - `ListenerSet`
 
 Some of these are refused with a specific reason:
 
 | Configuration | Result |
 |---|---|
-| `Gateway.spec.addresses` set, with or without a value (`GatewayStaticAddresses`, `GatewayAddressEmpty`) | `Accepted=False`, reason `UnsupportedAddress`. Cloudflare owns the edge addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
-| `Gateway.spec.allowedListeners` set (`ListenerSet`) | `Accepted=False`, reason `ListenersNotValid`. |
+| `Gateway.spec.addresses` set, with or without a value (`GatewayAddressEmpty`, `GatewayAddressRoutability`, `GatewayAddressRoutabilityCluster`, `GatewayStaticAddresses`) | `Accepted=False`, reason `UnsupportedAddress`. Cloudflare owns the edge addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
+| `Gateway.spec.tls` set | `Accepted=False`, reason `ListenersNotValid`. |
+| `Gateway.spec.listeners[].filters` set (`GatewayListenerFilters`) | The listener reports `Accepted=False`, reason `UnsupportedValue`. |
+| `Gateway.spec.allowedListeners.namespaces.from: None` | Accepted as a no-op. |
+| `Gateway.spec.allowedListeners.namespaces.from: Same`, `All`, or `Selector` (`ListenerSet`) | `Accepted=False`, reason `ListenersNotValid`. |
 | An `ExtensionRef` filter on a rule | The rule is invalid with reason `InvalidKind`. Flareway defines no extension filter kinds. |
 | A `backendRef` to anything other than a core `Service` | Reason `InvalidKind`. An `ExternalName` Service is treated as not found. |
 

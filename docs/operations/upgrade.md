@@ -5,10 +5,22 @@ Upgrade CRDs before the controller. Helm installs files in a chart's `crds/` dir
 ## Before upgrading
 
 1. Read the GitHub release notes for every version you skip, and compare chart values.
-2. Confirm Gateway API v1.6.3 Standard CRDs are installed.
+2. Confirm Gateway API v1.7.0 Standard CRDs are installed.
 3. Back up Flareway custom resources and the values used for the current release.
 4. Check for resources with `CleanupBlocked`, `Conflict`, or `Programmed=False`; resolve them before changing controller ownership.
 5. Keep the old controller running until managed resource teardown or migration is complete.
+
+## Version compatibility
+
+| Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
+|---|---|---|---|---|
+| `main` (unreleased) | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
+| `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
+
+A Flareway controller built for Gateway API v1.7.0 remains backward-compatible with clusters running Gateway API v1.6.x Standard CRDs for all v1.6.x resources and fields. Gateway API v1.7.0 Standard CRD features such as `HTTPRoute.spec.rules[].retry` require the v1.7.0 CRDs installed on the cluster.
+
+Gateway API v1.7.0 `standard-install.yaml` includes the `safe-upgrades` `ValidatingAdmissionPolicy`. It blocks downgrading Gateway API CRDs to v1.6.x unless you delete that policy first.
 
 ## Apply the CRDs first
 
