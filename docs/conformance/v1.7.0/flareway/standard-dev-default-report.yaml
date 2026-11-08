@@ -1,7 +1,7 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-10-09T13:20:01Z"
+date: "2026-11-08T04:13:44Z"
 gatewayAPIChannel: standard
-gatewayAPIVersion: v1.6.3
+gatewayAPIVersion: v1.7.0
 implementation:
   contact:
   - '@isac322'
@@ -16,13 +16,13 @@ profiles:
     result: success
     statistics:
       Failed: 0
-      Passed: 36
+      Passed: 40
       Skipped: 0
   extended:
     result: success
     statistics:
       Failed: 0
-      Passed: 32
+      Passed: 42
       Skipped: 0
     supportedFeatures:
     - BackendTLSPolicy
@@ -30,16 +30,20 @@ profiles:
     - GatewayHTTPListenerIsolation
     - GatewayHTTPSListenerDetectMisdirectedRequests
     - GatewayInfrastructure
+    - GatewayRouteHostnameIntersectionPrecedence
     - HTTPRoute303RedirectStatusCode
     - HTTPRoute307RedirectStatusCode
     - HTTPRoute308RedirectStatusCode
     - HTTPRouteBackendProtocolH2C
     - HTTPRouteBackendProtocolWebSocket
+    - HTTPRouteBackendRequestHeaderModification
     - HTTPRouteBackendTimeout
+    - HTTPRouteBackendURLRewrite
     - HTTPRouteCORS
     - HTTPRouteDestinationPortMatching
     - HTTPRouteHostRewrite
     - HTTPRouteMethodMatching
+    - HTTPRouteNamedRouteRule
     - HTTPRouteParentRefPort
     - HTTPRoutePathRedirect
     - HTTPRoutePathRewrite
@@ -50,19 +54,27 @@ profiles:
     - HTTPRouteRequestPercentageMirror
     - HTTPRouteRequestTimeout
     - HTTPRouteResponseHeaderModification
+    - HTTPRouteRetryCodes
+    - HTTPRouteRetryConnectionError
     - HTTPRouteSchemeRedirect
     unsupportedFeatures:
+    - ClusterTrustBundle
     - GatewayAddressEmpty
+    - GatewayAddressRoutability
+    - GatewayAddressRoutabilityCluster
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
     - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayListenerFilters
     - GatewayPort8080
     - GatewayStaticAddresses
-    - HTTPRouteBackendRequestHeaderModification
-    - HTTPRouteNamedRouteRule
-    - HTTPRouteRetry
-    - HTTPRouteRetryBackendTimeout
-    - HTTPRouteRetryConnectionError
     - ListenerSet
   name: GATEWAY-HTTP
   summary: Core tests succeeded. Extended tests succeeded.
+succeededProvisionalTests:
+- BackendTLSPolicyPreserveForeignStatus
+- GatewayPreserveForeignConditions
+- HTTPRouteBackendURLRewrite
+- HTTPRoutePreserveForeignStatus
+- HTTPRouteRetryWithBackendTimeout
+- HTTPRouteRetryWithRequestTimeout

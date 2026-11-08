@@ -64,6 +64,7 @@ type routeOutcome struct {
 	resolvedReason gatewayv1.RouteConditionReason
 	resolvedMsg    string
 	dropped        []string
+	droppedReason  gatewayv1.RouteConditionReason
 }
 
 type compiledRoute struct {
@@ -162,10 +163,18 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 		gatewayReason = gatewayv1.GatewayReasonUnsupportedAddress
 		gatewayMessage = "spec.addresses is not supported"
 	}
-	if in.Gateway.Spec.AllowedListeners != nil {
+	if in.Gateway.Spec.AllowedListeners != nil &&
+		(in.Gateway.Spec.AllowedListeners.Namespaces == nil ||
+			in.Gateway.Spec.AllowedListeners.Namespaces.From == nil ||
+			*in.Gateway.Spec.AllowedListeners.Namespaces.From != gatewayv1.NamespacesFromNone) {
 		globalInvalid = true
 		gatewayReason = gatewayv1.GatewayReasonListenersNotValid
 		gatewayMessage = "spec.allowedListeners is not supported"
+	}
+	if in.Gateway.Spec.TLS != nil && (in.Gateway.Spec.TLS.Backend != nil || in.Gateway.Spec.TLS.Frontend != nil) {
+		globalInvalid = true
+		gatewayReason = gatewayv1.GatewayReasonListenersNotValid
+		gatewayMessage = "spec.tls is not supported"
 	}
 	if infrastructure := in.Gateway.Spec.Infrastructure; infrastructure != nil && infrastructure.ParametersRef != nil {
 		ref := infrastructure.ParametersRef
@@ -407,6 +416,10 @@ func validateListener(in Inputs, translated *listenerTranslation, conformance bo
 		invalidateListener(translated, gatewayv1.ListenerReasonUnsupportedProtocol, "only HTTP and HTTPS listeners are supported")
 		return
 	}
+	if listener.Filters != nil && len(listener.Filters.Requests) > 0 {
+		invalidateListener(translated, gatewayv1.ListenerReasonUnsupportedValue, "listener filters are not supported")
+		return
+	}
 	if !conformance {
 		if listener.Hostname == nil || *listener.Hostname == "" {
 			invalidateListener(translated, gatewayv1.ListenerReasonUnsupportedValue, "listener hostname is required")
@@ -636,13 +649,18 @@ func compileHTTPRoutes(in Inputs, out *ir.Gateway, listeners []*listenerTranslat
 					if compiledByHost[listener.ir.Name] == nil {
 						compiledByHost[listener.ir.Name] = make(map[string][]compiledRoute)
 					}
-					compiledByHost[listener.ir.Name][string(host)] = append(compiledByHost[listener.ir.Name][string(host)], routeCompiled...)
+					for _, item := range routeCompiled {
+						cloned := item
+						cloned.route.Source.RouteHostname = mostSpecificMatchingRouteHostname(route.Spec.Hostnames, string(host))
+						compiledByHost[listener.ir.Name][string(host)] = append(compiledByHost[listener.ir.Name][string(host)], cloned)
+					}
 				}
 			}
 			outcome.resolved = routeResolvedReason == gatewayv1.RouteReasonResolvedRefs
 			outcome.resolvedReason = routeResolvedReason
 			outcome.resolvedMsg = routeResolvedMessage
 			outcome.dropped = slices.Clone(allDropped)
+			outcome.droppedReason = droppedReason
 			replacements = append(replacements, routeParentStatus(route, parentRef, outcome, now))
 		}
 
@@ -958,10 +976,14 @@ func routeParentStatus(route *gatewayv1.HTTPRoute, parent gatewayv1.ParentRefere
 		status.NewCondition(string(gatewayv1.RouteConditionResolvedRefs), conditionStatus(outcome.resolved), string(outcome.resolvedReason), outcome.resolvedMsg, route.Generation, now),
 	}
 	if outcome.accepted && len(outcome.dropped) > 0 {
+		droppedReason := outcome.droppedReason
+		if droppedReason == "" {
+			droppedReason = gatewayv1.RouteReasonUnsupportedValue
+		}
 		conditions = append(conditions, status.NewCondition(
 			string(gatewayv1.RouteConditionPartiallyInvalid),
 			metav1.ConditionTrue,
-			string(gatewayv1.RouteReasonUnsupportedValue),
+			string(droppedReason),
 			"Dropped Rule: "+strings.Join(outcome.dropped, "; "),
 			route.Generation,
 			now,
@@ -971,6 +993,9 @@ func routeParentStatus(route *gatewayv1.HTTPRoute, parent gatewayv1.ParentRefere
 }
 
 func compareCompiledRoutes(a, b compiledRoute) int {
+	if cmp := CompareRouteHostnameSpecificity(a.route.Source.RouteHostname, b.route.Source.RouteHostname); cmp != 0 {
+		return cmp
+	}
 	if a.route.Match.Type != b.route.Match.Type {
 		return pathTypeRank(a.route.Match.Type) - pathTypeRank(b.route.Match.Type)
 	}
@@ -999,6 +1024,73 @@ func compareCompiledRoutes(a, b compiledRoute) int {
 		return a.ruleIndex - b.ruleIndex
 	}
 	return a.matchIndex - b.matchIndex
+}
+func mostSpecificMatchingRouteHostname(routeHostnames []gatewayv1.Hostname, vhostHost string) string {
+	best := ""
+	found := false
+	for _, routeHostname := range routeHostnames {
+		candidate := string(routeHostname)
+		if !routeHostnameIntersectsVHost(candidate, vhostHost) {
+			continue
+		}
+		if !found || CompareRouteHostnameSpecificity(candidate, best) < 0 {
+			best = candidate
+			found = true
+		}
+	}
+	return best
+}
+
+func routeHostnameIntersectsVHost(routeHost, vhostHost string) bool {
+	routeHost = strings.ToLower(routeHost)
+	vhostHost = strings.ToLower(vhostHost)
+	if routeHost == "" || routeHost == "*" || vhostHost == "" || vhostHost == "*" {
+		return true
+	}
+	if routeHost == vhostHost {
+		return true
+	}
+	routeWildcard := strings.HasPrefix(routeHost, "*.")
+	vhostWildcard := strings.HasPrefix(vhostHost, "*.")
+	switch {
+	case routeWildcard && !vhostWildcard:
+		suffix := strings.TrimPrefix(routeHost, "*")
+		return strings.HasSuffix(vhostHost, suffix) && len(vhostHost) > len(suffix)
+	case !routeWildcard && vhostWildcard:
+		suffix := strings.TrimPrefix(vhostHost, "*")
+		return strings.HasSuffix(routeHost, suffix) && len(routeHost) > len(suffix)
+	case routeWildcard && vhostWildcard:
+		routeSuffix := strings.TrimPrefix(routeHost, "*")
+		vhostSuffix := strings.TrimPrefix(vhostHost, "*")
+		return strings.HasSuffix(routeSuffix, vhostSuffix) || strings.HasSuffix(vhostSuffix, routeSuffix)
+	default:
+		return false
+	}
+}
+
+// CompareRouteHostnameSpecificity orders exact hostnames before wildcard
+// hostnames (with longer wildcard suffixes first), then catch-all hostnames.
+func CompareRouteHostnameSpecificity(a, b string) int {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	aRank, bRank := routeHostnameSpecificity(a), routeHostnameSpecificity(b)
+	if aRank != bRank {
+		return aRank - bRank
+	}
+	if aRank == 1 && len(a) != len(b) {
+		return len(b) - len(a)
+	}
+	return 0
+}
+
+func routeHostnameSpecificity(hostname string) int {
+	if hostname == "" || hostname == "*" {
+		return 2
+	}
+	if strings.HasPrefix(hostname, "*.") {
+		return 1
+	}
+	return 0
 }
 
 func pathTypeRank(matchType string) int {

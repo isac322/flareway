@@ -841,7 +841,7 @@ func (r *GatewayReconciler) cloudflareGate(
 	}
 
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(gateway.Key.Namespace), client.MatchingLabels{dataplane.StandardGatewayLabelKey: gateway.Key.Name}); err != nil {
+	if err := r.List(ctx, &pods, client.InNamespace(gateway.Key.Namespace), client.MatchingLabels{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gateway.Key.Name)}); err != nil {
 		return false, nil, false, fmt.Errorf("list dataplane Pods: %w", err)
 	}
 	activePods := 0
@@ -1332,6 +1332,11 @@ func (r *GatewayReconciler) mapAccountToGateways(ctx context.Context, object cli
 }
 
 func (r *GatewayReconciler) mapPodToGateway(_ context.Context, object client.Object) []reconcile.Request {
+	if managed := object.GetAnnotations()[dataplane.ManagedByLabelKey]; managed != "" {
+		if namespace, name, ok := strings.Cut(managed, "/"); ok && namespace == object.GetNamespace() && name != "" {
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
+		}
+	}
 	name := object.GetLabels()[dataplane.StandardGatewayLabelKey]
 	if name == "" {
 		return nil

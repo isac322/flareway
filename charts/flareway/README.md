@@ -10,6 +10,16 @@ The chart packages every generated `flareway.bhyoo.com` CRD in `crds/`. Print th
 
 Helm installs files from `crds/` before the chart templates. Helm does not upgrade or delete those CRDs during a normal chart upgrade or uninstall; the [upgrade guide](https://flareway.bhyoo.com/docs/operations/upgrade/) applies them first. The chart has no uninstall hooks and does not contact Cloudflare or delete remote resources during uninstall.
 
+### Version compatibility
+
+| Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
+|---|---|---|---|---|
+| `main` (unreleased) | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
+| `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
+
+A Flareway controller built for Gateway API v1.7.0 remains backward-compatible with clusters running Gateway API v1.6.x Standard CRDs for all v1.6.x resources and fields. Gateway API v1.7.0 Standard CRD features such as `HTTPRoute.spec.rules[].retry` require the v1.7.0 CRDs installed on the cluster.
+
 ## Controller groups
 
 All controller groups default to enabled. The values map directly to the controller-manager feature flags rendered by the Deployment. The shared `CloudflareAccount` controller runs whenever any controller group is enabled.

@@ -14,7 +14,7 @@ CLOUD_PROVIDER_KIND_BIN="${CLOUD_PROVIDER_KIND:-${BIN_DIR}/cloud-provider-kind}"
 KIND_VERSION="${KIND_VERSION:-v0.33.0}"
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-flareway-conf}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.37.0}"
-GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.6.3}"
+GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.7.0}"
 KO_VERSION="${KO_VERSION:-v0.19.1}"
 KUSTOMIZE_VERSION="${KUSTOMIZE_VERSION:-v5.8.3}"
 CLOUD_PROVIDER_KIND_VERSION="${CLOUD_PROVIDER_KIND_VERSION:-v0.12.0}"
@@ -27,7 +27,7 @@ if [[ -z "${VERSION}" ]]; then
   VERSION="${VERSION:-dev}"
 fi
 
-REPORT_OUTPUT="${REPORT_OUTPUT:-docs/conformance/v1.6.3/flareway/standard-${VERSION}-default-report.yaml}"
+REPORT_OUTPUT="${REPORT_OUTPUT:-docs/conformance/${GATEWAY_API_VERSION}/flareway/standard-${VERSION}-default-report.yaml}"
 if [[ "${REPORT_OUTPUT}" != /* ]]; then
   REPORT_OUTPUT="${ROOT_DIR}/${REPORT_OUTPUT}"
 fi
@@ -120,7 +120,9 @@ kubectl apply --server-side -f \
 kubectl wait --for=condition=Established --timeout=2m \
   customresourcedefinition/gatewayclasses.gateway.networking.k8s.io \
   customresourcedefinition/gateways.gateway.networking.k8s.io \
-  customresourcedefinition/httproutes.gateway.networking.k8s.io
+  customresourcedefinition/httproutes.gateway.networking.k8s.io \
+  customresourcedefinition/referencegrants.gateway.networking.k8s.io \
+  customresourcedefinition/backendtlspolicies.gateway.networking.k8s.io
 
 controller_image=""
 if git rev-parse --verify HEAD >/dev/null 2>&1 && controller_image="$(

@@ -20,10 +20,11 @@ Flareway uses `cloudflared` for transport and Envoy for routing. Both run in the
 
 When several rules could match a request, Envoy tries them in this order:
 
-1. `Exact` path, then `RegularExpression` path, then `PathPrefix` path, with the longer prefix first.
-2. A rule that matches a method, before one that does not.
-3. More header matches, then more query parameter matches.
-4. The older `HTTPRoute` by creation time, then `namespace/name`, then rule index, then match index.
+1. Original route hostname specificity: exact, then the longest wildcard, then catch-all.
+2. `Exact` path, then `RegularExpression` path, then `PathPrefix` path, with the longer prefix first.
+3. A rule that matches a method, before one that does not.
+4. More header matches, then more query parameter matches.
+5. The older `HTTPRoute` by creation time, then `namespace/name`, then rule index, then match index.
 
 Gateway API does not define where regular-expression paths rank against other path types, so Flareway fixes them between `Exact` and `PathPrefix`.
 
@@ -31,23 +32,27 @@ Gateway API does not define where regular-expression paths rank against other pa
 
 Flareway supports GatewayHTTP Core: `Gateway`, `HTTPRoute`, and `ReferenceGrant`. That includes `Exact` and `PathPrefix` path matches, exact header matches, request header modification, request redirects, and weighted `backendRefs`. Flareway also accepts `RegularExpression` for path, header, and query parameter matches.
 
-The Extended features below are the ones Flareway claims in `GatewayClass.status.supportedFeatures`. Each name is a Gateway API feature name.
+The Extended features below are the ones Flareway claims in `GatewayClass.status.supportedFeatures`. Flareway claims 35 features in total: 3 Core and 32 Extended. Each name is a Gateway API feature name.
 
 ### Matching
 
 | Feature | What it adds |
 |---|---|
+| `GatewayRouteHostnameIntersectionPrecedence` | Resolve route precedence by the most specific original route hostname before path, method, header, query, and creation time. |
 | `HTTPRouteMethodMatching` | Match on the HTTP method. |
 | `HTTPRouteQueryParamMatching` | Match on query parameters. |
 | `HTTPRouteParentRefPort` | Attach a route to Gateway listeners by `parentRefs[].port`. |
 | `HTTPRouteDestinationPortMatching` | A route whose `parentRefs[].port` matches no listener is not accepted: it reports `Accepted=False` with reason `NoMatchingParent`. |
+| `HTTPRouteNamedRouteRule` | Set an optional, unique `rules[].name` on each `HTTPRoute` rule. |
 
 ### Rewrites, redirects, and response headers
 
 | Feature | What it adds |
 |---|---|
-| `HTTPRouteHostRewrite` | `URLRewrite` replaces the `Host` header sent to the backend. |
-| `HTTPRoutePathRewrite` | `URLRewrite` replaces the full path or a path prefix. |
+| `HTTPRouteHostRewrite` | Rule-level `URLRewrite` replaces the `Host` header sent to the backend. |
+| `HTTPRoutePathRewrite` | Rule-level `URLRewrite` replaces the full path or a path prefix. |
+| `HTTPRouteBackendRequestHeaderModification` | Per-`backendRef` `RequestHeaderModifier` filters modify request headers for that backend. |
+| `HTTPRouteBackendURLRewrite` | Per-`backendRef` `URLRewrite` filters rewrite the hostname on any backend and rewrite the path on single-backend rules. Combining rule-level and backend-level `URLRewrite` drops the rule with `IncompatibleFilters`. |
 | `HTTPRoutePathRedirect` | `RequestRedirect` sets the redirect path. |
 | `HTTPRoutePortRedirect` | `RequestRedirect` sets the redirect port. |
 | `HTTPRouteSchemeRedirect` | `RequestRedirect` sets the redirect scheme. |
@@ -56,7 +61,7 @@ The Extended features below are the ones Flareway claims in `GatewayClass.status
 | `HTTPRoute308RedirectStatusCode` | Redirect with status 308. |
 | `HTTPRouteResponseHeaderModification` | `ResponseHeaderModifier` sets, adds, or removes response headers. |
 
-A rule cannot combine `RequestRedirect` and `URLRewrite`; Flareway drops that rule.
+A rule cannot combine `RequestRedirect` and rule-level `URLRewrite`; Flareway drops that rule.
 
 ### Mirroring
 
@@ -65,6 +70,13 @@ A rule cannot combine `RequestRedirect` and `URLRewrite`; Flareway drops that ru
 | `HTTPRouteRequestMirror` | Copy requests to a second backend. |
 | `HTTPRouteRequestMultipleMirrors` | Copy requests to more than one backend. |
 | `HTTPRouteRequestPercentageMirror` | Copy only a percentage of requests. |
+
+### Retries
+
+| Feature | What it adds |
+|---|---|
+| `HTTPRouteRetryCodes` | `rules[].retry` retries configured response codes. `attempts: 0` disables retries, and `backoff` sets the delay between attempts. |
+| `HTTPRouteRetryConnectionError` | With `rules[].retry` configured, retries connection failures such as `connect-failure` and `refused-stream`. |
 
 ### Timeouts
 
@@ -105,22 +117,26 @@ The two listener features were verified in conformance mode, where clients conne
 
 ## Not supported, and what happens
 
-Flareway does not claim these Extended features. Where it rejects or drops the configuration, the status says so:
+Flareway does not claim these 11 Extended features:
 
 | Feature | What happens |
 |---|---|
-| `HTTPRouteRetry`, `HTTPRouteRetryBackendTimeout`, `HTTPRouteRetryConnectionError` | A rule with `retry` is dropped. The route reports `PartiallyInvalid=True` with a `Dropped Rule` message, or `Accepted=False` when every rule is dropped. |
-| `GatewayStaticAddresses`, `GatewayAddressEmpty` | A Gateway with any `spec.addresses` entry, including one without a value that asks for a dynamically assigned address, reports `Accepted=False` with reason `UnsupportedAddress`. Cloudflare's edge owns the public addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
-| `ListenerSet` | A Gateway with `spec.allowedListeners` reports `Accepted=False` with reason `ListenersNotValid`. |
+| `ClusterTrustBundle` | Flareway does not claim this feature. |
+| `GatewayAddressEmpty`, `GatewayAddressRoutability`, `GatewayAddressRoutabilityCluster`, `GatewayStaticAddresses` | A Gateway with any `spec.addresses` entry, including one without a value that asks for a dynamically assigned address, reports `Accepted=False` with reason `UnsupportedAddress`. Cloudflare's edge owns the public addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
+| `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback` | Flareway does not claim these features. |
+| `GatewayListenerFilters` | `Gateway.spec.listeners[].filters` is rejected on that listener with `Accepted=False` and reason `UnsupportedValue`. |
 | `GatewayPort8080` | Public listeners must be HTTP on port 80 or HTTPS on port 443. Any other port marks the listener `PortUnavailable`. Private HTTPS listeners accept any port. |
-| `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback`, `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteNamedRouteRule` | Flareway does not claim these features. Do not depend on them. |
+| `ListenerSet` | A Gateway with `spec.allowedListeners.namespaces.from: Same`, `All`, or `Selector` reports `Accepted=False` with reason `ListenersNotValid`. `None` is accepted as a no-op. |
+
+`Gateway.spec.tls` is rejected with `Accepted=False` and reason `ListenersNotValid`.
 
 Some configuration falls outside the feature list:
 
-- `sessionPersistence` is dropped the same way as `retry`.
+- `sessionPersistence` is dropped and the route reports the resulting invalid rule.
 - A listener whose `allowedRoutes.kinds` names anything other than `HTTPRoute`, such as `GRPCRoute`, `TLSRoute`, `TCPRoute`, or `UDPRoute`, reports `ResolvedRefs=False` with reason `InvalidRouteKinds`.
 - An `ExtensionRef` filter sets the route's `ResolvedRefs=False` with reason `InvalidKind`, and Envoy answers matching requests with HTTP 500, as the Gateway API specification requires.
 - For TCP, SSH, RDP, or other non-HTTP private services, use a `NetworkRoute` over WARP (see [Private services over WARP](../get-started/private-services-over-warp.md)) or a Direct-mode tunnel (see [Direct tunnels](../get-started/direct-tunnels.md)).
+
 
 ## Edge constraints that still apply
 
@@ -132,4 +148,4 @@ See [Limits](limits.md) for the rest of Flareway's boundaries.
 
 ## Evidence
 
-The supported feature names on this page are the list the controller publishes in `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go`). A local Gateway API conformance run tested every one of them; the [conformance report](../conformance/v1.6.3/flareway/README.md) gives the results and what the run did not cover.
+The supported feature names on this page are the list the controller publishes in `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go`). A local Gateway API conformance run tested every one of them; the [conformance report](../conformance/v1.7.0/flareway/README.md) gives the results and what the run did not cover.

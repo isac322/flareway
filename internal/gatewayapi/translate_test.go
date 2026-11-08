@@ -51,6 +51,25 @@ func TestSupportedFeaturesSortedAndCopySafe(t *testing.T) {
 			t.Fatalf("features are not sorted: %q before %q", first[i-1], first[i])
 		}
 	}
+	for _, expected := range []string{
+		"GatewayRouteHostnameIntersectionPrecedence",
+		"HTTPRouteBackendRequestHeaderModification",
+		"HTTPRouteBackendURLRewrite",
+		"HTTPRouteNamedRouteRule",
+		"HTTPRouteRetryCodes",
+		"HTTPRouteRetryConnectionError",
+	} {
+		found := false
+		for _, feature := range first {
+			if string(feature) == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("SupportedFeatures missing %q", expected)
+		}
+	}
 	original := first[0]
 	first[0] = "mutated"
 	if SupportedFeatures()[0] != original {
@@ -339,8 +358,9 @@ func TestTranslateDroppedRules(t *testing.T) {
 	in.Services = []corev1.Service{service("default", "backend", 8080, nil)}
 	valid := routeWithMatch("partial", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
 	valid.Spec.Rules = append(valid.Spec.Rules, gatewayv1.HTTPRouteRule{
-		Retry:       &gatewayv1.HTTPRouteRetry{},
-		BackendRefs: valid.Spec.Rules[0].BackendRefs,
+		//nolint:staticcheck // SA1019: SessionPersistence is deprecated in v1.7.0 but remains a rejected experimental field.
+		SessionPersistence: &gatewayv1.SessionPersistence{},
+		BackendRefs:        valid.Spec.Rules[0].BackendRefs,
 	})
 	in.HTTPRoutes = []gatewayv1.HTTPRoute{valid}
 	gateway, statuses := Translate(in)
@@ -358,7 +378,8 @@ func TestTranslateDroppedRules(t *testing.T) {
 	}
 
 	invalid := routeWithMatch("invalid", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
-	invalid.Spec.Rules[0].Retry = &gatewayv1.HTTPRouteRetry{}
+	//nolint:staticcheck // SA1019: SessionPersistence is deprecated in v1.7.0 but remains a rejected experimental field.
+	invalid.Spec.Rules[0].SessionPersistence = &gatewayv1.SessionPersistence{}
 	in.HTTPRoutes = []gatewayv1.HTTPRoute{invalid}
 	gateway, statuses = Translate(in)
 	if len(gateway.Domains[0].VirtualHosts) != 0 {
@@ -372,6 +393,155 @@ func TestTranslateDroppedRules(t *testing.T) {
 	}
 }
 
+func TestTranslateRetryAndNamedRuleValidation(t *testing.T) {
+	in := baseInputs()
+	in.Services = []corev1.Service{service("default", "backend", 8080, nil)}
+	route := routeWithMatch("retry", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	attempts := 0
+	backoff := gatewayv1.Duration("2s")
+	route.Spec.Rules[0].Retry = &gatewayv1.HTTPRouteRetry{
+		Attempts: &attempts,
+		Codes:    []gatewayv1.HTTPRouteRetryStatusCode{503, 500, 503},
+		Backoff:  &backoff,
+	}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+	gateway, _ := Translate(in)
+	translated := gateway.Domains[0].VirtualHosts[0].Routes[0]
+	if translated.Retry == nil || translated.Retry.Attempts != 0 ||
+		!reflect.DeepEqual(translated.Retry.Codes, []uint32{500, 503}) ||
+		translated.Retry.Backoff == nil || *translated.Retry.Backoff != 2*time.Second {
+		t.Fatalf("retry IR = %#v", translated.Retry)
+	}
+
+	if defaultRetry, invalid := compileRetry(&gatewayv1.HTTPRouteRetry{}); invalid != nil || defaultRetry == nil || defaultRetry.Attempts != 1 {
+		t.Fatalf("nil attempts retry = %#v, invalid=%v", defaultRetry, invalid)
+	}
+	route = routeWithMatch("named", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	name := gatewayv1.SectionName("rule")
+	route.Spec.Rules[0].Name = &name
+	duplicate := route.Spec.Rules[0]
+	route.Spec.Rules = append(route.Spec.Rules, duplicate)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+	gateway, statuses := Translate(in)
+	if len(gateway.Domains[0].VirtualHosts[0].Routes) != 1 {
+		t.Fatalf("duplicate named rule was not dropped: %#v", gateway.Domains[0].VirtualHosts[0].Routes)
+	}
+	partial := findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "named"}], gatewayv1.RouteConditionPartiallyInvalid)
+	if partial == nil || partial.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Fatalf("duplicate named rule condition = %#v", partial)
+	}
+}
+
+func TestRouteHostnameIntersectionSpecificity(t *testing.T) {
+	tests := []struct {
+		name, route, vhost string
+		want               bool
+	}{
+		{name: "exact", route: "api.example.com", vhost: "api.example.com", want: true},
+		{name: "different exact", route: "api.example.com", vhost: "www.example.com", want: false},
+		{name: "route wildcard", route: "*.example.com", vhost: "api.example.com", want: true},
+		{name: "wildcard disjoint", route: "*.example.com", vhost: "api.example.net", want: false},
+		{name: "wildcard overlap", route: "*.example.com", vhost: "*.api.example.com", want: true},
+		{name: "catch all", route: "", vhost: "api.example.com", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := routeHostnameIntersectsVHost(test.route, test.vhost); got != test.want {
+				t.Fatalf("intersection = %v, want %v", got, test.want)
+			}
+		})
+	}
+	if CompareRouteHostnameSpecificity("api.example.com", "*.example.com") >= 0 ||
+		CompareRouteHostnameSpecificity("*.api.example.com", "*.example.com") >= 0 ||
+		CompareRouteHostnameSpecificity("*.example.com", "") >= 0 {
+		t.Fatal("hostname specificity ordering is incorrect")
+	}
+}
+
+func TestTranslateGatewayTLSAndAllowedListenersFailClosed(t *testing.T) {
+	in := baseInputs()
+	in.Gateway.Spec.TLS = &gatewayv1.GatewayTLSConfig{Backend: &gatewayv1.GatewayBackendTLS{}}
+	gateway, statuses := Translate(in)
+	accepted := findGatewayCondition(statuses.Gateway, gatewayv1.GatewayConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != string(gatewayv1.GatewayReasonListenersNotValid) || len(gateway.Listeners) != 0 {
+		t.Fatalf("Gateway TLS validation: gateway=%#v condition=%#v", gateway, accepted)
+	}
+
+	in = baseInputs()
+	from := gatewayv1.NamespacesFromNone
+	in.Gateway.Spec.AllowedListeners = &gatewayv1.AllowedListeners{Namespaces: &gatewayv1.ListenerNamespaces{From: &from}}
+	gateway, statuses = Translate(in)
+	accepted = findGatewayCondition(statuses.Gateway, gatewayv1.GatewayConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionTrue || len(gateway.Listeners) != 1 {
+		t.Fatalf("allowedListeners None should be accepted: %#v", accepted)
+	}
+}
+
+func TestTranslateListenerFiltersFailClosedPerListener(t *testing.T) {
+	in := baseInputs()
+	in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
+		Name:     "other",
+		Hostname: new(gatewayv1.Hostname("other.example.com")),
+		Port:     80,
+		Protocol: gatewayv1.HTTPProtocolType,
+	})
+	in.Gateway.Spec.Listeners[0].Filters = &gatewayv1.ListenerFilters{
+		Requests: []gatewayv1.ListenerFilter{{Type: gatewayv1.ListenerFilterExtensionRef}},
+	}
+	_, statuses := Translate(in)
+	filtered := findListenerCondition(statuses.Gateway, "http", gatewayv1.ListenerConditionAccepted)
+	other := findListenerCondition(statuses.Gateway, "other", gatewayv1.ListenerConditionAccepted)
+	if filtered == nil || filtered.Status != metav1.ConditionFalse || filtered.Reason != string(gatewayv1.ListenerReasonUnsupportedValue) ||
+		other == nil || other.Status != metav1.ConditionTrue {
+		t.Fatalf("listener filter statuses: filtered=%#v other=%#v", filtered, other)
+	}
+}
+
+func TestTranslateBackendURLRewriteValidation(t *testing.T) {
+	in := baseInputs()
+	in.Services = []corev1.Service{
+		service("default", "backend", 8080, nil),
+		service("default", "second", 8081, nil),
+	}
+	route := routeWithMatch("combined", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	route.Spec.Rules[0].Filters = []gatewayv1.HTTPRouteFilter{{
+		Type: gatewayv1.HTTPRouteFilterURLRewrite,
+		URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+			Path: &gatewayv1.HTTPPathModifier{Type: gatewayv1.FullPathHTTPPathModifier, ReplaceFullPath: new("/new")},
+		},
+	}}
+	route.Spec.Rules[0].BackendRefs[0].Filters = []gatewayv1.HTTPRouteFilter{{
+		Type:       gatewayv1.HTTPRouteFilterURLRewrite,
+		URLRewrite: &gatewayv1.HTTPURLRewriteFilter{Hostname: new(gatewayv1.PreciseHostname("upstream.example.com"))},
+	}}
+	validRule := routeWithMatch("valid", gatewayv1.PathMatchPathPrefix, "/valid", nil, nil, nil, time.Unix(1, 0)).Spec.Rules[0]
+	route.Spec.Rules = append(route.Spec.Rules, validRule)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+	_, statuses := Translate(in)
+	partial := findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "combined"}], gatewayv1.RouteConditionPartiallyInvalid)
+	if partial == nil || partial.Reason != string(gatewayv1.RouteReasonIncompatibleFilters) {
+		t.Fatalf("combined URLRewrite condition = %#v", partial)
+	}
+
+	route = routeWithMatch("multi", gatewayv1.PathMatchPathPrefix, "/", nil, nil, nil, time.Unix(1, 0))
+	route.Spec.Rules[0].BackendRefs = append(route.Spec.Rules[0].BackendRefs, gatewayv1.HTTPBackendRef{
+		BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "second", Port: new(gatewayv1.PortNumber(8081))}},
+		Filters: []gatewayv1.HTTPRouteFilter{{
+			Type: gatewayv1.HTTPRouteFilterURLRewrite,
+			URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+				Path: &gatewayv1.HTTPPathModifier{Type: gatewayv1.FullPathHTTPPathModifier, ReplaceFullPath: new("/new")},
+			},
+		}},
+	})
+	validRule = routeWithMatch("valid", gatewayv1.PathMatchPathPrefix, "/valid", nil, nil, nil, time.Unix(1, 0)).Spec.Rules[0]
+	route.Spec.Rules = append(route.Spec.Rules, validRule)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+	_, statuses = Translate(in)
+	partial = findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "multi"}], gatewayv1.RouteConditionPartiallyInvalid)
+	if partial == nil || partial.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Fatalf("multi-backend path URLRewrite condition = %#v", partial)
+	}
+}
 func TestTranslateInvalidBackendTLSPolicyFailsClosed(t *testing.T) {
 	in := baseInputs()
 	in.Services = []corev1.Service{service("default", "backend", 8080, nil)}

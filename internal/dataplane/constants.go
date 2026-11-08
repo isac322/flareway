@@ -69,6 +69,30 @@ func TunnelTokenSecretName(gw *ir.Gateway) string {
 	return dnsLabelName("flareway-tunnel-", gw.Key.Name, "")
 }
 
+
+// StandardGatewayLabelValue returns a Gateway name safe for a Kubernetes label value.
+func StandardGatewayLabelValue(gatewayName string) string {
+	return labelValue(gatewayName)
+}
+
+// GatewayLabelValueForKey returns a namespaced Gateway identity safe for a label value.
+func GatewayLabelValueForKey(namespace, name string) string {
+	return labelValue(namespace + "--" + name)
+}
+
+// BoundedSecretName returns a deterministic Secret name no longer than 253 characters.
+func BoundedSecretName(prefix, name, suffix string) string {
+	full := prefix + name + suffix
+	if len(full) <= 253 {
+		return full
+	}
+	digest := sha256.Sum256([]byte(full))
+	hash := hex.EncodeToString(digest[:4])
+	keep := 253 - len(hash) - 1
+	base := strings.Trim(full[:keep], "-.")
+	return base + "-" + hash
+}
+
 func gatewayLabelValue(gw *ir.Gateway) string {
 	return labelValue(gw.Key.Namespace + "--" + gw.Key.Name)
 }
@@ -83,7 +107,7 @@ func resourceLabels(gw *ir.Gateway) map[string]string {
 		"app.kubernetes.io/component": "dataplane",
 		GatewayLabelKey:               gatewayLabelValue(gw),
 		ManagedByLabelKey:             "flareway",
-		StandardGatewayLabelKey:       gw.Key.Name,
+		StandardGatewayLabelKey:       StandardGatewayLabelValue(gw.Key.Name),
 	}
 }
 

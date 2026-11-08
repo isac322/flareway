@@ -41,6 +41,7 @@ func TestTranslatorSnapshotValidatesWithEnvoy(t *testing.T) {
 	method := "GET"
 	requestTimeout := 15 * time.Second
 	backendTimeout := 5 * time.Second
+	retryBackoff := 100 * time.Millisecond
 	maxAge := int32(600)
 	invalidBackend := &ir.Reason{Code: "BackendNotFound", Message: "missing backend"}
 	gateway := &ir.Gateway{
@@ -57,6 +58,7 @@ func TestTranslatorSnapshotValidatesWithEnvoy(t *testing.T) {
 				Routes: []ir.Route{
 					{
 						Name: "items", Match: ir.PathMatch{Type: ir.PathMatchExact, Value: "/v1/items"}, Method: &method,
+						Retry:   &ir.Retry{Attempts: 2, Codes: []uint32{500, 503}, Backoff: &retryBackoff},
 						Headers: []ir.HeaderMatch{{Name: "x-tenant", Type: ir.StringMatchExact, Value: "blue"}},
 						Query:   []ir.QueryMatch{{Name: "verbose", Type: ir.StringMatchRegularExpression, Value: "true|1"}},
 						Filters: ir.Filters{
@@ -90,6 +92,17 @@ func TestTranslatorSnapshotValidatesWithEnvoy(t *testing.T) {
 							Path: &ir.PathModifier{Type: ir.PathModifierReplacePrefixMatch, Replace: "/"},
 						}},
 						Backends: []ir.BackendRef{{Name: "primary", ClusterName: "primary", Weight: 1}},
+					},
+					{
+						Name:  "backend-filters",
+						Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/backend-filters"},
+						Backends: []ir.BackendRef{{
+							Name: "primary", ClusterName: "primary", Weight: 1,
+							Filters: ir.BackendFilters{
+								RequestHeaders: &ir.HeaderModifier{Set: []ir.HeaderValue{{Name: "x-backend", Value: "yes"}}},
+								URLRewrite:     &ir.URLRewrite{Hostname: "backend.example"},
+							},
+						}},
 					},
 				},
 			}},

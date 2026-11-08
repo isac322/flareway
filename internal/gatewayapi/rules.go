@@ -33,19 +33,34 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 	resolvedMessage := "references resolved"
 	dropped := make([]string, 0)
 	dropReason := gatewayv1.RouteReasonUnsupportedValue
+	seenRuleNames := make(map[string]struct{})
 
 	for ruleIndex := range route.Spec.Rules {
 		rule := &route.Spec.Rules[ruleIndex]
 		ruleID := fmt.Sprintf("rule %d", ruleIndex)
+		ruleName := ""
 		if rule.Name != nil {
+			ruleName = string(*rule.Name)
 			ruleID = fmt.Sprintf("rule %q", *rule.Name)
+			if ruleName != "" {
+				if _, duplicate := seenRuleNames[ruleName]; duplicate {
+					dropped = append(dropped, ruleID+": duplicate rule name")
+					dropReason = gatewayv1.RouteReasonUnsupportedValue
+					continue
+				}
+				seenRuleNames[ruleName] = struct{}{}
+			}
 		}
-		if rule.Retry != nil {
-			dropped = append(dropped, ruleID+" uses unsupported retry")
+		retryIR, retryInvalid := compileRetry(rule.Retry)
+		if retryInvalid != nil {
+			dropped = append(dropped, ruleID+" "+retryInvalid.Message)
+			dropReason = gatewayv1.RouteReasonUnsupportedValue
 			continue
 		}
+		//nolint:staticcheck // SA1019: SessionPersistence is deprecated in v1.7.0 but still rejected when set on experimental CRDs.
 		if rule.SessionPersistence != nil {
 			dropped = append(dropped, ruleID+" uses unsupported sessionPersistence")
+			dropReason = gatewayv1.RouteReasonUnsupportedValue
 			continue
 		}
 
@@ -54,6 +69,8 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 			dropped = append(dropped, ruleID+" "+filterInvalid.Message)
 			if filterInvalid.Code == string(gatewayv1.RouteReasonIncompatibleFilters) {
 				dropReason = gatewayv1.RouteReasonIncompatibleFilters
+			} else {
+				dropReason = gatewayv1.RouteReasonUnsupportedValue
 			}
 			continue
 		}
@@ -71,6 +88,31 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 				resolvedMessage = message
 			}
 		}
+		validBackendCount := 0
+		hasBackendRewrite := false
+		hasBackendPathRewrite := false
+		for _, backend := range backends {
+			if backend.Invalid != nil || backend.ClusterName == "" {
+				continue
+			}
+			validBackendCount++
+			if backend.Filters.URLRewrite != nil {
+				hasBackendRewrite = true
+				if backend.Filters.URLRewrite.Path != nil {
+					hasBackendPathRewrite = true
+				}
+			}
+		}
+		if filters.URLRewrite != nil && hasBackendRewrite {
+			dropped = append(dropped, ruleID+": combines rule and backend URLRewrite")
+			dropReason = gatewayv1.RouteReasonIncompatibleFilters
+			continue
+		}
+		if validBackendCount > 1 && hasBackendPathRewrite {
+			dropped = append(dropped, ruleID+": per-backend path rewrite requires a single backend")
+			dropReason = gatewayv1.RouteReasonUnsupportedValue
+			continue
+		}
 
 		if len(backends) == 0 && len(rule.Filters) == 0 && filterInvalid == nil {
 			filterInvalid = &ir.Reason{Code: string(gatewayv1.RouteReasonBackendNotFound), Message: "rule has no backendRefs or terminal filter"}
@@ -84,6 +126,7 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 			match, reason := compileMatch(matches[matchIndex])
 			if reason != nil {
 				dropped = append(dropped, ruleID+" "+reason.Message)
+				dropReason = gatewayv1.RouteReasonUnsupportedValue
 				continue
 			}
 			name := route.Namespace + "/" + route.Name + "/" + fmt.Sprint(ruleIndex) + "/" + fmt.Sprint(matchIndex)
@@ -94,17 +137,14 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 				route: ir.Route{
 					Name: name,
 					Source: ir.RouteSource{
-						Namespace:    route.Namespace,
-						Name:         route.Name,
-						RuleIndex:    ruleIndex,
-						MatchIndex:   matchIndex,
-						PathExplicit: matches[matchIndex].Path != nil,
-						RuleName: func() string {
-							if rule.Name == nil {
-								return ""
-							}
-							return string(*rule.Name)
-						}(),
+						Namespace:         route.Namespace,
+						Name:              route.Name,
+						RuleIndex:         ruleIndex,
+						MatchIndex:        matchIndex,
+						PathExplicit:      matches[matchIndex].Path != nil,
+						RouteHostname:     "",
+						CreationTimestamp: route.CreationTimestamp.UnixNano(),
+						RuleName:          ruleName,
 					},
 					Match:    match.path,
 					Headers:  match.headers,
@@ -113,6 +153,7 @@ func compileRules(in Inputs, route *gatewayv1.HTTPRoute) ([]compiledRoute, gatew
 					Filters:  filters,
 					Backends: slices.Clone(backends),
 					Timeouts: compileTimeouts(rule.Timeouts),
+					Retry:    retryIR,
 					Invalid:  filterInvalid,
 				},
 				creation:   route.CreationTimestamp,
@@ -403,4 +444,35 @@ func parseDuration(value *gatewayv1.Duration) *time.Duration {
 
 func unsupportedFilter(message string) *ir.Reason {
 	return &ir.Reason{Code: string(gatewayv1.RouteReasonUnsupportedValue), Message: message}
+}
+
+func compileRetry(retry *gatewayv1.HTTPRouteRetry) (*ir.Retry, *ir.Reason) {
+	if retry == nil {
+		return nil, nil
+	}
+	attempts := int32(1)
+	if retry.Attempts != nil {
+		attempts = int32(*retry.Attempts)
+	}
+	if attempts < 0 {
+		return nil, unsupportedFilter("retry attempts must be non-negative")
+	}
+	var backoff *time.Duration
+	if retry.Backoff != nil {
+		backoff = parseDuration(retry.Backoff)
+		if backoff == nil || *backoff < 0 {
+			return nil, unsupportedFilter("invalid retry backoff duration")
+		}
+	}
+	codes := make([]uint32, 0, len(retry.Codes))
+	for _, code := range retry.Codes {
+		value := uint32(code)
+		if value < 400 || value > 599 {
+			return nil, unsupportedFilter(fmt.Sprintf("retry status code %d must be between 400 and 599", code))
+		}
+		codes = append(codes, value)
+	}
+	slices.Sort(codes)
+	codes = slices.Compact(codes)
+	return &ir.Retry{Attempts: attempts, Codes: codes, Backoff: backoff}, nil
 }

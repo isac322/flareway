@@ -310,30 +310,31 @@ analysis.
 
 ## Gateway API support
 
-The supported features below are the list the controller publishes in
+The supported features below are the 35 features the controller publishes in
 `GatewayClass.status.supportedFeatures` (`internal/gatewayapi/features.go:29-59`).
-The [conformance report](../conformance/v1.6.3/flareway/README.md) for Gateway
-API v1.6.3 (standard channel, GATEWAY-HTTP profile: Core 36/36, Extended 32/32)
+The [conformance report](../conformance/v1.7.0/flareway/README.md) for Gateway
+API v1.7.0 (standard channel, GATEWAY-HTTP profile: Core 40/40, Extended 42/42)
 covers every one of them.
 
 | Area | Status |
 |---|---|
 | Core: `Gateway`, `HTTPRoute`, `ReferenceGrant` | Supported |
 | `BackendTLSPolicy`, `BackendTLSPolicySANValidation` | Supported |
-| `GatewayHTTPListenerIsolation`, `GatewayHTTPSListenerDetectMisdirectedRequests`, `GatewayInfrastructure` | Supported |
-| `HTTPRouteHostRewrite`, `HTTPRoutePathRewrite`, `HTTPRouteResponseHeaderModification` | Supported |
+| `GatewayHTTPListenerIsolation`, `GatewayHTTPSListenerDetectMisdirectedRequests`, `GatewayInfrastructure`, `GatewayRouteHostnameIntersectionPrecedence` | Supported |
+| `HTTPRouteHostRewrite`, `HTTPRoutePathRewrite`, `HTTPRouteBackendURLRewrite`, `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteResponseHeaderModification` | Supported |
 | `HTTPRoutePathRedirect`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoute303/307/308RedirectStatusCode` | Supported |
-| `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteParentRefPort` | Supported |
+| `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteParentRefPort`, `HTTPRouteNamedRouteRule` | Supported |
 | `HTTPRouteDestinationPortMatching` | Supported; a route whose `parentRefs[].port` matches no listener reports `Accepted=False/NoMatchingParent` |
 | `HTTPRouteRequestMirror`, `HTTPRouteRequestMultipleMirrors`, `HTTPRouteRequestPercentageMirror` | Supported |
 | `HTTPRouteRequestTimeout`, `HTTPRouteBackendTimeout`, `HTTPRouteCORS` | Supported |
 | `HTTPRouteBackendProtocolH2C`, `HTTPRouteBackendProtocolWebSocket` | Supported |
-| `GatewayStaticAddresses`, `GatewayAddressEmpty` | Unsupported; any `spec.addresses` entry, with or without a value, is rejected with `UnsupportedAddress`. Cloudflare owns the edge addresses; a Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname (D7) |
-| `GatewayPort8080` | Unsupported |
-| `HTTPRouteRetry`, `HTTPRouteRetryBackendTimeout`, `HTTPRouteRetryConnectionError` | Unsupported |
-| `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteNamedRouteRule` | Unsupported |
+| `HTTPRouteRetryCodes`, `HTTPRouteRetryConnectionError` | Supported; `rules[].retry` accepts `codes`, `attempts`, and `backoff`, and `attempts: 0` disables retries |
+| `ClusterTrustBundle` | Unsupported |
+| `GatewayAddressEmpty`, `GatewayAddressRoutability`, `GatewayAddressRoutabilityCluster`, `GatewayStaticAddresses` | Unsupported; any `spec.addresses` entry, with or without a value, is rejected with `UnsupportedAddress`. Cloudflare owns the edge addresses; a Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname (D7) |
 | `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback` | Unsupported |
-| `ListenerSet` | Unsupported; `spec.allowedListeners` is rejected with `ListenersNotValid` |
+| `GatewayListenerFilters` | Unsupported; `Gateway.spec.listeners[].filters` is rejected with `Accepted=False/UnsupportedValue` |
+| `GatewayPort8080` | Unsupported |
+| `ListenerSet` | Unsupported; `spec.allowedListeners.namespaces.from: None` is a no-op, while `Same`, `All`, and `Selector` are rejected with `ListenersNotValid` |
 | `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` | Unsupported; listeners report `InvalidRouteKinds`. Use `NetworkRoute` for private L4 |
 | `ExtensionRef` filters | Unsupported; the rule returns 500 and the route reports `ResolvedRefs=False/InvalidKind` |
 
@@ -390,7 +391,7 @@ on a Flareway hostname reaches a port the edge does not serve. See
 - Each tunnel belongs to one Gateway UID at a time. A second Gateway that
   references it stays unprogrammed until the owner releases it and its
   data plane drains.
-- Experimental-channel resources and fields (retries, session persistence,
+- Experimental-channel resources and fields (session persistence,
   `XBackendTrafficPolicy`, external auth) are out of scope.
 
 ## Alternatives considered
@@ -451,4 +452,4 @@ about Cloudflare (D12).
 - [Limits](../concepts/limits.md)
 - [Install](../get-started/install.md) and [Protect with Access](../get-started/protect-with-access.md)
 - [API reference](../reference/api.md)
-- [Gateway API v1.6.3 conformance report](../conformance/v1.6.3/flareway/README.md)
+- [Gateway API v1.7.0 conformance report](../conformance/v1.7.0/flareway/README.md)

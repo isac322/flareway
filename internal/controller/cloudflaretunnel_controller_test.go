@@ -47,6 +47,7 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -879,6 +880,23 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 	ginkgo.BeforeEach(func() {
 		testTunnelCloudflare.Reset()
 		testAccountCloudflare.reset()
+	})
+	ginkgo.It("TestLongTunnelNameSecrets keeps token Secret names within the Kubernetes bound", func() {
+		fixture := newTunnelFixture("long-name", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeExternal)
+		longName := strings.Repeat("t", 253)
+		fixture.tunnelKey.Name = longName
+		fixture.tunnel.Name = longName
+		fixture.create()
+
+		expected := dataplane.BoundedSecretName("flareway-tunnel-", longName, "")
+		gomega.Eventually(func(g gomega.Gomega) {
+			var tunnel v1alpha1.CloudflareTunnel
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.ConnectorTokenSecretRef).To(gomega.Equal(&corev1.LocalObjectReference{Name: expected}))
+			var secret corev1.Secret
+			g.Expect(testClient.Get(testContext, types.NamespacedName{Namespace: fixture.namespace, Name: expected}, &secret)).To(gomega.Succeed())
+			g.Expect(len(secret.Name)).To(gomega.BeNumerically("<=", 253))
+		}).WithTimeout(20 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("creates a managed Tunnel, token Secret, DNS record, and merged Ready status", func() {
