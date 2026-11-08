@@ -30,7 +30,7 @@ Kinds by area:
 
 | Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
 |---|---|---|---|---|
-| `main` (unreleased) | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.4.0` | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
 | `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
 | `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
 
