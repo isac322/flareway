@@ -455,6 +455,80 @@ func TestApplyTimeouts(t *testing.T) {
 	}
 }
 
+func TestApplyRetry(t *testing.T) {
+	backend := 5 * time.Second
+	request := 30 * time.Second
+	backoff := 2 * time.Second
+	retry := &ir.Retry{Attempts: 3, Codes: []uint32{500, 503}, Backoff: &backoff}
+	action := &routev3.RouteAction{}
+	timeouts := ir.Timeouts{Request: &request, BackendRequest: &backend}
+	applyRetry(action, retry, timeouts)
+	applyTimeouts(action, timeouts, retry)
+	if action.RetryPolicy == nil ||
+		action.RetryPolicy.RetryOn != "connect-failure,refused-stream,retriable-status-codes" ||
+		action.RetryPolicy.GetNumRetries().GetValue() != 3 ||
+		!slices.Equal(action.RetryPolicy.RetriableStatusCodes, []uint32{500, 503}) ||
+		action.RetryPolicy.GetRetryBackOff().GetBaseInterval().AsDuration() != backoff ||
+		action.RetryPolicy.GetPerTryTimeout().AsDuration() != backend ||
+		action.Timeout.AsDuration() != request {
+		t.Fatalf("retry policy/action = %#v / %#v", action.RetryPolicy, action)
+	}
+	action = &routev3.RouteAction{}
+	applyRetry(action, &ir.Retry{Attempts: 0}, ir.Timeouts{})
+	if action.RetryPolicy != nil {
+		t.Fatalf("attempts=0 produced retry policy: %#v", action.RetryPolicy)
+	}
+}
+
+func TestRoutePrecedesUsesStableGatewaySourceOrdering(t *testing.T) {
+	left := ir.Route{
+		Name: "left",
+		Source: ir.RouteSource{
+			RouteHostname: "api.example.com", CreationTimestamp: 10, Namespace: "default", Name: "route", RuleIndex: 11, MatchIndex: 12,
+		},
+		Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+	}
+	right := left
+	right.Name = "right"
+	right.Source.RouteHostname = "*.example.com"
+	if !routePrecedes(left, right) {
+		t.Fatal("exact route hostname should precede wildcard")
+	}
+	right.Source.RouteHostname = left.Source.RouteHostname
+	right.Source.CreationTimestamp = 11
+	if !routePrecedes(left, right) {
+		t.Fatal("older route should precede newer route")
+	}
+	right.Source.CreationTimestamp = left.Source.CreationTimestamp
+	right.Source.RuleIndex = 12
+	if !routePrecedes(left, right) {
+		t.Fatal("lower rule index should precede higher rule index")
+	}
+}
+
+func TestBuildRouteActionAppliesBackendFilters(t *testing.T) {
+	routes, err := buildRoutes(ir.Route{
+		Name:  "backend-filters",
+		Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+		Backends: []ir.BackendRef{{
+			ClusterName: "backend",
+			Weight:      1,
+			Filters: ir.BackendFilters{
+				RequestHeaders: &ir.HeaderModifier{Set: []ir.HeaderValue{{Name: "x-backend", Value: "yes"}}},
+				URLRewrite:     &ir.URLRewrite{Hostname: "upstream.example"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := routes[0].GetRoute().GetWeightedClusters().Clusters[0]
+	if cluster.GetHostRewriteLiteral() != "upstream.example" || len(cluster.RequestHeadersToAdd) != 1 ||
+		cluster.RequestHeadersToAdd[0].Header.Key != "x-backend" {
+		t.Fatalf("backend filters = %#v", cluster)
+	}
+}
+
 func TestReplacePrefixMatchRootAvoidsDoubleSlash(t *testing.T) {
 	routes, err := buildRoutes(ir.Route{
 		Name:  "strip-prefix",
@@ -1257,4 +1331,45 @@ func clusterDetails(cluster *clusterv3.Cluster) (clusterProjection, error) {
 		out.SANs = append(out.SANs, san.SanType.String()+":"+san.Matcher.GetExact())
 	}
 	return out, nil
+}
+
+func TestStripAccessHeadersFiltersRuleAndBackendRequestHeaders(t *testing.T) {
+	vhost, err := buildDomainVirtualHost(ir.VirtualHost{
+		Name:     "unprotected",
+		Hostname: "app.example.com",
+		Routes: []ir.Route{{
+			Name:  "route",
+			Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+			Filters: ir.Filters{
+				RequestHeaders: &ir.HeaderModifier{
+					Set: []ir.HeaderValue{
+						{Name: "cf-access-authenticated-user-email", Value: "forged@example.com"},
+						{Name: "x-allowed-rule", Value: "ok"},
+					},
+				},
+			},
+			Backends: []ir.BackendRef{{
+				Name: "svc", ClusterName: "k8s://default/svc:80", Port: 80, Weight: 1,
+				Filters: ir.BackendFilters{
+					RequestHeaders: &ir.HeaderModifier{
+						Set: []ir.HeaderValue{
+							{Name: "Cf-Access-Jwt-Assertion", Value: "forged-token"},
+							{Name: "x-allowed-backend", Value: "ok"},
+						},
+					},
+				},
+			}},
+		}},
+	}, ir.GuardUnprotected, true)
+	if err != nil {
+		t.Fatalf("buildDomainVirtualHost: %v", err)
+	}
+	route := vhost.Routes[0]
+	if len(route.RequestHeadersToAdd) != 1 || route.RequestHeadersToAdd[0].GetHeader().GetKey() != "x-allowed-rule" {
+		t.Fatalf("route.RequestHeadersToAdd = %#v, want only x-allowed-rule", route.RequestHeadersToAdd)
+	}
+	clusters := route.GetRoute().GetWeightedClusters().GetClusters()
+	if len(clusters) != 1 || len(clusters[0].RequestHeadersToAdd) != 1 || clusters[0].RequestHeadersToAdd[0].GetHeader().GetKey() != "x-allowed-backend" {
+		t.Fatalf("cluster.RequestHeadersToAdd = %#v, want only x-allowed-backend", clusters)
+	}
 }

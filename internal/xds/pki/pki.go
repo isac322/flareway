@@ -200,8 +200,19 @@ func validateClientSecretOwner(owner metav1.OwnerReference, gwKey types.Namespac
 
 // ClientSecretName returns the deterministic Secret name for a Gateway.
 func ClientSecretName(gatewayName string) string {
-	return "flareway-xds-" + gatewayName
+	return boundedName("flareway-xds-"+gatewayName)
 }
+
+func boundedName(full string) string {
+	if len(full) <= 253 {
+		return full
+	}
+	digest := sha256.Sum256([]byte(full))
+	hash := hex.EncodeToString(digest[:4])
+	keep := 253 - len(hash) - 1
+	return strings.Trim(full[:keep], "-.") + "-" + hash
+}
+
 
 // SPIFFEURI returns the sole URI SAN authorized for a Gateway xDS client.
 func SPIFFEURI(gwKey types.NamespacedName) *url.URL {
@@ -320,9 +331,13 @@ func newClientData(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, gwKey type
 	if err != nil {
 		return nil, err
 	}
+	commonName := gwKey.String()
+	if len(commonName) > 64 {
+		commonName = labelValue(commonName)
+	}
 	template := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: gwKey.String()},
+		Subject:      pkix.Name{CommonName: commonName},
 		NotBefore:    now.Add(-certificateClockSkew),
 		NotAfter:     minTime(now.Add(clientCertificateLifetime), caCert.NotAfter),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

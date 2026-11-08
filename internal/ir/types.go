@@ -265,6 +265,7 @@ type Route struct {
 	Filters  Filters       `json:"filters,omitempty"`
 	Backends []BackendRef  `json:"backends,omitempty"`
 	Timeouts Timeouts      `json:"timeouts,omitempty"`
+	Retry    *Retry        `json:"retry,omitempty"`
 	Invalid  *Reason       `json:"invalid,omitempty"`
 }
 
@@ -272,12 +273,14 @@ type Route struct {
 // It lets access policy compilation partition routes without parsing generated
 // xDS resource names.
 type RouteSource struct {
-	Namespace    string `json:"namespace,omitempty"`
-	Name         string `json:"name,omitempty"`
-	RuleName     string `json:"ruleName,omitempty"`
-	RuleIndex    int    `json:"ruleIndex,omitempty"`
-	MatchIndex   int    `json:"matchIndex,omitempty"`
-	PathExplicit bool   `json:"pathExplicit,omitempty"`
+	Namespace         string `json:"namespace,omitempty"`
+	Name              string `json:"name,omitempty"`
+	RuleName          string `json:"ruleName,omitempty"`
+	RuleIndex         int    `json:"ruleIndex,omitempty"`
+	MatchIndex        int    `json:"matchIndex,omitempty"`
+	PathExplicit      bool   `json:"pathExplicit,omitempty"`
+	RouteHostname     string `json:"routeHostname,omitempty"`
+	CreationTimestamp int64  `json:"creationTimestamp,omitempty"`
 }
 
 // PathMatch is an Exact, RegularExpression, or PathPrefix matcher.
@@ -385,6 +388,13 @@ type BackendFilters struct {
 type Timeouts struct {
 	Request        *time.Duration `json:"request,omitempty"`
 	BackendRequest *time.Duration `json:"backendRequest,omitempty"`
+}
+
+// Retry describes the HTTPRoute rule retry policy.
+type Retry struct {
+	Attempts int32          `json:"attempts"`
+	Codes    []uint32       `json:"codes,omitempty"`
+	Backoff  *time.Duration `json:"backoff,omitempty"`
 }
 
 // Cluster describes a Kubernetes Service backend and its ready endpoints.

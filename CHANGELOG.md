@@ -8,6 +8,10 @@
   groups, preserving Gateway DNS and Tunnel checks without requiring permissions
   for disabled features (#163).
 
+- Reject `Gateway.spec.tls` and `Gateway.spec.listeners[].filters` with
+  fail-closed status conditions, preserve foreign Gateway status conditions,
+  and handle 253-character Gateway and Tunnel names.
+
 ### Changed
 
 - Upgrade the Go toolchain to 1.27.3 and refresh Go modules, including the
@@ -24,6 +28,13 @@
   preserving the existing validation rules when Go formats the source.
 - Keep Gateway envtest status writes bounded while live controllers run:
   retry only resource-version conflicts and fail immediately on other errors.
+
+- Upgrade Gateway API to v1.7.0. Controllers remain backward-compatible with
+  Gateway API v1.6.x Standard CRDs for v1.6.x resources and fields.
+- Add support for `HTTPRouteRetryCodes`, `HTTPRouteRetryConnectionError`,
+  `HTTPRouteBackendURLRewrite`,
+  `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteNamedRouteRule`, and
+  `GatewayRouteHostnameIntersectionPrecedence`.
 
 ## v0.3.3 - 2026-10-11
 

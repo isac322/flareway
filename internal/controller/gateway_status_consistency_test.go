@@ -26,6 +26,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"testing"
 	"math/big"
 	"path/filepath"
 	"sync"
@@ -44,6 +45,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -63,6 +65,85 @@ import (
 // tracker, clock) are faked. Assertions read persisted state through an
 // uncached client and never pin message wording beyond the documented
 // reason/lag categories.
+
+func TestGatewayStatusPreservesForeignConditionOnConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatal(err)
+	}
+	foreignGateway := metav1.Condition{
+		Type: "example.net/ForeignGateway",
+		Status: metav1.ConditionTrue,
+		Reason: "ExternalController",
+		Message: "preserve this Gateway condition",
+	}
+	foreignListener := metav1.Condition{
+		Type: "example.net/ForeignListener",
+		Status: metav1.ConditionTrue,
+		Reason: "ExternalController",
+		Message: "preserve this Listener condition",
+	}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-preservation", Namespace: "default"},
+		Status: gatewayv1.GatewayStatus{
+			Conditions: []metav1.Condition{foreignGateway},
+			Listeners: []gatewayv1.ListenerStatus{{
+				Name:       "https",
+				Conditions: []metav1.Condition{foreignListener},
+			}},
+		},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(gateway).Build()
+	reconciler := &GatewayReconciler{Client: kube}
+	staleForeignGateway := foreignGateway
+	staleForeignGateway.Status = metav1.ConditionFalse
+	staleForeignGateway.Reason = "StaleCopyFromSnapshot"
+	staleForeignListener := foreignListener
+	staleForeignListener.Status = metav1.ConditionFalse
+	staleForeignListener.Reason = "StaleCopyFromSnapshot"
+	desired := gatewayv1.GatewayStatus{
+		Conditions: []metav1.Condition{
+			{
+				Type:   string(gatewayv1.GatewayConditionAccepted),
+				Status: metav1.ConditionTrue,
+			},
+			staleForeignGateway,
+		},
+		Listeners: []gatewayv1.ListenerStatus{{
+			Name: "https",
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(gatewayv1.ListenerConditionAccepted),
+					Status: metav1.ConditionTrue,
+				},
+				staleForeignListener,
+			},
+		}},
+	}
+	key := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+	if err := reconciler.patchGatewayStatus(context.Background(), key, desired); err != nil {
+		t.Fatal(err)
+	}
+	var current gatewayv1.Gateway
+	if err := kube.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	gotGateway := meta.FindStatusCondition(current.Status.Conditions, foreignGateway.Type)
+	if gotGateway == nil || gotGateway.Status != metav1.ConditionTrue || gotGateway.Reason != "ExternalController" {
+		t.Fatalf("Gateway-level foreign condition = %#v, want fresh ExternalController condition", gotGateway)
+	}
+	listener := listenerStatusByName(current.Status.Listeners, "https")
+	if listener == nil {
+		t.Fatal("Listener status missing")
+	}
+	gotListener := meta.FindStatusCondition(listener.Conditions, foreignListener.Type)
+	if gotListener == nil || gotListener.Status != metav1.ConditionTrue || gotListener.Reason != "ExternalController" {
+		t.Fatalf("Listener-level foreign condition = %#v, want fresh ExternalController condition", gotListener)
+	}
+}
 
 var _ = ginkgo.Describe("Gateway tunnel status consistency (issue 92)", func() {
 
