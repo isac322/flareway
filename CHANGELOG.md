@@ -2,17 +2,7 @@
 
 ## Unreleased
 
-## v0.4.0 - 2026-11-08
-
 ### Fixed
-
-- Scope periodic drift-sweep targets and remote list calls to enabled controller
-  groups, preserving Gateway DNS and Tunnel checks without requiring permissions
-  for disabled features (#163).
-
-- Reject `Gateway.spec.tls` and `Gateway.spec.listeners[].filters` with
-  fail-closed status conditions, preserve foreign Gateway status conditions,
-  and handle 253-character Gateway and Tunnel names.
 
 - Scope Access block-first transitions to protection domains whose Access
   binding changed, preserving forwarding for unchanged independent domains.
@@ -29,6 +19,18 @@
   independently of DNS and private readiness. Retiring an obsolete generated
   HostnameRoute also blocks matching active private listeners until a current
   route is Applied, preserving unrelated listeners during renames (#135).
+
+## v0.4.0 - 2026-11-08
+
+### Fixed
+
+- Scope periodic drift-sweep targets and remote list calls to enabled controller
+  groups, preserving Gateway DNS and Tunnel checks without requiring permissions
+  for disabled features (#163).
+
+- Reject `Gateway.spec.tls` and `Gateway.spec.listeners[].filters` with
+  fail-closed status conditions, preserve foreign Gateway status conditions,
+  and handle 253-character Gateway and Tunnel names.
 
 ### Changed
 
