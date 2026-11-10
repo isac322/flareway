@@ -104,7 +104,8 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		gomega.Expect(testClient.Patch(testContext, &drifted, client.MergeFrom(before))).To(gomega.Succeed())
 		changed, err := reconciler.reconcileGeneratedHostnameRoutes(testContext, gateway, tunnel, account, []v1alpha1.HostnameRoute{drifted})
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		gomega.Expect(changed).To(gomega.BeTrue())
+		gomega.Expect(changed.Changed).To(gomega.BeTrue())
+		gomega.Expect(changed.Listeners).To(gomega.HaveKey("private"))
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.HostnameRoute
 			g.Expect(testClient.Get(testContext, routeKey, &current)).To(gomega.Succeed())

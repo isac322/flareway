@@ -40,8 +40,20 @@ import (
 )
 
 type privatePrerequisiteResult struct {
-	Pending  string
-	Degraded bool
+	Pending   string
+	Degraded  bool
+	Listeners map[string]string
+}
+
+func pendingPrivatePrerequisites(gateway *ir.Gateway, message string) privatePrerequisiteResult {
+	state := privatePrerequisiteResult{Pending: message, Listeners: make(map[string]string)}
+	for _, listener := range gateway.Listeners {
+		if listener.Exposure == ir.ExposurePrivate {
+			state.Listeners[listener.Name] = message
+		}
+	}
+	blockPrivateDomains(gateway)
+	return state
 }
 
 func (r *GatewayReconciler) reconcilePrivatePrerequisites(
@@ -54,33 +66,34 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 	hasPrivate := hasPrivateIRListener(gateway)
 	if tunnel != nil && tunnel.Status.DeletedAt != nil {
 		if hasPrivate {
-			blockPrivateDomains(gateway)
-			return privatePrerequisiteResult{Pending: "Private listeners are blocked while the remotely deleted CloudflareTunnel drains"}, nil
+			return pendingPrivatePrerequisites(gateway, "Private listeners are blocked while the remotely deleted CloudflareTunnel drains"), nil
 		}
 		return privatePrerequisiteResult{}, nil
 	}
+	state := privatePrerequisiteResult{Listeners: make(map[string]string)}
 	if tunnel != nil && (!hasPrivate || account != nil) {
 		if !tunnel.DeletionTimestamp.IsZero() && tunnel.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true" {
 			if err := r.deletePlatformHostnameRoutes(ctx, gateway, tunnel, inputs.HostnameRoutes); err != nil {
 				return privatePrerequisiteResult{}, err
 			}
-			blockPrivateDomains(gateway)
-			return privatePrerequisiteResult{Pending: "Private listener teardown is removing platform HostnameRoutes"}, nil
+			return pendingPrivatePrerequisites(gateway, "Private listener teardown is removing platform HostnameRoutes"), nil
 		}
 		if changed, err := r.reconcileGeneratedHostnameRoutes(ctx, gateway, tunnel, account, inputs.HostnameRoutes); err != nil {
 			return privatePrerequisiteResult{}, err
-		} else if changed {
-			blockPrivateDomains(gateway)
-			return privatePrerequisiteResult{Pending: "Private listener routes are converging after a block-first update"}, nil
+		} else if changed.Changed {
+			state.Pending = "Private listener routes are converging after a block-first update"
+			for listener := range changed.Listeners {
+				state.Listeners[listener] = state.Pending
+				blockPrivateListenerDomains(gateway, listener)
+			}
 		}
 	}
 	if !hasPrivate {
-		return privatePrerequisiteResult{}, nil
+		return state, nil
 	}
 	if tunnel == nil || account == nil || tunnel.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
 		tunnel.Status.DeletedAt != nil || tunnel.Status.TunnelID == "" || !tunnel.Status.OwnershipVerified {
-		blockPrivateDomains(gateway)
-		return privatePrerequisiteResult{Pending: "Private listeners require an ownership-verified CloudflareTunnel and CloudflareAccount"}, nil
+		return pendingPrivatePrerequisites(gateway, "Private listeners require an ownership-verified CloudflareTunnel and CloudflareAccount"), nil
 	}
 
 	settings, message, err := r.privateDeviceSettings(ctx, account)
@@ -88,40 +101,50 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 		return privatePrerequisiteResult{}, err
 	}
 	if message != "" {
-		blockPrivateDomains(gateway)
-		return privatePrerequisiteResult{Pending: message}, nil
+		return pendingPrivatePrerequisites(gateway, message), nil
 	}
 	if !settings.GatewayProxyEnabled || !settings.GatewayUDPProxyEnabled {
-		blockPrivateDomains(gateway)
-		return privatePrerequisiteResult{Pending: "Private listeners require DeviceSettings gatewayProxyEnabled and gatewayUdpProxyEnabled"}, nil
+		return pendingPrivatePrerequisites(gateway, "Private listeners require DeviceSettings gatewayProxyEnabled and gatewayUdpProxyEnabled"), nil
 	}
 
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure != ir.ExposurePrivate {
 			continue
 		}
+		if state.Listeners[listener.Name] != "" {
+			continue
+		}
+		message := ""
 		if !privateListenerHasReadyVNet(listener.Name, tunnel, account, inputs.VirtualNetworks) {
-			blockPrivateDomains(gateway)
-			return privatePrerequisiteResult{Pending: fmt.Sprintf("Private listener %q requires a ready VirtualNetwork in the same account", listener.Name)}, nil
-		}
-		ready, created, err := r.ensurePrivateHostnameRoute(ctx, gateway.UID, listener, tunnel, account, inputs)
-		if err != nil {
-			return privatePrerequisiteResult{}, err
-		}
-		if !ready {
-			blockPrivateDomains(gateway)
-			if created {
-				return privatePrerequisiteResult{Pending: fmt.Sprintf("Waiting for the platform HostnameRoute for private listener %q", listener.Name)}, nil
+			message = fmt.Sprintf("Private listener %q requires a ready VirtualNetwork in the same account", listener.Name)
+		} else {
+			ready, created, err := r.ensurePrivateHostnameRoute(ctx, gateway.UID, listener, tunnel, account, inputs)
+			if err != nil {
+				return privatePrerequisiteResult{}, err
 			}
-			return privatePrerequisiteResult{Pending: fmt.Sprintf("Private listener %q requires a ready HostnameRoute targeting this tunnel", listener.Name)}, nil
+			if !ready {
+				message = fmt.Sprintf("Private listener %q requires a ready HostnameRoute targeting this tunnel", listener.Name)
+				if created {
+					message = fmt.Sprintf("Waiting for the platform HostnameRoute for private listener %q", listener.Name)
+				}
+			}
+		}
+		if message == "" {
+			if application := privateOriginJWTWithoutTLSContractForListener(gateway, inputs.AccessApplications, listener.Name); application != "" {
+				message = fmt.Sprintf("Private AccessApplication %s requires assumeGatewayTLSDecryption=true before origin JWT enforcement can be programmed", application)
+			}
+		}
+		if message != "" {
+			state.Listeners[listener.Name] = message
+			if state.Pending != "" {
+				state.Pending += "; "
+			}
+			state.Pending += message
+			blockPrivateListenerDomains(gateway, listener.Name)
 		}
 	}
-
-	if application := privateOriginJWTWithoutTLSContract(gateway, inputs.AccessApplications); application != "" {
-		blockPrivateDomains(gateway)
-		return privatePrerequisiteResult{Pending: fmt.Sprintf("Private AccessApplication %s requires assumeGatewayTLSDecryption=true before origin JWT enforcement can be programmed", application)}, nil
-	}
-	return privatePrerequisiteResult{Degraded: privateUsesPodIPBinding(gateway)}, nil
+	state.Degraded = state.Pending == "" && privateUsesPodIPBinding(gateway)
+	return state, nil
 }
 
 // gatewayInputsView limits the controller helper to the M4 objects it needs and
@@ -312,9 +335,14 @@ func (r *GatewayReconciler) deletePlatformHostnameRoutes(ctx context.Context, ga
 	return nil
 }
 
-func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1.CloudflareAccount, routes []v1alpha1.HostnameRoute) (bool, error) {
+type generatedHostnameRouteChanges struct {
+	Changed   bool
+	Listeners map[string]bool
+}
+
+func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1.CloudflareAccount, routes []v1alpha1.HostnameRoute) (generatedHostnameRouteChanges, error) {
 	if tunnel.Status.DeletedAt != nil {
-		return false, nil
+		return generatedHostnameRouteChanges{}, nil
 	}
 	platformNamespace := r.OperatorNamespace
 	if platformNamespace == "" {
@@ -326,7 +354,7 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 			desired[types.NamespacedName{Namespace: platformNamespace, Name: privateHostnameRouteName(tunnel.Namespace, tunnel.Name, listener.Name)}] = listener
 		}
 	}
-	changed := false
+	changed := generatedHostnameRouteChanges{Listeners: make(map[string]bool)}
 	for index := range routes {
 		route := &routes[index]
 		if route.Namespace != platformNamespace ||
@@ -339,6 +367,15 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 		key := client.ObjectKeyFromObject(route)
 		listener, retained := desired[key]
 		if !retained {
+			// Prerequisite evaluation still sees this pass's pre-delete inputs.
+			// Deny listeners that could otherwise reuse the retiring Applied route.
+			for _, active := range gateway.Listeners {
+				if active.Exposure == ir.ExposurePrivate &&
+					(account == nil || route.Spec.AccountRef.Name == account.Name) &&
+					normalizePrivateName(active.Hostname) == normalizePrivateName(route.Spec.Hostname) {
+					changed.Listeners[active.Name] = true
+				}
+			}
 			if route.Annotations[sourceGatewayUIDAnnotation] != string(gateway.UID) {
 				before := route.DeepCopy()
 				if route.Annotations == nil {
@@ -346,15 +383,15 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 				}
 				route.Annotations[sourceGatewayUIDAnnotation] = string(gateway.UID)
 				if err := r.Patch(ctx, route, client.MergeFrom(before)); err != nil {
-					return false, fmt.Errorf("bind obsolete generated HostnameRoute %s to current Gateway UID before deletion: %w", key, err)
+					return generatedHostnameRouteChanges{}, fmt.Errorf("bind obsolete generated HostnameRoute %s to current Gateway UID before deletion: %w", key, err)
 				}
-				changed = true
+				changed.Changed = true
 				continue
 			}
 			if err := r.Delete(ctx, route); err != nil && !apierrors.IsNotFound(err) {
-				return false, fmt.Errorf("delete obsolete generated HostnameRoute %s: %w", key, err)
+				return generatedHostnameRouteChanges{}, fmt.Errorf("delete obsolete generated HostnameRoute %s: %w", key, err)
 			}
-			changed = true
+			changed.Changed = true
 			continue
 		}
 		before := route.DeepCopy()
@@ -381,9 +418,10 @@ func (r *GatewayReconciler) reconcileGeneratedHostnameRoutes(ctx context.Context
 		route.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
 		if !reflect.DeepEqual(before.Spec, route.Spec) || !reflect.DeepEqual(before.Labels, route.Labels) || !reflect.DeepEqual(before.Annotations, route.Annotations) {
 			if err := r.Patch(ctx, route, client.MergeFrom(before)); err != nil {
-				return false, fmt.Errorf("repair generated HostnameRoute %s: %w", key, err)
+				return generatedHostnameRouteChanges{}, fmt.Errorf("repair generated HostnameRoute %s: %w", key, err)
 			}
-			changed = true
+			changed.Changed = true
+			changed.Listeners[listener.Name] = true
 		}
 	}
 	return changed, nil
@@ -424,22 +462,29 @@ func hasPrivateIRListener(gateway *ir.Gateway) bool {
 }
 
 func blockPrivateDomains(gateway *ir.Gateway) {
-	privateListeners := make(map[string]struct{})
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure == ir.ExposurePrivate {
-			privateListeners[listener.Name] = struct{}{}
+			blockPrivateListenerDomains(gateway, listener.Name)
 		}
 	}
+}
+
+func blockPrivateListenerDomains(gateway *ir.Gateway, listener string) {
 	for index := range gateway.Domains {
-		if _, private := privateListeners[gateway.Domains[index].ListenerName]; !private {
+		if gateway.Domains[index].ListenerName != listener {
 			continue
 		}
+		gateway.Domains[index].AccessBinding = accessBindingDigest(gateway.Domains[index])
 		gateway.Domains[index].Guard = ir.GuardBlocked
 		gateway.Domains[index].Access = nil
 	}
 }
 
 func privateOriginJWTWithoutTLSContract(gateway *ir.Gateway, applications []v1alpha1.AccessApplication) string {
+	return privateOriginJWTWithoutTLSContractForListener(gateway, applications, "")
+}
+
+func privateOriginJWTWithoutTLSContractForListener(gateway *ir.Gateway, applications []v1alpha1.AccessApplication, listener string) string {
 	privateListeners := make(map[string]struct{})
 	for _, listener := range gateway.Listeners {
 		if listener.Exposure == ir.ExposurePrivate {
@@ -452,6 +497,9 @@ func privateOriginJWTWithoutTLSContract(gateway *ir.Gateway, applications []v1al
 		byKey[application.Namespace+"/"+application.Name] = application
 	}
 	for _, domain := range gateway.Domains {
+		if listener != "" && domain.ListenerName != listener {
+			continue
+		}
 		if _, private := privateListeners[domain.ListenerName]; !private || domain.AccessApplication == "" {
 			continue
 		}

@@ -235,10 +235,18 @@ func TestDeletingAccessTombstoneHoldsPrivateHost(t *testing.T) {
 	assertAppBHeldOff(t, gateway, statuses, 443)
 }
 
-// Once the latch clears, no tombstone holds the host and app-b forwards it.
+// Once the latch clears, no tombstone holds the host and app-b forwards it
+// after its own new Access binding completes the initial denial handshake.
 func TestClearedAccessRevocationReleasesPrivateHost(t *testing.T) {
 	inputs := hostConflictInputs(t, true, 443)
 	inputs.AccessApplications[0].Annotations = nil
+	blocked, _ := buildRevokedGateway(t, inputs)
+	if live := domainOf(blocked, "default/app-b"); live == nil || live.Guard != ir.GuardBlocked {
+		t.Fatalf("new app-b binding = %#v, want initial Blocked handshake", live)
+	}
+	inputs.CloudflareTunnel.Status.ConfigVersion.Desired = 4
+	inputs.CloudflareTunnel.Status.ConfigVersion.Applied = 4
+	inputs.CloudflareTunnel.Status.Hostnames = desiredTunnelHostnames(blocked, 4)
 	gateway, statuses := buildRevokedGateway(t, inputs)
 	if tombstone := domainOf(gateway, "default/app-a"); tombstone != nil {
 		t.Fatalf("cleared revocation kept a tombstone: %#v", tombstone)
@@ -284,6 +292,7 @@ func TestRevokedAccessTombstoneKeepsOtherHostsProtected(t *testing.T) {
 			if !audReady {
 				inputs.AUDSecrets = nil
 			}
+			checkpointLiveAppB(t, inputs)
 			gateway, statuses := buildRevokedGateway(t, inputs)
 			assertAppBHeldOff(t, gateway, statuses, 18090)
 			if service := firstEdgeService(t, gateway, conflictHost); service != "http_status:403" {
@@ -318,6 +327,7 @@ func TestRevokedAccessTombstoneLeavesOtherHostsForwarding(t *testing.T) {
 		wildcard := gatewayv1.Hostname("*.example.com")
 		inputs.Gateway.Spec.Listeners[0].Hostname = &wildcard
 		inputs.HTTPRoutes[0].Spec.Hostnames = []gatewayv1.Hostname{"b.example.com"}
+		checkpointLiveAppB(t, inputs)
 		gateway, statuses := buildRevokedGateway(t, inputs)
 		assertTombstoneOnHost(t, gateway)
 		assertAppBForwarding(t, gateway, statuses)
@@ -447,6 +457,7 @@ func TestRevokedAccessPublicTombstoneDoesNotHoldPrivateListenerHosts(t *testing.
 		LocalPolicyTargetReference: appB.Spec.TargetRefs[0].LocalPolicyTargetReference,
 		SectionName:                new(gatewayv1.SectionName("private")),
 	})
+	checkpointLiveAppB(t, inputs)
 	gateway, statuses := buildRevokedGateway(t, inputs)
 	compiled := appBCompilation(statuses)
 	if !compiled.Accepted || !strings.Contains(compiled.Message, "default/app-a") || !strings.Contains(compiled.Message, conflictHost) {

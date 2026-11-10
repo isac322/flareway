@@ -11,6 +11,8 @@ kubectl explain gatewayclassconfig.spec --api-version=flareway.bhyoo.com/v1alpha
 kubectl explain gatewayclassconfig.spec.scheduling --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain cloudflareaccount.spec.grants --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain cloudflaretunnel.spec --api-version=flareway.bhyoo.com/v1alpha1
+kubectl explain cloudflaretunnel.status.hostnames --api-version=flareway.bhyoo.com/v1alpha1
+kubectl explain cloudflaretunnel.status.hostnames.accessBinding --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain accessapplication.spec --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain accessstandaloneapplication.spec --api-version=flareway.bhyoo.com/v1alpha1
 kubectl explain accesspolicy.spec --api-version=flareway.bhyoo.com/v1alpha1
@@ -33,6 +35,8 @@ kubectl explain zerotrustlist.spec --api-version=flareway.bhyoo.com/v1alpha1
 ```
 
 Add `--recursive` to inspect nested fields. Use `kubectl explain httproute.spec.rules --api-version=gateway.networking.k8s.io/v1` for the upstream routing API.
+
+`CloudflareTunnel.status.hostnames[].accessBinding` records the applied Access binding as a digest, without exposing AUD values. A missing digest in older status triggers one blocked configuration before forwarding can resume. See [Applied hostname status and Access transitions](api.md#applied-hostname-status-and-access-transitions) for the handoff and per-listener DNS gates.
 
 ## Resource groups
 
