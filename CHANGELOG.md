@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0 - 2026-11-08
+
 ### Fixed
 
 - Scope periodic drift-sweep targets and remote list calls to enabled controller
