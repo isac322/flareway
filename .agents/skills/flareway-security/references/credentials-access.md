@@ -219,14 +219,18 @@ Procedure:
    certificate must contain the exact SPIFFE URI for the claimed
    `node.cluster` (`namespace/gateway` form). Exact match only — no wildcard,
    prefix, or substring matching.
-2. Reject streams without verified mTLS peer information, non-delta requests, and
-   any later message that changes `node.cluster`.
+2. Reject streams without verified mTLS peer information, non-delta requests,
+   any later message that changes `node.cluster`, and any later message that
+   changes `node.id` once a non-empty `node.id` has been recorded for the
+   stream. Surface rejections (`PermissionDenied`) cleanly to the gRPC caller
+   even when the underlying ADS loop exits on `RecvMsg` errors.
 3. Keep the SPIFFE trust-domain prefix and the URI shape in lockstep with the PKI
    issuance side; a change on one side without the other silently denies every
    proxy.
 
 Verification:
 
-- Certificate tests: wrong namespace, wrong gateway name, missing URI SAN, and a
-  mid-stream `node.cluster` change must all yield `PermissionDenied` (see
-  `auth_test.go`).
+- Certificate tests: wrong namespace, wrong gateway name, missing URI SAN, and
+  mid-stream `node.cluster` or `node.id` changes must all yield
+  `PermissionDenied` over gRPC (see `auth_test.go` and
+  `keepalive_and_node_test.go`).

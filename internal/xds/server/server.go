@@ -26,12 +26,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -42,11 +44,22 @@ import (
 	xdslog "github.com/envoyproxy/go-control-plane/pkg/log"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-// DefaultAddress is the default Delta ADS listen address.
-const DefaultAddress = ":18000"
+const (
+	// DefaultAddress is the default Delta ADS listen address.
+	DefaultAddress = ":18000"
+	// DefaultKeepaliveTime is the server HTTP/2 PING cadence for idle streams.
+	DefaultKeepaliveTime = 30 * time.Second
+	// DefaultKeepaliveTimeout is the server HTTP/2 keepalive ACK wait window.
+	DefaultKeepaliveTimeout = 5 * time.Second
+	// DefaultKeepaliveMinTime is the minimum interval allowed between client
+	// HTTP/2 keepalive PINGs before ENHANCE_YOUR_CALM triggers. It stays below
+	// Envoy's 30s default keepalive interval to absorb timer jitter.
+	DefaultKeepaliveMinTime = 15 * time.Second
+)
 
 var snapshotResourceTypes = []resourcev3.Type{
 	resourcev3.ListenerType,
@@ -58,19 +71,26 @@ var snapshotResourceTypes = []resourcev3.Type{
 
 // Options configures a Delta ADS server.
 type Options struct {
-	Address   string
-	TLSConfig *tls.Config
-	Logger    logr.Logger
+	Address          string
+	TLSConfig        *tls.Config
+	Logger           logr.Logger
+	KeepaliveTime    *time.Duration
+	KeepaliveTimeout *time.Duration
+	KeepaliveMinTime *time.Duration
 }
 
 // Server owns the snapshot cache, ACK tracker, and leader-elected gRPC
 // lifecycle. It is safe to publish snapshots before Start is called.
 type Server struct {
-	address   string
-	tlsConfig *tls.Config
-	logger    logr.Logger
-	cache     cachev3.SnapshotCache
-	tracker   *AckTracker
+	address          string
+	tlsConfig        *tls.Config
+	logger           logr.Logger
+	cache            cachev3.SnapshotCache
+	tracker          *AckTracker
+	events           chan event.GenericEvent
+	keepaliveTime    time.Duration
+	keepaliveTimeout time.Duration
+	keepaliveMinTime time.Duration
 }
 
 var _ manager.Runnable = (*Server)(nil)
@@ -85,6 +105,27 @@ func New(opts Options) (*Server, error) {
 	if opts.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || opts.TLSConfig.ClientCAs == nil {
 		return nil, errors.New("xDS TLS configuration must require and verify client certificates")
 	}
+	keepaliveTime := DefaultKeepaliveTime
+	if opts.KeepaliveTime != nil {
+		if *opts.KeepaliveTime < time.Second {
+			return nil, fmt.Errorf("xDS keepalive time %s must be at least 1s", *opts.KeepaliveTime)
+		}
+		keepaliveTime = *opts.KeepaliveTime
+	}
+	keepaliveTimeout := DefaultKeepaliveTimeout
+	if opts.KeepaliveTimeout != nil {
+		if *opts.KeepaliveTimeout <= 0 {
+			return nil, fmt.Errorf("xDS keepalive timeout %s must be positive", *opts.KeepaliveTimeout)
+		}
+		keepaliveTimeout = *opts.KeepaliveTimeout
+	}
+	keepaliveMinTime := DefaultKeepaliveMinTime
+	if opts.KeepaliveMinTime != nil {
+		if *opts.KeepaliveMinTime <= 0 {
+			return nil, fmt.Errorf("xDS keepalive minimum interval %s must be positive", *opts.KeepaliveMinTime)
+		}
+		keepaliveMinTime = *opts.KeepaliveMinTime
+	}
 	address := opts.Address
 	if address == "" {
 		address = DefaultAddress
@@ -96,11 +137,15 @@ func New(opts Options) (*Server, error) {
 	tracker := NewAckTracker()
 	cache := cachev3.NewSnapshotCache(true, gatewayNodeHash{}, loggerAdapter{logger: logger.WithName("cache")})
 	return &Server{
-		address:   address,
-		tlsConfig: opts.TLSConfig.Clone(),
-		logger:    logger,
-		cache:     cache,
-		tracker:   tracker,
+		address:          address,
+		tlsConfig:        opts.TLSConfig.Clone(),
+		logger:           logger,
+		cache:            cache,
+		tracker:          tracker,
+		events:           make(chan event.GenericEvent, 256),
+		keepaliveTime:    keepaliveTime,
+		keepaliveTimeout: keepaliveTimeout,
+		keepaliveMinTime: keepaliveMinTime,
 	}, nil
 }
 
@@ -115,7 +160,25 @@ func (s *Server) Start(ctx context.Context) error {
 
 	callbacks := serverv3.CallbackFuncs{
 		DeltaStreamClosedFunc: func(streamID int64, _ *corev3.Node) {
-			s.tracker.OnStreamClosed(streamID)
+			node := s.tracker.OnStreamClosed(streamID)
+			if ctx.Err() != nil {
+				return
+			}
+			namespace, name, ok := strings.Cut(node, "/")
+			if !ok || namespace == "" || name == "" {
+				return
+			}
+			select {
+			case s.events <- event.GenericEvent{
+				Object: &metav1.PartialObjectMetadata{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: namespace,
+						Name:      name,
+					},
+				},
+			}:
+			default:
+			}
 		},
 		StreamDeltaRequestFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest) error {
 			s.tracker.OnRequest(streamID, req)
@@ -130,8 +193,8 @@ func (s *Server) Start(ctx context.Context) error {
 		grpc.Creds(credentials.NewTLS(s.tlsConfig.Clone())),
 		grpc.StreamInterceptor(sanAuthorizationInterceptor()),
 		grpc.MaxConcurrentStreams(1_000_000),
-		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 5 * time.Second}),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 30 * time.Second, PermitWithoutStream: true}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: s.keepaliveTime, Timeout: s.keepaliveTimeout}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: s.keepaliveMinTime, PermitWithoutStream: true}),
 	)
 	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, xdsServer)
 
@@ -197,9 +260,27 @@ func (s *Server) IsACKed(node, version string) bool {
 	return s.tracker.IsACKed(node, version)
 }
 
+// IsACKedForNodes reports whether every expected Envoy node.id on node has at
+// least one live stream and every live stream for those node IDs has proven
+// the requested snapshot fingerprints.
+func (s *Server) IsACKedForNodes(node, version string, nodeIDs []string) bool {
+	return s.tracker.IsACKedForNodes(node, version, nodeIDs)
+}
+
 // ACKDetails explains why the requested snapshot has not converged.
 func (s *Server) ACKDetails(node, version string) string {
 	return s.tracker.ConvergenceDetails(node, version)
+}
+
+// ACKDetailsForNodes explains why the expected Envoy pods have not converged
+// without exposing stream or Pod UIDs.
+func (s *Server) ACKDetailsForNodes(node, version string, nodeIDs []string) string {
+	return s.tracker.ConvergenceDetailsForNodes(node, version, nodeIDs)
+}
+
+// Events emits a Gateway-keyed generic event when an xDS stream closes.
+func (s *Server) Events() <-chan event.GenericEvent {
+	return s.events
 }
 
 // LastNACK returns the latest rejection for node.

@@ -39,6 +39,15 @@ const (
 	privateDNSVolumeName = "private-dns"
 )
 
+// EnvoyNodeID returns the Envoy node.id (--service-node) for a dataplane Pod.
+// An empty Pod UID returns "" so callers cannot match an unidentifiable stream.
+func EnvoyNodeID(namespace, gatewayName, podUID string) string {
+	if namespace == "" || gatewayName == "" || podUID == "" {
+		return ""
+	}
+	return namespace + "/" + gatewayName + "/" + podUID
+}
+
 // BuildDeployment returns the desired dataplane Deployment. Conformance mode
 // runs Envoy directly; Cloudflare mode also runs the cloudflared connector.
 func BuildDeployment(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig, bootstrapName, configHash string) *appsv1.Deployment {

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- Close half-open xDS streams faster and prevent stale Envoy dataplane routing
+  by enabling client-side HTTP/2 `connection_keepalive` (`30s` interval, `5s`
+  timeout, `30s` idle interval) in Envoy bootstrap, lowering xDS server
+  `KeepaliveEnforcementPolicy.MinTime` to `15s`, enforcing `node.id`
+  immutability on ADS streams, and waking the Gateway controller immediately on
+  stream closure.
+- Require xDS ACK convergence per active non-terminating dataplane Pod UID
+  across `cloudflareGate`, `ConformanceMode`, teardown deny gates (excluding
+  unscheduled `Pending` Pods without an IP), and `gatewayPromotionGuard`, and
+  avoid reporting false 30s timeouts on immediate post-convergence disconnects.
+
 ## v0.4.0 - 2026-11-08
 
 ### Fixed

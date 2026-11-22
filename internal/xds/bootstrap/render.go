@@ -23,18 +23,26 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 // Bootstrap defaults used when rendering Envoy configuration.
 const (
-	DefaultXDSAddress = "flareway-xds.flareway-system.svc.cluster.local:18000"
+	DefaultXDSAddress                    = "flareway-xds.flareway-system.svc.cluster.local:18000"
+	DefaultKeepaliveInterval             = 30 * time.Second
+	DefaultKeepaliveTimeout              = 5 * time.Second
+	DefaultKeepaliveConnectionIdleInterval = 30 * time.Second
 )
 
-// Options identifies an Envoy node and its xDS endpoint.
+// Options identifies an Envoy node, its xDS endpoint, and optional HTTP/2
+// keepalive overrides for the xDS management connection.
 type Options struct {
-	NodeCluster     string
-	XDSAddress      string
-	ConformanceMode bool
+	NodeCluster                     string
+	XDSAddress                      string
+	ConformanceMode                 bool
+	KeepaliveInterval               time.Duration
+	KeepaliveTimeout                time.Duration
+	KeepaliveConnectionIdleInterval time.Duration
 }
 
 // Files contains the three ConfigMap entries mounted under /etc/envoy.
@@ -57,6 +65,18 @@ func Render(opts Options) (Files, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || host == "" || port == "" {
 		return Files{}, fmt.Errorf("xDS address %q must be host:port", address)
+	}
+	keepaliveInterval, err := normalizeEnvoyDuration("keepalive interval", opts.KeepaliveInterval, DefaultKeepaliveInterval)
+	if err != nil {
+		return Files{}, err
+	}
+	keepaliveTimeout, err := normalizeEnvoyDuration("keepalive timeout", opts.KeepaliveTimeout, DefaultKeepaliveTimeout)
+	if err != nil {
+		return Files{}, err
+	}
+	keepaliveIdle, err := normalizeEnvoyDuration("keepalive connection idle interval", opts.KeepaliveConnectionIdleInterval, DefaultKeepaliveConnectionIdleInterval)
+	if err != nil {
+		return Files{}, err
 	}
 
 	bootstrap := fmt.Sprintf(`node:
@@ -116,7 +136,11 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
-          http2_protocol_options: {}
+          http2_protocol_options:
+            connection_keepalive:
+              interval: %s
+              timeout: %s
+              connection_idle_interval: %s
     transport_socket:
       name: envoy.transport_sockets.tls
       typed_config:
@@ -146,7 +170,7 @@ dynamic_resources:
         cluster_name: flareway-xds
   cds_config: {ads: {}, resource_api_version: V3}
   lds_config: {ads: {}, resource_api_version: V3}
-`, opts.NodeCluster, host, port, host)
+`, opts.NodeCluster, host, port, formatEnvoyDuration(keepaliveInterval), formatEnvoyDuration(keepaliveTimeout), formatEnvoyDuration(keepaliveIdle), host)
 
 	return Files{
 		BootstrapYAML: bootstrap,
@@ -166,4 +190,26 @@ dynamic_resources:
     watched_directory: {path: /etc/flareway/xds}
 `,
 	}, nil
+}
+
+func normalizeEnvoyDuration(name string, value, fallback time.Duration) (time.Duration, error) {
+	if value == 0 {
+		return fallback, nil
+	}
+	if value < time.Millisecond {
+		return 0, fmt.Errorf("%s %s must be at least 1ms", name, value)
+	}
+	return value, nil
+}
+
+// formatEnvoyDuration formats d as a protobuf JSON/YAML Duration without
+// compound Go units ("1m30s") or scientific notation.
+func formatEnvoyDuration(d time.Duration) string {
+	sec := d / time.Second
+	nsec := d % time.Second
+	if nsec == 0 {
+		return fmt.Sprintf("%ds", sec)
+	}
+	frac := strings.TrimRight(fmt.Sprintf("%09d", nsec), "0")
+	return fmt.Sprintf("%d.%ss", sec, frac)
 }

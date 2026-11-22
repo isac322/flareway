@@ -845,12 +845,14 @@ func (r *GatewayReconciler) cloudflareGate(
 		return false, nil, false, fmt.Errorf("list dataplane Pods: %w", err)
 	}
 	activePods := 0
+	var nodeIDs []string
 	for index := range pods.Items {
 		pod := &pods.Items[index]
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		if !isActiveDataplanePod(pod, false) {
 			continue
 		}
 		activePods++
+		nodeIDs = append(nodeIDs, dataplane.EnvoyNodeID(pod.Namespace, gateway.Key.Name, string(pod.UID)))
 		if pod.Status.PodIP == "" {
 			lagging = append(lagging, pod.Name+"(no Pod IP)")
 			continue
@@ -868,12 +870,19 @@ func (r *GatewayReconciler) cloudflareGate(
 			lagging = append(lagging, fmt.Sprintf("%s(version %d)", pod.Name, got))
 		}
 	}
+	sort.Strings(nodeIDs)
 	if activePods == 0 {
 		lagging = append(lagging, "no active dataplane Pods")
 	}
-	if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) {
+	if !r.Snapshots.IsACKedForNodes(gateway.Key.String(), snapshotVersion, nodeIDs) {
 		message := "Envoy xDS ACK"
 		if diagnostics, ok := r.Snapshots.(interface {
+			ACKDetailsForNodes(node, version string, nodeIDs []string) string
+		}); ok {
+			if details := diagnostics.ACKDetailsForNodes(gateway.Key.String(), snapshotVersion, nodeIDs); details != "" {
+				message += " (" + details + ")"
+			}
+		} else if diagnostics, ok := r.Snapshots.(interface {
 			ACKDetails(node, version string) string
 		}); ok {
 			if details := diagnostics.ACKDetails(gateway.Key.String(), snapshotVersion); details != "" {
@@ -1136,7 +1145,11 @@ func (r *GatewayReconciler) gatewayPromotionGuard(
 			live.Status.ConfigVersion.Remote != result.remoteVersion {
 			return fmt.Errorf("live CloudflareTunnel %s/%s configVersion no longer records this pass's desired state", live.Namespace, live.Name)
 		}
-		if !r.Snapshots.IsACKed(gateway.Key.String(), snapshotVersion) {
+		nodeIDs, err := r.activeDataplaneEnvoyNodeIDs(ctx, gateway, !requireGate)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errTunnelGateObservation, err)
+		}
+		if (requireGate || len(nodeIDs) > 0) && !r.Snapshots.IsACKedForNodes(gateway.Key.String(), snapshotVersion, nodeIDs) {
 			return fmt.Errorf("%w: compiled xDS snapshot %s is not ACKed", errTunnelConvergenceLost, snapshotVersion)
 		}
 		if requireGate {
@@ -1150,6 +1163,33 @@ func (r *GatewayReconciler) gatewayPromotionGuard(
 		}
 		return nil
 	}
+}
+
+func isActiveDataplanePod(pod *corev1.Pod, skipUnscheduledPending bool) bool {
+	if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return false
+	}
+	if skipUnscheduledPending && pod.Status.Phase == corev1.PodPending && pod.Status.PodIP == "" {
+		return false
+	}
+	return true
+}
+
+func (r *GatewayReconciler) activeDataplaneEnvoyNodeIDs(ctx context.Context, gateway *ir.Gateway, skipUnscheduledPending bool) ([]string, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(gateway.Key.Namespace), client.MatchingLabels{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gateway.Key.Name)}); err != nil {
+		return nil, fmt.Errorf("list dataplane Pods: %w", err)
+	}
+	nodeIDs := make([]string, 0, len(pods.Items))
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if !isActiveDataplanePod(pod, skipUnscheduledPending) {
+			continue
+		}
+		nodeIDs = append(nodeIDs, dataplane.EnvoyNodeID(pod.Namespace, gateway.Key.Name, string(pod.UID)))
+	}
+	sort.Strings(nodeIDs)
+	return nodeIDs, nil
 }
 
 // patchTunnelGatewayData applies the Gateway-owned data fields

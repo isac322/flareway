@@ -1375,6 +1375,13 @@ func (p *qa92SnapshotPublisher) IsACKed(key, version string) bool {
 	return p.publisher.IsACKed(key, version)
 }
 
+func (p *qa92SnapshotPublisher) IsACKedForNodes(key, version string, nodeIDs []string) bool {
+	if p.onIsACKed != nil {
+		p.onIsACKed()
+	}
+	return p.publisher.IsACKedForNodes(key, version, nodeIDs)
+}
+
 func (p *qa92SnapshotPublisher) LastNACK(key string) (string, string, bool) {
 	return p.publisher.LastNACK(key)
 }

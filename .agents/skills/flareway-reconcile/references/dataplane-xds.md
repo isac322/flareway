@@ -69,18 +69,28 @@ ACK:
   retained per stream/type and evaluated once when that snapshot is known.
   A mismatch is discarded. Responses or nonce-bearing requests supersede
   pending initial proof, so later updates or NACKs cannot replay it.
-- `OnStreamClosed` forgets that stream's nonces, subscriptions, ACK/NACK
-  records, and pending initial proof. Replacement streams start unproven.
+- `OnStreamClosed` forgets that stream's nonces, node ID, subscriptions, ACK/NACK
+  records, and pending initial proof, then returns the stream's node cluster key.
+  `Server` uses that return value to emit an immediate `XDSEvents` wakeup for the
+  affected Gateway whenever the server context is still active. Replacement streams
+  start unproven.
 - `Forget(node)` drops convergence records and pending initial proof but
-  keeps live stream identity and subscriptions; Delta requests carry `Node`
-  only on the first request of a stream.
-- `IsACKed(node, version)` requires current-fingerprint proof from every
-  live stream for its subscribed and required present types, with no current
-  NACK. An empty snapshot converges immediately; a non-empty snapshot
-  requires a live stream, so a dead Envoy cannot converge vacuously.
-- `ConvergenceDetails`/`ACKDetails` explains the wait (which type, which
-  version); `LastNACK` returns the earliest live stream's rejection for the
-  currently expected snapshot.
+  keeps live stream identity (`cluster` and `node.id`) and subscriptions; Delta
+  requests carry `Node` only on the first request of a stream, while `auth.go`
+  enforces `node.cluster` and `node.id` immutability once non-empty.
+- `IsACKedForNodes(node, version, nodeIDs)` requires every active dataplane
+  Pod (`EnvoyNodeID(ns, gw, uid)`) to have at least one live stream whose
+  subscribed and required present types match the current fingerprints with no
+  current NACK. Streams for Pod UIDs outside `nodeIDs` (such as terminating Pods)
+  are excluded, while empty `nodeIDs` or UID-less Pods never converge on a
+  non-empty snapshot. Envoy's bootstrap configures client HTTP/2
+  `connection_keepalive` (`30s`/`5s`/`30s`), and the xDS server enforces
+  `KeepaliveEnforcementPolicy.MinTime = 15s` so half-open connections close and
+  reconnect promptly without triggering `ENHANCE_YOUR_CALM`.
+- `ConvergenceDetailsForNodes`/`ACKDetailsForNodes` explains the wait (connected
+  Pod count vs active Pods, missing type, version) without leaking stream or Pod
+  UIDs; `LastNACK` returns the earliest live stream's rejection for the currently
+  expected snapshot.
 
 ## The Cloudflare programming gate
 
@@ -94,8 +104,12 @@ ACK:
    answers `/ready` with 200 **and** `/config` with the desired version.
    Terminating/failed Pods are skipped; a Pod with no IP, a failed probe, or
    a stale version is listed by name in the gate message.
-4. `Snapshots.IsACKed(gatewayKey, snapshotVersion)` — the Envoy ACK gate,
-   annotated with `ACKDetails` when available.
+4. `Snapshots.IsACKedForNodes(gatewayKey, snapshotVersion, nodeIDs)` — the per-Pod
+   Envoy ACK gate across active dataplane Pods, annotated with
+   `ACKDetailsForNodes` when available. `ConformanceMode` and teardown deny
+   gates (`denySnapshotApplied` / `gatewayPromotionGuard`) use the same per-Pod
+   convergence check, with teardown excluding unscheduled `Pending` Pods
+   (`PodIP == ""`) that cannot start Envoy.
 5. Managed DNS: every public listener hostname appears in
    `status.dnsRecords` (skipped entirely for `dns.mode: External`).
 6. Private prerequisites (`reconcilePrivatePrerequisites`): verified tunnel
