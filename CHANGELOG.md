@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.1 - 2026-11-22
+
 ### Fixed
 
 - Close half-open xDS streams faster and prevent stale Envoy dataplane routing
@@ -13,7 +15,8 @@
 - Require xDS ACK convergence per active non-terminating dataplane Pod UID
   across `cloudflareGate`, `ConformanceMode`, teardown deny gates (excluding
   unscheduled `Pending` Pods without an IP), and `gatewayPromotionGuard`, and
-  avoid reporting false 30s timeouts on immediate post-convergence disconnects.
+  avoid reporting false 30s timeouts on immediate post-convergence disconnects
+  (#175).
 
 ## v0.4.0 - 2026-11-08
 
