@@ -80,8 +80,15 @@ its first snapshot. Matching versions count toward convergence separately
 for each live stream and resource type. An unchanged named subscription may
 produce no xDS response, so a new ACK is not always needed.
 
+Each dataplane Envoy pod uses HTTP/2 keepalives (`30s` interval, `5s` timeout,
+`30s` idle interval; server enforcement minimum `15s`) so half-open xDS
+streams close quickly and trigger immediate Gateway re-evaluation. Convergence
+gates on every active non-terminating pod UID matching a live ACKed stream,
+so an ACK from one replica or a leftover stream from a deleted pod cannot mark
+the Gateway `Programmed=True`.
+
 If `Programmed=False` names an `Envoy xDS ACK` gate, check the listed missing
-types and the Envoy logs for a NACK or a disconnected stream. Mismatched or
+types, pod count, and the Envoy logs for a NACK or a disconnected stream. Mismatched or
 missing initial versions still require an acknowledged response. Closing a
 stream or clearing the Gateway snapshot discards its proof; a replacement
 stream cannot inherit another stream's ACK.

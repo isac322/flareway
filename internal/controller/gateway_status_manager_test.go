@@ -1616,6 +1616,10 @@ func (p *managerSnapshotPublisher) IsACKed(key, version string) bool {
 	return p.acked[key] == version
 }
 
+func (p *managerSnapshotPublisher) IsACKedForNodes(key, version string, _ []string) bool {
+	return p.IsACKed(key, version)
+}
+
 func (p *managerSnapshotPublisher) LastNACK(key string) (string, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

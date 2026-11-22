@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc"
@@ -57,7 +58,13 @@ func sanAuthorizationInterceptor() grpc.StreamServerInterceptor {
 		if err != nil {
 			return status.Error(codes.PermissionDenied, err.Error())
 		}
-		return handler(srv, wrapped)
+		err = handler(srv, wrapped)
+		if err == nil {
+			if stored := wrapped.authErr.Load(); stored != nil {
+				return *stored
+			}
+		}
+		return err
 	}
 }
 
@@ -65,7 +72,14 @@ type authorizedStream struct {
 	grpc.ServerStream
 	certificate *x509.Certificate
 	cluster     string
+	nodeID      string
 	authorized  bool
+	authErr     atomic.Pointer[error]
+}
+
+func (s *authorizedStream) failAuth(err error) error {
+	s.authErr.CompareAndSwap(nil, &err)
+	return err
 }
 
 func newAuthorizedStream(stream grpc.ServerStream) (*authorizedStream, error) {
@@ -92,19 +106,27 @@ func (s *authorizedStream) RecvMsg(message any) error {
 	}
 	req, ok := message.(*discoveryv3.DeltaDiscoveryRequest)
 	if !ok {
-		return status.Error(codes.PermissionDenied, "only Delta ADS requests are authorized")
+		return s.failAuth(status.Error(codes.PermissionDenied, "only Delta ADS requests are authorized"))
 	}
 	if !s.authorized {
 		cluster := req.GetNode().GetCluster()
 		if err := AuthorizeCertificate(s.certificate, cluster); err != nil {
-			return status.Error(codes.PermissionDenied, err.Error())
+			return s.failAuth(status.Error(codes.PermissionDenied, err.Error()))
 		}
 		s.cluster = cluster
+		s.nodeID = req.GetNode().GetId()
 		s.authorized = true
 		return nil
 	}
 	if req.GetNode() != nil && req.GetNode().GetCluster() != "" && req.GetNode().GetCluster() != s.cluster {
-		return status.Errorf(codes.PermissionDenied, "node.cluster changed from %q to %q", s.cluster, req.GetNode().GetCluster())
+		return s.failAuth(status.Errorf(codes.PermissionDenied, "node.cluster changed from %q to %q", s.cluster, req.GetNode().GetCluster()))
+	}
+	if nodeID := req.GetNode().GetId(); nodeID != "" {
+		if s.nodeID == "" {
+			s.nodeID = nodeID
+		} else if nodeID != s.nodeID {
+			return s.failAuth(status.Errorf(codes.PermissionDenied, "node.id changed from %q to %q", s.nodeID, nodeID))
+		}
 	}
 	return nil
 }

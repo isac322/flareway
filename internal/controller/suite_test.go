@@ -245,6 +245,10 @@ func (p *fakeSnapshotPublisher) IsACKed(key, version string) bool {
 	return p.acked[key] == version
 }
 
+func (p *fakeSnapshotPublisher) IsACKedForNodes(key, version string, _ []string) bool {
+	return p.IsACKed(key, version)
+}
+
 func (p *fakeSnapshotPublisher) LastNACK(key string) (string, string, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

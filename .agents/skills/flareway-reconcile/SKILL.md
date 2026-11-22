@@ -86,11 +86,14 @@ When `Programmed` stays `False`, work the gate in order — see
 
 1. `cloudflared` Pods: `/ready` returns 200 and `/config` reports the desired
    version on every active Pod.
-2. Envoy: every live Delta ADS stream proves the current resource fingerprints
-   through ACKs or matching initial versions. A current NACK or a missing
-   stream blocks convergence.
+2. Envoy: every active non-terminating dataplane Pod UID (`EnvoyNodeID`) has at
+   least one live Delta ADS stream whose subscribed and required types match the
+   current resource fingerprints through ACKs or matching initial versions. A
+   missing active stream or current NACK blocks convergence, while streams for
+   terminating Pods are excluded.
 3. DNS: every public listener hostname has exactly one `state: Ready` entry in
-   `status.dnsRecords`, matching case-insensitively (skipped for `dns.mode: External`).
+   `status.dnsRecords`, matching case-insensitively (skipped for
+   `dns.mode: External`).
 4. Private listeners: `DeviceSettings` proxy flags, ready `VirtualNetwork`,
    ready `HostnameRoute`, and the origin-JWT TLS contract.
 

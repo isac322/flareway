@@ -350,6 +350,7 @@ func main() {
 			Freshness:         freshnessPolicy,
 			Invalidator:       gateLatch,
 			SweepEvents:       sweepEvents,
+			XDSEvents:         xdsServer.Events(),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to set up Gateway controller")
 			os.Exit(1)
