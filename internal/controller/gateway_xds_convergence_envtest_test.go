@@ -50,6 +50,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -150,11 +151,8 @@ func newXDSEnvHarness(t *testing.T) *xdsEnvHarness {
 
 	xdsAddr := reserveLoopbackAddr(t)
 	xdsServer, err := xdsserver.New(xdsserver.Options{
-		Address:          xdsAddr,
-		TLSConfig:        serverTLS,
-		KeepaliveTime:    ptr.To(time.Second),
-		KeepaliveTimeout: ptr.To(500 * time.Millisecond),
-		KeepaliveMinTime: ptr.To(500 * time.Millisecond),
+		Address:   xdsAddr,
+		TLSConfig: serverTLS,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -676,6 +674,46 @@ func TestEnvtestConformanceModeAndTeardownDenyConvergence(t *testing.T) {
 
 	// Drop tdPod2 stream before deleting Tunnel -> 1/2 Running Pods connected.
 	stopTD2()
+	// Hold a test-only finalizer on the live CloudflareTunnel so envtest retains
+	// origTunnelUID until we observe teardown completion, preventing a delete+auto-recreate
+	// cycle from racing our poll window.
+	const teardownHoldFinalizer = "flareway.test/hold-teardown"
+	var origTunnelUID types.UID
+	h.waitFor(10*time.Second, "hold teardown finalizer on CloudflareTunnel", func() (bool, error) {
+		var tun v1alpha1.CloudflareTunnel
+		if err := h.direct.Get(h.ctx, gwTD, &tun); err != nil {
+			return false, err
+		}
+		if controllerutil.ContainsFinalizer(&tun, teardownHoldFinalizer) {
+			origTunnelUID = tun.UID
+			return true, nil
+		}
+		before := tun.DeepCopy()
+		controllerutil.AddFinalizer(&tun, teardownHoldFinalizer)
+		if err := h.direct.Patch(h.ctx, &tun, client.MergeFrom(before)); err != nil {
+			if apierrors.IsConflict(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		origTunnelUID = tun.UID
+		return true, nil
+	})
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		var cur v1alpha1.CloudflareTunnel
+		if err := h.direct.Get(cleanCtx, gwTD, &cur); err != nil || cur.UID != origTunnelUID {
+			return
+		}
+		if !controllerutil.ContainsFinalizer(&cur, teardownHoldFinalizer) {
+			return
+		}
+		before := cur.DeepCopy()
+		controllerutil.RemoveFinalizer(&cur, teardownHoldFinalizer)
+		_ = h.direct.Patch(cleanCtx, &cur, client.MergeFrom(before))
+	})
+
 	// Make tdPod2 stream fail closed while Running during teardown: delete Tunnel so teardown starts.
 	var tun v1alpha1.CloudflareTunnel
 	if err := h.direct.Get(h.ctx, gwTD, &tun); err != nil {
@@ -689,36 +727,49 @@ func TestEnvtestConformanceModeAndTeardownDenyConvergence(t *testing.T) {
 		if err := h.direct.Get(h.ctx, gwTD, &cur); err != nil {
 			return false, err
 		}
-		return cur.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true", nil
+		return cur.UID == origTunnelUID && cur.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true", nil
 	})
 
-	// With tdPod2 Running & disconnected, teardown must NOT mark HostnameGuardBlocked!
+	// With tdPod2 Running & disconnected, teardown must NOT block hostnames or release the finalizer.
 	deadline := time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		var cur v1alpha1.CloudflareTunnel
-		if err := h.direct.Get(h.ctx, gwTD, &cur); err == nil {
-			applied := meta.FindStatusCondition(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
-			if applied != nil && applied.Reason == "TeardownBlocked" {
-				t.Fatalf("teardown promoted TeardownBlocked while Running Pod tdPod2 lacked deny ACK: %#v", applied)
-			}
+		if err := h.direct.Get(h.ctx, gwTD, &cur); err != nil {
+			t.Fatalf("get CloudflareTunnel during negative teardown check: %v", err)
+		}
+		if cur.UID != origTunnelUID {
+			t.Fatalf("CloudflareTunnel UID changed during negative teardown check: got %s, want %s", cur.UID, origTunnelUID)
+		}
+		if !controllerutil.ContainsFinalizer(&cur, v1alpha1.CloudflareTunnelFinalizer) {
+			t.Fatalf("CloudflareTunnel finalizer removed while Running Pod tdPod2 lacked deny ACK")
+		}
+		if len(cur.Status.Hostnames) > 0 && allHostnamesBlocked(cur.Status.Hostnames) {
+			t.Fatalf("CloudflareTunnel hostnames were all blocked while Running Pod tdPod2 lacked deny ACK: %#v", cur.Status.Hostnames)
+		}
+		applied := meta.FindStatusCondition(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+		if applied != nil && applied.Reason == "TeardownBlocked" {
+			t.Fatalf("teardown promoted TeardownBlocked while Running Pod tdPod2 lacked deny ACK: %#v", applied)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Replace tdPod2 with an unscheduled Pending Pod (PodIP == ""): tdPod1 has ACKed deny snapshot,
-	// unscheduled Pending Pod is skipped so teardown completes TeardownBlocked without deadlock.
-	_ = h.direct.Delete(h.ctx, tdPod2)
+	// Create the unscheduled Pending Pod (PodIP == "") before deleting tdPod2 so
+	// deny convergence is always evaluated with dp-td-pending present alongside dp-td1.
 	createPod(nsTD, gwTD.Name, "dp-td-pending", corev1.PodPending, "")
+	if err := h.direct.Delete(h.ctx, tdPod2); err != nil {
+		t.Fatalf("delete tdPod2: %v", err)
+	}
 	h.waitFor(15*time.Second, "teardown completes with unscheduled Pending Pod skipped", func() (bool, error) {
 		var cur v1alpha1.CloudflareTunnel
 		if err := h.direct.Get(h.ctx, gwTD, &cur); err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil
-			}
 			return false, err
 		}
-		applied := meta.FindStatusCondition(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
-		return applied != nil && applied.Status == metav1.ConditionTrue && applied.Reason == "TeardownBlocked", nil
+		if cur.UID != origTunnelUID {
+			return false, nil
+		}
+		return len(cur.Status.Hostnames) > 0 &&
+			allHostnamesBlocked(cur.Status.Hostnames) &&
+			!controllerutil.ContainsFinalizer(&cur, v1alpha1.CloudflareTunnelFinalizer), nil
 	})
 }
 
