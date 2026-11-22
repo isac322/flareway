@@ -66,6 +66,7 @@ type AckTracker struct {
 	mu            sync.RWMutex
 	pending       map[int64]map[string]map[string]pendingResponse
 	nodes         map[int64]string
+	nodeIDs       map[int64]string
 	subscriptions map[int64]map[string]struct{}
 	expected      map[string]expectedSnapshot
 	fingerprints  map[string]map[string]string
@@ -82,6 +83,7 @@ func NewAckTracker() *AckTracker {
 	return &AckTracker{
 		pending:             make(map[int64]map[string]map[string]pendingResponse),
 		nodes:               make(map[int64]string),
+		nodeIDs:             make(map[int64]string),
 		subscriptions:       make(map[int64]map[string]struct{}),
 		expected:            make(map[string]expectedSnapshot),
 		fingerprints:        make(map[string]map[string]string),
@@ -136,12 +138,7 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	node := req.GetNode().GetCluster()
-	if node != "" {
-		t.nodes[streamID] = node
-	} else {
-		node = t.nodes[streamID]
-	}
+	node := t.recordStreamIdentityLocked(streamID, req)
 	if node == "" {
 		return
 	}
@@ -172,12 +169,7 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	node := req.GetNode().GetCluster()
-	if node != "" {
-		t.nodes[streamID] = node
-	} else {
-		node = t.nodes[streamID]
-	}
+	node := t.recordStreamIdentityLocked(streamID, req)
 	t.subscribeLocked(streamID, req.GetTypeUrl())
 	if req.GetResponseNonce() == "" {
 		t.acceptInitialVersionsLocked(streamID, node, req.GetTypeUrl(), req.GetInitialResourceVersions())
@@ -281,17 +273,34 @@ func (t *AckTracker) forgetInitialFingerprintLocked(streamID int64, typeURL stri
 }
 
 // OnStreamClosed forgets nonce correlation, subscription, and convergence
-// state for a disconnected stream. The stream's ACK and NACK records die with
+// state for a disconnected stream, returning the cluster node key associated
+// with the stream before removal. The stream's ACK and NACK records die with
 // it so a replacement stream starts unproven and cannot inherit them.
-func (t *AckTracker) OnStreamClosed(streamID int64) {
+func (t *AckTracker) OnStreamClosed(streamID int64) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	node := t.nodes[streamID]
 	delete(t.pending, streamID)
 	delete(t.nodes, streamID)
+	delete(t.nodeIDs, streamID)
 	delete(t.subscriptions, streamID)
 	delete(t.acked, streamID)
 	delete(t.nacks, streamID)
 	delete(t.initialFingerprints, streamID)
+	return node
+}
+
+func (t *AckTracker) recordStreamIdentityLocked(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) string {
+	node := req.GetNode().GetCluster()
+	if node != "" {
+		t.nodes[streamID] = node
+	} else {
+		node = t.nodes[streamID]
+	}
+	if nodeID := req.GetNode().GetId(); nodeID != "" && t.nodeIDs[streamID] == "" {
+		t.nodeIDs[streamID] = nodeID
+	}
+	return node
 }
 
 // Forget removes every convergence record associated with node while keeping
@@ -352,22 +361,84 @@ func (t *AckTracker) IsACKed(node, version string) bool {
 		if streamNode != node {
 			continue
 		}
-		if nack, ok := t.nacks[streamID]; ok && nack.Version == version {
+		if !t.streamConvergedLocked(streamID, expected, present) {
 			return false
 		}
-		acked := t.acked[streamID]
-		for typeURL, fingerprint := range present {
-			_, required := expected.required[typeURL]
-			_, subscribed := t.subscriptions[streamID][typeURL]
-			if !subscribed && !required {
-				continue
-			}
-			if acked[typeURL].fingerprint != fingerprint {
+	}
+	return true
+}
+
+// IsACKedForNodes reports whether every expected Envoy node.id has at least one
+// live stream on node and every live stream for those node IDs has ACKed the
+// current snapshot fingerprints. Streams belonging to node IDs outside nodeIDs
+// (such as terminating Pods) are excluded, while empty entries in nodeIDs or an
+// empty slice for a non-empty snapshot never converge.
+func (t *AckTracker) IsACKedForNodes(node, version string, nodeIDs []string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	expected, ok := t.expected[node]
+	if !ok || expected.version != version {
+		return false
+	}
+	present := t.fingerprints[node]
+	if len(present) == 0 {
+		return true
+	}
+	if len(nodeIDs) == 0 {
+		return false
+	}
+	byNodeID := t.nodeStreamsLocked(node)
+	for _, wantNodeID := range nodeIDs {
+		if wantNodeID == "" {
+			return false
+		}
+		streams := byNodeID[wantNodeID]
+		if len(streams) == 0 {
+			return false
+		}
+		for _, streamID := range streams {
+			if !t.streamConvergedLocked(streamID, expected, present) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func (t *AckTracker) streamConvergedLocked(streamID int64, expected expectedSnapshot, present map[string]string) bool {
+	if nack, ok := t.nacks[streamID]; ok && nack.Version == expected.version {
+		return false
+	}
+	acked := t.acked[streamID]
+	for typeURL, fingerprint := range present {
+		_, required := expected.required[typeURL]
+		_, subscribed := t.subscriptions[streamID][typeURL]
+		if !subscribed && !required {
+			continue
+		}
+		if acked[typeURL].fingerprint != fingerprint {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *AckTracker) nodeStreamsLocked(node string) map[string][]int64 {
+	byNodeID := make(map[string][]int64)
+	for streamID, streamNode := range t.nodes {
+		if streamNode != node {
+			continue
+		}
+		nodeID := t.nodeIDs[streamID]
+		if nodeID == "" {
+			continue
+		}
+		byNodeID[nodeID] = append(byNodeID[nodeID], streamID)
+	}
+	for nodeID := range byNodeID {
+		sort.Slice(byNodeID[nodeID], func(i, j int) bool { return byNodeID[nodeID][i] < byNodeID[nodeID][j] })
+	}
+	return byNodeID
 }
 
 // subscribeLocked records that streamID holds an active Delta subscription for
@@ -426,11 +497,102 @@ func (t *AckTracker) ConvergenceDetails(node, version string) string {
 	if len(present) > 0 && len(streams) == 0 {
 		return "no live xDS stream"
 	}
+	if nackDetail := t.firstNACKDetailLocked(streams, version); nackDetail != "" {
+		return nackDetail
+	}
+	missing := t.missingTypesLocked(expected, present, streams)
+	if len(missing) > 0 {
+		return fmt.Sprintf(
+			"want %s, %d live stream(s), missing %s",
+			shortVersion(version),
+			len(streams),
+			strings.Join(missing, ","),
+		)
+	}
+	return ""
+}
+
+// ConvergenceDetailsForNodes explains why the expected Envoy pods have not
+// converged without exposing stream or Pod UIDs.
+func (t *AckTracker) ConvergenceDetailsForNodes(node, version string, nodeIDs []string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	expected, ok := t.expected[node]
+	if !ok {
+		return "snapshot is not registered"
+	}
+	if expected.version != version {
+		return fmt.Sprintf("expected version %s, requested %s", shortVersion(expected.version), shortVersion(version))
+	}
+	present := t.fingerprints[node]
+	if len(present) == 0 {
+		return ""
+	}
+	if len(nodeIDs) == 0 {
+		return "no active dataplane Pods"
+	}
+	wantIDs, missingUIDCount := uniqueNodeIDs(nodeIDs)
+	totalWant := len(wantIDs) + missingUIDCount
+	if len(wantIDs) == 0 {
+		return fmt.Sprintf("no live xDS stream (%d dataplane Pod(s) missing node identity)", totalWant)
+	}
+	byNodeID := t.nodeStreamsLocked(node)
+	connectedNodes := 0
+	var streams []int64
+	for _, wantNodeID := range wantIDs {
+		nodeStreams := byNodeID[wantNodeID]
+		if len(nodeStreams) == 0 {
+			continue
+		}
+		connectedNodes++
+		streams = append(streams, nodeStreams...)
+	}
+	if connectedNodes == 0 {
+		return fmt.Sprintf("no live xDS stream (%d dataplane Pod(s) unconnected)", totalWant)
+	}
+	sort.Slice(streams, func(i, j int) bool { return streams[i] < streams[j] })
+	if nackDetail := t.firstNACKDetailLocked(streams, version); nackDetail != "" {
+		return nackDetail
+	}
+	missing := t.missingTypesLocked(expected, present, streams)
+	if len(missing) > 0 {
+		if connectedNodes < totalWant {
+			return fmt.Sprintf(
+				"want %s, %d/%d dataplane Pod(s) connected, missing %s",
+				shortVersion(version),
+				connectedNodes,
+				totalWant,
+				strings.Join(missing, ","),
+			)
+		}
+		return fmt.Sprintf(
+			"want %s, %d/%d dataplane Pod(s) connected (%d live stream(s)), missing %s",
+			shortVersion(version),
+			connectedNodes,
+			totalWant,
+			len(streams),
+			strings.Join(missing, ","),
+		)
+	}
+	if missingUIDCount > 0 {
+		return fmt.Sprintf("want %s, %d/%d dataplane Pod(s) connected (missing node identity)", shortVersion(version), connectedNodes, totalWant)
+	}
+	if connectedNodes < totalWant {
+		return fmt.Sprintf("want %s, %d/%d dataplane Pod(s) connected", shortVersion(version), connectedNodes, totalWant)
+	}
+	return ""
+}
+
+func (t *AckTracker) firstNACKDetailLocked(streams []int64, version string) string {
 	for _, streamID := range streams {
 		if nack, found := t.nacks[streamID]; found && nack.Version == version {
 			return fmt.Sprintf("NACK %s: %s", shortTypeURL(nack.TypeURL), nack.Detail)
 		}
 	}
+	return ""
+}
+
+func (t *AckTracker) missingTypesLocked(expected expectedSnapshot, present map[string]string, streams []int64) []string {
 	// Per type, report the worst state across streams: a required type no
 	// stream has subscribed to yet outranks a missing ACK, which outranks a
 	// stale ACK.
@@ -477,15 +639,26 @@ func (t *AckTracker) ConvergenceDetails(node, version string) string {
 		missing = append(missing, fmt.Sprintf("%s(%s)", shortTypeURL(typeURL), detail))
 	}
 	sort.Strings(missing)
-	if len(missing) > 0 {
-		return fmt.Sprintf(
-			"want %s, %d live stream(s), missing %s",
-			shortVersion(version),
-			len(streams),
-			strings.Join(missing, ","),
-		)
+	return missing
+}
+
+func uniqueNodeIDs(nodeIDs []string) ([]string, int) {
+	seen := make(map[string]struct{}, len(nodeIDs))
+	unique := make([]string, 0, len(nodeIDs))
+	missingUIDCount := 0
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
+			missingUIDCount++
+			continue
+		}
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		unique = append(unique, nodeID)
 	}
-	return ""
+	sort.Strings(unique)
+	return unique, missingUIDCount
 }
 
 func shortTypeURL(typeURL string) string {

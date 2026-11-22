@@ -93,6 +93,7 @@ type SnapshotPublisher interface {
 	SetSnapshot(context.Context, string, *cachev3.Snapshot) error
 	ClearSnapshot(key string)
 	IsACKed(key, version string) bool
+	IsACKedForNodes(key, version string, nodeIDs []string) bool
 	LastNACK(key string) (version, detail string, ok bool)
 }
 
@@ -130,6 +131,10 @@ type GatewayReconciler struct {
 	// SweepEvents carries drift wakeups from the sweep worker. When nil no
 	// raw source is registered in SetupWithManager.
 	SweepEvents <-chan event.GenericEvent
+	// XDSEvents carries stream-disconnect wakeups from the xDS server so
+	// Programmed drops when a dataplane stream closes. When nil no raw source
+	// is registered in SetupWithManager.
+	XDSEvents <-chan event.GenericEvent
 }
 
 func (r *GatewayReconciler) operatorNamespace() string {
@@ -507,7 +512,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		acked := r.Snapshots.IsACKed(key, version)
+		nodeIDs, err := r.activeDataplaneEnvoyNodeIDs(ctx, compiled, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		acked := r.Snapshots.IsACKedForNodes(key, version, nodeIDs)
 		statuses.Gateway.Addresses = addresses
 		pending = r.setProgrammedStatus(&statuses.Gateway, &gateway, key, version, acked, deploymentReady, addressReady, addressMessage)
 	} else {
@@ -530,7 +539,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		message := "Gateway configuration is acknowledged by Envoy, active in every cloudflared Pod, and present in DNS"
 		if !ready {
 			message = "Waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
-			if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && r.gatewayNow().Sub(condition.LastTransitionTime.Time) >= cloudflareConvergenceTimeout {
+			if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && condition.Status == metav1.ConditionFalse && r.gatewayNow().Sub(condition.LastTransitionTime.Time) >= cloudflareConvergenceTimeout {
 				message = "Timed out after 30s waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
 			}
 			pending = true
@@ -549,7 +558,17 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		hostnames := tunnel.Status.Hostnames
 		conditionStatus := metav1.ConditionFalse
 		reason := "Pending"
-		denySnapshotApplied := compiled.Cloudflare != nil && compiled.Cloudflare.Teardown && r.Snapshots.IsACKed(key, version)
+		denySnapshotApplied := false
+		if compiled.Cloudflare != nil && compiled.Cloudflare.Teardown {
+			teardownNodeIDs, err := r.activeDataplaneEnvoyNodeIDs(ctx, compiled, true)
+			if err != nil {
+				if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "GateError", "Cloudflare programming gate observation failed; see controller logs"); demoteErr != nil {
+					return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
+				}
+				return ctrl.Result{}, err
+			}
+			denySnapshotApplied = len(teardownNodeIDs) == 0 || r.Snapshots.IsACKedForNodes(key, version, teardownNodeIDs)
+		}
 		if ready || denySnapshotApplied {
 			config.Applied = cloudflareResult.version
 			hostnames = desiredTunnelHostnames(compiled, cloudflareResult.version)
@@ -2158,6 +2177,17 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Events carry the drifted CloudflareTunnel, so they map through the
 		// same tunnel→Gateway lookup as the regular Tunnel watch.
 		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToGateways)))
+	}
+	if r.XDSEvents != nil {
+		// Events carry PartialObjectMetadata addressed to the Gateway
+		// namespace/name so stream disconnects trigger prompt Programmed
+		// re-evaluation without scanning every Gateway.
+		blder = blder.WatchesRawSource(source.Channel(r.XDSEvents, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+			if object == nil || object.GetNamespace() == "" || object.GetName() == "" {
+				return nil
+			}
+			return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(object)}}
+		})))
 	}
 	return blder.Complete(observedReconciler("gateway", r))
 }
