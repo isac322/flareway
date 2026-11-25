@@ -34,6 +34,12 @@ const (
 	GuardBlocked     = "Blocked"
 	GuardUnprotected = "Unprotected"
 
+	BlockReasonAccessTransition    = "AccessTransition"
+	BlockReasonAccessNotReady      = "AccessNotReady"
+	BlockReasonDNSNotReady         = "DNSNotReady"
+	BlockReasonPrivatePrerequisite = "PrivatePrerequisite"
+	BlockReasonRevocation          = "Revocation"
+
 	ListenerBindingLoopback = "Loopback"
 	ListenerBindingPodIP    = "PodIP"
 
@@ -221,6 +227,7 @@ type ProtectionDomain struct {
 	// AccessBinding retains the desired binding digest while its guard is blocked.
 	AccessBinding      string        `json:"accessBinding,omitempty"`
 	Guard              string        `json:"guard,omitempty"`
+	BlockReason        string        `json:"blockReason,omitempty"`
 	StripAccessHeaders bool          `json:"stripAccessHeaders,omitempty"`
 	IngressPaths       []PathMatch   `json:"ingressPaths,omitempty"`
 	VirtualHosts       []VirtualHost `json:"virtualHosts,omitempty"`

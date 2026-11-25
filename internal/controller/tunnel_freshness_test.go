@@ -432,3 +432,70 @@ func TestGatewayTunnelConfigConfirmKeepsAppliedAt(t *testing.T) {
 		t.Fatal("the configVersion checkpoint for a new configuration was not observed, so the zero-write check above proves nothing")
 	}
 }
+
+func TestGatewayConfigFreshnessDoesNotClearTunnelDNSInvalidation(t *testing.T) {
+	ctx := context.Background()
+	scheme := tunnelFreshnessScheme(t)
+	const accountID = "0123456789abcdef0123456789abcdef"
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps", UID: "gateway-uid", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+		}}},
+	}
+	compiled := &ir.Gateway{
+		Key:        client.ObjectKeyFromObject(gateway),
+		UID:        gateway.UID,
+		Cloudflare: &ir.Cloudflare{AccountID: accountID, TunnelID: "remote-id"},
+		Listeners:  []ir.Listener{{Name: "http", Hostname: "edge.example.com", Exposure: ir.ExposurePublic}},
+		Domains: []ir.ProtectionDomain{{
+			Name: "http", ListenerName: "http", EnvoyPort: 18080, Guard: ir.GuardUnprotected,
+			VirtualHosts: []ir.VirtualHost{{Hostname: "edge.example.com"}},
+		}},
+	}
+	_, hash, err := cloudflaredconfig.Compile(compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid", Generation: 1},
+		Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "remote-id", AccountID: accountID, OwnershipVerified: true,
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "tunnel-token"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: gateway.Name}, GatewayUID: gateway.UID,
+			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 5, DesiredHash: hash, Applied: 5, Remote: 5},
+		},
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: accountID,
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{
+				Name: "cloudflare-token", Namespace: "apps", Key: "token",
+			}},
+		},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithObjects(gateway, tunnel, account, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "cloudflare-token", Namespace: "apps"}, Data: map[string][]byte{"token": []byte("tok")},
+		}).Build()
+	latch := freshness.NewLatch()
+	tunnelKey := client.ObjectKeyFromObject(tunnel)
+	latch.Invalidate("CloudflareTunnel", tunnelKey, "DNS record drift")
+
+	reconciler := &GatewayReconciler{
+		Client: kube, APIReader: kube, Scheme: scheme,
+		CloudflareFactory: gatewayCloudflareFactory{api: &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 5}},
+		Now:               func() time.Time { return now },
+		Freshness:         freshness.DefaultPolicy(),
+		Invalidator:       latch,
+	}
+	if _, err := reconciler.reconcileCloudflaredConfiguration(ctx, compiled, tunnel, account); err != nil {
+		t.Fatalf("reconcileCloudflaredConfiguration: %v", err)
+	}
+	if !latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("Gateway config confirmation cleared CloudflareTunnel DNS/identity sweep invalidation")
+	}
+}

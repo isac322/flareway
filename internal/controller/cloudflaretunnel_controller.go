@@ -686,12 +686,13 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 	}
 
+	hasManagedDNS := hasManagedDNSRecords(tunnel.Status.DNSRecords)
 	verifiedManagement := tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && tunnel.Status.OwnershipVerified
 	needsRemote := verifiedManagement && tunnel.Spec.DeletionPolicy != v1alpha1.DeletionPolicyOrphan
 	manageDNS := verifiedManagement
 	var cf TunnelCloudflareClient
 	accountID := ""
-	if manageDNS && len(tunnel.Status.DNSRecords) > 0 || needsRemote {
+	if manageDNS && hasManagedDNS || needsRemote {
 		var account v1alpha1.CloudflareAccount
 		if err := r.Get(ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account); err != nil {
 			return r.cleanupFailure(ctx, tunnel, status, clearIntent, "CredentialsUnavailable", fmt.Errorf("get CloudflareAccount for cleanup: %w", err))
@@ -703,7 +704,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 		}
 	}
 
-	if manageDNS && len(tunnel.Status.DNSRecords) > 0 {
+	if manageDNS && hasManagedDNS {
 		var expectedComments []string
 		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect || owner != nil {
 			clusterID, err := r.clusterID(ctx)
@@ -737,6 +738,10 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
+	} else if len(tunnel.Status.DNSRecords) > 0 && !hasManagedDNS {
+		// Synthetic foreign-conflict entries carry no RecordID and own no remote record.
+		status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{}
+		clearIntent.DNSRecords = true
 	}
 
 	drained, err := r.scaleDownRecordedGatewayDataplane(ctx, dependencyTunnel)
@@ -1928,6 +1933,15 @@ func tunnelAddresses(tunnelID string, public bool) []gatewayv1.GatewayStatusAddr
 	return []gatewayv1.GatewayStatusAddress{{Type: &addressType, Value: tunnelCNAMETarget(tunnelID)}}
 }
 
+func hasManagedDNSRecords(records []v1alpha1.CloudflareTunnelDNSRecordStatus) bool {
+	for _, record := range records {
+		if record.RecordID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func deleteDNSRecordIfOwned(
 	ctx context.Context,
 	cf TunnelCloudflareClient,
@@ -1935,6 +1949,9 @@ func deleteDNSRecordIfOwned(
 	expectedTargets []string,
 	expected v1alpha1.CloudflareTunnelDNSRecordStatus,
 ) (bool, string, error) {
+	if expected.RecordID == "" {
+		return true, "", nil
+	}
 	expectedName, err := flarecloudflare.NormalizeDNSHostname(expected.Hostname)
 	if err != nil {
 		return false, "", fmt.Errorf("normalize managed DNS hostname %q: %w", expected.Hostname, err)

@@ -40,9 +40,11 @@ import (
 )
 
 type privatePrerequisiteResult struct {
-	Pending   string
-	Degraded  bool
-	Listeners map[string]string
+	Pending                    string
+	Degraded                   bool
+	Listeners                  map[string]string
+	RouteMutated               bool
+	DeviceSettingsFallbackUsed bool
 }
 
 func pendingPrivatePrerequisites(gateway *ir.Gateway, message string) privatePrerequisiteResult {
@@ -81,6 +83,7 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 		if changed, err := r.reconcileGeneratedHostnameRoutes(ctx, gateway, tunnel, account, inputs.HostnameRoutes); err != nil {
 			return privatePrerequisiteResult{}, err
 		} else if changed.Changed {
+			state.RouteMutated = true
 			state.Pending = "Private listener routes are converging after a block-first update"
 			for listener := range changed.Listeners {
 				state.Listeners[listener] = state.Pending
@@ -96,15 +99,21 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 		return pendingPrivatePrerequisites(gateway, "Private listeners require an ownership-verified CloudflareTunnel and CloudflareAccount"), nil
 	}
 
-	settings, message, err := r.privateDeviceSettings(ctx, account)
+	settings, message, fallbackUsed, err := r.privateDeviceSettings(ctx, account)
 	if err != nil {
 		return privatePrerequisiteResult{}, err
 	}
 	if message != "" {
-		return pendingPrivatePrerequisites(gateway, message), nil
+		res := pendingPrivatePrerequisites(gateway, message)
+		res.DeviceSettingsFallbackUsed = fallbackUsed
+		res.RouteMutated = state.RouteMutated
+		return res, nil
 	}
 	if !settings.GatewayProxyEnabled || !settings.GatewayUDPProxyEnabled {
-		return pendingPrivatePrerequisites(gateway, "Private listeners require DeviceSettings gatewayProxyEnabled and gatewayUdpProxyEnabled"), nil
+		res := pendingPrivatePrerequisites(gateway, "Private listeners require DeviceSettings gatewayProxyEnabled and gatewayUdpProxyEnabled")
+		res.DeviceSettingsFallbackUsed = fallbackUsed
+		res.RouteMutated = state.RouteMutated
+		return res, nil
 	}
 
 	for _, listener := range gateway.Listeners {
@@ -121,6 +130,9 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 			ready, created, err := r.ensurePrivateHostnameRoute(ctx, gateway.UID, listener, tunnel, account, inputs)
 			if err != nil {
 				return privatePrerequisiteResult{}, err
+			}
+			if created {
+				state.RouteMutated = true
 			}
 			if !ready {
 				message = fmt.Sprintf("Private listener %q requires a ready HostnameRoute targeting this tunnel", listener.Name)
@@ -143,7 +155,7 @@ func (r *GatewayReconciler) reconcilePrivatePrerequisites(
 			blockPrivateListenerDomains(gateway, listener.Name)
 		}
 	}
-	state.Degraded = state.Pending == "" && privateUsesPodIPBinding(gateway)
+	state.Degraded = privateActiveUsesPodIPBinding(gateway, state.Listeners)
 	return state, nil
 }
 
@@ -166,11 +178,11 @@ type observedDeviceSettings struct {
 	GatewayUDPProxyEnabled bool
 }
 
-func (r *GatewayReconciler) privateDeviceSettings(ctx context.Context, account *v1alpha1.CloudflareAccount) (observedDeviceSettings, string, error) {
+func (r *GatewayReconciler) privateDeviceSettings(ctx context.Context, account *v1alpha1.CloudflareAccount) (observedDeviceSettings, string, bool, error) {
 	var objects v1alpha1.DeviceSettingsList
 	if err := r.List(ctx, &objects); err != nil {
 		if !apimeta.IsNoMatchError(err) {
-			return observedDeviceSettings{}, "", fmt.Errorf("list DeviceSettings: %w", err)
+			return observedDeviceSettings{}, "", false, fmt.Errorf("list DeviceSettings: %w", err)
 		}
 	} else {
 		candidates := make([]v1alpha1.DeviceSettings, 0, len(objects.Items))
@@ -188,7 +200,7 @@ func (r *GatewayReconciler) privateDeviceSettings(ctx context.Context, account *
 				if apierrors.IsNotFound(err) {
 					continue
 				}
-				return observedDeviceSettings{}, "", fmt.Errorf("get DeviceSettings namespace %q: %w", object.Namespace, err)
+				return observedDeviceSettings{}, "", false, fmt.Errorf("get DeviceSettings namespace %q: %w", object.Namespace, err)
 			}
 			if !authz.Evaluate(account, &namespace, authz.Request{PlatformObject: true}).Allowed {
 				continue
@@ -204,23 +216,23 @@ func (r *GatewayReconciler) privateDeviceSettings(ctx context.Context, account *
 		if len(candidates) > 0 {
 			object := &candidates[0]
 			if object.Status.Observed.GatewayProxyEnabled == nil || object.Status.Observed.GatewayUDPProxyEnabled == nil {
-				return observedDeviceSettings{}, "Authorized DeviceSettings/default has not observed the remote account settings yet", nil
+				return observedDeviceSettings{}, "Authorized DeviceSettings/default has not observed the remote account settings yet", false, nil
 			}
 			return observedDeviceSettings{
 				GatewayProxyEnabled:    *object.Status.Observed.GatewayProxyEnabled,
 				GatewayUDPProxyEnabled: *object.Status.Observed.GatewayUDPProxyEnabled,
-			}, "", nil
+			}, "", false, nil
 		}
 	}
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
-		return observedDeviceSettings{}, "Cloudflare device settings could not be read: " + err.Error(), nil
+		return observedDeviceSettings{}, "Cloudflare device settings could not be read: " + err.Error(), true, nil
 	}
 	settings, err := api.GetDeviceSettings(ctx)
 	if err != nil {
-		return observedDeviceSettings{}, "Cloudflare device settings could not be read: " + err.Error(), nil
+		return observedDeviceSettings{}, "Cloudflare device settings could not be read: " + err.Error(), true, nil
 	}
-	return observedDeviceSettings{GatewayProxyEnabled: settings.GatewayProxyEnabled, GatewayUDPProxyEnabled: settings.GatewayUDPProxyEnabled}, "", nil
+	return observedDeviceSettings{GatewayProxyEnabled: settings.GatewayProxyEnabled, GatewayUDPProxyEnabled: settings.GatewayUDPProxyEnabled}, "", true, nil
 }
 
 func conditionTrueForGeneration(conditions []metav1.Condition, conditionType string, generation int64) bool {
@@ -243,14 +255,22 @@ func (r *GatewayReconciler) ensurePrivateHostnameRoute(
 	if tunnel.Status.DeletedAt != nil {
 		return false, false, nil
 	}
+	hasMatchingRoute := false
 	for index := range inputs.HostnameRoutes {
 		route := &inputs.HostnameRoutes[index]
 		if normalizePrivateName(route.Spec.Hostname) != normalizePrivateName(listener.Hostname) ||
 			route.Spec.AccountRef.Name != account.Name || !privateRouteTargetsTunnel(route.Spec.TunnelRef, route.Namespace, tunnel) {
 			continue
 		}
-		return currentHostnameRouteApplied(route) &&
-			route.Status.Applied.TunnelID == tunnel.Status.TunnelID, false, nil
+		hasMatchingRoute = true
+		if route.DeletionTimestamp.IsZero() &&
+			currentHostnameRouteApplied(route) &&
+			route.Status.Applied.TunnelID == tunnel.Status.TunnelID {
+			return true, false, nil
+		}
+	}
+	if hasMatchingRoute {
+		return false, false, nil
 	}
 
 	if !hostnameRouteCreationEnabled(tunnel, listener.Name) {
@@ -439,6 +459,9 @@ func privateListenerCondition(gateway *ir.Gateway, state privatePrerequisiteResu
 		status = metav1.ConditionTrue
 		reason = "PodIPFallback"
 		message = "Private listeners use the recorded PodIP fallback and rely on NetworkPolicy isolation"
+		if state.Pending != "" {
+			message += "; pending listeners: " + state.Pending
+		}
 	case state.Pending != "":
 		reason = "Pending"
 		message = state.Pending
@@ -474,10 +497,19 @@ func blockPrivateListenerDomains(gateway *ir.Gateway, listener string) {
 		if gateway.Domains[index].ListenerName != listener {
 			continue
 		}
-		gateway.Domains[index].AccessBinding = accessBindingDigest(gateway.Domains[index])
-		gateway.Domains[index].Guard = ir.GuardBlocked
-		gateway.Domains[index].Access = nil
+		blockDomain(&gateway.Domains[index], ir.BlockReasonPrivatePrerequisite)
 	}
+}
+
+func privateActiveUsesPodIPBinding(gateway *ir.Gateway, pendingListeners map[string]string) bool {
+	for _, listener := range gateway.Listeners {
+		if listener.Exposure == ir.ExposurePrivate &&
+			listener.Binding == ir.ListenerBindingPodIP &&
+			pendingListeners[listener.Name] == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func privateOriginJWTWithoutTLSContract(gateway *ir.Gateway, applications []v1alpha1.AccessApplication) string {
@@ -573,15 +605,6 @@ func privateRouteTargetsTunnel(ref v1alpha1.TunnelReference, routeNamespace stri
 
 func cloudflareTunnelReference(ref v1alpha1.TunnelReference) bool {
 	return ref.Kind == "" || ref.Kind == v1alpha1.TunnelReferenceKindCloudflareTunnel
-}
-
-func privateUsesPodIPBinding(gateway *ir.Gateway) bool {
-	for _, listener := range gateway.Listeners {
-		if listener.Exposure == ir.ExposurePrivate && listener.Binding == ir.ListenerBindingPodIP {
-			return true
-		}
-	}
-	return false
 }
 
 func normalizePrivateName(value string) string {

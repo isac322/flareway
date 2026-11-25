@@ -17,6 +17,9 @@ limitations under the License.
 package gatewayapi
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -260,6 +263,7 @@ func (holds *accessRevocationHolds) apply(gateway *ir.Gateway) {
 			}
 			domain.Protected = true
 			domain.Guard = ir.GuardBlocked
+			domain.BlockReason = ir.BlockReasonRevocation
 			domain.Access = nil
 			domain.StripAccessHeaders = false
 		}
@@ -269,19 +273,165 @@ func (holds *accessRevocationHolds) apply(gateway *ir.Gateway) {
 	gateway.Domains = kept
 }
 
-// publicEnvoyPorts hands out positional loopback Envoy ports for public
-// listeners and public Access hosts, skipping every port a revocation
-// tombstone holds.
+const (
+	publicPortMin   int32 = 18080
+	publicPortMax   int32 = 65535
+	publicHashRange int32 = 40000
+)
+
+// publicEnvoyPorts hands out loopback Envoy ports for public listeners and
+// public Access domains. Persisted (listener, domain) bindings from
+// CloudflareTunnel.Status.Listeners keep their recorded ports across
+// reconciles and upgrades so adding or removing unrelated listeners never
+// shifts existing ports. Unseen domains receive a deterministic unused port.
 type publicEnvoyPorts struct {
-	next     int32
-	reserved map[int32]struct{}
+	next                  int32
+	reserved              map[int32]struct{}
+	used                  map[int32]struct{}
+	preClaimed            map[int32]struct{}
+	stickyDomain          map[string]int32
+	stickyBase            map[string]int32
+	hasPersistedListeners bool
 }
 
-func (ports *publicEnvoyPorts) take() int32 {
+func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance bool) *publicEnvoyPorts {
+	ports := &publicEnvoyPorts{
+		next:         publicPortMin,
+		reserved:     make(map[int32]struct{}, len(reserved)+4),
+		used:         make(map[int32]struct{}),
+		preClaimed:   make(map[int32]struct{}),
+		stickyDomain: make(map[string]int32),
+		stickyBase:   make(map[string]int32),
+	}
+	for port := range reserved {
+		ports.reserved[port] = struct{}{}
+	}
+	for _, internalPort := range []int32{18000, 19000, 19001} {
+		ports.reserved[internalPort] = struct{}{}
+	}
+	if conformance || in.Gateway == nil {
+		return ports
+	}
+	livePublic := make(map[string]struct{}, len(in.Gateway.Spec.Listeners))
+	for _, listener := range in.Gateway.Spec.Listeners {
+		exposure := listenerExposure(in.CloudflareTunnel, listener.Name)
+		if exposure == v1alpha1.ExposurePrivate {
+			if port := int32(listener.Port); port > 0 && port <= publicPortMax {
+				ports.reserved[port] = struct{}{}
+			}
+			continue
+		}
+		livePublic[string(listener.Name)] = struct{}{}
+	}
+	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.DeletedAt != nil || len(in.CloudflareTunnel.Status.Listeners) == 0 {
+		return ports
+	}
+	ports.hasPersistedListeners = true
+	for _, ls := range in.CloudflareTunnel.Status.Listeners {
+		if ls.Exposure == v1alpha1.ExposurePrivate {
+			continue
+		}
+		listenerName := string(ls.Name)
+		if _, live := livePublic[listenerName]; !live {
+			continue
+		}
+		suffix := "-" + disambiguateListenerHash(listenerName)
+		for _, pd := range ls.ProtectionDomains {
+			port := pd.EnvoyPort
+			if port < publicPortMin || port > publicPortMax {
+				continue
+			}
+			if _, blocked := ports.reserved[port]; blocked {
+				continue
+			}
+			if _, claimed := ports.preClaimed[port]; claimed {
+				continue
+			}
+			ports.preClaimed[port] = struct{}{}
+			ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
+			if pd.Name == listenerName ||
+				pd.Name == listenerName+"-public" ||
+				pd.Name == listenerName+"-blocked" ||
+				pd.Name == listenerName+"-public"+suffix ||
+				pd.Name == listenerName+"-blocked"+suffix {
+				if _, exists := ports.stickyBase[listenerName]; !exists {
+					ports.stickyBase[listenerName] = port
+				}
+			}
+		}
+	}
+	return ports
+}
+
+func disambiguateListenerHash(listenerName string) string {
+	sum := sha256.Sum256([]byte(listenerName))
+	return hex.EncodeToString(sum[:4])
+}
+
+func (ports *publicEnvoyPorts) isBlocked(port int32) bool {
+	if _, r := ports.reserved[port]; r {
+		return true
+	}
+	if _, u := ports.used[port]; u {
+		return true
+	}
+	_, pc := ports.preClaimed[port]
+	return pc
+}
+
+func (ports *publicEnvoyPorts) takeBase(listenerName string) int32 {
+	if port, ok := ports.stickyBase[listenerName]; ok {
+		if _, r := ports.reserved[port]; !r {
+			if _, u := ports.used[port]; !u {
+				ports.used[port] = struct{}{}
+				return port
+			}
+		}
+	}
+	return ports.takeFresh(listenerName, listenerName)
+}
+
+func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
+	for _, candidate := range []string{domainName, domainName + "-" + disambiguateListenerHash(listenerName)} {
+		if port, ok := ports.stickyDomain[listenerName+"\x00"+candidate]; ok {
+			if _, r := ports.reserved[port]; !r {
+				if _, u := ports.used[port]; !u {
+					ports.used[port] = struct{}{}
+					return port
+				}
+			}
+		}
+	}
+	return ports.takeFresh(listenerName, domainName)
+}
+
+func (ports *publicEnvoyPorts) takeFresh(listenerName, domainName string) int32 {
+	if !ports.hasPersistedListeners {
+		for {
+			port := ports.next
+			ports.next++
+			if !ports.isBlocked(port) {
+				ports.used[port] = struct{}{}
+				return port
+			}
+		}
+	}
+	sum := sha256.Sum256([]byte(listenerName + "\x00" + domainName))
+	offset := int32(binary.BigEndian.Uint32(sum[:4]) % uint32(publicHashRange))
+	span := publicPortMax - publicPortMin + 1
+	for i := int32(0); i < span; i++ {
+		port := publicPortMin + ((offset + i) % span)
+		if !ports.isBlocked(port) {
+			ports.used[port] = struct{}{}
+			return port
+		}
+	}
+	// Fallback beyond span is unreachable for bounded Gateway listeners.
 	for {
 		port := ports.next
 		ports.next++
-		if _, taken := ports.reserved[port]; !taken {
+		if !ports.isBlocked(port) {
+			ports.used[port] = struct{}{}
 			return port
 		}
 	}

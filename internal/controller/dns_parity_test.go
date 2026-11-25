@@ -199,14 +199,14 @@ func TestEnsureDNSFreshConflictReportsListenerWithoutAdoptingForeignRecord(t *te
 				t.Fatalf("DNS conflict readiness: Gateway=%#v healthy=%#v blocked=%#v", global, healthy, blocked)
 			}
 
-			// Removing the listener drops the unowned conflict projection;
-			// it must never turn the foreign record into a deletion target.
+			// Removing the listener drops the unowned conflict projection locally
+			// (RecordID == "") without making extra remote DNS writes or calls.
 			remaining, cleanupConflict, err := removeDNSRecords(context.Background(), cloudflareClient, []string{owner}, []string{tunnelCNAMETarget(tunnelID)}, []v1alpha1.CloudflareTunnelDNSRecordStatus{conflicted})
 			if err != nil || cleanupConflict != "" || len(remaining) != 0 {
 				t.Fatalf("unowned conflict cleanup: remaining=%#v conflict=%q error=%v", remaining, cleanupConflict, err)
 			}
-			if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords", "ListDNSRecords", "ListDNSRecords"}) {
-				t.Fatalf("foreign conflict triggered a DNS write: %v", calls)
+			if calls := cloudflareClient.Calls(); !slices.Equal(calls, []string{"ListDNSRecords", "ListDNSRecords"}) {
+				t.Fatalf("foreign conflict triggered unexpected DNS calls: %v", calls)
 			}
 			if got, present := cloudflareClient.DNSRecord(zoneID, foreign.ID); !present || got.Content != foreign.Content || got.Comment != foreign.Comment || got.Type != foreign.Type {
 				t.Fatalf("foreign DNS record mutated: %#v, present=%t", got, present)

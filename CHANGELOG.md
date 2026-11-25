@@ -2,25 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- Isolate Access block-first transitions, listener DNS readiness, and private
+  routing prerequisites per listener or protection domain while keeping
+  persisted public Envoy ports sticky across listener additions, removals, and
+  upgrades:
+  - Keep `(listener, protectionDomain) -> envoyPort` bindings sticky across
+    reconciles and upgrades, and assign deterministic unused hash ports to new
+    domains instead of shifting unrelated listeners' ports.
+  - Model domain blocking with explicit `BlockReason` states so Access
+    block-first transitions, unready Access applications, and revocation holds
+    keep only the affected listeners and Gateway `Programmed=False` (`Pending`)
+    until forwarding resumes, while leaving independent listeners and domains
+    forwarding.
+  - Restore the 30s convergence timeout when `ConfigApplied=True` and replace
+    steady 2s polling with bounded timeout/freshness requeues after
+    convergence or timeout.
+  - Normalize managed DNS hostnames consistently across DNS readiness checks
+    and listener status computation.
+  - Ignore synthetic conflict-only `status.dnsRecords[]` entries (empty
+    `recordId`) during `CloudflareTunnel` deletion (`Delete` and `Orphan`),
+    preventing deletion deadlocks.
+  - Preserve `PrivateListenerDegraded=True` (`PodIPFallback`) whenever an
+    active private listener uses PodIP fallback while a sibling listener is
+    pending, and prefer non-deleting `Applied` `HostnameRoute` objects.
+  - Separate the Gateway config freshness gate key (`"CloudflareTunnelConfig"`)
+    from the tunnel/DNS drift sweep key (`"CloudflareTunnel"`) (#135).
+
 ## v0.4.1 - 2026-11-22
 
 ### Fixed
-
-- Scope Access block-first transitions to protection domains whose Access
-  binding changed, preserving forwarding for unchanged independent domains.
-  Each public protected hostname has its own domain; private hostnames
-  sharing a route table transition together. Record the binding digest after
-  the blocked configuration converges, including a one-time handshake for
-  older status without a digest. Managed DNS requires exactly one explicit
-  `Ready` record per case-insensitive hostname. Missing, empty, unknown,
-  duplicate, or conflicted records block only their listener's hostnames;
-  healthy listeners can forward and report `Programmed=True` while Gateway
-  `Programmed` remains false until all required records are ready. Private
-  VNet, HostnameRoute, and TLS-decryption prerequisites also block only their
-  listener. Applied hostname checkpoints advance after Pod/xDS convergence
-  independently of DNS and private readiness. Retiring an obsolete generated
-  HostnameRoute also blocks matching active private listeners until a current
-  route is Applied, preserving unrelated listeners during renames (#135).
 
 - Close half-open xDS streams faster and prevent stale Envoy dataplane routing
   by enabling client-side HTTP/2 `connection_keepalive` (`30s` interval, `5s`

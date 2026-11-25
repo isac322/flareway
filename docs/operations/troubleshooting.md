@@ -26,7 +26,7 @@ kubectl describe accessapplication -n <namespace> <name>
 | `DNSReady=False` | The zone is not granted, the zone was not discovered, or an existing record has a foreign ownership comment. Flareway omits DNS tags and will not overwrite a foreign record. |
 | `CleanupBlocked=True` | A finalizer is preserving teardown order. Remove remaining `NetworkRoute`/`HostnameRoute` references or restore the Cloudflare permission needed for deletion. Do not strip the finalizer unless you accept remote leaks or exposed traffic. If you strip an `AccessApplication` finalizer, the controller still removes that application's AUD handoff and private-tunnel ledger Secrets from the operator namespace, but the remote Cloudflare objects are left behind. |
 | `Ready=False`, reason `RecoveryPending` | A ServiceToken create attempt was journaled as dispatched but the remote token is not yet visible, or a zone-scope recovery is waiting for the retiring token's deletion to be confirmed. The controller treats absence from the remote list as unknown, so it blocks and re-lists instead of issuing a blind create or rotate. This bounded wait is intended fail-closed behavior. |
-| `PrivateListenerDegraded=True` | A private listener uses the Pod-IP fallback instead of loopback. Verify the NetworkPolicy before treating it as ready. |
+| `PrivateListenerDegraded=True` | An active private listener uses the Pod-IP fallback instead of loopback (reported even while a sibling private listener is pending). Verify the NetworkPolicy before treating it as ready. |
 
 Deleting an `AccessApplication` never makes a protected route public. The route remains blocked unless no Access application targets it and `CloudflareAccount.spec.grants[].unprotectedHostnames` explicitly permits the hostname.
 
@@ -37,7 +37,7 @@ Deleting an `AccessApplication` that never reached a Cloudflare write, such as o
 ## A DNS conflict blocks one listener
 
 Compare the listener's hostname with `CloudflareTunnel.status.dnsRecords`.
-Readiness requires exactly one `state: Ready` entry per case-insensitive hostname.
+Readiness requires exactly one `state: Ready` entry per canonical normalized DNS hostname.
 Missing records, empty or unknown states, and duplicates keep that listener
 pending; a record with `state: Conflict` reports listener `Programmed=False`
 with reason `DNSConflict`. These cases
@@ -63,14 +63,7 @@ be retiring. Active listeners that could reuse that route stay blocked and
 hostnames and listeners with automatic route creation disabled. Healthy
 listeners with unrelated hostnames continue forwarding.
 
-An Access binding change first blocks its protection domain. Public
-protected hostnames have separate domains; private hosts sharing a route
-table transition together. Inspect
-`status.hostnames[].guard`, `appliedVersion`, and `accessBinding` to follow
-that handoff. Older status without `accessBinding` completes one blocked
-configuration carrying the digest before forwarding resumes. Unchanged
-bindings in independent domains continue forwarding through an unrelated
-domain's transition.
+An Access binding change first blocks its protection domain and keeps the affected listener and Gateway `Programmed=False` (`Pending`) until forwarding resumes. Public protected hostnames have separate domains; private hosts sharing a route table transition together. Inspect `status.hostnames[].guard`, `appliedVersion`, and `accessBinding` to follow that handoff. Older status without `accessBinding` completes one blocked configuration carrying the digest before forwarding resumes. Unchanged bindings in independent domains continue forwarding on sticky Envoy ports through an unrelated domain's transition or listener change.
 
 ## xDS convergence after a controller restart
 

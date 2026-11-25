@@ -386,7 +386,7 @@ func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 	return result
 }
 
-func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds) {
+func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds, publicPorts *publicEnvoyPorts) {
 	statuses.AccessApplications = make(map[types.NamespacedName]AccessApplicationCompilation)
 	if gateway == nil || gateway.ConformanceMode || len(in.AccessApplications) == 0 {
 		markPublicDomainsForHeaderStripping(gateway)
@@ -431,7 +431,9 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 
 	original := slices.Clone(gateway.Domains)
 	gateway.Domains = nil
-	publicPorts := publicEnvoyPorts{next: nextAccessEnvoyPort(original), reserved: holds.reservedPorts()}
+	if publicPorts == nil {
+		publicPorts = newPublicEnvoyPorts(in, holds.reservedPorts(), gateway.ConformanceMode)
+	}
 	dropped := make(map[types.NamespacedName][]string)
 	remaining := make(map[types.NamespacedName]int)
 	for _, domain := range original {
@@ -444,7 +446,7 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 
 	for _, domain := range original {
 		for _, virtualHost := range domain.VirtualHosts {
-			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, &publicPorts, dropped, remaining)
+			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, publicPorts, dropped, remaining)
 		}
 	}
 	disambiguateDerivedDomainNames(gateway, statuses)
@@ -669,7 +671,7 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			// table. The name identifies that table in xDS and status, so it
 			// must differ per host too.
 			protected.Name += "-" + accessHostSuffix(owner, host.Hostname)
-			protected.EnvoyPort = publicPorts.take()
+			protected.EnvoyPort = publicPorts.takeDomain(base.ListenerName, protected.Name)
 		}
 		protected.Protected = true
 		protected.AccessApplication = owner
@@ -689,6 +691,7 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 				protected.Guard = ir.GuardForwarding
 			} else {
 				protected.Guard = ir.GuardBlocked
+				protected.BlockReason = ir.BlockReasonAccessNotReady
 			}
 		default:
 			audiences, ready := accessAudiencesForDomain(in, statuses, key, base.ListenerName, host.Hostname)
@@ -704,6 +707,7 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			} else {
 				protected.Access = nil
 				protected.Guard = ir.GuardBlocked
+				protected.BlockReason = ir.BlockReasonAccessNotReady
 			}
 		}
 		gateway.Domains = append(gateway.Domains, protected)
@@ -1044,16 +1048,6 @@ func accessRegionsToMatches(regions []accessRegion) []ir.PathMatch {
 		result = append(result, ir.PathMatch{Type: matchType, Value: region.path})
 	}
 	return result
-}
-
-func nextAccessEnvoyPort(domains []ir.ProtectionDomain) int32 {
-	nextPublic := int32(18080)
-	for _, domain := range domains {
-		if domain.EnvoyPort >= nextPublic {
-			nextPublic = domain.EnvoyPort + 1
-		}
-	}
-	return nextPublic
 }
 
 func effectiveOriginJWTMode(application *v1alpha1.AccessApplication) v1alpha1.AccessOriginJWTMode {

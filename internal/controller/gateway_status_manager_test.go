@@ -3109,14 +3109,12 @@ func TestQA92_38_DNSRecordsWakeup(t *testing.T) {
 		return programmed != nil && programmed.Status == metav1.ConditionFalse, nil
 	})
 
-	// Stimulus: after a quiet period, apply the compiled hostname's
-	// dnsRecords entry while DNS creation still fails, so the test — not the
-	// tunnel controller's retry timer — fixes where the event lands in the
-	// Gateway's requeue period. The DNS-error path preserves the live entry
-	// (it never clears dnsRecords), and clearing the failure afterwards lets
-	// the tunnel controller replace it with the real record. Releasing the
-	// stimulus manager's fields leaves the entry to the tunnel controller.
-	h.freshWindow(t)
+	// Stimulus: after a quiescent window (ConfigApplied=True and DNS-gated,
+	// so Gateway stops 2s polling and waits up to the 30s timeout), apply the
+	// compiled hostname's dnsRecords entry while DNS creation still fails so
+	// only the watch event wakes GatewayReconciler. Clearing the failure
+	// afterwards lets the tunnel controller replace it with the real record.
+	h.waitQuiescent(t, f, programmedRequeue)
 	records := h.applyTunnelDNSRecords(t, f.tunnelKey, []v1alpha1.CloudflareTunnelDNSRecordStatus{{
 		Hostname: f.hostname, RecordID: managerInjectedDNSRecordID, ZoneID: "zone-1", State: dnsRecordStateReady,
 	}})

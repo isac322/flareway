@@ -179,3 +179,56 @@ func TestPrivatePrerequisiteStatusPreservesDNSConflict(t *testing.T) {
 		}
 	}
 }
+
+func TestPrivateListenerDegradedPreservedWhileSiblingPending(t *testing.T) {
+	gateway := &ir.Gateway{
+		Listeners: []ir.Listener{
+			{Name: "a", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+			{Name: "b", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+		},
+	}
+	state := privatePrerequisiteResult{
+		Pending:   `Private listener "b" requires a ready VirtualNetwork in the same account`,
+		Listeners: map[string]string{"b": `Private listener "b" requires a ready VirtualNetwork in the same account`},
+	}
+	state.Degraded = privateActiveUsesPodIPBinding(gateway, state.Listeners)
+	if !state.Degraded {
+		t.Fatal("expected active PodIP listener a to keep state.Degraded=true while sibling b is pending")
+	}
+	condition := privateListenerCondition(gateway, state, metav1.Now())
+	if condition.Status != metav1.ConditionTrue || condition.Reason != "PodIPFallback" || !strings.Contains(condition.Message, "pending listeners:") {
+		t.Fatalf("privateListenerCondition = %#v, want True/PodIPFallback with pending summary", condition)
+	}
+}
+
+func TestEnsurePrivateHostnameRoutePrefersActiveOverDeleting(t *testing.T) {
+	now := metav1.Now()
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "tunnel", Namespace: "tenant"},
+		Status:     v1alpha1.CloudflareTunnelStatus{TunnelID: "tunnel-id"},
+	}
+	account := privatePrerequisiteAccount("tenant", false)
+	deleting := v1alpha1.HostnameRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-route", Namespace: "tenant", DeletionTimestamp: &now},
+		Spec:       v1alpha1.HostnameRouteSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, Hostname: "priv.example.com", TunnelRef: v1alpha1.TunnelReference{Name: "tunnel"}},
+	}
+	active := v1alpha1.HostnameRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "manual-route", Namespace: "tenant"},
+		Spec:       v1alpha1.HostnameRouteSpec{AccountRef: corev1.LocalObjectReference{Name: account.Name}, Hostname: "priv.example.com", TunnelRef: v1alpha1.TunnelReference{Name: "tunnel"}},
+	}
+	active.Status.RouteID = "route-id"
+	active.Status.Applied.TunnelID = "tunnel-id"
+	active.Status.Applied.Hostname = "priv.example.com"
+	active.Status.Conditions = []metav1.Condition{{Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue}}
+
+	r := &GatewayReconciler{}
+	ready, created, err := r.ensurePrivateHostnameRoute(context.Background(), "gw-uid", ir.Listener{Name: "priv", Hostname: "priv.example.com", Exposure: ir.ExposurePrivate}, tunnel, account, gatewayInputsView{
+		HostnameRoutes: []v1alpha1.HostnameRoute{deleting, active},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready || created {
+		t.Fatalf("expected active route after deleting route to be ready without creating duplicate, got ready=%t created=%t", ready, created)
+	}
+}

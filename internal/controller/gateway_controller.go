@@ -504,6 +504,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	pending := false
+	requeueDelay := programmedRequeue
 	if compiled.ConformanceMode {
 		addresses, addressReady, addressMessage, err := r.serviceAddresses(ctx, compiled)
 		if err != nil {
@@ -536,16 +537,51 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if privateState.Pending != "" {
 			lagging = append(lagging, privateState.Pending)
 		}
+		accessPending, accessTransitioning := blockedAccessListeners(compiled)
 		message := "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
-		if !ready || !dnsReady || privateState.Pending != "" {
+		if !ready || !dnsReady || privateState.Pending != "" || len(accessPending) > 0 {
 			if !dnsReady {
 				lagging = append(lagging, "managed DNS records")
 			}
+			if accessTransitioning {
+				lagging = append(lagging, "Access block-first transition")
+			} else if len(accessPending) > 0 {
+				lagging = append(lagging, "Access readiness")
+			}
+			nowTime := r.gatewayNow()
+			var pendingSince time.Time
+			if !ready {
+				if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && condition.Status == metav1.ConditionFalse {
+					pendingSince = condition.LastTransitionTime.Time
+				}
+			} else if condition := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); condition != nil &&
+				condition.Status == metav1.ConditionFalse &&
+				condition.ObservedGeneration == gateway.Generation &&
+				condition.Reason != string(gatewayv1.GatewayReasonInvalid) {
+				pendingSince = condition.LastTransitionTime.Time
+			}
+			timedOut := !pendingSince.IsZero() && nowTime.Sub(pendingSince) >= cloudflareConvergenceTimeout
 			message = "Waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
-			if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && condition.Status == metav1.ConditionFalse && r.gatewayNow().Sub(condition.LastTransitionTime.Time) >= cloudflareConvergenceTimeout {
+			if timedOut {
 				message = "Timed out after 30s waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
 			}
 			pending = true
+			if ready && !accessTransitioning && !privateState.RouteMutated {
+				switch {
+				case !timedOut && !pendingSince.IsZero():
+					remaining := cloudflareConvergenceTimeout - nowTime.Sub(pendingSince)
+					if remaining < programmedRequeue {
+						remaining = programmedRequeue
+					}
+					requeueDelay = remaining
+				case !timedOut:
+					requeueDelay = cloudflareConvergenceTimeout
+				case privateState.DeviceSettingsFallbackUsed:
+					requeueDelay = cloudflareConvergenceTimeout
+				default:
+					requeueDelay = cloudflareResult.requeue
+				}
+			}
 		}
 		r.setCloudflareDNSProgrammedStatus(&statuses.Gateway, &gateway, compiled, tunnel, ready, message, privateState)
 		config := tunnel.Status.ConfigVersion
@@ -659,7 +695,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if pending {
-		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 	return ctrl.Result{RequeueAfter: cloudflareResult.requeue}, nil
 }

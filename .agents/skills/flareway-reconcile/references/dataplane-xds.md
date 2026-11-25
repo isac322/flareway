@@ -111,17 +111,17 @@ Its checks run in order:
    gates (`denySnapshotApplied` / `gatewayPromotionGuard`) use the same per-Pod
    convergence check, with teardown excluding unscheduled `Pending` Pods
    (`PodIP == ""`) that cannot start Envoy.
-5. Managed DNS: every public listener hostname has exactly one `state: Ready`
-   entry in `status.dnsRecords`, matching case-insensitively (skipped entirely
-   for `dns.mode: External`).
-6. Private prerequisites (`reconcilePrivatePrerequisites`): verified tunnel
-   + account, `DeviceSettings` `gatewayProxyEnabled` and
-   `gatewayUdpProxyEnabled`, a ready `VirtualNetwork` per private listener,
-   a ready `HostnameRoute`, and the origin-JWT TLS-decryption contract. Any
-   miss blocks the private domains and adds a `Pending` message.
 
-Private prerequisites (`reconcilePrivatePrerequisites`) control listener
-readiness independently of this applied-configuration checkpoint. A missing
+`cloudflareConverged` also evaluates managed DNS readiness (`publicDNSReady`) as
+a separate boolean without blocking the `ConfigApplied` checkpoint; `cloudflareGate`
+combines data-plane convergence with managed DNS for callers that need both.
+
+Private prerequisites (`reconcilePrivatePrerequisites`, executed in `Reconcile`
+before snapshot build and remote config push) check verified tunnel + account,
+`DeviceSettings` `gatewayProxyEnabled` and `gatewayUdpProxyEnabled`, a ready
+`VirtualNetwork` per private listener, a ready non-deleting `HostnameRoute`, and
+the origin-JWT TLS-decryption contract. These control listener readiness
+independently of the applied-configuration checkpoint: a missing
 VirtualNetwork, HostnameRoute, or origin-JWT TLS-decryption contract blocks
 only its private listener's domains. Shared account ownership or
 DeviceSettings proxy failures block all private listeners. Denial retains
@@ -136,10 +136,8 @@ unrelated listeners remain available.
 
 Managed DNS is a separate readiness result: every public listener's required
 hostname must have exactly one `state: Ready` entry in `status.dnsRecords`,
-matching case-insensitively. Missing, empty, unknown, or duplicate entries
-remain unready. This
-check is skipped for `dns.mode: External`. `cloudflareGate` combines it with
-data-plane convergence for callers that need the full Gateway gate.
+matched using canonical normalized DNS hostnames. Missing, empty, unknown, or duplicate entries
+remain unready. This check is skipped for `dns.mode: External`.
 
 Gateway `Programmed=True` requires both results and private readiness. Each public listener uses its own
 DNS record, so a healthy listener can report `Programmed=True` while another
@@ -149,15 +147,24 @@ affected listener's actual IR before cloudflared compilation and xDS
 publication, preserving the binding digest in the denied configuration.
 
 When a gate fails, `Programmed=False`/`Pending` lists the lagging items;
-after the convergence timeout the message switches to "Timed out".
+after the 30s convergence timeout (tracked from `ConfigApplied=False` or from persisted `Gateway.Programmed=False` at the same generation) the message switches to "Timed out".
+Once `ConfigApplied=True` (and outside active Access transitions or HostnameRoute mutations), the controller schedules the timeout boundary or falls back to the freshness interval instead of polling every 2s.
 Data-plane convergence (or a teardown deny snapshot that Envoy ACKed) sets
 `ConfigApplied=True`/`Applied` and stamps `hostnames[].appliedVersion`, even
 while managed DNS or private prerequisites are pending. Applied hostname
 guards describe the published configuration, including listener-local
 blocks. Tunnel `Ready` retains its three-condition formula; use listener
-`Programmed` to check private routing availability.
+`Programmed` to check private routing availability. `PrivateListenerDegraded=True` (`PodIPFallback`) stays set whenever any active private listener uses Pod-IP fallback, even if a sibling private listener is pending.
 
-## Block-first handoff
+## Port stability, freshness latch, and Block-first handoff
+
+Public listeners and public Access protection domains retain recorded
+`(listener, protectionDomain) -> envoyPort` bindings from `status.listeners` across
+listener additions, removals, and upgrades; unseen domains receive
+deterministic unused hash ports in `[18080, 65535]`. The Gateway controller
+tracks remote tunnel configuration freshness under `"CloudflareTunnelConfig"`,
+separate from the tunnel controller's `"CloudflareTunnel"` DNS/identity sweep
+key.
 
 `accessBlockFirstGateway` compares each protected domain's desired Access
 binding with its applied `hostnames[].accessBinding`. The digest covers the
@@ -165,15 +172,11 @@ application key, canonical AUD set, auth domain and team name,
 preflight-bypass setting, and origin-JWT mode. Disabled origin-JWT
 enforcement carries its own binding identity without an AUD handoff.
 
-A changed or missing binding first publishes that protection domain as
-`Blocked`, retaining the desired digest while clearing its Access guard.
-Public protected hostnames have separate protection domains, so unrelated
-hosts keep forwarding. A domain that shares one route table across hosts
-keeps that table intact during the transition. Once Pods and xDS apply the
-blocked configuration, status records its guard and digest, and the next
-pass can publish forwarding. A legacy `Blocked` entry without a digest must
-complete this one-time handoff too. A public carve-out or backend change
-does not re-block a hostname whose binding is unchanged.
+A changed or missing binding first marks that protection domain `Blocked` with
+`BlockReasonAccessTransition`, retaining the desired digest while clearing its
+Access guard. Any Access block-first transition, unready Access application
+(`BlockReasonAccessNotReady`), or revocation hold (`BlockReasonRevocation`)
+keeps the affected listener and Gateway `Programmed=False` (`Pending`). Public protected hostnames have separate protection domains, so unrelated hosts keep forwarding. A domain that shares one route table across hosts keeps that table intact during the transition. Once Pods and xDS apply the blocked configuration, status records its guard and digest, and the next pass can publish forwarding. A legacy `Blocked` entry without a digest must complete this one-time handoff too. A public carve-out or backend change does not re-block a hostname whose binding is unchanged.
 
 Debugging a stuck handoff:
 
