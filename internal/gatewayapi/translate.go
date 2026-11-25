@@ -156,7 +156,8 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 		}
 	}
 
-	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, holds.reservedPorts())
+	publicPorts := newPublicEnvoyPorts(in, holds.reservedPorts(), conformanceMode)
+	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, publicPorts)
 	globalInvalid := false
 	if len(in.Gateway.Spec.Addresses) > 0 {
 		globalInvalid = true
@@ -202,7 +203,7 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 	}
 
 	compileHTTPRoutes(in, out, listeners, &outStatuses, now)
-	applyAccessApplications(in, out, &outStatuses, now, holds)
+	applyAccessApplications(in, out, &outStatuses, now, holds, publicPorts)
 	populateBackendTLSPolicyStatuses(in, out, &outStatuses, now)
 	out.Clusters = buildClusters(in, out)
 	finalizeIR(out)
@@ -339,8 +340,7 @@ func namespaceByName(namespaces []corev1.Namespace, name string) *corev1.Namespa
 	return nil
 }
 
-func translateListeners(in Inputs, out *ir.Gateway, reserved map[int32]struct{}) ([]*listenerTranslation, gatewayv1.GatewayConditionReason, string) {
-	publicPorts := publicEnvoyPorts{next: 18080, reserved: reserved}
+func translateListeners(in Inputs, out *ir.Gateway, publicPorts *publicEnvoyPorts) ([]*listenerTranslation, gatewayv1.GatewayConditionReason, string) {
 	listeners := make([]*listenerTranslation, 0, len(in.Gateway.Spec.Listeners))
 	conformance := out.ConformanceMode
 	for i := range in.Gateway.Spec.Listeners {
@@ -362,7 +362,7 @@ func translateListeners(in Inputs, out *ir.Gateway, reserved map[int32]struct{})
 		if exposure == v1alpha1.ExposurePrivate {
 			envoyPort = int32(spec.Port)
 		} else {
-			envoyPort = publicPorts.take()
+			envoyPort = publicPorts.takeBase(string(spec.Name))
 		}
 		validateListener(in, translated, conformance, envoyPort, out)
 		listeners = append(listeners, translated)

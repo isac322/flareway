@@ -48,8 +48,22 @@ of the pipeline is stuck, in this order:
 | `Conflict` | Ownership, adoption, DNS, or remote-writer conflict |
 
 `Gateway` `Programmed` requires the full Cloudflare gate: Envoy xDS ACK,
-every active cloudflared Pod on the desired config version, and managed DNS
-present. The condition message lists the lagging items verbatim.
+every active cloudflared Pod on the desired config version, Access
+readiness/transitions/revocations, private readiness, and managed DNS
+represented by exactly one `state: Ready` entry per canonical normalized
+hostname. Missing, empty, unknown, or duplicate entries remain unready. The
+condition message lists the lagging items verbatim. Listener `Programmed` uses
+that listener's required DNS record and Access/private readiness; missing or
+conflicted records block only its hostname configuration, and a conflict reports
+`DNSConflict`. `ConfigApplied` and applied hostname guards advance after
+Pod-version and xDS convergence independently of managed DNS and private
+routing readiness, while Access block-first transitions keep the affected
+listener and Gateway `Programmed=False` until forwarding resumes. Private VNet,
+HostnameRoute, and TLS-decryption prerequisites block only their listener;
+shared account and DeviceSettings failures block all private listeners. Tunnel
+`Ready` retains its formula, while Gateway/listener `Programmed` reports private
+routing availability, and `PrivateListenerDegraded=True` (`PodIPFallback`)
+remains set whenever any active private listener falls back to Pod IP.
 
 ## Direct vs Gateway tunnel writer
 
@@ -82,8 +96,9 @@ When `Programmed` stays `False`, work the gate in order — see
    current resource fingerprints through ACKs or matching initial versions. A
    missing active stream or current NACK blocks convergence, while streams for
    terminating Pods are excluded.
-3. DNS: every public listener hostname has a record in
-   `status.dnsRecords` (skipped for `dns.mode: External`).
+3. DNS: every public listener hostname has exactly one `state: Ready` entry in
+   `status.dnsRecords`, matched using canonical normalized DNS hostnames (skipped for
+   `dns.mode: External`).
 4. Private listeners: `DeviceSettings` proxy flags, ready `VirtualNetwork`,
    ready `HostnameRoute`, and the origin-JWT TLS contract.
 

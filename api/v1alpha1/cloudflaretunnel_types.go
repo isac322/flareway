@@ -471,6 +471,9 @@ type CloudflareTunnelHostnameStatus struct {
 	AccessApplication string        `json:"accessApplication"`
 	Guard             HostnameGuard `json:"guard"`
 	AppliedVersion    int64         `json:"appliedVersion,omitempty"`
+	// AccessBinding identifies the Access policy applied to this hostname.
+	// A missing value from an older status is treated as changed.
+	AccessBinding string `json:"accessBinding,omitempty"`
 }
 
 // CloudflareTunnelDNSRecordStatus records a bounded projection of one managed DNS record.

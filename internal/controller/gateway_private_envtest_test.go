@@ -104,7 +104,8 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		gomega.Expect(testClient.Patch(testContext, &drifted, client.MergeFrom(before))).To(gomega.Succeed())
 		changed, err := reconciler.reconcileGeneratedHostnameRoutes(testContext, gateway, tunnel, account, []v1alpha1.HostnameRoute{drifted})
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		gomega.Expect(changed).To(gomega.BeTrue())
+		gomega.Expect(changed.Changed).To(gomega.BeTrue())
+		gomega.Expect(changed.Listeners).To(gomega.HaveKey("private"))
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current v1alpha1.HostnameRoute
 			g.Expect(testClient.Get(testContext, routeKey, &current)).To(gomega.Succeed())
@@ -270,7 +271,7 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		blockPrivateDomains(compiled)
 		status := gatewayv1.GatewayStatus{Listeners: []gatewayv1.ListenerStatus{{Name: "private"}}}
 		reconciler := &GatewayReconciler{Client: testClient}
-		reconciler.setCloudflareProgrammedStatus(&status, gateway, false, state.Pending)
+		reconciler.setCloudflareProgrammedStatus(&status, gateway, false, state.Pending, nil)
 		gomega.Expect(reconciler.patchGatewayStatus(testContext, clientObjectKey(gateway), status)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			var current gatewayv1.Gateway
@@ -320,7 +321,7 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		}
 		gomega.Expect(testClient.Create(testContext, denied)).To(gomega.Succeed())
 		gomega.Eventually(func() error { return setDeviceSettingsStatus(testContext, denied, falsity, falsity) }, 10*time.Second, 100*time.Millisecond).Should(gomega.Succeed())
-		settings, message, err := reconciler.privateDeviceSettings(testContext, account)
+		settings, message, _, err := reconciler.privateDeviceSettings(testContext, account)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(message).To(gomega.BeEmpty())
 		gomega.Expect(settings).To(gomega.Equal(observedDeviceSettings{GatewayProxyEnabled: true, GatewayUDPProxyEnabled: true}))
@@ -335,7 +336,7 @@ var _ = ginkgo.Describe("Gateway private prerequisites", func() {
 		gomega.Expect(testClient.Create(testContext, authorized)).To(gomega.Succeed())
 		gomega.Eventually(func(g gomega.Gomega) {
 			g.Expect(setDeviceSettingsStatus(testContext, authorized, truth, falsity)).To(gomega.Succeed())
-			settings, message, err = reconciler.privateDeviceSettings(testContext, account)
+			settings, message, _, err = reconciler.privateDeviceSettings(testContext, account)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 			g.Expect(message).To(gomega.BeEmpty())
 			g.Expect(settings).To(gomega.Equal(observedDeviceSettings{GatewayProxyEnabled: true, GatewayUDPProxyEnabled: false}))

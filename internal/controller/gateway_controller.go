@@ -288,6 +288,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("prepare Access block-first transition: %w", err)
 	}
+	blockDomainsForUnreadyDNS(compiled, tunnel)
 	privateState := privatePrerequisiteResult{}
 	if !compiled.ConformanceMode && block == nil {
 		privateState, err = r.reconcilePrivatePrerequisites(ctx, compiled, tunnel, account, privateInputsView(
@@ -488,7 +489,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			); err != nil {
 				return ctrl.Result{}, err
 			}
-			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message)
+			r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, message, nil)
 			if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -503,6 +504,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	pending := false
+	requeueDelay := programmedRequeue
 	if compiled.ConformanceMode {
 		addresses, addressReady, addressMessage, err := r.serviceAddresses(ctx, compiled)
 		if err != nil {
@@ -521,7 +523,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		pending = r.setProgrammedStatus(&statuses.Gateway, &gateway, key, version, acked, deploymentReady, addressReady, addressMessage)
 	} else {
 		statuses.Gateway.Addresses = tunnelGatewayAddresses(compiled, tunnel)
-		ready, lagging, _, err := r.cloudflareGate(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
+		ready, lagging, dnsReady, err := r.cloudflareConverged(ctx, compiled, tunnel, fmt.Sprint(cloudflareResult.version), version)
 		if err != nil {
 			// Observation failure is not proof of convergence: demote while
 			// this Gateway still holds the writer identity, then surface the
@@ -533,18 +535,55 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		if privateState.Pending != "" {
-			ready = false
 			lagging = append(lagging, privateState.Pending)
 		}
-		message := "Gateway configuration is acknowledged by Envoy, active in every cloudflared Pod, and present in DNS"
-		if !ready {
+		accessPending, accessTransitioning := blockedAccessListeners(compiled)
+		message := "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
+		if !ready || !dnsReady || privateState.Pending != "" || len(accessPending) > 0 {
+			if !dnsReady {
+				lagging = append(lagging, "managed DNS records")
+			}
+			if accessTransitioning {
+				lagging = append(lagging, "Access block-first transition")
+			} else if len(accessPending) > 0 {
+				lagging = append(lagging, "Access readiness")
+			}
+			nowTime := r.gatewayNow()
+			var pendingSince time.Time
+			if !ready {
+				if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && condition.Status == metav1.ConditionFalse {
+					pendingSince = condition.LastTransitionTime.Time
+				}
+			} else if condition := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); condition != nil &&
+				condition.Status == metav1.ConditionFalse &&
+				condition.ObservedGeneration == gateway.Generation &&
+				condition.Reason != string(gatewayv1.GatewayReasonInvalid) {
+				pendingSince = condition.LastTransitionTime.Time
+			}
+			timedOut := !pendingSince.IsZero() && nowTime.Sub(pendingSince) >= cloudflareConvergenceTimeout
 			message = "Waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
-			if condition := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied); condition != nil && condition.Status == metav1.ConditionFalse && r.gatewayNow().Sub(condition.LastTransitionTime.Time) >= cloudflareConvergenceTimeout {
+			if timedOut {
 				message = "Timed out after 30s waiting for Cloudflare programming gate: " + strings.Join(lagging, ", ")
 			}
 			pending = true
+			if ready && !accessTransitioning && !privateState.RouteMutated {
+				switch {
+				case !timedOut && !pendingSince.IsZero():
+					remaining := cloudflareConvergenceTimeout - nowTime.Sub(pendingSince)
+					if remaining < programmedRequeue {
+						remaining = programmedRequeue
+					}
+					requeueDelay = remaining
+				case !timedOut:
+					requeueDelay = cloudflareConvergenceTimeout
+				case privateState.DeviceSettingsFallbackUsed:
+					requeueDelay = cloudflareConvergenceTimeout
+				default:
+					requeueDelay = cloudflareResult.requeue
+				}
+			}
 		}
-		r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, ready, message)
+		r.setCloudflareDNSProgrammedStatus(&statuses.Gateway, &gateway, compiled, tunnel, ready, message, privateState)
 		config := tunnel.Status.ConfigVersion
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -579,12 +618,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 		now := metav1.NewTime(r.gatewayNow())
+		configMessage := message
+		if ready {
+			configMessage = "Gateway configuration is acknowledged by Envoy and active in every cloudflared Pod"
+		}
 		driftCondition := gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
 		if cloudflareResult.drift {
 			driftCondition = gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
 		}
 		conditions := []metav1.Condition{
-			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, message, now),
+			gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, conditionStatus, reason, configMessage, now),
 			privateListenerCondition(compiled, privateState, now),
 			driftCondition,
 		}
@@ -614,7 +657,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "Pending", err.Error()); demoteErr != nil {
 						return ctrl.Result{}, fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", err, demoteErr)
 					}
-					r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, err.Error())
+					r.setCloudflareProgrammedStatus(&statuses.Gateway, &gateway, false, err.Error(), nil)
 					pending = true
 				case errors.Is(err, errTunnelGateObservation):
 					// Real observation failure: demote while still
@@ -652,7 +695,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if pending {
-		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 	return ctrl.Result{RequeueAfter: cloudflareResult.requeue}, nil
 }
@@ -1349,7 +1392,7 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 ) error {
 	r.clearSnapshot(key)
 	statuses.Gateway.Addresses = nil
-	r.setCloudflareProgrammedStatus(&statuses.Gateway, gateway, false, message)
+	r.setCloudflareProgrammedStatus(&statuses.Gateway, gateway, false, message, nil)
 	if retractDataplane {
 		if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
 			return err

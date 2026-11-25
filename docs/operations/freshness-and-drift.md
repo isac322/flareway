@@ -142,7 +142,7 @@ Setting every freshness flag to `0` keeps every gate closed, so reconcilers read
 
 | Metric | Labels | Reading |
 |---|---|---|
-| `flareway_gate_total` | `kind`, `decision` | `decision="open"` counts skipped remote reads. A kind stuck at `closed_hash` means its desired hash keeps changing, usually because of an unstable spec input |
+| `flareway_gate_total` | `kind`, `decision` | `decision="open"` counts skipped remote reads. A kind stuck at `closed_hash` means its desired hash keeps changing, usually because of an unstable spec input (the Gateway tunnel-config gate reports `kind="CloudflareTunnelConfig"`, separate from `"CloudflareTunnel"` DNS/identity sweep invalidation) |
 | `flareway_drift_detected_total` | `kind`, `case` | Out-of-band changes found, by `orphan`, `missing`, `mismatch`, or `version` |
 | `flareway_sweep_total` | `kind`, `result` | `ok`, `partial`, or `error` per sweep pass |
 | `flareway_sweep_last_success_timestamp` | `kind` | Last pass that observed a complete listing. A stale value with rising `partial` counts means drift detection is degraded |

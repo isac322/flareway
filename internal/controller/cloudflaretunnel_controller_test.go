@@ -1514,7 +1514,9 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 			g.Expect(conflict).NotTo(gomega.BeNil())
 			g.Expect(conflict.Status).To(gomega.Equal(metav1.ConditionTrue))
 			g.Expect(conflict.Reason).To(gomega.Equal("DNSOwnership"))
-			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord))
+			g.Expect(current.Status.DNSRecords).To(gomega.ConsistOf(ownedRecord, v1alpha1.CloudflareTunnelDNSRecordStatus{
+				Hostname: collisionHostname, ZoneID: "zone-example", State: dnsRecordStateConflict,
+			}))
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
 
 		expectTunnelStatusSettles(fixture.tunnelKey)
@@ -1647,6 +1649,36 @@ var _ = ginkgo.Describe("CloudflareTunnel reconciler", ginkgo.Ordered, func() {
 		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
 		gomega.Expect(testTunnelCloudflare.HasTunnel(remoteID)).To(gomega.BeTrue())
 		gomega.Expect(testTunnelCloudflare.Calls()).NotTo(gomega.ContainElement("DeleteTunnel"))
+	})
+
+	ginkgo.It("deletes an Orphan tunnel with synthetic DNS conflict entries even without CloudflareAccount", func() {
+		fixture := newTunnelFixture("orphan-conflict", v1alpha1.ManagementPolicyManaged, v1alpha1.DNSModeManaged)
+		fixture.tunnel.Spec.DeletionPolicy = v1alpha1.DeletionPolicyOrphan
+		testTunnelCloudflare.PutDNS("zone-example", RemoteDNSRecord{
+			ID: "foreign-orphan-conflict", Name: fixture.hostname, Type: "CNAME",
+			Content: "foreign.example.net", Comment: "terraform", Proxied: true,
+		})
+		fixture.create()
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+			g.Expect(tunnel.Status.TunnelID).NotTo(gomega.BeEmpty())
+			g.Expect(tunnel.Status.DNSRecords).To(gomega.HaveLen(1))
+			g.Expect(tunnel.Status.DNSRecords[0].State).To(gomega.Equal(dnsRecordStateConflict))
+			g.Expect(tunnel.Status.DNSRecords[0].RecordID).To(gomega.BeEmpty())
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.Succeed())
+
+		var account v1alpha1.CloudflareAccount
+		gomega.Expect(testClient.Get(testContext, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &account)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, &account)).To(gomega.Succeed())
+
+		gomega.Expect(testClient.Get(testContext, fixture.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, &tunnel)).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			var current v1alpha1.CloudflareTunnel
+			return apierrors.IsNotFound(testClient.Get(testContext, fixture.tunnelKey, &current))
+		}).WithTimeout(10 * time.Second).WithPolling(200 * time.Millisecond).Should(gomega.BeTrue())
 	})
 
 	ginkgo.It("continues fail-closed teardown when the owning Gateway is already absent", func() {
