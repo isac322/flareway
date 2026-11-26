@@ -763,27 +763,35 @@ func collectDeltaWatchChanges(
 	prevMap := sub.ReturnedResources()
 	subscribed := sub.SubscribedResources()
 	removedSet = make(map[string]struct{})
+	var replays []deltaCachedResource
+
+	consider := func(name string, res cachetypes.Resource) {
+		effectiveVer, deferUpdate := resolveVersion(name)
+		prevVer, found := prevMap[name]
+		if deferUpdate {
+			if found {
+				nextVersionMap[name] = prevVer
+			}
+			return
+		}
+		nextVersionMap[name] = effectiveVer
+		_, replayRequested := rs.replay[name]
+		rejVer, wasRejected := rs.rejectedVersion(name)
+		if wasRejected && effectiveVer == rejVer && !replayRequested {
+			return
+		}
+		item := deltaCachedResource{name: name, version: effectiveVer, resource: res}
+		if !found || prevVer != effectiveVer {
+			filtered = append(filtered, item)
+		} else if replayRequested {
+			replays = append(replays, item)
+		}
+	}
 
 	if sub.IsWildcard() {
 		nextVersionMap = make(map[string]string, len(resources))
 		for name, res := range resources {
-			effectiveVer, deferUpdate := resolveVersion(name)
-			prevVer, found := prevMap[name]
-			if deferUpdate {
-				if found {
-					nextVersionMap[name] = prevVer
-				}
-				continue
-			}
-			nextVersionMap[name] = effectiveVer
-			_, replayRequested := rs.replay[name]
-			rejVer, wasRejected := rs.rejectedVersion(name)
-			if wasRejected && effectiveVer == rejVer && !replayRequested {
-				continue
-			}
-			if replayRequested || !found || prevVer != effectiveVer {
-				filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
-			}
+			consider(name, res)
 		}
 		for name := range prevMap {
 			if _, ok := resources[name]; !ok {
@@ -794,29 +802,19 @@ func collectDeltaWatchChanges(
 	} else {
 		nextVersionMap = make(map[string]string, len(subscribed))
 		for name := range subscribed {
-			prevVer, found := prevMap[name]
 			if res, ok := resources[name]; ok {
-				effectiveVer, deferUpdate := resolveVersion(name)
-				if deferUpdate {
-					if found {
-						nextVersionMap[name] = prevVer
-					}
-					continue
-				}
-				nextVersionMap[name] = effectiveVer
-				_, replayRequested := rs.replay[name]
-				rejVer, wasRejected := rs.rejectedVersion(name)
-				if wasRejected && effectiveVer == rejVer && !replayRequested {
-					continue
-				}
-				if replayRequested || !found || prevVer != effectiveVer {
-					filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
-				}
-			} else if found {
+				consider(name, res)
+			} else if _, found := prevMap[name]; found {
 				removed = append(removed, name)
 				removedSet[name] = struct{}{}
 			}
 		}
+	}
+
+	// Ship fresh updates or removals before queued sibling replays so a still-invalid
+	// replay cannot cause a NACK on an overlapping correction.
+	if len(filtered) == 0 && len(removed) == 0 {
+		filtered = replays
 	}
 
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].name < filtered[j].name })
