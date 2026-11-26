@@ -114,7 +114,7 @@ func resolveScope(zoneName string, byName map[string]string) (string, bool) {
 // checkpoints and are always judged when their scopes are listed, even when
 // reporting local conditions like SecretMissing.
 func accessGroupScopeUnverified(group *v1alpha1.AccessGroup) bool {
-	if group.Status.GroupID == "" || len(group.Status.Conditions) == 0 {
+	if group.Status.GroupID == "" {
 		return false
 	}
 	var accepted, ready *metav1.Condition

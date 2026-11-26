@@ -1820,6 +1820,70 @@ func TestServiceTokenSpecEditDuringInitialListRestartsWithoutStaleDispatchOrBack
 	}
 }
 
+type serviceTokenObserveOnlyDuringPostAPI struct {
+	*serviceTokenFakeAPI
+	onCreate func()
+}
+
+func (f *serviceTokenObserveOnlyDuringPostAPI) CreateServiceToken(ctx context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput) (flarecloudflare.ServiceTokenSecret, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+		f.onCreate = nil
+	}
+	return f.serviceTokenFakeAPI.CreateServiceToken(ctx, scope, input)
+}
+
+func TestServiceTokenObserveOnlySwitchDuringPostLeavesDestinationUntouched(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	baseAPI := &serviceTokenFakeAPI{
+		now:       func() time.Time { return clock },
+		tokens:    make(map[string]flarecloudflare.ServiceToken),
+		secrets:   make(map[string]string),
+		createErr: cloudflareStatusError(http.StatusForbidden),
+	}
+	var world *serviceTokenWorld
+	api := &serviceTokenObserveOnlyDuringPostAPI{
+		serviceTokenFakeAPI: baseAPI,
+		onCreate: func() {
+			var obj v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+				t.Fatal(err)
+			}
+			base := client.MergeFrom(obj.DeepCopy())
+			obj.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+			obj.Spec.ExternalRef = &v1alpha1.ServiceTokenExternalReference{TokenID: "ext-1"}
+			obj.Generation = 2
+			if err := world.kube.Patch(ctx, &obj, base); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	world = newServiceTokenWorld(t, baseAPI, clock)
+	world.reconciler.NewCloudflareClient = func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }
+
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+		t.Fatalf("reconcile failed when switched to ObserveOnly mid-POST: %v", err)
+	}
+	if err := world.kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "token-credentials"}, &corev1.Secret{}); err != nil {
+		t.Fatalf("destination Secret should remain untouched after switching to ObserveOnly mid-POST: %v", err)
+	}
+	var current v1alpha1.ServiceToken
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&current, serviceTokenAttemptFinalizer) {
+		t.Fatal("attempt finalizer still present after rejected POST rollback")
+	}
+	journals, err := serviceTokenJournalSecrets(ctx, world.kube, &current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journals) != 0 {
+		t.Fatalf("expected journal cleaned up after rollback, found %d", len(journals))
+	}
+}
+
 func TestServiceTokenAmbiguousCreateErrorsRetainRecoveryPending(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

@@ -319,7 +319,13 @@ func TestAccessSweepIsolatesZoneForbiddenPreservingAccountAndPermittedZones(t *t
 							Name:             "acct-grp",
 							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
 						},
-						Status: v1alpha1.AccessGroupStatus{GroupID: "remote-acct-grp"},
+						Status: v1alpha1.AccessGroupStatus{
+							GroupID: "remote-acct-grp",
+							Conditions: []metav1.Condition{
+								{Type: "Accepted", Status: metav1.ConditionTrue, Reason: "Ready"},
+								{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"},
+							},
+						},
 					},
 					&v1alpha1.AccessGroup{
 						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "ok-zone-grp", UID: "uid-ok-grp"},
@@ -329,7 +335,13 @@ func TestAccessSweepIsolatesZoneForbiddenPreservingAccountAndPermittedZones(t *t
 							Name:             "ok-zone-grp",
 							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
 						},
-						Status: v1alpha1.AccessGroupStatus{GroupID: "remote-ok-grp"},
+						Status: v1alpha1.AccessGroupStatus{
+							GroupID: "remote-ok-grp",
+							Conditions: []metav1.Condition{
+								{Type: "Accepted", Status: metav1.ConditionTrue, Reason: "Ready"},
+								{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"},
+							},
+						},
 					},
 					&v1alpha1.AccessGroup{
 						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "denied-zone-grp", UID: "uid-denied-grp"},
@@ -339,7 +351,13 @@ func TestAccessSweepIsolatesZoneForbiddenPreservingAccountAndPermittedZones(t *t
 							Name:             "denied-zone-grp",
 							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
 						},
-						Status: v1alpha1.AccessGroupStatus{GroupID: "remote-denied-grp"},
+						Status: v1alpha1.AccessGroupStatus{
+							GroupID: "remote-denied-grp",
+							Conditions: []metav1.Condition{
+								{Type: "Accepted", Status: metav1.ConditionTrue, Reason: "Ready"},
+								{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"},
+							},
+						},
 					},
 				}
 			},
@@ -637,6 +655,7 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 		generation         int64
 		observedGeneration int64
 		condObservedGen    int64
+		omitConditions     bool
 		readyStatus        metav1.ConditionStatus
 		reason             string
 		wantResult         string
@@ -649,6 +668,20 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 			reason:         "RefNotPermitted",
 			wantResult:     observability.SweepResultPartial,
 			wantItems:      0,
+		},
+		{
+			name:           "partial_sweep_withholds_legacy_binding_without_conditions",
+			denyZoneDenied: true,
+			omitConditions: true,
+			wantResult:     observability.SweepResultPartial,
+			wantItems:      0,
+		},
+		{
+			name:           "complete_sweep_judges_legacy_binding_without_conditions",
+			denyZoneDenied: false,
+			omitConditions: true,
+			wantResult:     observability.SweepResultOK,
+			wantItems:      1,
 		},
 		{
 			name:               "partial_sweep_withholds_interrupted_v041_zone_write_with_stale_ready",
@@ -708,10 +741,15 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 					ZoneID:             "zone-ok",
 					OwnershipVerified:  true,
 					ObservedGeneration: tc.observedGeneration,
-					Conditions: []metav1.Condition{
-						{Type: "Accepted", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
-						{Type: "Ready", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
-					},
+					Conditions: func() []metav1.Condition {
+						if tc.omitConditions {
+							return nil
+						}
+						return []metav1.Condition{
+							{Type: "Accepted", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
+							{Type: "Ready", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
+						}
+					}(),
 				},
 			}
 

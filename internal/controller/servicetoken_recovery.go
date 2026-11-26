@@ -182,10 +182,17 @@ func (r *ServiceTokenReconciler) ensureServiceTokenAttemptFinalizer(ctx context.
 }
 
 func (r *ServiceTokenReconciler) removeServiceTokenAttemptFinalizer(ctx context.Context, object *v1alpha1.ServiceToken) error {
+	expectedUID := object.UID
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		current := new(v1alpha1.ServiceToken)
 		if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
 			return err
+		}
+		if current.UID != expectedUID {
+			return nil
 		}
 		if !controllerutil.ContainsFinalizer(current, serviceTokenAttemptFinalizer) {
 			*object = *current
@@ -691,6 +698,21 @@ func (r *ServiceTokenReconciler) cleanupRejectedServiceTokenAttempt(ctx context.
 	if journal != nil {
 		if err := journal.validateRejected(); err != nil {
 			return err
+		}
+	}
+	if deleteDestination {
+		live := new(v1alpha1.ServiceToken)
+		if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(object), live); err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.deleteServiceTokenJournalSecret(ctx, journalSecret)
+			}
+			return fmt.Errorf("read ServiceToken before destination cleanup: %w", err)
+		}
+		if live.UID != object.UID {
+			return nil
+		}
+		if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+			deleteDestination = false
 		}
 	}
 	if deleteDestination {
