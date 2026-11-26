@@ -125,6 +125,15 @@ type localRef struct {
 	// scope is the listing scope the remote object must appear in: "" for
 	// account scope, otherwise the zone ID.
 	scope string
+	// recordedScope is the checkpointed status.zoneId from the object's prior
+	// convergence, if any. When it differs from scope during a cross-scope
+	// transition, both scopes must list before the object can be judged safely.
+	recordedScope string
+	// unverifiedScope marks a recorded binding whose status conditions indicate
+	// it has not been established by a scoped observation (such as a legacy
+	// error checkpoint carrying forward an older ID). Partial passes withhold
+	// judgment for these bindings until observation re-establishes Ready=True.
+	unverifiedScope bool
 }
 
 // kindGVK maps invalidation target kinds to their API identity for the

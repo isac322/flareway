@@ -21,28 +21,61 @@ import (
 	"fmt"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 )
 
-// accessScopes returns the account scope plus every zone scope. Zone-scoped
-// kinds must list each zone or their objects would be judged missing.
-// listed records which scopes were covered so refs in unlisted scopes are
-// skipped.
-func (as *AccountSweeper) accessScopes(ctx context.Context) ([]flarecloudflare.AccessScope, map[string]bool, error) {
-	scopes := []flarecloudflare.AccessScope{{}}
-	listed := map[string]bool{"": true}
+// accessScopes returns the account scope followed by every zone scope.
+func (as *AccountSweeper) accessScopes(ctx context.Context) ([]flarecloudflare.AccessScope, error) {
 	zones, err := as.zones(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	scopes := make([]flarecloudflare.AccessScope, 0, 1+len(zones))
+	scopes = append(scopes, flarecloudflare.AccessScope{})
 	for _, zone := range zones {
 		scopes = append(scopes, flarecloudflare.AccessScope{ZoneID: zone.ID})
-		listed[zone.ID] = true
 	}
-	return scopes, listed, nil
+	return scopes, nil
+}
+
+// listAccessScoped lists account and zone scopes for Access resources. Account
+// scope ("") and non-isolatable failures abort fail-closed; isolatable zone
+// failures (403, 404, 5xx, transport) leave that zone unlisted and aggregate into
+// a *scopedListingError so account-scoped and permitted zones still converge.
+func listAccessScoped[T any](
+	ctx context.Context,
+	scopes []flarecloudflare.AccessScope,
+	wait func(context.Context) error,
+	list func(context.Context, flarecloudflare.AccessScope) ([]T, error),
+) ([]T, map[string]bool, error) {
+	listed := make(map[string]bool, len(scopes))
+	var (
+		all      []T
+		failures []error
+	)
+	for _, scope := range scopes {
+		if err := wait(ctx); err != nil {
+			return nil, nil, err
+		}
+		items, err := list(ctx, scope)
+		if err != nil {
+			if scope.ZoneID == "" {
+				return nil, nil, listFailure(err)
+			}
+			if !zoneFailureIsolatable(err) {
+				return nil, nil, err
+			}
+			failures = append(failures, &zoneFailure{zoneID: scope.ZoneID, err: err})
+			continue
+		}
+		listed[scope.ZoneID] = true
+		all = append(all, items...)
+	}
+	return all, listed, scopedListingErr(failures)
 }
 
 // zoneIDByName maps a normalized spec.zone DNS name (lowercase, no
@@ -72,34 +105,50 @@ func resolveScope(zoneName string, byName map[string]string) (string, bool) {
 	return id, ok
 }
 
-// listAccessApplications collects applications across every scope. Any
-// scope that fails makes the whole listing incomplete (fail-closed).
-func (as *AccountSweeper) listAccessApplications(ctx context.Context, api flarecloudflare.API, wait func(context.Context) error, scopes []flarecloudflare.AccessScope) ([]flarecloudflare.AccessApplication, error) {
-	var all []flarecloudflare.AccessApplication
-	for _, scope := range scopes {
-		if err := wait(ctx); err != nil {
-			return nil, err
-		}
-		apps, err := api.ListAccessApplications(ctx, scope)
-		if err != nil {
-			return nil, listFailure(err)
-		}
-		all = append(all, apps...)
+// accessGroupScopeUnverified reports whether an AccessGroup's recorded
+// binding has not yet been established for its current generation and conditions
+// (missing, non-True, or stale ObservedGeneration on Accepted/Ready — covering
+// both legacy error checkpoints and interrupted zone/ID status updates), so
+// partial passes withhold judgment until a complete pass or scoped observation
+// establishes the pair. Non-AccessGroup targets do not write split zone
+// checkpoints and are always judged when their scopes are listed, even when
+// reporting local conditions like SecretMissing.
+func accessGroupScopeUnverified(group *v1alpha1.AccessGroup) bool {
+	if group.Status.GroupID == "" {
+		return false
 	}
-	return all, nil
+	var accepted, ready *metav1.Condition
+	for i := range group.Status.Conditions {
+		switch group.Status.Conditions[i].Type {
+		case "Accepted":
+			accepted = &group.Status.Conditions[i]
+		case "Ready":
+			ready = &group.Status.Conditions[i]
+		}
+	}
+	if accepted == nil || ready == nil {
+		return true
+	}
+	if accepted.Status != metav1.ConditionTrue || ready.Status != metav1.ConditionTrue {
+		return true
+	}
+	if group.Generation > 0 && (group.Status.ObservedGeneration != group.Generation || ready.ObservedGeneration != group.Generation || accepted.ObservedGeneration != group.Generation) {
+		return true
+	}
+	return false
 }
 
 // sweepAccessApplications covers AccessApplication CRs. Remote ownership
 // is proven by the managed tag plus an owner tag (HMAC or legacy).
 func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
 	api, wait := as.remote()
-	scopes, listed, err := as.accessScopes(ctx)
+	scopes, err := as.accessScopes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	remotes, err := as.listAccessApplications(ctx, api, wait, scopes)
-	if err != nil {
-		return nil, err
+	remotes, listed, scopedErr := listAccessScoped(ctx, scopes, wait, api.ListAccessApplications)
+	if listed == nil {
+		return nil, scopedErr
 	}
 	clusterID, err := as.clusterID(ctx)
 	if err != nil {
@@ -116,6 +165,8 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 	if err := as.client.List(ctx, &list); err != nil {
 		return nil, fmt.Errorf("list AccessApplications: %w", err)
 	}
+	partial := scopedErr != nil
+	scopePredicate := accessScopeListed(listed, partial)
 	var refs []localRef
 	markers := make(map[types.NamespacedName][]string)
 	needProviders, needPages := false, false
@@ -128,8 +179,6 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		if !ok {
 			continue
 		}
-		needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
-		needPages = needPages || len(app.Spec.Application.CustomPageRefs) > 0
 		expectedName := app.Spec.Application.Name
 		if expectedName == "" {
 			expectedName = app.Namespace + "/" + app.Name
@@ -137,7 +186,11 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		ref := localRef{
 			kind: "AccessApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
-			specName: app.Name, scope: scope,
+			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
+		}
+		if scopePredicate(ref) {
+			needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
+			needPages = needPages || len(app.Spec.Application.CustomPageRefs) > 0
 		}
 		refs = append(refs, ref)
 		markers[ref.key] = accessOwnerMarkers(key, clusterID, app.Namespace, app.Name, app.UID)
@@ -187,7 +240,7 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		kind:    "AccessApplication",
 		content: content,
 		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed:  scopeListed(listed),
+		listed:  scopePredicate,
 		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		extra: func(ref localRef, remote flarecloudflare.AccessApplication) string {
 			mine := markers[ref.key]
@@ -219,7 +272,7 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 			}
 			return types.NamespacedName{}, false
 		},
-	}), nil
+	}), scopedErr
 }
 
 // sweepAccessStandaloneApplications covers AccessStandaloneApplication
@@ -227,13 +280,13 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 // generated "flareway/<clusterID>/<ns>/<name>" remote name.
 func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
 	api, wait := as.remote()
-	scopes, listed, err := as.accessScopes(ctx)
+	scopes, err := as.accessScopes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	remotes, err := as.listAccessApplications(ctx, api, wait, scopes)
-	if err != nil {
-		return nil, err
+	remotes, listed, scopedErr := listAccessScoped(ctx, scopes, wait, api.ListAccessApplications)
+	if listed == nil {
+		return nil, scopedErr
 	}
 	clusterID, err := as.clusterID(ctx)
 	if err != nil {
@@ -266,7 +319,7 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 		refs = append(refs, localRef{
 			kind: "AccessStandaloneApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
-			specName: app.Name, scope: scope,
+			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
 		})
 	}
 
@@ -274,12 +327,12 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 		kind:    "AccessStandaloneApplication",
 		content: contentCheck[flarecloudflare.AccessApplication](ctx, as),
 		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed, scopedErr != nil),
 		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(a flarecloudflare.AccessApplication) string { return a.ID },
 			func(a flarecloudflare.AccessApplication) string { return a.Name }),
-	}), nil
+	}), scopedErr
 }
 
 // accessNamedOrphan builds the orphan predicate for kinds whose remote
@@ -358,20 +411,15 @@ func sweepAccessPolicies(ctx context.Context, as *AccountSweeper) ([]DriftItem, 
 
 func sweepAccessGroups(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
 	api, wait := as.remote()
-	scopes, listed, err := as.accessScopes(ctx)
+	scopes, err := as.accessScopes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var remotes []flarecloudflare.AccessGroup
-	for _, scope := range scopes {
-		if err := wait(ctx); err != nil {
-			return nil, err
-		}
-		groups, err := api.ListAccessGroups(ctx, flarecloudflare.AccessGroupListOptions{Scope: scope})
-		if err != nil {
-			return nil, listFailure(err)
-		}
-		remotes = append(remotes, groups...)
+	remotes, listed, scopedErr := listAccessScoped(ctx, scopes, wait, func(ctx context.Context, scope flarecloudflare.AccessScope) ([]flarecloudflare.AccessGroup, error) {
+		return api.ListAccessGroups(ctx, flarecloudflare.AccessGroupListOptions{Scope: scope})
+	})
+	if listed == nil {
+		return nil, scopedErr
 	}
 	clusterID, err := as.clusterID(ctx)
 	if err != nil {
@@ -401,37 +449,31 @@ func sweepAccessGroups(ctx context.Context, as *AccountSweeper) ([]DriftItem, er
 			kind: "AccessGroup", key: types.NamespacedName{Namespace: group.Namespace, Name: group.Name},
 			uid: group.UID, remoteID: group.Status.GroupID,
 			expectedName: accessRemoteNameValue(clusterID, group.Namespace, group.Spec.Name),
-			specName:     group.Spec.Name, scope: scope,
+			specName:     group.Spec.Name, scope: scope, recordedScope: group.Status.ZoneID,
+			unverifiedScope: accessGroupScopeUnverified(group),
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessGroup]{
 		kind:    "AccessGroup",
 		content: contentCheck[flarecloudflare.AccessGroup](ctx, as),
 		idOf:    func(g flarecloudflare.AccessGroup) string { return g.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed, scopedErr != nil),
 		nameOf:  func(g flarecloudflare.AccessGroup) string { return g.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(g flarecloudflare.AccessGroup) string { return g.ID },
 			func(g flarecloudflare.AccessGroup) string { return g.Name }),
-	}), nil
+	}), scopedErr
 }
 
 func sweepServiceTokens(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {
 	api, wait := as.remote()
-	scopes, listed, err := as.accessScopes(ctx)
+	scopes, err := as.accessScopes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var remotes []flarecloudflare.ServiceToken
-	for _, scope := range scopes {
-		if err := wait(ctx); err != nil {
-			return nil, err
-		}
-		tokens, err := api.ListServiceTokens(ctx, scope)
-		if err != nil {
-			return nil, listFailure(err)
-		}
-		remotes = append(remotes, tokens...)
+	remotes, listed, scopedErr := listAccessScoped(ctx, scopes, wait, api.ListServiceTokens)
+	if listed == nil {
+		return nil, scopedErr
 	}
 	clusterID, err := as.clusterID(ctx)
 	if err != nil {
@@ -461,19 +503,19 @@ func sweepServiceTokens(ctx context.Context, as *AccountSweeper) ([]DriftItem, e
 			kind: "ServiceToken", key: types.NamespacedName{Namespace: token.Namespace, Name: token.Name},
 			uid: token.UID, remoteID: token.Status.TokenID,
 			expectedName: accessRemoteNameValue(clusterID, token.Namespace, token.Spec.Name),
-			specName:     token.Spec.Name, scope: scope,
+			specName:     token.Spec.Name, scope: scope, recordedScope: token.Status.ZoneID,
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.ServiceToken]{
 		kind:    "ServiceToken",
 		content: contentCheck[flarecloudflare.ServiceToken](ctx, as),
 		idOf:    func(t flarecloudflare.ServiceToken) string { return t.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed, scopedErr != nil),
 		nameOf:  func(t flarecloudflare.ServiceToken) string { return t.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(t flarecloudflare.ServiceToken) string { return t.ID },
 			func(t flarecloudflare.ServiceToken) string { return t.Name }),
-	}), nil
+	}), scopedErr
 }
 
 func sweepIdentityProviders(ctx context.Context, as *AccountSweeper) ([]DriftItem, error) {

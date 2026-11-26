@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,6 +62,9 @@ type ServiceTokenReconciler struct {
 	Freshness           freshness.Policy
 	Invalidator         *freshness.Latch
 	SweepEvents         <-chan event.GenericEvent
+
+	createBackoffMu sync.Mutex
+	createBackoff   map[types.NamespacedName]serviceTokenCreateBackoff
 }
 
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=servicetokens;cloudflareaccounts,verbs=get;list;watch
@@ -73,9 +78,13 @@ type ServiceTokenReconciler struct {
 func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	object := new(v1alpha1.ServiceToken)
 	if err := r.Get(ctx, request.NamespacedName, object); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.clearServiceTokenCreateBackoff(request.NamespacedName)
+		}
 		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "ServiceToken", request.NamespacedName, err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
+		r.clearServiceTokenCreateBackoff(request.NamespacedName)
 		return ctrl.Result{}, r.reconcileDelete(ctx, object)
 	}
 	if !controllerutil.ContainsFinalizer(object, v1alpha1.ServiceTokenFinalizer) {
@@ -89,6 +98,17 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
+		if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Status.TokenID == "" {
+			if journalSecret, journal, journalErr := r.loadServiceTokenJournal(ctx, object); journalErr == nil && journal != nil && journal.phase == serviceTokenJournalPhaseRejected {
+				if bad := journal.validateRejected(); bad != nil {
+					return ctrl.Result{}, r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+				}
+				if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, true); rbErr != nil {
+					return ctrl.Result{}, errors.Join(err, rbErr)
+				}
+				return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+			}
+		}
 		_ = r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, privateErrorReason(err), err.Error(), serviceTokenStatusUpdate{})
 		return ctrl.Result{}, err
 	}
@@ -99,25 +119,48 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		return ctrl.Result{}, journalErr
 	}
+	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly &&
+		journal != nil &&
+		journal.phase == serviceTokenJournalPhaseRejected &&
+		object.Status.TokenID == "" {
+		if bad := journal.validateRejected(); bad != nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+		}
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, true); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+	}
+	validRejectedForObserve := object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly &&
+		journal != nil &&
+		journal.phase == serviceTokenJournalPhaseRejected &&
+		journal.validateRejected() == nil
 	scope, err := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
 	if err != nil {
-		if journal != nil && !journal.matchesSpecIdentity(object, account) {
+		if journal != nil && !validRejectedForObserve && !journal.matchesSpecIdentity(object, account) {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal identity does not match the live spec; refusing to resume", serviceTokenStatusUpdate{})
 		}
-		if journal == nil {
+		if journal == nil || validRejectedForObserve {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Invalid", err.Error(), serviceTokenStatusUpdate{})
 		}
 		// A verified-zone status flap must not strand a pending attempt: resume
 		// under the journaled zone binding after normal grant authorization.
 		scope = flarecloudflare.AccessScope{ZoneID: journal.zoneID}
-	} else if journal != nil && journal.matchesSpecIdentity(object, account) && journal.zoneID != scope.ZoneID {
+	} else if journal != nil && !validRejectedForObserve && journal.matchesSpecIdentity(object, account) && journal.zoneID != scope.ZoneID {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "journaled service token zone binding no longer resolves", serviceTokenStatusUpdate{})
 	}
 
 	id := object.Status.TokenID
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
 		if journal != nil && object.Status.TokenID == "" {
-			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "RecoveryPending", "an unresolved service token journal blocks observation", serviceTokenStatusUpdate{})
+			if journal.phase == serviceTokenJournalPhaseRejected {
+				if bad := journal.validateRejected(); bad != nil {
+					return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+				}
+			} else {
+				return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "RecoveryPending", "an unresolved service token journal blocks observation", serviceTokenStatusUpdate{})
+			}
 		}
 		if object.Spec.ExternalRef == nil {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Invalid", "ObserveOnly requires externalRef", serviceTokenStatusUpdate{})
@@ -152,7 +195,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		if object.Status.TokenID != "" {
 			// The status checkpoint already landed: a lingering journal is
 			// reap-only and never grounds resume or rotation.
-			if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
+			if err := r.deleteServiceTokenJournalSecret(ctx, journalSecret); err != nil {
 				return ctrl.Result{}, err
 			}
 			if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {
@@ -197,6 +240,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	var remote flarecloudflare.ServiceToken
 	if id == "" {
 		if object.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
+			r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
 			if object.Spec.ExternalRef == nil {
 				return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionFalse, "Invalid", "AdoptById requires externalRef", serviceTokenStatusUpdate{})
 			}
@@ -534,6 +578,18 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 		return r.patchCleanupBlocked(ctx, object, "JournalError", journalErr)
 	}
 	attemptMarked := controllerutil.ContainsFinalizer(object, serviceTokenAttemptFinalizer)
+	if journal != nil && journal.phase == serviceTokenJournalPhaseRejected {
+		if bad := journal.validateRejected(); bad != nil {
+			return r.patchCleanupBlocked(ctx, object, "JournalError", bad)
+		}
+		deleteDestination := object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, deleteDestination); err != nil {
+			return r.patchCleanupBlocked(ctx, object, "JournalError", err)
+		}
+		journalSecret = nil
+		journal = nil
+		attemptMarked = false
+	}
 	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
 		if object.Status.TokenID != "" && object.Status.OwnershipVerified {
 			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
@@ -562,7 +618,7 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 		}
 	}
 	if journalSecret != nil {
-		if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.deleteServiceTokenJournalSecret(ctx, journalSecret); err != nil {
 			return r.patchCleanupBlocked(ctx, object, "JournalError", err)
 		}
 	}
@@ -595,14 +651,20 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue || remote.ID != "" {
+		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 // finishRemoteError reports a failed remote call on the object's conditions.
 // A typed 404 revokes acceptance because the remote object is gone; any other
 // failure is transient, so the existing Accepted condition and the recorded
 // remote identifiers are preserved while Ready flips to False.
-func (r *ServiceTokenReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.ServiceToken, err error) error {
+func applyRemoteErrorConditions(object *v1alpha1.ServiceToken, now time.Time, err error) {
 	conditions := []metav1.Condition{
 		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteError", err.Error()),
 	}
@@ -612,10 +674,52 @@ func (r *ServiceTokenReconciler) finishRemoteError(ctx context.Context, object *
 			accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteMissing", err.Error()),
 		}
 	}
-	base := client.MergeFrom(object.DeepCopy())
 	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
-	if patchErr := r.Status().Patch(ctx, object, base); patchErr != nil {
+	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, now, conditions...)
+}
+
+// patchRemoteError updates the ServiceToken conditions for a failed remote
+// call and returns only any Kubernetes status-patch error.
+func (r *ServiceTokenReconciler) patchRemoteError(ctx context.Context, object *v1alpha1.ServiceToken, err error) error {
+	base := client.MergeFrom(object.DeepCopy())
+	applyRemoteErrorConditions(object, r.now(), err)
+	return r.Status().Patch(ctx, object, base)
+}
+
+// patchRemoteErrorForAttempt updates the ServiceToken error conditions using a
+// fresh optimistic-locked read, skipping the patch if the object's UID or
+// generation changed while the request or rollback was in flight.
+func (r *ServiceTokenReconciler) patchRemoteErrorForAttempt(ctx context.Context, object *v1alpha1.ServiceToken, err error, attemptedUID types.UID, attemptedGeneration int64) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := new(v1alpha1.ServiceToken)
+		if getErr := r.apiReader().Get(ctx, client.ObjectKeyFromObject(object), current); getErr != nil {
+			if apierrors.IsNotFound(getErr) {
+				return nil
+			}
+			return getErr
+		}
+		if current.UID != attemptedUID || current.Generation != attemptedGeneration {
+			return nil
+		}
+		base := client.MergeFromWithOptions(current.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		applyRemoteErrorConditions(current, r.now(), err)
+		if patchErr := r.Status().Patch(ctx, current, base); patchErr != nil {
+			return patchErr
+		}
+		*object = *current
+		return nil
+	})
+}
+
+func (r *ServiceTokenReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.ServiceToken, err error) error {
+	if patchErr := r.patchRemoteError(ctx, object, err); patchErr != nil {
+		return errors.Join(err, patchErr)
+	}
+	return err
+}
+
+func (r *ServiceTokenReconciler) finishRemoteErrorForAttempt(ctx context.Context, object *v1alpha1.ServiceToken, err error, attemptedUID types.UID, attemptedGeneration int64) error {
+	if patchErr := r.patchRemoteErrorForAttempt(ctx, object, err, attemptedUID, attemptedGeneration); patchErr != nil {
 		return errors.Join(err, patchErr)
 	}
 	return err

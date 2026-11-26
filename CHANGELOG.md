@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Roll back the pending `ServiceToken` create journal, empty reserved destination
+  Secret, and attempt finalizer when `CreateServiceToken` fails with a
+  definite non-creation HTTP `4xx` error (excluding `408`, `409`, and `429`),
+  preventing objects from wedging in `RecoveryPending` or `CleanupBlocked` (#181).
+- Isolate per-zone listing failures (HTTP `403`, `404`, `5xx`, and transport
+  errors) in zone-scoped Access sweeps (`AccessApplication`,
+  `AccessStandaloneApplication`, `AccessGroup`, `ServiceToken`) so account-scoped
+  and permitted-zone drift detection continue cleanly (#183).
 - Bind each `ClusterLoadAssignment` (`EndpointType`) Delta xDS version to its
   owning `Cluster` version in `translator.Build`, eliminating the 15s Envoy EDS
   warming stall and temporary stale-SAN window when `BackendTLSPolicy` or

@@ -51,7 +51,8 @@ func listFailure(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, flarecloudflare.ErrRateLimitWait) {
 		return err
 	}
 	if status, ok := flarecloudflare.StatusCode(err); ok && status >= 400 && status < 500 {

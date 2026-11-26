@@ -54,13 +54,21 @@ limitations under the License.
 // client-side rejection (HTTP 4xx) is recorded as result=error and likewise
 // abandons judgement for that kind only — other kinds keep sweeping.
 //
-// One exception, currently only the DNS target: a multi-scope listing that
-// fails for some scopes returns a *scopedListingError. The pass is still
-// partial — last-success stays stale and the aggregate names the failed
-// scopes — but items judged against the scopes that listed completely are
-// safe and are dispatched normally. Scopes that did not list contribute no
-// records and no judgement, so a denied zone can never produce a false
-// missing verdict. Every other target keeps the strict contract above.
+// Exceptions: the DNS target (`sweepDNSRecords`) and the four zone-scoped Access
+// targets (`AccessApplication`, `AccessStandaloneApplication`, `AccessGroup`,
+// `ServiceToken` via `listAccessScoped`). A multi-scope listing that fails for
+// some zones returns a *scopedListingError. The pass is still partial —
+// last-success stays stale and the aggregate names the failed scopes — but
+// items judged against completed scopes are safe and are dispatched normally.
+// Account-scope failures on Access targets still abort fail-closed. Scopes that
+// did not list contribute no records and no judgement, and Access objects with
+// a distinct checkpointed `status.zoneId` require both target and checkpointed
+// scopes in `listed` (`accessScopeListed`), while partial passes also withhold
+// judgement for `AccessGroup` objects whose `Accepted`/`Ready` conditions do not
+// yet confirm the recorded binding for their current generation
+// (`unverifiedScope`), so an unlisted zone or inherited/interrupted zone
+// checkpoint can never produce a false missing verdict (non-AccessGroup objects
+// with local failures such as `ServiceToken` `SecretMissing` still get judged).
 //
 // # Content confirmation
 //
@@ -72,16 +80,16 @@ limitations under the License.
 // listing can confirm it by registering a content baseline after its own
 // verify: a listed object that matches the baseline counts as a fresh verify
 // and keeps the object from reading the remote itself; one that does not is
-// a DriftCaseMismatch like any other. Confirmations happen only inside
-// classify, which is only ever called with a complete listing, so a partial
-// or failed pass confirms nothing. The DNS target does not use classify and
-// confirms nothing.
+// a DriftCaseMismatch like any other. `classify` invokes ConfirmContent only
+// for objects whose required scopes passed `opts.listed(ref)`, so a strict
+// target confirms nothing on any failure and a scoped-partial Access pass
+// confirms only objects whose relevant scopes completed listing. The DNS target
+// does not use classify and confirms nothing.
 //
-// The AccessApplication target hands the confirmer an
-// AccessApplicationListing rather than the bare application: the whole
-// application listing (bypass children live there) and, when any application
-// references them, the identity provider and custom page listings, all taken
-// in the same pass. A failure listing any of them abandons the pass.
+// When any eligible `AccessApplication` (whose target and checkpointed scopes
+// completed listing) references identity providers or custom pages, the same
+// pass also lists those account-wide targets. A failure listing either
+// referenced set aborts the pass fail-closed and confirms nothing.
 //
 // # Orphans are observe-only
 //

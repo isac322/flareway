@@ -30,7 +30,7 @@ The journal is a Secret named `flareway-st-intent-<ServiceToken UID>`, controlle
 - `spec.name` and the credential destination Secret;
 - a random attempt nonce (8 bytes, hex-encoded) and the attempt name derived from it.
 
-It also records the phase (`prepared`, `dispatched`, or `retiring`), the issued token ID once known, and the ID and name of a token being retired.
+It also records the phase (`prepared`, `dispatched`, `retiring`, or `rejected`), the issued token ID once known, and the ID and name of a token being retired.
 
 Only the managed fresh-create path writes a journal. `AdoptById`, `ObserveOnly`, and an established token (with `status.tokenId` set) never create one. The controller reads the cluster ID, the journal, and the credential Secret through the uncached API reader, which `SetupWithManager` initializes. If the cluster ID is unavailable or empty, the create fails closed.
 
@@ -49,17 +49,17 @@ The name is capped at 200 characters by truncating `spec.name`. The prefix up to
 1. List tokens in scope. Any token whose name starts with this ServiceToken's attempt prefix, or equals the canonical name, is an untracked collision: report `Conflict` and stop.
 2. Generate a nonce, add the attempt finalizer `flareway.bhyoo.com/service-token-attempt`, and create the journal in phase `prepared`. The finalizer covers the window before the journal exists.
 3. Reserve the destination: create an empty Secret controlled by the ServiceToken and annotated as reserved. An existing Secret must be controlled by this ServiceToken, mutable, and accept a versioned metadata update. Otherwise report `Conflict`.
-4. Persist phase `dispatched`, then call `CreateServiceToken` with the attempt name.
+4. Persist phase `dispatched`, then call `CreateServiceToken` with the attempt name and client retries disabled (`WithMaxRetries(0)`). If Cloudflare returns a definite non-creation `4xx` response (any `4xx` except `408`, `409`, and `429`), persist phase `rejected` (with bounded retries on transient Kubernetes API failures while leaving `dispatched` fail-closed if persistence still fails), record per-CR exponential create backoff (reset when `ServiceToken` generation, `CloudflareAccount` resource version, or resolved remote name changes) before local cleanup, remove any empty controller-reserved destination Secret carrying the pending-reservation annotation, release the attempt finalizer with an optimistic-lock fresh read, delete the journal Secret with `UID` and `ResourceVersion` preconditions, and surface the API error (`RemoteError`, or `RemoteMissing` for `404`) with `RequeueAfter` instead of entering `RecoveryPending`.
 5. Record the issued token ID in the journal.
 6. Write the credential to the destination Secret. If the returned name differs from the attempt name, write the credential anyway and report `Conflict`; the create is never repeated.
 7. Align mutable fields and the canonical name, patch `status.tokenId` with `Ready=True`, then delete the journal and remove the attempt finalizer.
 
 ### Recovery
 
-When a journal exists and `status.tokenId` is empty, recovery runs after grant authorization and before the freshness gate:
+When a journal exists and `status.tokenId` is empty, recovery runs after grant authorization and before the freshness gate — with one explicit exception: a managed `rejected` journal (validated to carry neither `issuedID` nor `retiringID`) finishes local cleanup (empty reserved destination via the journaled destination, optimistic-lock attempt finalizer removal, and version-checked journal deletion) even if grant authorization, zone verification, `spec.zone`, or `spec.secretRef` changed, making zero Cloudflare calls. Contradictory `rejected` journals carrying an `issuedID` or `retiringID` fail closed with `Conflict` (`CleanupBlocked` on deletion). Otherwise:
 
 - The journal must match the live spec, account, and cluster ID. A `spec.zone` or `accountRef` edit during a pending attempt reports `Conflict`. A verified-zone status flap does not: recovery resumes under the journaled zone ID.
-- A pending journal under `AdoptById` reports `Conflict`. Under `ObserveOnly`, an unresolved journal with no `status.tokenId` reports `RecoveryPending` and performs no recovery mutation.
+- A pending journal under `AdoptById` reports `Conflict`. Under `ObserveOnly`, an unresolved non-`rejected` journal (or a contradictory `rejected` journal) with no `status.tokenId` reports `RecoveryPending` or `Conflict` and performs no recovery mutation; a valid `rejected` journal allows read-only observation via `externalRef` while leaving any destination Secret untouched (and on deletion under `ObserveOnly`, `rejected` cleanup removes only the attempt finalizer and journal Secret, leaving any destination Secret to Kubernetes garbage collection).
 - The controller reads the destination Secret first. A credential counts as committed only when the client ID, client secret, and token ID annotation are all non-empty. A committed credential converges without rotating or re-creating. If its token ID differs from the journaled issued ID, the controller reports `Conflict`.
 
 Otherwise the phase decides:
@@ -72,6 +72,7 @@ Otherwise the phase decides:
 | `dispatched`, one exact match, account scope | Record its ID, then `RotateServiceToken` to obtain a fresh credential, capture it, and converge. A failed rotate stays journaled for retry; there is no delete fallback. |
 | `dispatched`, one exact match, zone scope | Zone-scoped tokens cannot rotate. Record the token as retiring and move to `retiring`. |
 | `retiring` | Delete the retiring token and report `RecoveryPending`. Once `GetServiceToken` returns 404 and the listing no longer shows it, draw a new nonce and return to `prepared`. |
+| `rejected` | Complete rollback locally with no Cloudflare calls: remove any empty reserved destination Secret, release the attempt finalizer, delete the journal Secret with `UID`/`ResourceVersion` preconditions, and requeue. |
 
 A journal that remains after `status.tokenId` is recorded only needs removal: the controller deletes it and the attempt finalizer, and never uses it to resume or rotate.
 

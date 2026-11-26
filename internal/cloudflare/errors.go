@@ -49,3 +49,20 @@ func IsRateLimited(err error) bool {
 	statusCode, ok := StatusCode(err)
 	return ok && statusCode == http.StatusTooManyRequests
 }
+
+// IsDefiniteNonCreationClientError reports whether err wraps an HTTP 4xx
+// Cloudflare response proving the create request was rejected without creating
+// a remote resource. Ambiguous client statuses (408, 409, 429) return false so
+// recovery retains fail-closed tracking.
+func IsDefiniteNonCreationClientError(err error) bool {
+	statusCode, ok := StatusCode(err)
+	if !ok || statusCode < http.StatusBadRequest || statusCode >= http.StatusInternalServerError {
+		return false
+	}
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
+}
