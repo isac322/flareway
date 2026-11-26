@@ -1509,5 +1509,35 @@ var _ = ginkgo.Describe("CRD CEL and singleton admission validation", func() {
 		err = testClient.Create(testContext, ztOrg)
 		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
 		gomega.Expect(err.Error()).To(gomega.ContainSubstring("deletionPolicy"))
+
+		// Issue #184 sibling: Exclude mode DeviceProfile omitting optional privateHostnameRange must admit cleanly.
+		deviceProfile := &v1alpha1.DeviceProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "exclude-no-private-range", Namespace: namespace},
+			Spec: v1alpha1.DeviceProfileSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "acct"},
+				Profile: v1alpha1.DeviceProfileTarget{
+					Kind: v1alpha1.DeviceProfileKindDefault,
+				},
+				SplitTunnel: v1alpha1.DeviceProfileSplitTunnel{
+					Mode: v1alpha1.DeviceProfileSplitTunnelModeExclude,
+					RouteSources: v1alpha1.DeviceProfileRouteSources{
+						NetworkRoutes: &v1alpha1.DeviceProfileRouteSelector{
+							Selector: metav1.LabelSelector{MatchLabels: map[string]string{"env": "prod"}},
+						},
+					},
+				},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, deviceProfile)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, deviceProfile)).To(gomega.Succeed())
+
+		// Positive admission with valid Orphan deletionPolicy and HTTPS+Access without ipRules.
+		validTunnel := tunnel.DeepCopy()
+		validTunnel.Name = "https-access-no-iprules"
+		validTunnel.Spec.Configuration.Direct.Ingress[0].Service = v1alpha1.CloudflareTunnelIngressService{
+			HTTPS: &v1alpha1.CloudflareTunnelAddressService{Address: "localhost:443"},
+		}
+		gomega.Expect(testClient.Create(testContext, validTunnel)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, validTunnel)).To(gomega.Succeed())
 	})
 })

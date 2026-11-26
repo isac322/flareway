@@ -4,10 +4,12 @@
 
 ### Fixed
 
-- Guard optional CRD CEL fields with `has(...)` before calling `size(...)` on
+- Guard optional CRD CEL fields with `has(...)` before calling `size(...)` or
+  dereferencing optional booleans on
   `CloudflareTunnelIngressRule.originRequest.ipRules`,
-  `DevicePostureRule.input.certificateId`, and
-  `DevicePostureIntegration.config.{apiUrl,authUrl,clientId,customerId}` (#184).
+  `DevicePostureRule.input.certificateId`,
+  `DevicePostureIntegration.config.{apiUrl,authUrl,clientId,customerId}`, and
+  `DeviceProfile.spec.splitTunnel.routeSources.privateHostnameRange` (#184).
 - Restrict `DeviceSettings` and `ZeroTrustOrganization` `deletionPolicy` to
   `Orphan` at CRD admission via `OrphanOnlyDeletionPolicy` (#185).
 - Isolate Access block-first transitions, listener DNS readiness, and private

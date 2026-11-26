@@ -196,8 +196,8 @@ Kinds that manage a remote object share
 identifier also supports `externalRef` and
 `adoption.mode: None | AdoptById`. The account singletons `DeviceSettings`
 and `ZeroTrustOrganization` omit `externalRef` and adoption, and
-`ZeroTrustOrganization` permits only `deletionPolicy: Orphan`; a
-`DeviceProfile` of kind `Default` rejects `externalRef` and adoption too.
+permit only `deletionPolicy: Orphan`; a `DeviceProfile` of kind
+`Default` rejects `externalRef` and adoption too.
 Consult each kind's schema for its exact lifecycle fields. A newly created
 object is owned through its recorded remote ID and Flareway metadata (tags,
 comment, or name prefix, depending on the Cloudflare object). An existing
