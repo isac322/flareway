@@ -176,7 +176,39 @@ func Build(gw *ir.Gateway, cfg *v1alpha1.GatewayClassConfig) (*cachev3.Snapshot,
 	if err := snapshot.ConstructVersionMap(); err != nil {
 		return nil, fmt.Errorf("construct Delta xDS version map: %w", err)
 	}
+	bindEndpointVersionsToClusters(snapshot)
 	return snapshot, nil
+}
+
+// bindEndpointVersionsToClusters mixes each Cluster's version hash into its
+// matching ClusterLoadAssignment version so Cluster updates (such as
+// BackendTLSPolicy SAN/CA or AppProtocol changes) with unchanged Pod IPs emit
+// a fresh Delta EDS resource instead of stalling warming clusters for Envoy's
+// 15s initial_fetch_timeout.
+func bindEndpointVersionsToClusters(snapshot *cachev3.Snapshot) {
+	if snapshot == nil || snapshot.VersionMap == nil {
+		return
+	}
+	clusterVersions := snapshot.VersionMap[string(resourcev3.ClusterType)]
+	endpointVersions := snapshot.VersionMap[string(resourcev3.EndpointType)]
+	if len(clusterVersions) == 0 || len(endpointVersions) == 0 {
+		return
+	}
+	for clusterName, endpointVersion := range endpointVersions {
+		clusterVersion, ok := clusterVersions[clusterName]
+		if !ok {
+			continue
+		}
+		endpointVersions[clusterName] = BindEndpointVersion(endpointVersion, clusterVersion)
+	}
+}
+
+// BindEndpointVersion mixes a Cluster's version hash into its matching
+// ClusterLoadAssignment version so Cluster updates with unchanged Pod IPs emit
+// a fresh Delta EDS resource instead of reusing an already-sent version.
+func BindEndpointVersion(endpointVersion, clusterVersion string) string {
+	sum := sha256.Sum256([]byte(endpointVersion + "\x00" + clusterVersion))
+	return hex.EncodeToString(sum[:])
 }
 
 // rejectDuplicateResourceNames fails the build when two resources of one type

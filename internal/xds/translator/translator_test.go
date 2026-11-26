@@ -1373,3 +1373,63 @@ func TestStripAccessHeadersFiltersRuleAndBackendRequestHeaders(t *testing.T) {
 		t.Fatalf("cluster.RequestHeadersToAdd = %#v, want only x-allowed-backend", clusters)
 	}
 }
+
+func TestBuildRotatesEndpointVersionWhenClusterTLSChangesWithSameEndpoints(t *testing.T) {
+	buildForSAN := func(san string) *cachev3.Snapshot {
+		gateway := &ir.Gateway{
+			Key: types.NamespacedName{Namespace: "default", Name: "gw"},
+			Listeners: []ir.Listener{{
+				Name:      "web",
+				Hostname:  "app.example.com",
+				Port:      443,
+				EnvoyPort: 18080,
+				Protocol:  "HTTPS",
+				Exposure:  ir.ExposurePublic,
+			}},
+			Domains: []ir.ProtectionDomain{{
+				Name:         "web",
+				ListenerName: "web",
+				EnvoyPort:    18080,
+				VirtualHosts: []ir.VirtualHost{{
+					Name:     "app",
+					Hostname: "app.example.com",
+					Routes: []ir.Route{{
+						Name:     "r1",
+						Match:    ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/"},
+						Backends: []ir.BackendRef{{Name: "svc", ClusterName: "k8s://default/svc:443", Port: 443, Weight: 1}},
+					}},
+				}},
+			}},
+			Clusters: []ir.Cluster{{
+				Name:      "k8s://default/svc:443",
+				Namespace: "default",
+				Service:   "svc",
+				Port:      443,
+				Endpoints: []ir.Endpoint{{Address: "10.0.0.10", Port: 8443}},
+				TLS: &ir.BackendTLS{
+					ServerName:      "svc.default.svc",
+					CACertificate:   []byte("ca-pem"),
+					SubjectAltNames: []ir.SubjectAltName{{Type: "Hostname", Value: san}},
+				},
+			}},
+		}
+		snap, err := Build(gateway, nil)
+		if err != nil {
+			t.Fatalf("Build(%q): %v", san, err)
+		}
+		return snap
+	}
+
+	first := buildForSAN("svc.default.svc")
+	repeat := buildForSAN("svc.default.svc")
+	updated := buildForSAN("other.default.svc")
+
+	if !maps.Equal(first.GetVersionMap(resourcev3.EndpointType), repeat.GetVersionMap(resourcev3.EndpointType)) {
+		t.Fatalf("repeated Build altered EndpointType VersionMap deterministically: %v vs %v",
+			first.GetVersionMap(resourcev3.EndpointType), repeat.GetVersionMap(resourcev3.EndpointType))
+	}
+	if first.GetVersionMap(resourcev3.EndpointType)["k8s://default/svc:443"] == updated.GetVersionMap(resourcev3.EndpointType)["k8s://default/svc:443"] {
+		t.Fatalf("EndpointType version stayed %q across Cluster SubjectAltNames change",
+			updated.GetVersionMap(resourcev3.EndpointType)["k8s://default/svc:443"])
+	}
+}

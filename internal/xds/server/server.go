@@ -85,7 +85,7 @@ type Server struct {
 	address          string
 	tlsConfig        *tls.Config
 	logger           logr.Logger
-	cache            cachev3.SnapshotCache
+	cache            *orderedDeltaCache
 	tracker          *AckTracker
 	events           chan event.GenericEvent
 	keepaliveTime    time.Duration
@@ -135,7 +135,8 @@ func New(opts Options) (*Server, error) {
 		logger = logr.Discard()
 	}
 	tracker := NewAckTracker()
-	cache := cachev3.NewSnapshotCache(true, gatewayNodeHash{}, loggerAdapter{logger: logger.WithName("cache")})
+	baseCache := cachev3.NewSnapshotCache(true, gatewayNodeHash{}, loggerAdapter{logger: logger.WithName("cache")})
+	cache := newOrderedDeltaCache(baseCache, gatewayNodeHash{})
 	return &Server{
 		address:          address,
 		tlsConfig:        opts.TLSConfig.Clone(),
@@ -160,6 +161,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	callbacks := serverv3.CallbackFuncs{
 		DeltaStreamClosedFunc: func(streamID int64, _ *corev3.Node) {
+			s.cache.OnStreamClosed(streamID)
 			node := s.tracker.OnStreamClosed(streamID)
 			if ctx.Err() != nil {
 				return
@@ -181,11 +183,15 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		},
 		StreamDeltaRequestFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest) error {
+			s.cache.BindRequestStream(req, streamID)
+			s.cache.OnRequest(streamID, req)
 			s.tracker.OnRequest(streamID, req)
 			return nil
 		},
 		StreamDeltaResponseFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest, resp *discoverygrpc.DeltaDiscoveryResponse) {
-			s.tracker.OnResponse(streamID, req, resp)
+			fp, ok := s.cache.ConsumeResponseFingerprint(resp)
+			s.cache.OnResponse(streamID, req, resp)
+			s.tracker.OnResponseWithFingerprint(streamID, req, resp, fp, ok)
 		},
 	}
 	xdsServer := serverv3.NewServer(ctx, s.cache, callbacks)
@@ -236,11 +242,11 @@ func (s *Server) SetSnapshot(ctx context.Context, node string, snapshot *cachev3
 	if err := snapshot.ConstructVersionMap(); err != nil {
 		return fmt.Errorf("construct Delta xDS version map for %s: %w", node, err)
 	}
-	version, fingerprints, err := snapshotVersionAndFingerprints(snapshot)
+	version, fingerprints, expectedResources, err := snapshotVersionAndFingerprints(snapshot)
 	if err != nil {
 		return fmt.Errorf("inspect xDS snapshot for %s: %w", node, err)
 	}
-	s.tracker.ExpectSnapshot(node, version, fingerprints, snapshotRequiredTypes(snapshot))
+	s.tracker.ExpectSnapshotResources(node, version, fingerprints, snapshotRequiredTypes(snapshot), expectedResources)
 	if err := s.cache.SetSnapshot(ctx, node, snapshot); err != nil {
 		return fmt.Errorf("publish xDS snapshot for %s: %w", node, err)
 	}
@@ -312,27 +318,36 @@ func (gatewayNodeHash) ID(node *corev3.Node) string {
 	return node.GetCluster()
 }
 
-func snapshotVersionAndFingerprints(snapshot *cachev3.Snapshot) (string, map[string]string, error) {
+func snapshotVersionAndFingerprints(snapshot *cachev3.Snapshot) (string, map[string]string, map[string]map[string]string, error) {
 	version := snapshot.GetVersion(resourcev3.ListenerType)
 	if version == "" {
-		return "", nil, errors.New("snapshot has no version")
+		return "", nil, nil, errors.New("snapshot has no version")
 	}
 	fingerprints := make(map[string]string)
+	expectedResources := make(map[string]map[string]string)
 	for _, typeURL := range snapshotResourceTypes {
 		current := snapshot.GetVersion(typeURL)
 		if current != "" && current != version {
-			return "", nil, fmt.Errorf("resource type %s has version %q, want %q", typeURL, current, version)
+			return "", nil, nil, fmt.Errorf("resource type %s has version %q, want %q", typeURL, current, version)
 		}
 		if len(snapshot.GetResources(typeURL)) == 0 {
 			continue
 		}
-		fingerprint, err := fingerprintVersionMap(snapshot.GetVersionMap(string(typeURL)))
+		versionMap := snapshot.GetVersionMap(string(typeURL))
+		fingerprint, err := fingerprintVersionMap(versionMap)
 		if err != nil {
-			return "", nil, fmt.Errorf("fingerprint resources for %s: %w", typeURL, err)
+			return "", nil, nil, fmt.Errorf("fingerprint resources for %s: %w", typeURL, err)
 		}
 		fingerprints[string(typeURL)] = fingerprint
+		if typeURL != resourcev3.SecretType {
+			copied := make(map[string]string, len(versionMap))
+			for k, v := range versionMap {
+				copied[k] = v
+			}
+			expectedResources[string(typeURL)] = copied
+		}
 	}
-	return version, fingerprints, nil
+	return version, fingerprints, expectedResources, nil
 }
 
 func fingerprintVersionMap(versionMap map[string]string) (string, error) {
