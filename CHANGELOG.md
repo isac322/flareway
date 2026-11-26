@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Bind each `ClusterLoadAssignment` (`EndpointType`) Delta xDS version to its
+  owning `Cluster` version in `translator.Build`, eliminating the 15s Envoy EDS
+  warming stall and temporary stale-SAN window when `BackendTLSPolicy` or
+  cluster settings update without endpoint IP changes (#180).
 - Guard optional CRD CEL fields with `has(...)` before calling `size(...)` or
   dereferencing optional booleans on
   `CloudflareTunnelIngressRule.originRequest.ipRules`,
