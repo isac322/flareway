@@ -636,14 +636,21 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 	}
 
 	var (
-		hardFailure        *gatewayapi.AccessApplicationCompilation
+		nonLossFailure     *gatewayapi.AccessApplicationCompilation
+		targetLossFailure  *gatewayapi.AccessApplicationCompilation
 		emptyFailure       *gatewayapi.AccessApplicationCompilation
 		anyResolvedTargets bool
 	)
 	recordHardFailure := func(candidate gatewayapi.AccessApplicationCompilation) {
-		if hardFailure == nil {
-			copied := candidate
-			hardFailure = &copied
+		copied := candidate
+		if targetInfrastructureUnavailable(copied) {
+			if targetLossFailure == nil {
+				targetLossFailure = &copied
+			}
+			return
+		}
+		if nonLossFailure == nil {
+			nonLossFailure = &copied
 		}
 	}
 	if len(application.Spec.Destinations) > 0 {
@@ -739,8 +746,15 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			continue
 		}
 	}
-	if hardFailure != nil {
-		failure := *hardFailure
+	if nonLossFailure != nil {
+		failure := *nonLossFailure
+		failure.NoTargetsResolved = false
+		failure.TargetLoss = gatewayapi.AccessTargetLossNone
+		result.compilation = failure
+		return result, nil
+	}
+	if targetLossFailure != nil {
+		failure := *targetLossFailure
 		failure.NoTargetsResolved = false
 		if anyResolvedTargets {
 			failure.TargetLoss = gatewayapi.AccessTargetLossNone
@@ -1894,19 +1908,45 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
 		return fmt.Errorf("decode Access revocation latch: %w", err)
 	}
-	if latch.TokensRevoked {
+	if !latch.TokensRevoked {
+		latch.TokensRevoked = true
+		payload, err := json.Marshal(latch)
+		if err != nil {
+			return fmt.Errorf("encode Access revocation latch: %w", err)
+		}
+		before := application.DeepCopy()
+		application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
+		if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
+			return fmt.Errorf("persist Access token revocation: %w", err)
+		}
+	}
+	if application.UID == "" {
 		return nil
 	}
-	latch.TokensRevoked = true
-	payload, err := json.Marshal(latch)
-	if err != nil {
-		return fmt.Errorf("encode Access revocation latch: %w", err)
+	latchDigest := gatewayapi.AccessRevocationLatchDigest(application.UID, latch.Claims)
+	if latchDigest == "" {
+		return nil
 	}
-	before := application.DeepCopy()
-	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
-	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("persist Access token revocation: %w", err)
+	if application.Status.Revocation != nil &&
+		application.Status.Revocation.TokensRevoked &&
+		application.Status.Revocation.LatchDigest == latchDigest {
+		return nil
 	}
+	status := *application.Status.DeepCopy()
+	revStatus := v1alpha1.AccessApplicationRevocationStatus{
+		LatchDigest:        latchDigest,
+		ObservedGeneration: application.Generation,
+		TokensRevoked:      true,
+	}
+	if status.Revocation != nil && status.Revocation.LatchDigest == latchDigest {
+		revStatus.Acknowledged = status.Revocation.Acknowledged
+		revStatus.Released = status.Revocation.Released
+	}
+	status.Revocation = &revStatus
+	if err := r.patchStatus(ctx, application, status); err != nil {
+		return fmt.Errorf("persist Access token revocation status proof: %w", err)
+	}
+	application.Status = status
 	return nil
 }
 

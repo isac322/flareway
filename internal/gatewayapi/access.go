@@ -1101,28 +1101,32 @@ func targetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses
 }
 
 func gatewayTargetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses, sectionName *gatewayv1.SectionName) bool {
-	if in.Gateway != nil && gateway != nil {
-		activeListeners := make(map[string]struct{}, len(gateway.Listeners))
-		for _, listener := range gateway.Listeners {
-			activeListeners[listener.Name] = struct{}{}
+	var (
+		targetPort      *gatewayv1.PortNumber
+		targetListeners []gatewayv1.Listener
+	)
+	if in.Gateway != nil {
+		var activeListeners map[string]struct{}
+		if gateway != nil {
+			activeListeners = make(map[string]struct{}, len(gateway.Listeners))
+			for _, listener := range gateway.Listeners {
+				activeListeners[listener.Name] = struct{}{}
+			}
 		}
 		for _, listener := range in.Gateway.Spec.Listeners {
 			if sectionName != nil && listener.Name != *sectionName {
 				continue
 			}
-			if _, active := activeListeners[string(listener.Name)]; !active {
-				return true
+			if gateway != nil {
+				if _, active := activeListeners[string(listener.Name)]; !active {
+					return true
+				}
 			}
-		}
-	}
-	var targetPort *gatewayv1.PortNumber
-	if sectionName != nil && in.Gateway != nil {
-		for _, listener := range in.Gateway.Spec.Listeners {
-			if listener.Name == *sectionName {
+			if sectionName != nil && targetPort == nil {
 				port := listener.Port
 				targetPort = &port
-				break
 			}
+			targetListeners = append(targetListeners, listener)
 		}
 	}
 	for index := range in.HTTPRoutes {
@@ -1143,6 +1147,21 @@ func gatewayTargetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *S
 			if targetPort != nil && parentStatus.ParentRef.Port != nil &&
 				*parentStatus.ParentRef.Port != *targetPort {
 				continue
+			}
+			if parentStatus.ParentRef.SectionName == nil && len(targetListeners) > 0 {
+				applicable := false
+				for _, listener := range targetListeners {
+					if parentStatus.ParentRef.Port != nil && *parentStatus.ParentRef.Port != listener.Port {
+						continue
+					}
+					if len(ComputeHosts(route.Spec.Hostnames, listener.Hostname, nil)) > 0 {
+						applicable = true
+						break
+					}
+				}
+				if !applicable {
+					continue
+				}
 			}
 			for _, cond := range parentStatus.Conditions {
 				if cond.Type == string(gatewayv1.RouteConditionAccepted) &&

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -1156,8 +1157,9 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 			},
 		}
 		gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "tenant", UID: "gw-uid"}}
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
 		remote := newFakeAccessApplicationCloudflare()
-		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
 		kube := accessApplicationTestClientBuilder(scheme).
 			WithStatusSubresource(app).
 			WithObjects(
@@ -1212,14 +1214,14 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "HTTPRoute", Name: "deleted-route"},
 				}},
 				Destinations: []v1alpha1.AccessApplicationDestinationSpec{{
-					Type:   v1alpha1.AccessApplicationDestinationPublic,
-					Public: &v1alpha1.AccessPublicDestinationSpec{URI: "extra.example"},
+					Type:       v1alpha1.AccessApplicationDestinationAllWorkers,
+					AllWorkers: &v1alpha1.AccessAllWorkersDestinationSpec{},
 				}},
 			},
 			Status: v1alpha1.AccessApplicationStatus{
 				ApplicationID: "remote-id", OwnershipVerified: true,
 				DataPlanes:   []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "tun", Listener: "web", ProtectionDomain: "route-domain", EnvoyPort: 18082}},
-				Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "extra.example"}},
+				Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationAllWorkers}},
 			},
 		}
 		tun := &v1alpha1.CloudflareTunnel{
@@ -1234,8 +1236,9 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 			},
 		}
 		gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "tenant", UID: "gw-uid"}}
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
 		remote := newFakeAccessApplicationCloudflare()
-		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
 		kube := accessApplicationTestClientBuilder(scheme).
 			WithStatusSubresource(app).
 			WithObjects(
@@ -1257,6 +1260,10 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 		}
 		if stored.Status.ApplicationID != "remote-id" {
 			t.Fatalf("ApplicationID = %q, want remote-id preserved when declared destination remains", stored.Status.ApplicationID)
+		}
+		programmed := conditionByType(stored.Status.Conditions, accessApplicationConditionProgrammed)
+		if programmed == nil || programmed.Status != metav1.ConditionFalse || programmed.Reason != "TargetNotFound" {
+			t.Fatalf("Programmed = %+v, want False/TargetNotFound for missing HTTPRoute", programmed)
 		}
 		if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || stored.Status.Revocation.Released {
 			t.Fatalf("status.revocation = %+v, want Acknowledged=true Released=false", stored.Status.Revocation)
@@ -1297,8 +1304,9 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 			},
 		}
 		gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "tenant", UID: "gw-uid"}}
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
 		remote := newFakeAccessApplicationCloudflare()
-		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
 		kube := accessApplicationTestClientBuilder(scheme).
 			WithStatusSubresource(app).
 			WithObjects(
@@ -1383,8 +1391,9 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 				Rules:           []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}}}},
 			},
 		}
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
 		remote := newFakeAccessApplicationCloudflare()
-		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
 		kube := accessApplicationTestClientBuilder(scheme).
 			WithStatusSubresource(app).
 			WithObjects(
@@ -1483,8 +1492,178 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 		if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
 			t.Fatal(err)
 		}
-		if stored.Status.Revocation != nil {
-			t.Fatalf("status.revocation = %+v, want nil (never stamped with stale Gen 2 evaluation onto Gen 3)", stored.Status.Revocation)
+		if stored.Status.Revocation == nil || !stored.Status.Revocation.TokensRevoked || stored.Status.Revocation.Acknowledged || stored.Status.Revocation.Released {
+			t.Fatalf("status.revocation = %+v, want TokensRevoked=true with Acknowledged=false Released=false when Generation changed during RevokeAccessApplicationTokens", stored.Status.Revocation)
+		}
+	})
+
+	t.Run("mixed missing Gateway and rejected Gateway prefers non-loss rejection regardless of targetRefs order", func(t *testing.T) {
+		group := gatewayv1.Group(v1alpha1.Group)
+		rejectedHost := gatewayv1.Hostname("*.example")
+		orders := []struct {
+			name string
+			refs []gatewayv1.LocalPolicyTargetReferenceWithSectionName
+		}{
+			{
+				name: "missing first",
+				refs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-missing"}},
+					{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-rejected"}},
+				},
+			},
+			{
+				name: "rejected first",
+				refs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-rejected"}},
+					{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-missing"}},
+				},
+			},
+		}
+		for _, order := range orders {
+			t.Run(order.name, func(t *testing.T) {
+				app := &v1alpha1.AccessApplication{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 2,
+						Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+						Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"tun-rejected","protectionDomain":"rejected-domain","hostname":"app.example","baselineVersion":1}]}`},
+					},
+					Spec: v1alpha1.AccessApplicationSpec{
+						AccountRef:       corev1.LocalObjectReference{Name: "account"},
+						Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+						SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+						ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+						TargetRefs:       order.refs,
+					},
+					Status: v1alpha1.AccessApplicationStatus{
+						ApplicationID: "remote-id", OwnershipVerified: true,
+						DataPlanes:   []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "tun-rejected", Listener: "web", ProtectionDomain: "rejected-domain", EnvoyPort: 18082}},
+						Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "app.example"}},
+					},
+				}
+				gwClass := &gatewayv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "flareway"}, Spec: gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName}}
+				gwRejected := &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Name: "gw-rejected", Namespace: "tenant", UID: "gw-rejected-uid"},
+					Spec: gatewayv1.GatewaySpec{
+						GatewayClassName: "flareway",
+						Listeners:        []gatewayv1.Listener{{Name: "web", Hostname: &rejectedHost, Port: 443, Protocol: gatewayv1.HTTPSProtocolType}},
+						Infrastructure:   &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{Group: group, Kind: "CloudflareTunnel", Name: "tun-rejected"}},
+					},
+				}
+				tunRejected := &v1alpha1.CloudflareTunnel{
+					ObjectMeta: metav1.ObjectMeta{Name: "tun-rejected", Namespace: "tenant"},
+					Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "other-account"}},
+					Status: v1alpha1.CloudflareTunnelStatus{
+						GatewayRef: &corev1.LocalObjectReference{Name: "gw-rejected"}, GatewayUID: "gw-rejected-uid",
+						ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 2, Applied: 2},
+						Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+							Hostname: "app.example", ProtectionDomain: "rejected-domain", AccessApplication: "tenant/app",
+							Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+						}},
+					},
+				}
+				remote := newFakeAccessApplicationCloudflare()
+				remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+				kube := accessApplicationTestClientBuilder(scheme).
+					WithStatusSubresource(app).
+					WithObjects(
+						app, newAccount(), gwClass, gwRejected, tunRejected,
+						&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
+						&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+						&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
+					).Build()
+				r := &AccessApplicationReconciler{
+					Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time },
+					NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+				}
+				if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err != nil {
+					t.Fatalf("Reconcile: %v", err)
+				}
+				var stored v1alpha1.AccessApplication
+				if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+					t.Fatal(err)
+				}
+				if stored.Status.ApplicationID != "remote-id" {
+					t.Fatalf("ApplicationID = %q, want remote-id preserved when another target failed non-loss rejection", stored.Status.ApplicationID)
+				}
+				if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || stored.Status.Revocation.Released {
+					t.Fatalf("status.revocation = %+v, want Acknowledged=true Released=false", stored.Status.Revocation)
+				}
+				if _, ok := remote.applications["remote-id"]; !ok {
+					t.Fatal("remote application deleted despite non-loss RefNotPermitted rejection")
+				}
+			})
+		}
+	})
+
+	t.Run("deletion checkpoints Status.Revocation.TokensRevoked before failed Delete so retry skips Revoke", func(t *testing.T) {
+		deletedAt := metav1.NewTime(now.Time)
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 2,
+				DeletionTimestamp: &deletedAt,
+				Finalizers:        []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations:       map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"tun","protectionDomain":"route-domain","hostname":"app.example","baselineVersion":1}]}`},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: "account"},
+				Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+			Status: v1alpha1.AccessApplicationStatus{ApplicationID: "remote-id", OwnershipVerified: true},
+		}
+		tun := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tun", Namespace: "tenant"},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				GatewayRef: &corev1.LocalObjectReference{Name: "gw"}, GatewayUID: "gw-uid",
+				ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 2, Applied: 2},
+				Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+					Hostname: "app.example", ProtectionDomain: "route-domain", AccessApplication: "tenant/app",
+					Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+				}},
+			},
+		}
+		gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "tenant", UID: "gw-uid"}}
+		ownerTag := accessDigestTag(accessOwnerTagPrefix, flarecloudflare.OwnerTag("cluster-uid", "tenant", "app", "app-uid"))
+		remote := newFakeAccessApplicationCloudflare()
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted, Tags: []string{accessManagedTag, ownerTag}})
+		remote.Fail("Delete:remote-id", errors.New("transient delete error"))
+		kube := accessApplicationTestClientBuilder(scheme).
+			WithStatusSubresource(app).
+			WithObjects(
+				app, newAccount(), tun, gw,
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
+			).Build()
+		r := &AccessApplicationReconciler{
+			Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time },
+			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		}
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err == nil {
+			t.Fatal("first delete reconcile succeeded, want transient Delete error")
+		}
+		var stored v1alpha1.AccessApplication
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status.Revocation == nil || !stored.Status.Revocation.TokensRevoked {
+			t.Fatalf("status.revocation = %+v, want TokensRevoked=true checkpointed on failed cleanup", stored.Status.Revocation)
+		}
+		remote.ClearFailure("Delete:remote-id")
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err != nil {
+			t.Fatalf("second delete Reconcile: %v", err)
+		}
+		revokeCount := 0
+		for _, call := range remote.Calls() {
+			if call == "Revoke:remote-id" {
+				revokeCount++
+			}
+		}
+		if revokeCount != 1 {
+			t.Fatalf("Revoke calls = %d (%v), want 1 when TokensRevoked was checkpointed before failed Delete", revokeCount, remote.Calls())
 		}
 	})
 }

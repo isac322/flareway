@@ -280,6 +280,25 @@ func TestEmptyTargetCompilationDoesNotReleaseOnNoMatchingParentOrInvalidListener
 		}
 	})
 
+	t.Run("Gateway-wide route with non-overlapping hostname leaves NoTargetsResolved true", func(t *testing.T) {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+		route := routeWithBackend("unrelated-domain", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"other.otherdomain.test"}
+		route.Spec.ParentRefs[0].SectionName = nil
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+		app := accessApplication("app", "Gateway", "gateway", "http")
+		compiled := CompileAccessApplication(in, &app)
+		if compiled.Accepted || compiled.Reason != "TargetNotFound" {
+			t.Fatalf("compiled = %+v, want TargetNotFound rejection", compiled)
+		}
+		if !compiled.NoTargetsResolved {
+			t.Fatalf("NoTargetsResolved = false when Gateway-wide unrelated route missed listener hostname, want true")
+		}
+	})
+
 	t.Run("dropped invalid Gateway listener keeps NoTargetsResolved false", func(t *testing.T) {
 		in := accessInputs(true)
 		in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
