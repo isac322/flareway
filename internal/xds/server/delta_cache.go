@@ -18,6 +18,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"sort"
@@ -38,6 +40,7 @@ type orderedSnapshot struct {
 	clusterVersions     map[string]string
 	rawEndpointVersions map[string]string
 	targetEndpointVer   map[string]string
+	typeFingerprints    map[string]string
 }
 
 type openDeltaWatch struct {
@@ -64,6 +67,8 @@ type deltaCachedResource struct {
 type orderedDeltaResponse struct {
 	request           *discoveryv3.DeltaDiscoveryRequest
 	systemVersionInfo string
+	originFingerprint string
+	onMarshal         func(*discoveryv3.DeltaDiscoveryResponse, string)
 	resources         []deltaCachedResource
 	removed           []string
 	returnedResources map[string]string
@@ -98,6 +103,9 @@ func (r *orderedDeltaResponse) GetDeltaDiscoveryResponse() (*discoveryv3.DeltaDi
 		RemovedResources:  r.removed,
 		TypeUrl:           typeURL,
 		SystemVersionInfo: r.systemVersionInfo,
+	}
+	if r.onMarshal != nil {
+		r.onMarshal(resp, r.originFingerprint)
 	}
 	r.marshaled.Store(resp)
 	return resp, nil
@@ -143,6 +151,9 @@ type orderedDeltaCache struct {
 	streams          map[chan cachev3.DeltaResponse]*deltaStreamState
 	streamByID       map[int64]*deltaStreamState
 	pendingReqStream map[*discoveryv3.DeltaDiscoveryRequest]int64
+
+	fpMu             sync.Mutex
+	sentFingerprints map[*discoveryv3.DeltaDiscoveryResponse]string
 }
 
 var _ cachev3.SnapshotCache = (*orderedDeltaCache)(nil)
@@ -155,7 +166,33 @@ func newOrderedDeltaCache(base cachev3.SnapshotCache, hash cachev3.NodeHash) *or
 		streams:          make(map[chan cachev3.DeltaResponse]*deltaStreamState),
 		streamByID:       make(map[int64]*deltaStreamState),
 		pendingReqStream: make(map[*discoveryv3.DeltaDiscoveryRequest]int64),
+		sentFingerprints: make(map[*discoveryv3.DeltaDiscoveryResponse]string),
 	}
+}
+
+func (c *orderedDeltaCache) recordSentFingerprint(resp *discoveryv3.DeltaDiscoveryResponse, fingerprint string) {
+	if resp == nil {
+		return
+	}
+	c.fpMu.Lock()
+	c.sentFingerprints[resp] = fingerprint
+	c.fpMu.Unlock()
+}
+
+// ConsumeResponseFingerprint returns and removes the originating type
+// fingerprint captured when the cache materialized resp, avoiding loss even if
+// many snapshots publish while the response is buffered before transmission.
+func (c *orderedDeltaCache) ConsumeResponseFingerprint(resp *discoveryv3.DeltaDiscoveryResponse) (string, bool) {
+	if resp == nil {
+		return "", false
+	}
+	c.fpMu.Lock()
+	fp, ok := c.sentFingerprints[resp]
+	if ok {
+		delete(c.sentFingerprints, resp)
+	}
+	c.fpMu.Unlock()
+	return fp, ok
 }
 
 func (c *orderedDeltaCache) BindRequestStream(req *discoveryv3.DeltaDiscoveryRequest, streamID int64) {
@@ -358,7 +395,8 @@ func (c *orderedDeltaCache) evaluateWatchLocked(ctx context.Context, st *deltaSt
 	if typeURL == resourcev3.EndpointType {
 		return c.evaluateEndpointWatchLocked(ctx, st, snap, watch)
 	}
-	resp := buildGenericDeltaResponse(ctx, watch.request, watch.sub, snap.snapshot, typeURL)
+	resp := buildGenericDeltaResponse(ctx, watch.request, watch.sub, snap, typeURL)
+	resp.onMarshal = c.recordSentFingerprint
 	if !shouldSendDeltaResponse(resp, watch.request, watch.sub) {
 		return false, nil
 	}
@@ -436,13 +474,17 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	sort.Strings(removed)
 
 	systemVersion := ""
+	originFingerprint := ""
 	if sameVersionMap(nextVersionMap, snap.targetEndpointVer) {
 		systemVersion = snap.snapshot.GetVersion(resourcev3.EndpointType)
+		originFingerprint = snap.typeFingerprints[resourcev3.EndpointType]
 	}
 
 	resp := &orderedDeltaResponse{
 		request:           watch.request,
 		systemVersionInfo: systemVersion,
+		originFingerprint: originFingerprint,
+		onMarshal:         c.recordSentFingerprint,
 		resources:         filtered,
 		removed:           removed,
 		returnedResources: nextVersionMap,
@@ -454,6 +496,11 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	case <-ctx.Done():
 		return false, context.Canceled
 	}
+}
+
+func provisionalEndpointVersion(targetVer string) string {
+	sum := sha256.Sum256([]byte("provisional\x00" + targetVer))
+	return hex.EncodeToString(sum[:])
 }
 
 func effectiveEndpointVersionForStream(st *deltaStreamState, snap *orderedSnapshot, clusterName string, prevMap map[string]string) (string, bool) {
@@ -487,16 +534,21 @@ func effectiveEndpointVersionForStream(st *deltaStreamState, snap *orderedSnapsh
 		return targetVer, false
 	}
 
-	// Stream has no recorded CDS for this cluster yet. Defer stale-update sends
-	// when the client already holds a previous version, or after CDS has started
-	// flowing on the stream without naming this cluster yet.
-	if hasPrev && prevVer != targetVer {
-		return prevVer, true
+	// Stream has no recorded CDS state for this cluster yet. Serve targetVer
+	// when the client already holds it or when CDS is not active on this stream;
+	// otherwise serve a deterministic provisional version so reconnecting warming
+	// clusters unblock paused CDS without consuming the final CDS-bound version.
+	if hasPrev && prevVer == targetVer {
+		return targetVer, false
 	}
-	if !hasPrev && st.cdsSeen {
-		return "", true
+	if !hasPrev && !st.cdsSeen {
+		return targetVer, false
 	}
-	return targetVer, false
+	prov := provisionalEndpointVersion(targetVer)
+	if hasPrev && prevVer == prov {
+		return prov, true
+	}
+	return prov, false
 }
 
 func buildOrderedSnapshot(snapshot cachev3.ResourceSnapshot) (*orderedSnapshot, error) {
@@ -509,15 +561,28 @@ func buildOrderedSnapshot(snapshot cachev3.ResourceSnapshot) (*orderedSnapshot, 
 		}
 		rawEndpoints[name] = cachev3.HashResource(raw)
 	}
+	typeFingerprints := make(map[string]string, len(snapshotResourceTypes))
+	for _, typeURL := range snapshotResourceTypes {
+		if len(snapshot.GetResources(typeURL)) == 0 {
+			continue
+		}
+		fp, err := fingerprintVersionMap(snapshot.GetVersionMap(string(typeURL)))
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint %s: %w", typeURL, err)
+		}
+		typeFingerprints[string(typeURL)] = fp
+	}
 	return &orderedSnapshot{
 		snapshot:            snapshot,
 		clusterVersions:     maps.Clone(snapshot.GetVersionMap(resourcev3.ClusterType)),
 		rawEndpointVersions: rawEndpoints,
 		targetEndpointVer:   maps.Clone(snapshot.GetVersionMap(resourcev3.EndpointType)),
+		typeFingerprints:    typeFingerprints,
 	}, nil
 }
 
-func buildGenericDeltaResponse(ctx context.Context, req *discoveryv3.DeltaDiscoveryRequest, sub cachev3.Subscription, snapshot cachev3.ResourceSnapshot, typeURL string) *orderedDeltaResponse {
+func buildGenericDeltaResponse(ctx context.Context, req *discoveryv3.DeltaDiscoveryRequest, sub cachev3.Subscription, osnap *orderedSnapshot, typeURL string) *orderedDeltaResponse {
+	snapshot := osnap.snapshot
 	resources := snapshot.GetResources(typeURL)
 	versionMap := snapshot.GetVersionMap(typeURL)
 	prevMap := sub.ReturnedResources()
@@ -565,6 +630,7 @@ func buildGenericDeltaResponse(ctx context.Context, req *discoveryv3.DeltaDiscov
 	return &orderedDeltaResponse{
 		request:           req,
 		systemVersionInfo: snapshot.GetVersion(typeURL),
+		originFingerprint: osnap.typeFingerprints[typeURL],
 		resources:         filtered,
 		removed:           removed,
 		returnedResources: nextVersionMap,

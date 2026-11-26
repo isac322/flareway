@@ -357,56 +357,111 @@ func TestOrderedDeltaCacheUnblocksPriorCDSClusterWarmingWhenSameClusterChangesAg
 	}
 }
 
-func TestOrderedDeltaCacheDefersEDSBeforeCDSOnReconnect(t *testing.T) {
-	cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
-	node := "default/gw"
-	ch := make(chan cachev3.DeltaResponse, 8)
-
+func TestOrderedDeltaCacheServesProvisionalEDSBeforeCDSOnReconnect(t *testing.T) {
 	v1 := buildBoundClusterSnapshot(t, "v1", map[string]string{"cluster-a": "a1.example"})
 	v2 := buildBoundClusterSnapshot(t, "v2", map[string]string{"cluster-a": "a2.example"})
-	if err := cache.SetSnapshot(context.Background(), node, v2); err != nil {
-		t.Fatal(err)
-	}
 
-	// Reconnecting client subscribes EDS first holding v1 versions.
-	edsInitial := map[string]string{"cluster-a": v1.GetVersionMap(resourcev3.EndpointType)["cluster-a"]}
-	edsReq := &discoveryv3.DeltaDiscoveryRequest{
-		Node:                    &corev3.Node{Cluster: node},
-		TypeUrl:                 resourcev3.EndpointType,
-		ResourceNamesSubscribe:  []string{"cluster-a"},
-		InitialResourceVersions: edsInitial,
-	}
-	edsSub := streamv3.NewDeltaSubscription([]string{"cluster-a"}, nil, edsInitial, false)
-	cancelEDS, err := cache.CreateDeltaWatch(edsReq, &edsSub, ch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancelEDS()
-	if early := drainDeltaResponses(ch); len(early) != 0 {
-		t.Fatalf("EDS sent before CDS on reconnect: %d response(s)", len(early))
-	}
+	for _, tc := range []struct {
+		name               string
+		cdsInitialVersion  string
+		expectCDSResources int
+	}{
+		{name: "stale_cds_on_reconnect", cdsInitialVersion: v1.GetVersionMap(resourcev3.ClusterType)["cluster-a"], expectCDSResources: 1},
+		{name: "current_cds_paused_on_reconnect", cdsInitialVersion: v2.GetVersionMap(resourcev3.ClusterType)["cluster-a"], expectCDSResources: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
+			node := "default/gw"
+			ch := make(chan cachev3.DeltaResponse, 8)
+			if err := cache.SetSnapshot(context.Background(), node, v2); err != nil {
+				t.Fatal(err)
+			}
 
-	cdsInitial := map[string]string{"cluster-a": v1.GetVersionMap(resourcev3.ClusterType)["cluster-a"]}
-	cdsReq := &discoveryv3.DeltaDiscoveryRequest{
-		Node:                    &corev3.Node{Cluster: node},
-		TypeUrl:                 resourcev3.ClusterType,
-		InitialResourceVersions: cdsInitial,
-	}
-	cdsSub := streamv3.NewDeltaSubscription(nil, nil, cdsInitial, true)
-	cancelCDS, err := cache.CreateDeltaWatch(cdsReq, &cdsSub, ch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancelCDS()
+			// Reconnecting client subscribes EDS first holding v1 endpoints while CDS is paused.
+			edsInitial := map[string]string{"cluster-a": v1.GetVersionMap(resourcev3.EndpointType)["cluster-a"]}
+			edsReq := &discoveryv3.DeltaDiscoveryRequest{
+				Node:                    &corev3.Node{Cluster: node},
+				TypeUrl:                 resourcev3.EndpointType,
+				ResourceNamesSubscribe:  []string{"cluster-a"},
+				InitialResourceVersions: edsInitial,
+			}
+			edsSub := streamv3.NewDeltaSubscription([]string{"cluster-a"}, nil, edsInitial, false)
+			cancelEDS, err := cache.CreateDeltaWatch(edsReq, &edsSub, ch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancelEDS()
 
-	ordered := drainDeltaResponses(ch)
-	if len(ordered) != 2 {
-		t.Fatalf("got %d responses after CDS arrived, want 2", len(ordered))
-	}
-	if ordered[0].GetDeltaRequest().GetTypeUrl() != resourcev3.ClusterType || ordered[1].GetDeltaRequest().GetTypeUrl() != resourcev3.EndpointType {
-		t.Fatalf("wrong reconnect order: %s then %s", ordered[0].GetDeltaRequest().GetTypeUrl(), ordered[1].GetDeltaRequest().GetTypeUrl())
-	}
-	if ordered[1].GetResponseVersion() != "v2" {
-		t.Fatalf("reconnect EDS SystemVersionInfo = %q, want v2", ordered[1].GetResponseVersion())
+			early := drainDeltaResponses(ch)
+			if len(early) != 1 {
+				t.Fatalf("got %d early EDS responses, want 1 provisional response", len(early))
+			}
+			if early[0].GetResponseVersion() != "" {
+				t.Fatalf("provisional EDS SystemVersionInfo = %q, want empty", early[0].GetResponseVersion())
+			}
+			earlyProto, err := early[0].GetDeltaDiscoveryResponse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			provVer := earlyProto.Resources[0].Version
+			targetVer := v2.GetVersionMap(resourcev3.EndpointType)["cluster-a"]
+			if provVer == edsInitial["cluster-a"] || provVer == targetVer {
+				t.Fatalf("provisional EDS version %q collided with old %q or target %q", provVer, edsInitial["cluster-a"], targetVer)
+			}
+
+			// Client ACKs provisional EDS; cache must hold steady without resending until CDS establishes state.
+			edsSub.SetReturnedResources(early[0].GetNextVersionMap())
+			cancelEDS, err = cache.CreateDeltaWatch(&discoveryv3.DeltaDiscoveryRequest{
+				Node:          &corev3.Node{Cluster: node},
+				TypeUrl:       resourcev3.EndpointType,
+				ResponseNonce: "eds-prov",
+			}, &edsSub, ch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancelEDS()
+			if dup := drainDeltaResponses(ch); len(dup) != 0 {
+				t.Fatalf("provisional EDS re-sent after ACK: %d response(s)", len(dup))
+			}
+
+			// Envoy unpauses CDS -> final CDS-bound EDS version ships right after CDS.
+			cdsInitial := map[string]string{"cluster-a": tc.cdsInitialVersion}
+			cdsReq := &discoveryv3.DeltaDiscoveryRequest{
+				Node:                    &corev3.Node{Cluster: node},
+				TypeUrl:                 resourcev3.ClusterType,
+				InitialResourceVersions: cdsInitial,
+			}
+			cdsSub := streamv3.NewDeltaSubscription(nil, nil, cdsInitial, true)
+			cancelCDS, err := cache.CreateDeltaWatch(cdsReq, &cdsSub, ch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancelCDS()
+
+			ordered := drainDeltaResponses(ch)
+			if len(ordered) != 2 {
+				t.Fatalf("got %d responses after CDS arrived, want 2", len(ordered))
+			}
+			if ordered[0].GetDeltaRequest().GetTypeUrl() != resourcev3.ClusterType || ordered[1].GetDeltaRequest().GetTypeUrl() != resourcev3.EndpointType {
+				t.Fatalf("wrong reconnect order: %s then %s", ordered[0].GetDeltaRequest().GetTypeUrl(), ordered[1].GetDeltaRequest().GetTypeUrl())
+			}
+			cdsProto, err := ordered[0].GetDeltaDiscoveryResponse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cdsProto.Resources) != tc.expectCDSResources {
+				t.Fatalf("CDS resources count = %d, want %d", len(cdsProto.Resources), tc.expectCDSResources)
+			}
+			edsProto, err := ordered[1].GetDeltaDiscoveryResponse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(edsProto.Resources) != 1 || edsProto.Resources[0].Version != targetVer {
+				t.Fatalf("final reconnect EDS = %v, want target version %q", edsProto.Resources, targetVer)
+			}
+			if ordered[1].GetResponseVersion() != "v2" {
+				t.Fatalf("reconnect EDS SystemVersionInfo = %q, want v2", ordered[1].GetResponseVersion())
+			}
+		})
 	}
 }

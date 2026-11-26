@@ -172,6 +172,12 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	}
 
 	containerName := "flareway-envoy-eds-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	cleanupTarget := containerName
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cleanupCancel()
+		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", cleanupTarget).Run()
+	})
 	startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer startCancel()
 	createOut, err := exec.CommandContext(startCtx,
@@ -197,11 +203,7 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	if containerID == "" {
 		containerID = containerName
 	}
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cleanupCancel()
-		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", containerID).Run()
-	})
+	cleanupTarget = containerID
 	if startOut, err := exec.CommandContext(startCtx, "docker", "start", containerID).CombinedOutput(); err != nil {
 		t.Fatalf("start Envoy container: %v\n%s", err, startOut)
 	}
@@ -262,9 +264,18 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 		t.Fatalf("updated SAN mismatch did not activate within 3s (15s EDS warming stall?): %v\nlogs:\n%s", err, containerLogs(containerID))
 	}
 
-	logs := containerLogs(containerID)
+	logs := requireContainerLogs(t, containerID)
 	if strings.Contains(logs, "initial fetch timed out") {
 		t.Fatalf("Envoy logged initial fetch timeout waiting on EDS:\n%s", logs)
+	}
+	statCtx, statCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer statCancel()
+	updateTimeouts, err := readEnvoyStatCount(statCtx, adminAddr, `cluster\..*\.update_timeout`)
+	if err != nil {
+		t.Fatalf("read Envoy cluster update_timeout stats: %v", err)
+	}
+	if updateTimeouts != 0 {
+		t.Fatalf("Envoy logged %d cluster update_timeout(s)", updateTimeouts)
 	}
 
 	cancel()
@@ -316,9 +327,24 @@ func probeHostGETContext(ctx context.Context, addr, host, path string) (int, str
 	return resp.StatusCode, string(body), nil
 }
 
+func requireContainerLogs(t *testing.T, target string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "logs", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("capture logs for %s: %v\n%s", target, err, out)
+	}
+	return string(out)
+}
+
 func readEnvoySANFailureCount(ctx context.Context, adminAddr string) (int64, error) {
+	return readEnvoyStatCount(ctx, adminAddr, `cluster\..*\.ssl\.fail_verify_san`)
+}
+
+func readEnvoyStatCount(ctx context.Context, adminAddr, filter string) (int64, error) {
 	q := url.Values{}
-	q.Set("filter", `cluster\..*\.ssl\.fail_verify_san`)
+	q.Set("filter", filter)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+adminAddr+"/stats?"+q.Encode(), nil)
 	if err != nil {
 		return 0, fmt.Errorf("build Envoy stats request: %w", err)
@@ -340,14 +366,15 @@ func readEnvoySANFailureCount(ctx context.Context, adminAddr string) (int64, err
 		if line == "" {
 			continue
 		}
-		_, valStr, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
+		sep := strings.LastIndexByte(line, ':')
+		if sep < 0 {
+			return 0, fmt.Errorf("unexpected Envoy stat line %q", line)
 		}
-		n, err := strconv.ParseInt(strings.TrimSpace(valStr), 10, 64)
-		if err == nil {
-			total += n
+		n, err := strconv.ParseInt(strings.TrimSpace(line[sep+1:]), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse Envoy stat line %q: %w", line, err)
 		}
+		total += n
 	}
 	return total, nil
 }
