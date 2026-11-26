@@ -18,6 +18,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -50,16 +52,196 @@ type openDeltaWatch struct {
 	sub     cachev3.Subscription
 }
 
+type provisionalEndpointRecord struct {
+	version string
+	target  string
+}
+
+type inFlightDeltaBatch struct {
+	resources map[string]string
+	removed   map[string]struct{}
+}
+
+type rejectedDeltaBatch struct {
+	members map[string]string
+}
+
+type typeRejectionState struct {
+	pending map[string]inFlightDeltaBatch
+	batches []*rejectedDeltaBatch
+	replay  map[string]struct{}
+}
+
+func newTypeRejectionState() *typeRejectionState {
+	return &typeRejectionState{
+		pending: make(map[string]inFlightDeltaBatch),
+		replay:  make(map[string]struct{}),
+	}
+}
+
+func (rs *typeRejectionState) rejectedVersion(name string) (string, bool) {
+	for _, batch := range rs.batches {
+		if ver, ok := batch.members[name]; ok {
+			return ver, true
+		}
+	}
+	return "", false
+}
+
+func (rs *typeRejectionState) recordNACK(sent map[string]string) {
+	if len(sent) == 0 {
+		return
+	}
+	merged := maps.Clone(sent)
+	kept := make([]*rejectedDeltaBatch, 0, len(rs.batches)+1)
+	for _, batch := range rs.batches {
+		overlaps := false
+		for name := range sent {
+			if _, ok := batch.members[name]; ok {
+				overlaps = true
+				break
+			}
+		}
+		if !overlaps {
+			kept = append(kept, batch)
+			continue
+		}
+		for name, ver := range batch.members {
+			if _, replaced := sent[name]; !replaced {
+				merged[name] = ver
+			}
+		}
+	}
+	kept = append(kept, &rejectedDeltaBatch{members: merged})
+	rs.batches = kept
+	for name := range sent {
+		delete(rs.replay, name)
+	}
+}
+
+func (rs *typeRejectionState) recordACK(sent inFlightDeltaBatch) {
+	kept := make([]*rejectedDeltaBatch, 0, len(rs.batches))
+	for _, batch := range rs.batches {
+		touched := false
+		for name := range sent.resources {
+			if _, ok := batch.members[name]; ok {
+				delete(batch.members, name)
+				touched = true
+			}
+		}
+		for name := range sent.removed {
+			if _, ok := batch.members[name]; ok {
+				delete(batch.members, name)
+				touched = true
+			}
+		}
+		if !touched {
+			kept = append(kept, batch)
+			continue
+		}
+		for name := range batch.members {
+			rs.replay[name] = struct{}{}
+		}
+	}
+	rs.batches = kept
+}
+
+func (rs *typeRejectionState) handleUnsubscribe(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	removedSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		removedSet[name] = struct{}{}
+		delete(rs.replay, name)
+	}
+	if len(removedSet) == 0 {
+		return
+	}
+	kept := make([]*rejectedDeltaBatch, 0, len(rs.batches))
+	for _, batch := range rs.batches {
+		touched := false
+		for name := range removedSet {
+			if _, ok := batch.members[name]; ok {
+				delete(batch.members, name)
+				touched = true
+			}
+		}
+		if !touched {
+			kept = append(kept, batch)
+			continue
+		}
+		for name := range batch.members {
+			rs.replay[name] = struct{}{}
+		}
+	}
+	rs.batches = kept
+}
+
+func (rs *typeRejectionState) prune(resources map[string]cachetypes.Resource, isWildcard bool, subscribed map[string]struct{}, pendingRemoval map[string]struct{}) {
+	inScope := func(name string) bool {
+		if _, ok := resources[name]; !ok {
+			return false
+		}
+		if !isWildcard {
+			_, ok := subscribed[name]
+			return ok
+		}
+		return true
+	}
+	for name := range rs.replay {
+		if !inScope(name) {
+			delete(rs.replay, name)
+		}
+	}
+	kept := make([]*rejectedDeltaBatch, 0, len(rs.batches))
+	for _, batch := range rs.batches {
+		touched := false
+		for name := range batch.members {
+			if _, removing := pendingRemoval[name]; removing {
+				continue
+			}
+			if !inScope(name) {
+				delete(batch.members, name)
+				touched = true
+			}
+		}
+		if len(batch.members) == 0 {
+			continue
+		}
+		if touched {
+			for name := range batch.members {
+				rs.replay[name] = struct{}{}
+			}
+			continue
+		}
+		kept = append(kept, batch)
+	}
+	rs.batches = kept
+}
+
 type deltaStreamState struct {
-	node                string
-	streamID            int64
-	streamSeq           int64
-	value               chan cachev3.DeltaResponse
-	watches             map[string]openDeltaWatch
-	sentClusterVersions map[string]string
-	pendingEndpoints    map[string]map[string]string
-	rejectedEndpoints   map[string]string
-	cdsSeen             bool
+	node                     string
+	streamID                 int64
+	streamSeq                int64
+	value                    chan cachev3.DeltaResponse
+	watches                  map[string]openDeltaWatch
+	sentClusterVersions      map[string]string
+	sentProvisionalEndpoints map[string]provisionalEndpointRecord
+	typeRejections           map[string]*typeRejectionState
+	cdsSeen                  bool
+}
+
+func (st *deltaStreamState) rejectionState(typeURL string) *typeRejectionState {
+	rs := st.typeRejections[typeURL]
+	if rs == nil {
+		rs = newTypeRejectionState()
+		st.typeRejections[typeURL] = rs
+	}
+	return rs
 }
 
 type deltaCachedResource struct {
@@ -145,8 +327,9 @@ func (r *orderedDeltaResponse) GetContext() context.Context {
 // Cluster's CDS update, while new/warming Clusters from earlier CDS responses
 // still receive their EDS assignments immediately so warming cannot deadlock.
 type orderedDeltaCache struct {
-	base cachev3.SnapshotCache
-	hash cachev3.NodeHash
+	base          cachev3.SnapshotCache
+	hash          cachev3.NodeHash
+	instanceNonce string
 
 	nextWatchID   atomic.Int64
 	nextStreamSeq atomic.Int64
@@ -163,10 +346,19 @@ type orderedDeltaCache struct {
 
 var _ cachev3.SnapshotCache = (*orderedDeltaCache)(nil)
 
+func newInstanceNonce() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		return hex.EncodeToString(buf[:])
+	}
+	return strconv.FormatInt(time.Now().UnixNano(), 16)
+}
+
 func newOrderedDeltaCache(base cachev3.SnapshotCache, hash cachev3.NodeHash) *orderedDeltaCache {
 	return &orderedDeltaCache{
 		base:             base,
 		hash:             hash,
+		instanceNonce:    newInstanceNonce(),
 		snapshots:        make(map[string]*orderedSnapshot),
 		streams:          make(map[chan cachev3.DeltaResponse]*deltaStreamState),
 		streamByID:       make(map[int64]*deltaStreamState),
@@ -209,15 +401,16 @@ func (c *orderedDeltaCache) BindRequestStream(req *discoveryv3.DeltaDiscoveryReq
 	c.pendingReqStream[req] = streamID
 }
 
-// OnResponse records the delivered Endpoint resource versions by nonce so an
-// eventual NACK can mark all assignments from that batch eligible for replay
-// once a subsequent snapshot introduces a correction.
+// OnResponse records delivered Delta resources and removals by nonce for any
+// type so an eventual NACK isolates the rejected batch while keeping siblings
+// eligible for replay once a batch correction or removal is ACKed.
 func (c *orderedDeltaCache) OnResponse(streamID int64, _ *discoveryv3.DeltaDiscoveryRequest, resp *discoveryv3.DeltaDiscoveryResponse) {
-	if streamID == 0 || resp == nil || resp.GetNonce() == "" || resp.GetTypeUrl() != resourcev3.EndpointType {
+	if streamID == 0 || resp == nil || resp.GetNonce() == "" || resp.GetTypeUrl() == "" {
 		return
 	}
 	resources := resp.GetResources()
-	if len(resources) == 0 {
+	removedList := resp.GetRemovedResources()
+	if len(resources) == 0 && len(removedList) == 0 {
 		return
 	}
 	sent := make(map[string]string, len(resources))
@@ -226,19 +419,29 @@ func (c *orderedDeltaCache) OnResponse(streamID int64, _ *discoveryv3.DeltaDisco
 			sent[res.GetName()] = res.GetVersion()
 		}
 	}
-	if len(sent) == 0 {
+	removed := make(map[string]struct{}, len(removedList))
+	for _, name := range removedList {
+		if name != "" {
+			removed[name] = struct{}{}
+		}
+	}
+	if len(sent) == 0 && len(removed) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if st, ok := c.streamByID[streamID]; ok {
-		st.pendingEndpoints[resp.GetNonce()] = sent
+		st.rejectionState(resp.GetTypeUrl()).pending[resp.GetNonce()] = inFlightDeltaBatch{
+			resources: sent,
+			removed:   removed,
+		}
 	}
 }
 
-// OnRequest reconciles delivered Endpoint batch state on ACK or NACK.
+// OnRequest reconciles per-type Delta batch rejection state on ACK, NACK, or
+// explicit resource unsubscription.
 func (c *orderedDeltaCache) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) {
-	if streamID == 0 || req == nil || req.GetTypeUrl() != resourcev3.EndpointType || req.GetResponseNonce() == "" {
+	if streamID == 0 || req == nil || req.GetTypeUrl() == "" {
 		return
 	}
 	c.mu.Lock()
@@ -247,20 +450,27 @@ func (c *orderedDeltaCache) OnRequest(streamID int64, req *discoveryv3.DeltaDisc
 	if !ok {
 		return
 	}
-	sent, ok := st.pendingEndpoints[req.GetResponseNonce()]
+	rs := st.typeRejections[req.GetTypeUrl()]
+	if rs == nil {
+		return
+	}
+	if req.GetErrorDetail() == nil && len(req.GetResourceNamesUnsubscribe()) > 0 {
+		rs.handleUnsubscribe(req.GetResourceNamesUnsubscribe())
+	}
+	nonce := req.GetResponseNonce()
+	if nonce == "" {
+		return
+	}
+	sent, ok := rs.pending[nonce]
 	if !ok {
 		return
 	}
-	delete(st.pendingEndpoints, req.GetResponseNonce())
+	delete(rs.pending, nonce)
 	if req.GetErrorDetail() != nil {
-		for name, ver := range sent {
-			st.rejectedEndpoints[name] = ver
-		}
+		rs.recordNACK(sent.resources)
 		return
 	}
-	for name := range sent {
-		delete(st.rejectedEndpoints, name)
-	}
+	rs.recordACK(sent)
 }
 
 func (c *orderedDeltaCache) OnStreamClosed(streamID int64) {
@@ -380,14 +590,14 @@ func (c *orderedDeltaCache) CreateDeltaWatch(request *cachev3.DeltaRequest, sub 
 	st, exists := c.streams[value]
 	if !exists {
 		st = &deltaStreamState{
-			node:                nodeID,
-			streamID:            streamID,
-			streamSeq:           c.nextStreamSeq.Add(1),
-			value:               value,
-			watches:             make(map[string]openDeltaWatch),
-			sentClusterVersions: make(map[string]string),
-			pendingEndpoints:    make(map[string]map[string]string),
-			rejectedEndpoints:   make(map[string]string),
+			node:                     nodeID,
+			streamID:                 streamID,
+			streamSeq:                c.nextStreamSeq.Add(1),
+			value:                    value,
+			watches:                  make(map[string]openDeltaWatch),
+			sentClusterVersions:      make(map[string]string),
+			sentProvisionalEndpoints: make(map[string]provisionalEndpointRecord),
+			typeRejections:           make(map[string]*typeRejectionState),
 		}
 		c.streams[value] = st
 	} else {
@@ -457,15 +667,35 @@ func (c *orderedDeltaCache) evaluateWatchLocked(ctx context.Context, st *deltaSt
 	if typeURL == resourcev3.EndpointType {
 		return c.evaluateEndpointWatchLocked(ctx, st, snap, watch)
 	}
-	resp := buildGenericDeltaResponse(ctx, watch.request, watch.sub, snap, typeURL)
-	resp.onMarshal = c.recordSentFingerprint
-	if !shouldSendDeltaResponse(resp, watch.request, watch.sub) {
+	resources := snap.snapshot.GetResources(typeURL)
+	versionMap := snap.snapshot.GetVersionMap(typeURL)
+	sub := watch.sub
+	rs := st.rejectionState(typeURL)
+	filtered, removed, nextVersionMap, removedSet := collectDeltaWatchChanges(resources, sub, rs, func(name string) (string, bool) {
+		return versionMap[name], false
+	})
+	resp := &orderedDeltaResponse{
+		request:           watch.request,
+		systemVersionInfo: snap.snapshot.GetVersion(typeURL),
+		originFingerprint: snap.typeFingerprints[typeURL],
+		onMarshal:         c.recordSentFingerprint,
+		resources:         filtered,
+		removed:           removed,
+		returnedResources: nextVersionMap,
+		ctx:               ctx,
+	}
+	if !shouldSendDeltaResponse(resp, watch.request, sub) {
+		rs.prune(resources, sub.IsWildcard(), sub.SubscribedResources(), removedSet)
 		return false, nil
 	}
 	select {
 	case st.value <- resp:
+		rs.prune(resources, sub.IsWildcard(), sub.SubscribedResources(), removedSet)
+		for _, item := range filtered {
+			delete(rs.replay, item.name)
+		}
 		if typeURL == resourcev3.ClusterType {
-			updateSentClusterVersions(st.sentClusterVersions, watch.sub, resp.returnedResources)
+			updateSentClusterVersions(st.sentClusterVersions, sub, resp.returnedResources)
 		}
 		return true, nil
 	case <-ctx.Done():
@@ -477,73 +707,15 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	resources := snap.snapshot.GetResources(resourcev3.EndpointType)
 	sub := watch.sub
 	prevMap := sub.ReturnedResources()
-	subscribed := sub.SubscribedResources()
-	hasCorrection := hasRejectedEndpointCorrection(st, snap, resources, sub.IsWildcard(), subscribed, prevMap)
-
-	var (
-		filtered       []deltaCachedResource
-		removed        []string
-		nextVersionMap map[string]string
-	)
-
-	if sub.IsWildcard() {
-		nextVersionMap = make(map[string]string, len(resources))
-		for name, res := range resources {
-			effectiveVer, deferUpdate := effectiveEndpointVersionForStream(st, snap, name, prevMap)
-			prevVer, found := prevMap[name]
-			if deferUpdate {
-				if found {
-					nextVersionMap[name] = prevVer
-				}
-				continue
-			}
-			nextVersionMap[name] = effectiveVer
-			rejVer, wasRejected := st.rejectedEndpoints[name]
-			suppressRejected := wasRejected && effectiveVer == rejVer && !hasCorrection
-			replayRejected := wasRejected && effectiveVer == rejVer && hasCorrection
-			if !suppressRejected && (!found || prevVer != effectiveVer || replayRejected) {
-				filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
-			}
-		}
-		for name := range prevMap {
-			if _, ok := resources[name]; !ok {
-				removed = append(removed, name)
-			}
-		}
-	} else {
-		nextVersionMap = make(map[string]string, len(subscribed))
-		for name := range subscribed {
-			prevVer, found := prevMap[name]
-			if res, ok := resources[name]; ok {
-				effectiveVer, deferUpdate := effectiveEndpointVersionForStream(st, snap, name, prevMap)
-				if deferUpdate {
-					if found {
-						nextVersionMap[name] = prevVer
-					}
-					continue
-				}
-				nextVersionMap[name] = effectiveVer
-				rejVer, wasRejected := st.rejectedEndpoints[name]
-				suppressRejected := wasRejected && effectiveVer == rejVer && !hasCorrection
-				replayRejected := wasRejected && effectiveVer == rejVer && hasCorrection
-				if !suppressRejected && (!found || prevVer != effectiveVer || replayRejected) {
-					filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
-				}
-			} else if found {
-				removed = append(removed, name)
-			}
-		}
-	}
+	rs := st.rejectionState(resourcev3.EndpointType)
+	filtered, removed, nextVersionMap, removedSet := collectDeltaWatchChanges(resources, sub, rs, func(name string) (string, bool) {
+		return effectiveEndpointVersionForStream(c.instanceNonce, st, snap, name, prevMap)
+	})
 
 	if len(filtered) == 0 && len(removed) == 0 && (!sub.IsWildcard() || watch.request.GetResponseNonce() != "") {
-		if hasCorrection {
-			pruneGoneRejectedEndpoints(st.rejectedEndpoints, resources, sub.IsWildcard(), subscribed)
-		}
+		rs.prune(resources, sub.IsWildcard(), sub.SubscribedResources(), removedSet)
 		return false, nil
 	}
-
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].name < filtered[j].name })
-	sort.Strings(removed)
 
 	systemVersion := ""
 	originFingerprint := ""
@@ -564,8 +736,17 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	}
 	select {
 	case st.value <- resp:
-		if hasCorrection {
-			pruneGoneRejectedEndpoints(st.rejectedEndpoints, resources, sub.IsWildcard(), subscribed)
+		rs.prune(resources, sub.IsWildcard(), sub.SubscribedResources(), removedSet)
+		for _, item := range filtered {
+			delete(rs.replay, item.name)
+			if targetVer := snap.targetEndpointVer[item.name]; item.version != targetVer {
+				st.sentProvisionalEndpoints[item.name] = provisionalEndpointRecord{version: item.version, target: targetVer}
+			} else {
+				delete(st.sentProvisionalEndpoints, item.name)
+			}
+		}
+		for _, name := range removed {
+			delete(st.sentProvisionalEndpoints, name)
 		}
 		return true, nil
 	case <-ctx.Done():
@@ -573,47 +754,82 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	}
 }
 
-func hasRejectedEndpointCorrection(st *deltaStreamState, snap *orderedSnapshot, resources map[string]cachetypes.Resource, isWildcard bool, subscribed map[string]struct{}, prevMap map[string]string) bool {
-	if len(st.rejectedEndpoints) == 0 {
-		return false
-	}
-	for name, rejVer := range st.rejectedEndpoints {
-		if _, ok := resources[name]; !ok {
-			return true
-		}
-		if !isWildcard {
-			if _, ok := subscribed[name]; !ok {
-				return true
+func collectDeltaWatchChanges(
+	resources map[string]cachetypes.Resource,
+	sub cachev3.Subscription,
+	rs *typeRejectionState,
+	resolveVersion func(name string) (string, bool),
+) (filtered []deltaCachedResource, removed []string, nextVersionMap map[string]string, removedSet map[string]struct{}) {
+	prevMap := sub.ReturnedResources()
+	subscribed := sub.SubscribedResources()
+	removedSet = make(map[string]struct{})
+
+	if sub.IsWildcard() {
+		nextVersionMap = make(map[string]string, len(resources))
+		for name, res := range resources {
+			effectiveVer, deferUpdate := resolveVersion(name)
+			prevVer, found := prevMap[name]
+			if deferUpdate {
+				if found {
+					nextVersionMap[name] = prevVer
+				}
+				continue
+			}
+			nextVersionMap[name] = effectiveVer
+			_, replayRequested := rs.replay[name]
+			rejVer, wasRejected := rs.rejectedVersion(name)
+			if wasRejected && effectiveVer == rejVer && !replayRequested {
+				continue
+			}
+			if replayRequested || !found || prevVer != effectiveVer {
+				filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
 			}
 		}
-		effectiveVer, deferUpdate := effectiveEndpointVersionForStream(st, snap, name, prevMap)
-		if !deferUpdate && effectiveVer != rejVer {
-			return true
+		for name := range prevMap {
+			if _, ok := resources[name]; !ok {
+				removed = append(removed, name)
+				removedSet[name] = struct{}{}
+			}
 		}
-	}
-	return false
-}
-
-func pruneGoneRejectedEndpoints(rejected map[string]string, resources map[string]cachetypes.Resource, isWildcard bool, subscribed map[string]struct{}) {
-	for name := range rejected {
-		if _, ok := resources[name]; !ok {
-			delete(rejected, name)
-			continue
-		}
-		if !isWildcard {
-			if _, ok := subscribed[name]; !ok {
-				delete(rejected, name)
+	} else {
+		nextVersionMap = make(map[string]string, len(subscribed))
+		for name := range subscribed {
+			prevVer, found := prevMap[name]
+			if res, ok := resources[name]; ok {
+				effectiveVer, deferUpdate := resolveVersion(name)
+				if deferUpdate {
+					if found {
+						nextVersionMap[name] = prevVer
+					}
+					continue
+				}
+				nextVersionMap[name] = effectiveVer
+				_, replayRequested := rs.replay[name]
+				rejVer, wasRejected := rs.rejectedVersion(name)
+				if wasRejected && effectiveVer == rejVer && !replayRequested {
+					continue
+				}
+				if replayRequested || !found || prevVer != effectiveVer {
+					filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
+				}
+			} else if found {
+				removed = append(removed, name)
+				removedSet[name] = struct{}{}
 			}
 		}
 	}
+
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].name < filtered[j].name })
+	sort.Strings(removed)
+	return filtered, removed, nextVersionMap, removedSet
 }
 
-func provisionalEndpointVersion(streamSeq int64, targetVer string) string {
-	sum := sha256.Sum256([]byte("provisional\x00" + strconv.FormatInt(streamSeq, 10) + "\x00" + targetVer))
+func provisionalEndpointVersion(instanceNonce string, streamSeq int64, targetVer string) string {
+	sum := sha256.Sum256([]byte("provisional\x00" + instanceNonce + "\x00" + strconv.FormatInt(streamSeq, 10) + "\x00" + targetVer))
 	return hex.EncodeToString(sum[:])
 }
 
-func effectiveEndpointVersionForStream(st *deltaStreamState, snap *orderedSnapshot, clusterName string, prevMap map[string]string) (string, bool) {
+func effectiveEndpointVersionForStream(instanceNonce string, st *deltaStreamState, snap *orderedSnapshot, clusterName string, prevMap map[string]string) (string, bool) {
 	targetVer := snap.targetEndpointVer[clusterName]
 	snapCDSVer, hasSnapCDS := snap.clusterVersions[clusterName]
 	if !hasSnapCDS {
@@ -644,17 +860,19 @@ func effectiveEndpointVersionForStream(st *deltaStreamState, snap *orderedSnapsh
 		return targetVer, false
 	}
 
-	// Stream has no recorded CDS state for this cluster yet. Only pass through
-	// targetVer when the client already holds that exact final CDS-bound version;
-	// otherwise issue a unique provisional version once for this stream so any
-	// warming or reconnecting cluster unblocks paused CDS while reserving
-	// targetVer until matching CDS arrives.
-	if hasPrev && prevVer == targetVer {
-		return targetVer, false
+	// Stream has no recorded CDS state for this cluster yet. Serve a fresh
+	// provisional assignment once per stream even when prevVer matches targetVer
+	// (rollback) or a prior controller instance's provisional version (restart),
+	// then suppress repeats on that stream and reserve targetVer for matching CDS.
+	if rec, sentOnStream := st.sentProvisionalEndpoints[clusterName]; sentOnStream && rec.target == targetVer {
+		if hasPrev && prevVer == rec.version {
+			return rec.version, true
+		}
+		return rec.version, false
 	}
-	prov := provisionalEndpointVersion(st.streamSeq, targetVer)
+	prov := provisionalEndpointVersion(instanceNonce, st.streamSeq, targetVer)
 	if hasPrev && prevVer == prov {
-		return prov, true
+		prov = provisionalEndpointVersion(instanceNonce, st.streamSeq, targetVer+"\x00"+prevVer)
 	}
 	return prov, false
 }
@@ -687,63 +905,6 @@ func buildOrderedSnapshot(snapshot cachev3.ResourceSnapshot) (*orderedSnapshot, 
 		targetEndpointVer:   maps.Clone(snapshot.GetVersionMap(resourcev3.EndpointType)),
 		typeFingerprints:    typeFingerprints,
 	}, nil
-}
-
-func buildGenericDeltaResponse(ctx context.Context, req *discoveryv3.DeltaDiscoveryRequest, sub cachev3.Subscription, osnap *orderedSnapshot, typeURL string) *orderedDeltaResponse {
-	snapshot := osnap.snapshot
-	resources := snapshot.GetResources(typeURL)
-	versionMap := snapshot.GetVersionMap(typeURL)
-	prevMap := sub.ReturnedResources()
-
-	var (
-		filtered       []deltaCachedResource
-		removed        []string
-		nextVersionMap map[string]string
-	)
-
-	if sub.IsWildcard() {
-		nextVersionMap = make(map[string]string, len(resources))
-		for name, res := range resources {
-			ver := versionMap[name]
-			nextVersionMap[name] = ver
-			if prevVer, found := prevMap[name]; !found || prevVer != ver {
-				filtered = append(filtered, deltaCachedResource{name: name, version: ver, resource: res})
-			}
-		}
-		for name := range prevMap {
-			if _, ok := resources[name]; !ok {
-				removed = append(removed, name)
-			}
-		}
-	} else {
-		subscribed := sub.SubscribedResources()
-		nextVersionMap = make(map[string]string, len(subscribed))
-		for name := range subscribed {
-			prevVer, found := prevMap[name]
-			if res, ok := resources[name]; ok {
-				ver := versionMap[name]
-				if !found || prevVer != ver {
-					filtered = append(filtered, deltaCachedResource{name: name, version: ver, resource: res})
-				}
-				nextVersionMap[name] = ver
-			} else if found {
-				removed = append(removed, name)
-			}
-		}
-	}
-
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].name < filtered[j].name })
-	sort.Strings(removed)
-
-	return &orderedDeltaResponse{
-		request:           req,
-		systemVersionInfo: snapshot.GetVersion(typeURL),
-		originFingerprint: osnap.typeFingerprints[typeURL],
-		resources:         filtered,
-		removed:           removed,
-		returnedResources: nextVersionMap,
-		ctx:               ctx,
-	}
 }
 
 func shouldSendDeltaResponse(resp *orderedDeltaResponse, req *discoveryv3.DeltaDiscoveryRequest, sub cachev3.Subscription) bool {
