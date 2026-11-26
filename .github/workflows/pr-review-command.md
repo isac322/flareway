@@ -607,16 +607,21 @@ safe-outputs:
                   core.setFailed("Agent output missing items array; refusing publication on incomplete snapshot.");
                   return;
                 }
-                const norm = (t) => String(t || "").replace(/-/g, "_");
-                const reviews = parsed.items.filter((item) => norm(item?.type) === "submit_pull_request_review");
-                const reviewComments = parsed.items.filter((item) => norm(item?.type) === "create_pull_request_review_comment");
-                const nonBlocking = reviews.find((item) => String(item?.event || "").toUpperCase() !== "REQUEST_CHANGES");
-                if (nonBlocking) {
-                  core.setFailed(`Refusing ${String(nonBlocking?.event || "COMMENT")} review on incomplete PR snapshot (${snapshotSummary}); incomplete snapshots must not supersede blocking reviews.`);
-                  return;
-                }
-                if (reviewComments.length > 0 && reviews.length === 0) {
-                  core.setFailed(`Refusing implicit COMMENT review from orphaned review comments on incomplete PR snapshot (${snapshotSummary}).`);
+                const norm = (t) => {
+                  const normalized = String(t || "").replace(/-/g, "_");
+                  if (normalized === "missing_tool") return "report_missing_tool";
+                  if (normalized === "missing_data") return "report_missing_data";
+                  return normalized;
+                };
+                const ALLOWED_DIAGNOSTIC_TYPES = new Set([
+                  "noop",
+                  "report_incomplete",
+                  "report_missing_data",
+                  "report_missing_tool",
+                ]);
+                const disallowedItem = parsed.items.find((item) => !ALLOWED_DIAGNOSTIC_TYPES.has(norm(item?.type)));
+                if (disallowedItem) {
+                  core.setFailed(`Refusing non-diagnostic safe-output '${String(disallowedItem?.type || "<unknown>")}' on incomplete PR snapshot (${snapshotSummary}); only diagnostics are permitted.`);
                   return;
                 }
               }
@@ -657,10 +662,11 @@ Perform a read-only on-demand review of the triggering pull request in `${{ gith
 
 3. **Completeness gate (fail-closed) and runtime honesty**:
    - Shell execution is disabled in this command workflow. Do **not** run or claim to have run `go test`, linters, builds, or containers; cite everything as `static source inspection` and note runtime/CI checks under `## Not verified`. Never cite CI check status as review evidence.
-   - **Never issue `**Verdict: CLEAN (COMMENT)**` unless `diff_complete` is `true` and all evidence needed for the verdict was directly observed; the safe-outputs publisher rejects any non-blocking (`COMMENT`) review when `diff_complete` is `false`.**
-   - If `diff_complete` is `false` (any file in `truncated_files`, `omitted_files`, `binary_files`, `missing_patch_files`, or `manifest_truncated: true`), or if verifying a candidate issue requires unseen PR-head lines outside the snapshot:
-     - Only issue `REQUEST_CHANGES` if you already proved at least one confirmed P0–P2 blocking issue entirely within completely observed hunks (after `challenger` verification), and list every truncated, omitted, binary, or uninspected file in `## Not verified`.
-     - Otherwise, do **not** call `submit-pull-request-review`; call `report_incomplete` naming all truncated/omitted/binary/uninspected files and stating that a full local checkout review is required.
+   - The `safe-outputs` publication gate rejects all non-diagnostic safe-outputs when `diff_complete` is `false`.
+   - If `diff_complete` is `false` (any file in `truncated_files`, `omitted_files`, `binary_files`, `missing_patch_files`, or `manifest_truncated: true`):
+     - Emit diagnostics only: do **not** call `challenger`, `submit-pull-request-review`, `create-pull-request-review-comment`, or `reply-to-pull-request-review-comment`.
+     - Immediately call `report_incomplete` naming all truncated, omitted, binary, and missing-patch files and stating that a full local checkout review is required.
+   - If `diff_complete` is `true`, never guess when verifying a candidate issue requires unseen PR-head lines outside the snapshot: unless another P0–P2 blocking issue is already confirmed strictly within observed hunks (and verified by `challenger`), do **not** call `submit-pull-request-review`; call `report_incomplete` naming the uninspected files or regions.
 
 4. **Challenge blocking candidates**:
    - Before submitting `REQUEST_CHANGES`, invoke the inline `challenger` sub-agent (`spawn_agent` with `agent_type: "challenger"`) to test each candidate P0–P2 blocking finding against the exact code paths and look for counterexamples. Record refuted candidates concisely in `<details><summary>Considered</summary>`.
@@ -669,11 +675,11 @@ Perform a read-only on-demand review of the triggering pull request in `${{ gith
    - For a vulnerability **introduced** by this PR, report `file:line`, mechanism, and minimal fix without echoing leaked secrets or live exploit payloads.
    - For a **pre-existing** vulnerability already on `main`, post no exploit details publicly and ask maintainers for a private channel.
 
-6. **Submit one consolidated review (when completeness gate permits)**:
+6. **Submit one consolidated review (only when `diff_complete` is `true`)**:
    - Place diff-anchored findings only in `create-pull-request-review-comment` (`side: RIGHT`), not duplicated in the review body.
    - Reply via `reply-to-pull-request-review-comment` only on unresolved bot threads whose state changed on this head or where a human replied after the bot.
-   - Call `submit-pull-request-review` once (`REQUEST_CHANGES` for confirmed blocking findings including missing parity; `COMMENT` only when `diff_complete` is `true` and no blocking findings remain — `supersede-older-reviews: true` clears older blocking reviews when no inline findings remain).
-   - Start with `**Verdict: BLOCKING** reviewed at ${{ needs.pr_context.outputs.pr_head_sha }}` or `**Verdict: CLEAN (COMMENT)** reviewed at ${{ needs.pr_context.outputs.pr_head_sha }}`, followed by a brief summary, `## Parity check`, `## Verified` (static source + base rules from `${{ needs.pr_context.outputs.pr_base_sha }}`), `## Not verified` (runtime tests deferred because shell is disabled for fork safety, plus any truncated/omitted/binary snapshot items), any non-diff findings only if unattachable, and `<details><summary>Considered</summary>` if needed. Keep prose concise and English-only, with no internal rule IDs or runner internals.
+   - Call `submit-pull-request-review` once only when `diff_complete` is `true` (`REQUEST_CHANGES` for confirmed blocking findings including missing parity; `COMMENT` when no blocking findings remain — `supersede-older-reviews: true` clears older blocking reviews when no inline findings remain).
+   - Start with `**Verdict: BLOCKING** reviewed at ${{ needs.pr_context.outputs.pr_head_sha }}` or `**Verdict: CLEAN (COMMENT)** reviewed at ${{ needs.pr_context.outputs.pr_head_sha }}`, followed by a brief summary, `## Parity check`, `## Verified` (static source + base rules from `${{ needs.pr_context.outputs.pr_base_sha }}`), `## Not verified` (runtime tests deferred because shell is disabled for fork safety), any non-diff findings only if unattachable, and `<details><summary>Considered</summary>` if needed. Keep prose concise and English-only, with no internal rule IDs or runner internals.
 
 ## agent: `challenger`
 ---
