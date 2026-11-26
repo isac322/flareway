@@ -632,12 +632,15 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name           string
-		denyZoneDenied bool
-		readyStatus    metav1.ConditionStatus
-		reason         string
-		wantResult     string
-		wantItems      int
+		name               string
+		denyZoneDenied     bool
+		generation         int64
+		observedGeneration int64
+		condObservedGen    int64
+		readyStatus        metav1.ConditionStatus
+		reason             string
+		wantResult         string
+		wantItems          int
 	}{
 		{
 			name:           "partial_sweep_withholds_unestablished_legacy_binding",
@@ -648,12 +651,26 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 			wantItems:      0,
 		},
 		{
-			name:           "partial_sweep_judges_once_scoped_observation_establishes_ready",
-			denyZoneDenied: true,
-			readyStatus:    metav1.ConditionTrue,
-			reason:         "Ready",
-			wantResult:     observability.SweepResultPartial,
-			wantItems:      1,
+			name:               "partial_sweep_withholds_interrupted_v041_zone_write_with_stale_ready",
+			denyZoneDenied:     true,
+			generation:         2,
+			observedGeneration: 1,
+			condObservedGen:    1,
+			readyStatus:        metav1.ConditionTrue,
+			reason:             "Ready",
+			wantResult:         observability.SweepResultPartial,
+			wantItems:          0,
+		},
+		{
+			name:               "partial_sweep_judges_once_scoped_observation_establishes_ready",
+			denyZoneDenied:     true,
+			generation:         2,
+			observedGeneration: 2,
+			condObservedGen:    2,
+			readyStatus:        metav1.ConditionTrue,
+			reason:             "Ready",
+			wantResult:         observability.SweepResultPartial,
+			wantItems:          1,
 		},
 		{
 			name:           "complete_sweep_judges_unestablished_binding_safely",
@@ -675,10 +692,11 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 			}
 
 			// Legacy v0.4.1 upgrade state: remote group actually lives in zone-denied,
-			// while a rule-resolution failure under v0.4.1 paired GroupID with zone-ok and
-			// stamped Accepted=False / Ready=False. Once observation succeeds, Ready=True.
+			// while either a rule-resolution failure paired GroupID with zone-ok and
+			// stamped Accepted=False / Ready=False, or an interrupted split status
+			// update left stale Ready=True from an earlier generation.
 			group := &v1alpha1.AccessGroup{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "legacy-upgraded", UID: "uid-legacy-grp"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "legacy-upgraded", UID: "uid-legacy-grp", Generation: tc.generation},
 				Spec: v1alpha1.AccessGroupSpec{
 					AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
 					Zone:             "ok.example.com",
@@ -686,12 +704,13 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 					ManagementPolicy: v1alpha1.ManagementPolicyManaged,
 				},
 				Status: v1alpha1.AccessGroupStatus{
-					GroupID:           "remote-grp-a",
-					ZoneID:            "zone-ok",
-					OwnershipVerified: true,
+					GroupID:            "remote-grp-a",
+					ZoneID:             "zone-ok",
+					OwnershipVerified:  true,
+					ObservedGeneration: tc.observedGeneration,
 					Conditions: []metav1.Condition{
-						{Type: "Accepted", Status: tc.readyStatus, Reason: tc.reason},
-						{Type: "Ready", Status: tc.readyStatus, Reason: tc.reason},
+						{Type: "Accepted", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
+						{Type: "Ready", Status: tc.readyStatus, Reason: tc.reason, ObservedGeneration: tc.condObservedGen},
 					},
 				},
 			}
@@ -722,6 +741,58 @@ func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testi
 				t.Fatalf("unexpected drift item = %#v, want Missing for legacy-upgraded", items)
 			}
 		})
+	}
+}
+
+func TestAccessPartialSweepJudgesServiceTokenWithSecretMissing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	stub := cfstub.New(t)
+	stub.State.AddZone(cfstub.Zone{ID: "zone-denied", Name: "denied.example.com", AccountID: "account-1"})
+	stub.Fault(http.MethodGet, "^/zones/zone-denied/access/service_tokens$", cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+
+	token := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "acct-st-secret-missing", UID: "uid-acct-st-sm", Generation: 1},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+			Name:             "acct-st-secret-missing",
+			SecretRef:        corev1.LocalObjectReference{Name: "missing-secret"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+		},
+		Status: v1alpha1.ServiceTokenStatus{
+			TokenID:           "remote-acct-st",
+			OwnershipVerified: true,
+			Conditions: []metav1.Condition{
+				{Type: "Accepted", Status: metav1.ConditionTrue, Reason: "Ready", ObservedGeneration: 1},
+				{Type: "Ready", Status: metav1.ConditionFalse, Reason: "SecretMissing", ObservedGeneration: 1},
+			},
+		},
+	}
+
+	fixture := newDNSProbeFixture(t, dnsProbeConfig{objects: []client.Object{probeAccount([]string{"*"}), token}})
+	sweeper := NewAccountSweeper(AccountSweeperOptions{
+		AccountName:       probeAccountName,
+		AccountID:         "account-1",
+		Token:             "token",
+		Factory:           flarecloudflare.NewFactory(logr.Discard(), flarecloudflare.WithBaseURL(stub.URL)),
+		Client:            fixture.kube,
+		APIReader:         fixture.kube,
+		OperatorNamespace: probeOperatorNamespace,
+		RateLimit:         1e9,
+		RateBurst:         1,
+		Logger:            logr.Discard(),
+	})
+
+	items, result, err := sweeper.RunTargetOnce(ctx, TargetDescriptor{
+		Kind:      "ServiceToken",
+		Grade:     freshness.GradeAuthz,
+		SweepFunc: sweepServiceTokens,
+	})
+	if result != observability.SweepResultPartial {
+		t.Fatalf("result = %q, want %q (err=%v)", result, observability.SweepResultPartial, err)
+	}
+	if len(items) != 1 || items[0].Case != DriftCaseMissing || items[0].NamespacedName.Name != "acct-st-secret-missing" {
+		t.Fatalf("account ServiceToken with SecretMissing should still be judged missing on partial pass, got %#v", items)
 	}
 }
 

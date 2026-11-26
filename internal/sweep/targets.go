@@ -134,9 +134,10 @@ func accountScopeListed(ref localRef) bool {
 
 // accessScopeListed returns a predicate requiring both the target spec scope
 // and any distinct checkpointed status.zoneId scope to appear in listed. When
-// partial is true, refs carrying unverifiedScope (unhealthy Ready/Accepted
-// conditions such as inherited pre-observation error checkpoints) are withheld
-// until a complete pass or fresh observation establishes the binding.
+// partial is true, AccessGroup refs carrying unverifiedScope (missing,
+// unhealthy, or generation-stale Accepted/Ready conditions such as interrupted
+// or pre-observation legacy error checkpoints) are withheld until a complete
+// pass or scoped observation establishes the binding.
 func accessScopeListed(listed map[string]bool, partial bool) func(localRef) bool {
 	return func(ref localRef) bool {
 		if !listed[ref.scope] {

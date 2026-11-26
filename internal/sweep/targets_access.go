@@ -105,15 +105,35 @@ func resolveScope(zoneName string, byName map[string]string) (string, bool) {
 	return id, ok
 }
 
-// accessScopeUnverified reports whether controller conditions mark the current
-// recorded binding as unhealthy/unestablished (e.g., an error condition such as
-// Ready=False or Accepted=False), so partial passes withhold judgment until a
-// complete pass or scoped observation establishes Ready=True.
-func accessScopeUnverified(conditions []metav1.Condition) bool {
-	for _, cond := range conditions {
-		if (cond.Type == "Ready" || cond.Type == "Accepted") && cond.Status != metav1.ConditionTrue {
-			return true
+// accessGroupScopeUnverified reports whether an AccessGroup's recorded
+// binding has not yet been established for its current generation and conditions
+// (missing, non-True, or stale ObservedGeneration on Accepted/Ready — covering
+// both legacy error checkpoints and interrupted zone/ID status updates), so
+// partial passes withhold judgment until a complete pass or scoped observation
+// establishes the pair. Non-AccessGroup targets do not write split zone
+// checkpoints and are always judged when their scopes are listed, even when
+// reporting local conditions like SecretMissing.
+func accessGroupScopeUnverified(group *v1alpha1.AccessGroup) bool {
+	if group.Status.GroupID == "" || len(group.Status.Conditions) == 0 {
+		return false
+	}
+	var accepted, ready *metav1.Condition
+	for i := range group.Status.Conditions {
+		switch group.Status.Conditions[i].Type {
+		case "Accepted":
+			accepted = &group.Status.Conditions[i]
+		case "Ready":
+			ready = &group.Status.Conditions[i]
 		}
+	}
+	if accepted == nil || ready == nil {
+		return true
+	}
+	if accepted.Status != metav1.ConditionTrue || ready.Status != metav1.ConditionTrue {
+		return true
+	}
+	if group.Generation > 0 && (group.Status.ObservedGeneration != group.Generation || ready.ObservedGeneration != group.Generation || accepted.ObservedGeneration != group.Generation) {
+		return true
 	}
 	return false
 }
@@ -167,7 +187,6 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 			kind: "AccessApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
 			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
-			unverifiedScope: accessScopeUnverified(app.Status.Conditions),
 		}
 		if scopePredicate(ref) {
 			needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
@@ -301,7 +320,6 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 			kind: "AccessStandaloneApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
 			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
-			unverifiedScope: accessScopeUnverified(app.Status.Conditions),
 		})
 	}
 
@@ -432,7 +450,7 @@ func sweepAccessGroups(ctx context.Context, as *AccountSweeper) ([]DriftItem, er
 			uid: group.UID, remoteID: group.Status.GroupID,
 			expectedName: accessRemoteNameValue(clusterID, group.Namespace, group.Spec.Name),
 			specName:     group.Spec.Name, scope: scope, recordedScope: group.Status.ZoneID,
-			unverifiedScope: accessScopeUnverified(group.Status.Conditions),
+			unverifiedScope: accessGroupScopeUnverified(group),
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessGroup]{
@@ -486,7 +504,6 @@ func sweepServiceTokens(ctx context.Context, as *AccountSweeper) ([]DriftItem, e
 			uid: token.UID, remoteID: token.Status.TokenID,
 			expectedName: accessRemoteNameValue(clusterID, token.Namespace, token.Spec.Name),
 			specName:     token.Spec.Name, scope: scope, recordedScope: token.Status.ZoneID,
-			unverifiedScope: accessScopeUnverified(token.Status.Conditions),
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.ServiceToken]{

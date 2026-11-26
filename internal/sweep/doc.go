@@ -64,10 +64,11 @@ limitations under the License.
 // did not list contribute no records and no judgement, and Access objects with
 // a distinct checkpointed `status.zoneId` require both target and checkpointed
 // scopes in `listed` (`accessScopeListed`), while partial passes also withhold
-// judgement for objects whose `Accepted`/`Ready` conditions do not confirm the
-// recorded binding (`unverifiedScope`), so an unlisted zone or inherited error
-// checkpoint can never produce a false missing verdict. All other targets keep
-// the strict contract.
+// judgement for `AccessGroup` objects whose `Accepted`/`Ready` conditions do not
+// yet confirm the recorded binding for their current generation
+// (`unverifiedScope`), so an unlisted zone or inherited/interrupted zone
+// checkpoint can never produce a false missing verdict (non-AccessGroup objects
+// with local failures such as `ServiceToken` `SecretMissing` still get judged).
 //
 // # Content confirmation
 //

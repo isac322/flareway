@@ -1740,6 +1740,86 @@ func TestServiceTokenObserveOnlyObservesWithValidRejectedJournal(t *testing.T) {
 	}
 }
 
+type serviceTokenSpecEditBeforeFinalizerAPI struct {
+	*serviceTokenFakeAPI
+	onList func()
+}
+
+func (f *serviceTokenSpecEditBeforeFinalizerAPI) ListServiceTokens(ctx context.Context, scope flarecloudflare.AccessScope) ([]flarecloudflare.ServiceToken, error) {
+	if f.onList != nil {
+		f.onList()
+		f.onList = nil
+	}
+	return f.serviceTokenFakeAPI.ListServiceTokens(ctx, scope)
+}
+
+func TestServiceTokenSpecEditDuringInitialListRestartsWithoutStaleDispatchOrBackoff(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	baseAPI := &serviceTokenFakeAPI{
+		now:       func() time.Time { return clock },
+		tokens:    make(map[string]flarecloudflare.ServiceToken),
+		secrets:   make(map[string]string),
+		createErr: cloudflareStatusError(http.StatusForbidden),
+	}
+	var world *serviceTokenWorld
+	api := &serviceTokenSpecEditBeforeFinalizerAPI{
+		serviceTokenFakeAPI: baseAPI,
+		onList: func() {
+			var obj v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+				t.Fatal(err)
+			}
+			base := client.MergeFrom(obj.DeepCopy())
+			obj.Spec.Duration = "24h"
+			obj.Generation = 2
+			if err := world.kube.Patch(ctx, &obj, base); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	world = newServiceTokenWorld(t, baseAPI, clock)
+	world.reconciler.NewCloudflareClient = func(string, string) (flarecloudflare.AccessAPI, error) { return api, nil }
+
+	res, err := world.reconciler.Reconcile(ctx, world.request)
+	if err != nil || res.RequeueAfter != time.Millisecond {
+		t.Fatalf("reconcile on mid-list spec edit = (%v, %v), want (1ms, nil)", res, err)
+	}
+	if baseAPI.createCalls != 0 {
+		t.Fatalf("expected zero CreateServiceToken calls with stale duration, got %d", baseAPI.createCalls)
+	}
+	var current v1alpha1.ServiceToken
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&current, serviceTokenAttemptFinalizer) {
+		t.Fatal("attempt finalizer should not be added to generation 2 before restart")
+	}
+	journals, err := serviceTokenJournalSecrets(ctx, world.kube, &current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journals) != 0 {
+		t.Fatalf("expected zero journals created on restart, found %d", len(journals))
+	}
+	if ready := serviceTokenCondition(current.Status.Conditions, "Ready"); ready != nil {
+		t.Fatalf("expected no stale error status on generation 2, got %#v", ready)
+	}
+
+	// Next reconcile runs with generation 2's 24h duration cleanly without backoff from gen 1.
+	baseAPI.createErr = nil
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+		t.Fatalf("reconcile on generation 2 failed: %v", err)
+	}
+	if baseAPI.createCalls != 1 {
+		t.Fatalf("expected generation 2 to dispatch immediately without backoff, createCalls=%d", baseAPI.createCalls)
+	}
+	ready := serviceTokenReady(ctx, t, world)
+	if ready.Status.ObservedDuration != "24h" {
+		t.Fatalf("ObservedDuration = %q, want 24h from generation 2", ready.Status.ObservedDuration)
+	}
+}
+
 func TestServiceTokenAmbiguousCreateErrorsRetainRecoveryPending(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

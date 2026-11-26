@@ -153,13 +153,32 @@ func (r *ServiceTokenReconciler) apiReader() client.Reader {
 	}
 	return r.Client
 }
-func (r *ServiceTokenReconciler) ensureServiceTokenAttemptFinalizer(ctx context.Context, object *v1alpha1.ServiceToken) error {
-	if controllerutil.ContainsFinalizer(object, serviceTokenAttemptFinalizer) {
+func (r *ServiceTokenReconciler) ensureServiceTokenAttemptFinalizer(ctx context.Context, object *v1alpha1.ServiceToken) (bool, error) {
+	expectedUID := object.UID
+	expectedGeneration := object.Generation
+	var specChanged bool
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := new(v1alpha1.ServiceToken)
+		if getErr := r.apiReader().Get(ctx, client.ObjectKeyFromObject(object), current); getErr != nil {
+			return getErr
+		}
+		if current.UID != expectedUID || current.Generation != expectedGeneration {
+			specChanged = true
+			return nil
+		}
+		if controllerutil.ContainsFinalizer(current, serviceTokenAttemptFinalizer) {
+			*object = *current
+			return nil
+		}
+		base := client.MergeFromWithOptions(current.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		controllerutil.AddFinalizer(current, serviceTokenAttemptFinalizer)
+		if patchErr := r.Patch(ctx, current, base); patchErr != nil {
+			return patchErr
+		}
+		*object = *current
 		return nil
-	}
-	base := client.MergeFrom(object.DeepCopy())
-	controllerutil.AddFinalizer(object, serviceTokenAttemptFinalizer)
-	return r.Patch(ctx, object, base)
+	})
+	return specChanged, err
 }
 
 func (r *ServiceTokenReconciler) removeServiceTokenAttemptFinalizer(ctx context.Context, object *v1alpha1.ServiceToken) error {
@@ -418,8 +437,12 @@ func (r *ServiceTokenReconciler) recoverServiceToken(ctx context.Context, object
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
-	if err := r.ensureServiceTokenAttemptFinalizer(ctx, object); err != nil {
-		return ctrl.Result{}, err
+	changed, finErr := r.ensureServiceTokenAttemptFinalizer(ctx, object)
+	if finErr != nil {
+		return ctrl.Result{}, finErr
+	}
+	if changed {
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
 		object.Spec.Adoption.Mode == v1alpha1.AdoptionModeAdoptByID {
@@ -886,8 +909,12 @@ func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.ensureServiceTokenAttemptFinalizer(ctx, object); err != nil {
-		return ctrl.Result{}, err
+	changed, finErr := r.ensureServiceTokenAttemptFinalizer(ctx, object)
+	if finErr != nil {
+		return ctrl.Result{}, finErr
+	}
+	if changed {
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 	journalSecret, journal, err := r.createServiceTokenJournal(ctx, object, account, scope, clusterID, nonce)
 	if err != nil {
