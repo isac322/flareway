@@ -350,3 +350,82 @@ func TestAckTrackerExpectsOnlyChangedDeltaTypes(t *testing.T) {
 		t.Fatal("resource type absent from the new snapshot blocked convergence")
 	}
 }
+
+func TestAckTrackerCreditsLateEDSAckAcrossRouteOnlySnapshot(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+
+	tracker.ExpectSnapshot(node, "v1", map[string]string{
+		resourcev3.ClusterType:  "c1",
+		resourcev3.EndpointType: "e1",
+		resourcev3.RouteType:    "r1",
+	}, nil)
+	for _, tc := range []struct {
+		typeURL string
+		nonce   string
+	}{
+		{resourcev3.ClusterType, "c1-n"},
+		{resourcev3.EndpointType, "e1-n"},
+		{resourcev3.RouteType, "r1-n"},
+	} {
+		req := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: tc.typeURL}
+		tracker.OnRequest(1, req)
+		tracker.OnResponse(1, req, &discoveryv3.DeltaDiscoveryResponse{TypeUrl: tc.typeURL, SystemVersionInfo: "v1", Nonce: tc.nonce})
+		tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: tc.typeURL, ResponseNonce: tc.nonce})
+	}
+	if !tracker.IsACKed(node, "v1") {
+		t.Fatal("v1 did not converge")
+	}
+
+	// v2 updates Cluster and Endpoint. Server emits both CDS and EDS for v2.
+	tracker.ExpectSnapshot(node, "v2", map[string]string{
+		resourcev3.ClusterType:  "c2",
+		resourcev3.EndpointType: "e2",
+		resourcev3.RouteType:    "r1",
+	}, nil)
+	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.ClusterType, SystemVersionInfo: "v2", Nonce: "c2-n"})
+	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.EndpointType, SystemVersionInfo: "v2", Nonce: "e2-n"})
+
+	// Envoy ACKs CDS(v2) first; route-only v3 becomes current before EDS(v2) ACK arrives.
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c2-n"})
+	tracker.ExpectSnapshot(node, "v3", map[string]string{
+		resourcev3.ClusterType:  "c2",
+		resourcev3.EndpointType: "e2",
+		resourcev3.RouteType:    "r2",
+	}, nil)
+	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.RouteType, SystemVersionInfo: "v3", Nonce: "r2-n"})
+
+	// Late EDS(v2) ACK arrives carrying v2's SystemVersionInfo, which still matches v3's Endpoint fingerprint.
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "e2-n"})
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.RouteType, ResponseNonce: "r2-n"})
+	if !tracker.IsACKed(node, "v3") {
+		t.Fatalf("late EDS ACK across route-only snapshot failed to converge: %s", tracker.ConvergenceDetails(node, "v3"))
+	}
+}
+
+func TestAckTrackerRejectsQueuedResponseFromDifferentFingerprintAfterSupersedingSnapshot(t *testing.T) {
+	tracker := NewAckTracker()
+	node := "default/gateway"
+
+	tracker.ExpectSnapshot(node, "v2", map[string]string{resourcev3.EndpointType: "e2"}, nil)
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.EndpointType})
+
+	// v3 supersedes Endpoint fingerprint before queued v2 response's OnResponse runs.
+	tracker.ExpectSnapshot(node, "v3", map[string]string{resourcev3.EndpointType: "e3"}, nil)
+	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.EndpointType, SystemVersionInfo: "v2", Nonce: "queued-v2"})
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "queued-v2"})
+	if tracker.IsACKed(node, "v3") {
+		t.Fatal("stale v2 response converged newer Endpoint fingerprint v3")
+	}
+
+	tracker.OnResponse(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType},
+		&discoveryv3.DeltaDiscoveryResponse{TypeUrl: resourcev3.EndpointType, SystemVersionInfo: "v3", Nonce: "v3-n"})
+	tracker.OnRequest(1, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "v3-n"})
+	if !tracker.IsACKed(node, "v3") {
+		t.Fatalf("current v3 response did not converge: %s", tracker.ConvergenceDetails(node, "v3"))
+	}
+}

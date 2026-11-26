@@ -199,9 +199,16 @@ func bindEndpointVersionsToClusters(snapshot *cachev3.Snapshot) {
 		if !ok {
 			continue
 		}
-		sum := sha256.Sum256([]byte(endpointVersion + "\x00" + clusterVersion))
-		endpointVersions[clusterName] = hex.EncodeToString(sum[:])
+		endpointVersions[clusterName] = BindEndpointVersion(endpointVersion, clusterVersion)
 	}
+}
+
+// BindEndpointVersion mixes a Cluster's version hash into its matching
+// ClusterLoadAssignment version so Cluster updates with unchanged Pod IPs emit
+// a fresh Delta EDS resource instead of reusing an already-sent version.
+func BindEndpointVersion(endpointVersion, clusterVersion string) string {
+	sum := sha256.Sum256([]byte(endpointVersion + "\x00" + clusterVersion))
+	return hex.EncodeToString(sum[:])
 }
 
 // rejectDuplicateResourceNames fails the build when two resources of one type

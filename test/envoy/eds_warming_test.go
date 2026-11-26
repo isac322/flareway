@@ -32,8 +32,10 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,10 +66,6 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	}
 
 	xdsAddr := reserveLoopbackAddr(t)
-	_, xdsPort, err := net.SplitHostPort(xdsAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
 	srv, err := xdsserver.New(xdsserver.Options{
 		Address:          xdsAddr,
 		TLSConfig:        serverTLS,
@@ -89,12 +87,12 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = xdsPort
 
 	xdsDir := writeRenderedXDSMaterial(t, gwKey, caSecret, bootstrap.Options{
 		NodeCluster: gwKey.String(),
 		XDSAddress:  "flareway-xds.flareway-system.svc.cluster.local:" + proxyPort,
 	})
+	exposeEnvoyAdminInTestDir(t, xdsDir)
 
 	certPEM, tlsCert := selfSignedBackendCert(t, "backend.example")
 	backendLn, err := tls.Listen("tcp4", "0.0.0.0:0", &tls.Config{
@@ -176,8 +174,8 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	containerName := "flareway-envoy-eds-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer startCancel()
-	if out, err := exec.CommandContext(startCtx,
-		"docker", "run", "-d", "--name", containerName,
+	createOut, err := exec.CommandContext(startCtx,
+		"docker", "create", "--name", containerName,
 		"--dns", "127.0.0.1",
 		"--add-host", "host.docker.internal:host-gateway",
 		"--add-host", "flareway-xds.flareway-system.svc.cluster.local:host-gateway",
@@ -191,16 +189,25 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 		"--service-cluster", gwKey.String(),
 		"--concurrency", "1",
 		"--disable-hot-restart",
-	).CombinedOutput(); err != nil {
-		t.Fatalf("start Envoy container: %v\n%s", err, out)
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("create Envoy container: %v\n%s", err, createOut)
+	}
+	containerID := strings.TrimSpace(string(createOut))
+	if containerID == "" {
+		containerID = containerName
 	}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()
-		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", containerName).Run()
+		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", containerID).Run()
 	})
+	if startOut, err := exec.CommandContext(startCtx, "docker", "start", containerID).CombinedOutput(); err != nil {
+		t.Fatalf("start Envoy container: %v\n%s", err, startOut)
+	}
 
-	listenerAddr := dockerPort(t, containerName, envoyListenerPort)
+	listenerAddr := dockerPort(t, containerID, envoyListenerPort)
+	adminAddr := dockerPort(t, containerID, envoyAdminPort)
 	waitCtx, waitCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer waitCancel()
 	if err := waitForHTTP(waitCtx, 100*time.Millisecond, func() (int, string, error) {
@@ -209,29 +216,53 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 		}
 		return probeHostGET(listenerAddr, "app.example.com", "/")
 	}, http.StatusOK); err != nil {
-		t.Fatalf("initial TLS SAN match failed: %v\nlogs:\n%s", err, containerLogs(containerName))
+		t.Fatalf("initial TLS SAN match failed: %v\nlogs:\n%s", err, containerLogs(containerID))
 	}
 
-	// Narrow SubjectAltNames to a non-matching hostname while keeping endpoints identical.
-	// Envoy must activate the updated EDS cluster and start failing TLS verification immediately (<3s),
-	// never stalling for the 15s EDS initial_fetch_timeout while still serving 200 through the old cluster.
+	beforeSANFailures, err := readEnvoySANFailureCount(waitCtx, adminAddr)
+	if err != nil {
+		t.Fatalf("read initial ssl.fail_verify_san: %v", err)
+	}
+
 	v2Snap, v2Ver := buildTLSSnapshot("wrong-san.example")
-	if err := srv.SetSnapshot(ctx, gwKey.String(), v2Snap); err != nil {
+	mismatchCtx, mismatchCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer mismatchCancel()
+	if err := srv.SetSnapshot(mismatchCtx, gwKey.String(), v2Snap); err != nil {
 		t.Fatalf("SetSnapshot v2: %v", err)
 	}
 
-	mismatchCtx, mismatchCancel := context.WithTimeout(ctx, 3*time.Second)
-	defer mismatchCancel()
 	if err := waitForHTTP(mismatchCtx, 100*time.Millisecond, func() (int, string, error) {
+		if mismatchCtx.Err() != nil {
+			return 0, "", mismatchCtx.Err()
+		}
 		if !srv.IsACKedForNodes(gwKey.String(), v2Ver, []string{podID}) {
 			return 0, "", fmt.Errorf("v2 not ACKed yet: %s", srv.ACKDetailsForNodes(gwKey.String(), v2Ver, []string{podID}))
 		}
-		return probeHostGET(listenerAddr, "app.example.com", "/")
+		status, body, err := probeHostGETContext(mismatchCtx, listenerAddr, "app.example.com", "/")
+		if err != nil {
+			return 0, "", err
+		}
+		if mismatchCtx.Err() != nil {
+			return 0, "", mismatchCtx.Err()
+		}
+		if status == http.StatusServiceUnavailable {
+			afterSANFailures, err := readEnvoySANFailureCount(mismatchCtx, adminAddr)
+			if err != nil {
+				return 0, "", err
+			}
+			if mismatchCtx.Err() != nil {
+				return 0, "", mismatchCtx.Err()
+			}
+			if afterSANFailures <= beforeSANFailures {
+				return 0, "", fmt.Errorf("503 observed without ssl.fail_verify_san increase (before=%d after=%d)", beforeSANFailures, afterSANFailures)
+			}
+		}
+		return status, body, nil
 	}, http.StatusServiceUnavailable); err != nil {
-		t.Fatalf("updated SAN mismatch did not activate within 3s (15s EDS warming stall?): %v\nlogs:\n%s", err, containerLogs(containerName))
+		t.Fatalf("updated SAN mismatch did not activate within 3s (15s EDS warming stall?): %v\nlogs:\n%s", err, containerLogs(containerID))
 	}
 
-	logs := containerLogs(containerName)
+	logs := containerLogs(containerID)
 	if strings.Contains(logs, "initial fetch timed out") {
 		t.Fatalf("Envoy logged initial fetch timeout waiting on EDS:\n%s", logs)
 	}
@@ -246,6 +277,79 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for xds server shutdown")
 	}
+}
+
+func exposeEnvoyAdminInTestDir(t *testing.T, xdsDir string) {
+	t.Helper()
+	bootstrapPath := filepath.Join(xdsDir, "bootstrap.yaml")
+	raw, err := os.ReadFile(bootstrapPath)
+	if err != nil {
+		t.Fatalf("read test bootstrap.yaml: %v", err)
+	}
+	const loopbackAdmin = "      address: 127.0.0.1\n      port_value: 19000"
+	const anyAdmin = "      address: 0.0.0.0\n      port_value: 19000"
+	updated := strings.Replace(string(raw), loopbackAdmin, anyAdmin, 1)
+	if updated == string(raw) {
+		t.Fatalf("unexpected bootstrap admin block:\n%s", string(raw))
+	}
+	if err := os.WriteFile(bootstrapPath, []byte(updated), 0o600); err != nil {
+		t.Fatalf("update test bootstrap.yaml: %v", err)
+	}
+}
+
+func probeHostGETContext(ctx context.Context, addr, host, path string) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Host = host
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.StatusCode, string(body), nil
+}
+
+func readEnvoySANFailureCount(ctx context.Context, adminAddr string) (int64, error) {
+	q := url.Values{}
+	q.Set("filter", `cluster\..*\.ssl\.fail_verify_san`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+adminAddr+"/stats?"+q.Encode(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("build Envoy stats request: %w", err)
+	}
+	resp, err := (&http.Client{Transport: &http.Transport{DisableKeepAlives: true}}).Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("query Envoy stats: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("read Envoy stats: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("Envoy stats status %d: %s", resp.StatusCode, string(raw))
+	}
+	var total int64
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		_, valStr, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(valStr), 10, 64)
+		if err == nil {
+			total += n
+		}
+	}
+	return total, nil
 }
 
 func resolveDockerHostGatewayIP(t *testing.T) string {

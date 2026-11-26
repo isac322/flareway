@@ -85,7 +85,7 @@ type Server struct {
 	address          string
 	tlsConfig        *tls.Config
 	logger           logr.Logger
-	cache            cachev3.SnapshotCache
+	cache            *orderedDeltaCache
 	tracker          *AckTracker
 	events           chan event.GenericEvent
 	keepaliveTime    time.Duration
@@ -135,7 +135,8 @@ func New(opts Options) (*Server, error) {
 		logger = logr.Discard()
 	}
 	tracker := NewAckTracker()
-	cache := cachev3.NewSnapshotCache(true, gatewayNodeHash{}, loggerAdapter{logger: logger.WithName("cache")})
+	baseCache := cachev3.NewSnapshotCache(true, gatewayNodeHash{}, loggerAdapter{logger: logger.WithName("cache")})
+	cache := newOrderedDeltaCache(baseCache, gatewayNodeHash{})
 	return &Server{
 		address:          address,
 		tlsConfig:        opts.TLSConfig.Clone(),
@@ -160,6 +161,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	callbacks := serverv3.CallbackFuncs{
 		DeltaStreamClosedFunc: func(streamID int64, _ *corev3.Node) {
+			s.cache.OnStreamClosed(streamID)
 			node := s.tracker.OnStreamClosed(streamID)
 			if ctx.Err() != nil {
 				return
@@ -181,6 +183,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		},
 		StreamDeltaRequestFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest) error {
+			s.cache.BindRequestStream(req, streamID)
 			s.tracker.OnRequest(streamID, req)
 			return nil
 		},

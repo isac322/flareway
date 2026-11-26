@@ -33,9 +33,12 @@ type NACK struct {
 }
 
 type pendingResponse struct {
-	node    string
-	version string
+	node        string
+	version     string
+	fingerprint string
 }
+
+const maxTrackedVersionsPerNode = 64
 
 // streamAck records the response version a stream acknowledged and the
 // resource fingerprint that response carried. The fingerprint is the
@@ -63,15 +66,17 @@ type expectedSnapshot struct {
 // neither converge nor clear the rejection of a peer, and a closed stream's
 // records are never inherited by its replacement.
 type AckTracker struct {
-	mu            sync.RWMutex
-	pending       map[int64]map[string]map[string]pendingResponse
-	nodes         map[int64]string
-	nodeIDs       map[int64]string
-	subscriptions map[int64]map[string]struct{}
-	expected      map[string]expectedSnapshot
-	fingerprints  map[string]map[string]string
-	acked         map[int64]map[string]streamAck
-	nacks         map[int64]NACK
+	mu                  sync.RWMutex
+	pending             map[int64]map[string]map[string]pendingResponse
+	nodes               map[int64]string
+	nodeIDs             map[int64]string
+	subscriptions       map[int64]map[string]struct{}
+	expected            map[string]expectedSnapshot
+	fingerprints        map[string]map[string]string
+	versionFingerprints map[string]map[string]map[string]string
+	versionOrder        map[string][]string
+	acked               map[int64]map[string]streamAck
+	nacks               map[int64]NACK
 	// initialFingerprints holds bootstrap proof received before a snapshot is
 	// known. Each stream/type has at most one immutable fingerprint, consumed
 	// by the first expectation or superseding protocol activity.
@@ -87,6 +92,8 @@ func NewAckTracker() *AckTracker {
 		subscriptions:       make(map[int64]map[string]struct{}),
 		expected:            make(map[string]expectedSnapshot),
 		fingerprints:        make(map[string]map[string]string),
+		versionFingerprints: make(map[string]map[string]map[string]string),
+		versionOrder:        make(map[string][]string),
 		acked:               make(map[int64]map[string]streamAck),
 		nacks:               make(map[int64]NACK),
 		initialFingerprints: make(map[int64]map[string]string),
@@ -116,6 +123,7 @@ func (t *AckTracker) ExpectSnapshot(node, version string, fingerprints map[strin
 		current[typeURL] = fingerprint
 	}
 	t.fingerprints[node] = current
+	t.recordVersionFingerprintsLocked(node, version, current)
 	t.expected[node] = expectedSnapshot{version: version, required: requiredPresent}
 	for streamID, streamNode := range t.nodes {
 		if streamNode == node {
@@ -154,9 +162,11 @@ func (t *AckTracker) OnResponse(streamID int64, req *discoveryv3.DeltaDiscoveryR
 		byNonce = make(map[string]pendingResponse)
 		byType[resp.GetTypeUrl()] = byNonce
 	}
+	respVersion := resp.GetSystemVersionInfo()
 	byNonce[resp.GetNonce()] = pendingResponse{
-		node:    node,
-		version: resp.GetSystemVersionInfo(),
+		node:        node,
+		version:     respVersion,
+		fingerprint: t.versionFingerprints[node][respVersion][resp.GetTypeUrl()],
 	}
 }
 
@@ -204,24 +214,61 @@ func (t *AckTracker) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRe
 		}
 		return
 	}
-	// Record the fingerprint the ACKed response carried. An ACK for a stale
-	// version still proves the stream holds current resources when the type's
-	// fingerprint is unchanged, so only the expected version's ACK is
-	// recorded; anything older is ignored.
-	if expected, ok := t.expected[pending.node]; ok && expected.version == pending.version {
+	// Credit an ACK whenever its originating response carried the same type
+	// fingerprint that is currently expected, even if an intervening snapshot
+	// bumped SystemVersionInfo for another resource type (e.g. route-only
+	// change arriving after CDS ACK and before EDS ACK).
+	expected, hasExpected := t.expected[pending.node]
+	currentFingerprint := t.fingerprints[pending.node][req.GetTypeUrl()]
+	fingerprintMatches := hasExpected && pending.fingerprint != "" && pending.fingerprint == currentFingerprint
+	if fingerprintMatches {
 		byAckType := t.acked[streamID]
 		if byAckType == nil {
 			byAckType = make(map[string]streamAck)
 			t.acked[streamID] = byAckType
 		}
 		byAckType[req.GetTypeUrl()] = streamAck{
-			version:     pending.version,
-			fingerprint: t.fingerprints[pending.node][req.GetTypeUrl()],
+			version:     expected.version,
+			fingerprint: pending.fingerprint,
 		}
 	}
-	if nack, ok := t.nacks[streamID]; ok && nack.Version == pending.version && nack.TypeURL == req.GetTypeUrl() {
+	if nack, ok := t.nacks[streamID]; ok && nack.TypeURL == req.GetTypeUrl() &&
+		(nack.Version == pending.version || (fingerprintMatches && nack.Version == expected.version)) {
 		delete(t.nacks, streamID)
 	}
+}
+
+func (t *AckTracker) recordVersionFingerprintsLocked(node, version string, current map[string]string) {
+	if node == "" || version == "" {
+		return
+	}
+	byVersion := t.versionFingerprints[node]
+	if byVersion == nil {
+		byVersion = make(map[string]map[string]string)
+		t.versionFingerprints[node] = byVersion
+	}
+	if _, exists := byVersion[version]; exists {
+		order := t.versionOrder[node]
+		for i, existing := range order {
+			if existing == version {
+				order = append(order[:i], order[i+1:]...)
+				break
+			}
+		}
+		t.versionOrder[node] = append(order, version)
+	} else {
+		t.versionOrder[node] = append(t.versionOrder[node], version)
+		if len(t.versionOrder[node]) > maxTrackedVersionsPerNode {
+			oldest := t.versionOrder[node][0]
+			t.versionOrder[node] = t.versionOrder[node][1:]
+			delete(byVersion, oldest)
+		}
+	}
+	copied := make(map[string]string, len(current))
+	for k, v := range current {
+		copied[k] = v
+	}
+	byVersion[version] = copied
 }
 
 // acceptInitialVersionsLocked recognizes a reconnected Delta client that
@@ -312,6 +359,8 @@ func (t *AckTracker) Forget(node string) {
 	defer t.mu.Unlock()
 	delete(t.expected, node)
 	delete(t.fingerprints, node)
+	delete(t.versionFingerprints, node)
+	delete(t.versionOrder, node)
 	for streamID, streamNode := range t.nodes {
 		if streamNode == node {
 			delete(t.acked, streamID)
