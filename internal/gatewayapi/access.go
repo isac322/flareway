@@ -164,7 +164,7 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 		if len(application.Spec.TargetRefs) > 0 {
 			return accessLossFailure("Gateway target was not found", AccessTargetLossGateway)
 		}
-		return compileDeclaredAccessDestinations(in, application)
+		return CompileDeclaredAccessDestinations(in, application)
 	}
 	compiled := compileAccessApplicationAgainstIR(in, gateway, application)
 	if compiled.NoTargetsResolved && targetAttachmentRejected(in, gateway, &baseStatuses, application) {
@@ -311,7 +311,7 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		}
 	}
 
-	declared := compileDeclaredAccessDestinations(in, application)
+	declared := CompileDeclaredAccessDestinations(in, application)
 	if !declared.Accepted {
 		return declared
 	}
@@ -351,7 +351,9 @@ func accessApplicationPathScope(application *v1alpha1.AccessApplication) (access
 	}
 }
 
-func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
+// CompileDeclaredAccessDestinations compiles explicit spec.destinations entries
+// independent of Gateway route targets.
+func CompileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
 	result := CompilePrivateDestinations(in, application)
 	if !result.Accepted {
 		return result
@@ -1072,7 +1074,7 @@ func targetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses
 			if string(target.Name) != gateway.Key.Name {
 				continue
 			}
-			if gatewayTargetAttachmentRejected(in, statuses, target.SectionName) {
+			if gatewayTargetAttachmentRejected(in, gateway, statuses, target.SectionName) {
 				return true
 			}
 		case group == gatewayGroup && kind == "HTTPRoute":
@@ -1098,7 +1100,21 @@ func targetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses
 	return false
 }
 
-func gatewayTargetAttachmentRejected(in Inputs, statuses *Statuses, sectionName *gatewayv1.SectionName) bool {
+func gatewayTargetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses, sectionName *gatewayv1.SectionName) bool {
+	if in.Gateway != nil && gateway != nil {
+		activeListeners := make(map[string]struct{}, len(gateway.Listeners))
+		for _, listener := range gateway.Listeners {
+			activeListeners[listener.Name] = struct{}{}
+		}
+		for _, listener := range in.Gateway.Spec.Listeners {
+			if sectionName != nil && listener.Name != *sectionName {
+				continue
+			}
+			if _, active := activeListeners[string(listener.Name)]; !active {
+				return true
+			}
+		}
+	}
 	var targetPort *gatewayv1.PortNumber
 	if sectionName != nil && in.Gateway != nil {
 		for _, listener := range in.Gateway.Spec.Listeners {
@@ -1130,8 +1146,7 @@ func gatewayTargetAttachmentRejected(in Inputs, statuses *Statuses, sectionName 
 			}
 			for _, cond := range parentStatus.Conditions {
 				if cond.Type == string(gatewayv1.RouteConditionAccepted) &&
-					cond.Status == metav1.ConditionFalse &&
-					cond.Reason == string(gatewayv1.RouteReasonNotAllowedByListeners) {
+					cond.Status == metav1.ConditionFalse {
 					return true
 				}
 			}

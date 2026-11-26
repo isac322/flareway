@@ -259,3 +259,41 @@ func TestEmptyTargetCompilationDoesNotReleaseOnAllowedRoutesRejection(t *testing
 		t.Fatalf("NoTargetsResolved = true when HTTPRoute attachment was rejected by allowedRoutes, want false")
 	}
 }
+
+func TestEmptyTargetCompilationDoesNotReleaseOnNoMatchingParentOrInvalidListener(t *testing.T) {
+	t.Run("NoMatchingParent HTTPRoute rejection keeps NoTargetsResolved false", func(t *testing.T) {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+		route := routeWithBackend("mismatched-host", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"other.otherdomain.test"}
+		route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+		app := accessApplication("app", "Gateway", "gateway", "http")
+		compiled := CompileAccessApplication(in, &app)
+		if compiled.Accepted || compiled.Reason != "TargetNotFound" {
+			t.Fatalf("compiled = %+v, want TargetNotFound rejection", compiled)
+		}
+		if compiled.NoTargetsResolved {
+			t.Fatalf("NoTargetsResolved = true when HTTPRoute attachment failed with NoMatchingListenerHostname/NoMatchingParent, want false")
+		}
+	})
+
+	t.Run("dropped invalid Gateway listener keeps NoTargetsResolved false", func(t *testing.T) {
+		in := accessInputs(true)
+		in.Gateway.Spec.Listeners = append(in.Gateway.Spec.Listeners, gatewayv1.Listener{
+			Name:     "broken-tcp",
+			Port:     9000,
+			Protocol: gatewayv1.TCPProtocolType,
+		})
+		app := accessApplication("app", "Gateway", "gateway", "broken-tcp")
+		compiled := CompileAccessApplication(in, &app)
+		if compiled.Accepted || compiled.Reason != "TargetNotFound" {
+			t.Fatalf("compiled = %+v, want TargetNotFound rejection", compiled)
+		}
+		if compiled.NoTargetsResolved {
+			t.Fatalf("NoTargetsResolved = true when targeted spec listener was rejected/dropped, want false")
+		}
+	})
+}

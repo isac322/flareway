@@ -671,7 +671,8 @@ type AccessApplicationRevocationStatus struct {
 	// TokensRevoked reports that remote Access tokens were revoked for this latch.
 	TokensRevoked bool `json:"tokensRevoked,omitempty"`
 	// Released reports whether completed revocation tombstones may be released
-	// for the evaluated generation when no Forwarding entry remains on the tunnel.
+	// for the evaluated generation when no Forwarding entry remains for that
+	// protection domain and application on the tunnel.
 	Released bool `json:"released,omitempty"`
 }
 
