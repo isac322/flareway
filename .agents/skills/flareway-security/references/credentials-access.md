@@ -131,6 +131,7 @@ Discovery hints:
   `internal/controller/servicetoken_controller.go`; journal and recovery
   helpers (`createServiceTokenJournal`, `recoverServiceToken`,
   `resumePreparedServiceToken`, `dispatchServiceTokenCreate`,
+  `rollbackUncreatedServiceTokenAttempt`,
   `resumeDispatchedServiceToken`, `resumeRetiringServiceToken`,
   `reserveServiceTokenDestination`, `writeInitialSecret`,
   `committedServiceTokenCredential`, `cleanupPendingServiceTokenJournal`,
@@ -163,11 +164,16 @@ Procedure:
    `flareway/<clusterUID>/<namespace>/<crUID>/<specName>-<nonce>`; the journal
    commits `dispatched` before the request is sent, so a crash between the
    remote create and the credential write resumes through
-   `recoverServiceToken` instead of blindly re-creating. Resume is
-   fail-closed: `prepared` + zero remote candidates is the only state that
-   may send a create; `dispatched` + zero candidates blocks with
-   `RecoveryPending` (absence is unknown, not absent); multiple or foreign
-   candidates block with `Conflict`. Account scope recovers via
+   `recoverServiceToken` instead of blindly re-creating. Definite
+   non-creation `4xx` create responses (`IsDefiniteNonCreationClientError`,
+   excluding `408`, `409`, and `429`) roll back the journal, empty reserved
+   destination Secret, and attempt finalizer via
+   `rollbackUncreatedServiceTokenAttempt` and surface the API error immediately.
+   For ambiguous or `dispatched` attempts, resume is fail-closed: `prepared` +
+   zero remote candidates is the only state that may send a create;
+   `dispatched` + zero candidates blocks with `RecoveryPending` (absence is
+   unknown, not absent); multiple or foreign candidates block with `Conflict`.
+   Account scope recovers via
    `RotateServiceToken` on the verified token; zone scope has no rotate, so
    the retiring ID/name is journaled and a replacement is created only after
    the delete is confirmed. `writeInitialSecret` captures the credential and

@@ -82,7 +82,7 @@ A sweep confirmation keeps the gate open for two periods, so a new pass always l
 | Running | The next pass: at most 1.2 × TTL plus the listing time |
 | Stopped, failing, or `--disable-sweep` | 2 × TTL, when the object's own verify resumes |
 
-Only a complete listing confirms anything. A pass that fails or is partial confirms nothing, and objects fall back to their own verify.
+Confirmation requires a complete listing for the object's scope. A pass whose listing fails confirms nothing (and an isolated zone failure leaves objects in unlisted scopes unconfirmed and never missing), so those objects fall back to their own verify.
 
 Content confirmation applies only where the listing shows everything the reconciler checks:
 
@@ -117,9 +117,9 @@ The sweep never treats a partial page as a complete list, because a partial list
 
 The DNS sweep lists only the zones this installation can own records in: every zone named in the account's `spec.grants[].zones` (all zones when any grant lists `"*"`), plus every zone where a managed `CloudflareTunnel` still has a record in `status.dnsRecords`, which covers zones whose grant was revoked. The sweep never calls other zones in the account, so a token that can read DNS only in the granted zones produces `result="ok"` when everything is healthy. A zone ID in `status.dnsRecords` that is missing from the account is skipped, and its checkpoints are not judged.
 
-DNS records are the one exception to discarding a failed listing, because a zone in that set can still be unreadable, for example after the token was narrowed. When listing one zone fails with an access or server error (HTTP 403, 404, or 5xx, or a transport failure mid-pagination), the sweep drops that zone's records, continues through the remaining zones, and still reports drift found in the zones it could read. A zone that could not be listed is never treated as empty, so its records cannot be misreported as deleted. Authentication failures, rate limiting, and cancellation still abort the whole pass, as does any listing failure on the other kinds.
+DNS records and zone-scoped Access targets (`AccessApplication`, `AccessStandaloneApplication`, `AccessGroup`, and `ServiceToken`) isolate per-zone failures, because a zone in that set can still be unreadable, for example after the token was narrowed or when a DNS-scoped token lacks Zone Access permissions. When listing one zone fails with an access or server error (HTTP 403, 404, or 5xx, or a transport failure mid-pagination), the sweep drops that zone's records, continues through the account scope and remaining zones, and still reports drift found in the scopes it could read. A scope that could not be listed is never treated as empty, so its objects cannot be misreported as deleted. Account-scope failures on Access targets, authentication failures, rate limiting, and cancellation still abort the whole pass, as does any listing failure on the other kinds.
 
-A DNS pass with isolated zone failures reports `result="partial"`, never `ok`, even when every zone was denied. It preserves findings from completed zones and logs an aggregate diagnostic naming the failed zones and their causes, and `flareway_sweep_last_success_timestamp` does not advance. Per-zone authentication, rate-limiting, pacing, and deadline failures abort the pass with `result="error"`; context cancellation aborts silently. Account-wide zone discovery and other resource kinds report the generic partial or error outcome, without partial findings or a DNS zone aggregate.
+A DNS or zone-scoped Access pass with isolated zone failures reports `result="partial"`, never `ok`, even when every zone was denied. It preserves findings from completed scopes and logs an aggregate diagnostic naming the failed zones and their causes, and `flareway_sweep_last_success_timestamp` does not advance. Per-zone authentication, rate-limiting, pacing, and deadline failures abort the pass with `result="error"`; context cancellation aborts silently. Account-wide zone discovery and other resource kinds report the generic partial or error outcome, without partial findings or a per-zone aggregate.
 
 ## Drift policy
 

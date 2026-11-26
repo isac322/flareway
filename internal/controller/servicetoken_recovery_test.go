@@ -18,15 +18,20 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
@@ -869,5 +874,180 @@ func TestServiceTokenCreateNameDivergenceBlocks(t *testing.T) {
 	secret := serviceTokenCredentialSecret(ctx, t, world)
 	if string(secret.Data[v1alpha1.ServiceTokenClientSecretKey]) != initialClientSecret {
 		t.Fatal("create-name divergence changed the captured credential")
+	}
+}
+
+func cloudflareStatusError(status int) error {
+	return &cloudflaresdk.Error{
+		StatusCode: status,
+		Request:    httptest.NewRequest(http.MethodPost, "https://api.cloudflare.com/client/v4/accounts/acct-1/access/service_tokens", nil),
+		Response:   &http.Response{StatusCode: status},
+	}
+}
+
+func TestServiceTokenDefinite4xxCreateRollsBackJournalAndAllowsDelete(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		t.Run(fmt.Sprintf("http_%d", status), func(t *testing.T) {
+			ctx := context.Background()
+			clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+			api := &serviceTokenFakeAPI{
+				now:       func() time.Time { return clock },
+				tokens:    make(map[string]flarecloudflare.ServiceToken),
+				secrets:   make(map[string]string),
+				createErr: cloudflareStatusError(status),
+			}
+			world := newServiceTokenWorld(t, api, clock)
+
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+				t.Fatalf("reconcile unexpectedly succeeded on HTTP %d", status)
+			}
+
+			var current v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&current, serviceTokenAttemptFinalizer) {
+				t.Fatalf("attempt finalizer still present after definite HTTP %d rollback", status)
+			}
+			ready := serviceTokenCondition(current.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "RemoteError" {
+				t.Fatalf("Ready condition = %#v, want False (RemoteError)", ready)
+			}
+			journals, err := serviceTokenJournalSecrets(ctx, world.kube, &current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(journals) != 0 {
+				t.Fatalf("expected journal Secrets deleted on HTTP %d rollback, found %d", status, len(journals))
+			}
+			var dest corev1.Secret
+			if err := world.kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "token-credentials"}, &dest); !apierrors.IsNotFound(err) {
+				t.Fatalf("expected empty reserved destination Secret deleted, got err=%v", err)
+			}
+
+			// Reconciling again must not wedge in RecoveryPending.
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+				t.Fatalf("second reconcile unexpectedly succeeded on HTTP %d", status)
+			}
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			if ready := serviceTokenCondition(current.Status.Conditions, "Ready"); ready == nil || ready.Reason != "RemoteError" {
+				t.Fatalf("second reconcile Ready condition = %#v, want RemoteError (not RecoveryPending)", ready)
+			}
+
+			// Deleting the ServiceToken must remove finalizers cleanly without CleanupBlocked.
+			if err := world.kube.Delete(ctx, &current); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+				t.Fatalf("delete reconcile blocked after HTTP %d rollback: %v", status, err)
+			}
+			err = world.kube.Get(ctx, world.request.NamespacedName, &current)
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("ServiceToken still present after delete reconcile: err=%v conditions=%#v", err, current.Status.Conditions)
+			}
+		})
+	}
+}
+
+func TestServiceTokenDefinite4xxRollbackPreservesPopulatedOrForeignDestinationSecret(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := &serviceTokenFakeAPI{
+		now:       func() time.Time { return clock },
+		tokens:    make(map[string]flarecloudflare.ServiceToken),
+		secrets:   make(map[string]string),
+		createErr: cloudflareStatusError(http.StatusForbidden),
+	}
+	world := newServiceTokenWorld(t, api, clock)
+
+	var object v1alpha1.ServiceToken
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &object); err != nil {
+		t.Fatal(err)
+	}
+	populated := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "tenant",
+			Name:        "token-credentials",
+			Annotations: map[string]string{serviceTokenReservedForAnnotation: string(object.UID)},
+		},
+		Data: map[string][]byte{v1alpha1.ServiceTokenClientSecretKey: []byte("do-not-delete")},
+	}
+	if err := controllerutil.SetControllerReference(&object, populated, world.kube.Scheme()); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.kube.Create(ctx, populated); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+		t.Fatal("reconcile unexpectedly succeeded on HTTP 403")
+	}
+	var kept corev1.Secret
+	if err := world.kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "token-credentials"}, &kept); err != nil {
+		t.Fatalf("rollback deleted destination Secret holding data: %v", err)
+	}
+	if string(kept.Data[v1alpha1.ServiceTokenClientSecretKey]) != "do-not-delete" {
+		t.Fatalf("destination Secret data altered: %#v", kept.Data)
+	}
+}
+
+func TestServiceTokenAmbiguousCreateErrorsRetainRecoveryPending(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		createErr error
+	}{
+		{name: "http_408", createErr: cloudflareStatusError(http.StatusRequestTimeout)},
+		{name: "http_409", createErr: cloudflareStatusError(http.StatusConflict)},
+		{name: "http_429", createErr: cloudflareStatusError(http.StatusTooManyRequests)},
+		{name: "http_500", createErr: cloudflareStatusError(http.StatusInternalServerError)},
+		{name: "transport", createErr: errors.New("dial tcp: i/o timeout")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+			api := &serviceTokenFakeAPI{
+				now:       func() time.Time { return clock },
+				tokens:    make(map[string]flarecloudflare.ServiceToken),
+				secrets:   make(map[string]string),
+				createErr: tc.createErr,
+			}
+			world := newServiceTokenWorld(t, api, clock)
+
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+				t.Fatalf("reconcile unexpectedly succeeded on %s", tc.name)
+			}
+			var current v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			if !controllerutil.ContainsFinalizer(&current, serviceTokenAttemptFinalizer) {
+				t.Fatalf("attempt finalizer removed on ambiguous %s failure", tc.name)
+			}
+			journals, err := serviceTokenJournalSecrets(ctx, world.kube, &current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(journals) != 1 {
+				t.Fatalf("expected 1 retained journal on ambiguous %s failure, got %d", tc.name, len(journals))
+			}
+
+			// Next reconcile must enter RecoveryPending without blindly re-creating.
+			api.createErr = nil
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+				t.Fatalf("recovery reconcile failed: %v", err)
+			}
+			if api.creates != 0 {
+				t.Fatalf("ambiguous %s failure allowed a blind create on recovery: creates=%d calls=%v", tc.name, api.creates, api.calls)
+			}
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			ready := serviceTokenCondition(current.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "RecoveryPending" {
+				t.Fatalf("Ready condition on %s recovery = %#v, want False (RecoveryPending)", tc.name, ready)
+			}
+		})
 	}
 }

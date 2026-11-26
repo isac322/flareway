@@ -478,6 +478,11 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 		Enabled:  input.Enabled,
 	})
 	if createErr != nil {
+		if flarecloudflare.IsDefiniteNonCreationClientError(createErr) {
+			if rbErr := r.rollbackUncreatedServiceTokenAttempt(ctx, object, journalSecret); rbErr != nil {
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, rbErr))
+			}
+		}
 		return ctrl.Result{}, r.finishRemoteError(ctx, object, createErr)
 	}
 	journal.issuedID = issued.ID
@@ -501,6 +506,37 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 		remote = refreshed
 	}
 	return r.convergeCapturedServiceToken(ctx, object, api, scope, input, journal.attemptName, journalSecret, remote)
+}
+
+// rollbackUncreatedServiceTokenAttempt cleans up a pending create attempt when
+// Cloudflare definitely rejected creation before issuing any token (e.g. HTTP
+// 403/400/422): reap the journal first so retries never enter RecoveryPending,
+// delete an empty controller-reserved destination Secret with preconditions, and
+// release the attempt finalizer so deletion is never wedged in CleanupBlocked.
+func (r *ServiceTokenReconciler) rollbackUncreatedServiceTokenAttempt(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret) error {
+	if journalSecret != nil {
+		if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete service token attempt journal: %w", err)
+		}
+	}
+	dest := new(corev1.Secret)
+	destKey := types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}
+	if err := r.apiReader().Get(ctx, destKey, dest); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("read reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+		}
+	} else if metav1.IsControlledBy(dest, object) &&
+		dest.Annotations[serviceTokenReservedForAnnotation] == string(object.UID) &&
+		dest.Annotations[v1alpha1.ServiceTokenIDAnnotation] == "" &&
+		len(dest.Data) == 0 {
+		if err := r.Delete(ctx, dest, client.Preconditions{UID: &dest.UID, ResourceVersion: &dest.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete empty reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+		}
+	}
+	if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {
+		return fmt.Errorf("remove service token attempt finalizer: %w", err)
+	}
+	return nil
 }
 
 // resumeDispatchedServiceToken resumes an attempt whose create was dispatched.
