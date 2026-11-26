@@ -10,6 +10,8 @@ engine:
   auth:
     type: github-oidc
     audience: https://cpa-gw.bhyoo.com
+  config: |
+    project_doc_max_bytes = 0
   env:
     OPENAI_BASE_URL: https://cpa-gw.bhyoo.com/v1
     AWF_AUTH_TYPE: api-key

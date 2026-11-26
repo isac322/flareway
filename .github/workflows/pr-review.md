@@ -20,8 +20,6 @@ concurrency:
 timeout-minutes: 25
 checkout:
   fetch-depth: 0
-runtimes:
-  go: {}
 tools:
   bash: true
   edit: false
@@ -32,6 +30,37 @@ network:
     - defaults
     - cpa-gw.bhyoo.com
     - go
+pre-agent-steps:
+  - name: Verify base workflow actions were restored
+    env:
+      CHECKED_OUT: "${{ steps.checkout-pr.outputs.checked_out }}"
+    run: |
+      set -euo pipefail
+      if [ "${CHECKED_OUT}" != "true" ]; then
+        echo "::error::PR branch checkout/base restore did not run; refusing to invoke local composite action."
+        exit 1
+      fi
+  - name: Set up Go and restore the shared build cache
+    id: go_cache
+    uses: ./.github/actions/go-cache
+  - name: Capture Go toolchain and verify shared build cache for AWF
+    env:
+      RESTORED_GOCACHE: "${{ steps.go_cache.outputs.gocache }}"
+    run: |
+      set -euo pipefail
+      unset GOROOT
+      go_root="$(GOTOOLCHAIN=local go env GOROOT)"
+      if [ -z "$go_root" ] || [ ! -x "$go_root/bin/go" ]; then
+        echo "ERROR: Selected Go toolchain has no executable bin/go; check ./.github/actions/go-cache." >&2
+        exit 1
+      fi
+      printf 'GOROOT=%s\n' "$go_root" >> "$GITHUB_ENV"
+      default_gocache="${HOME}/.cache/go-build"
+      if [ -n "$RESTORED_GOCACHE" ] && [ "$RESTORED_GOCACHE" != "$default_gocache" ]; then
+        mkdir -p "$default_gocache"
+        cp -a "$RESTORED_GOCACHE"/. "$default_gocache"/
+      fi
+      echo "Configured GOROOT=${go_root} with AWF-mounted GOCACHE=${default_gocache}"
 safe-outputs:
   create-pull-request-review-comment:
     max: 20
