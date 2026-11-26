@@ -7,7 +7,7 @@
 ### Changed
 
 - Tighten `DeviceSettings` and `ZeroTrustOrganization` `spec.deletionPolicy` from `DeletionPolicy` to `OrphanOnlyDeletionPolicy` (`Enum=Orphan`) in `api/v1alpha1` and CRD admission (#185); see [the upgrade guide](docs/operations/upgrade.md) to remove legacy `deletionPolicy: Delete` values before restoring manifests.
-- Reject negative and sub-second `GatewayOriginRequestSpec` durations (`connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`) at CRD admission via CEL on `GatewayClassConfig` and `CloudflareTunnel` (#182).
+- Require non-negative whole-second precision on all three `GatewayOriginRequestSpec` durations (`connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`) at CRD admission via CEL on `GatewayClassConfig` (`spec.originRequest`) and Gateway-mode `CloudflareTunnel` (`spec.originRequest`) (#182); see [the upgrade guide](docs/operations/upgrade.md) to fix negative or fractional durations before restoring manifests.
 
 ### Fixed
 

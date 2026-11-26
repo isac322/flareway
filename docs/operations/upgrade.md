@@ -10,6 +10,7 @@ Upgrade CRDs before the controller. Helm installs files in a chart's `crds/` dir
 4. Check for resources with `CleanupBlocked`, `Conflict`, or `Programmed=False`; resolve them before changing controller ownership.
 5. Keep the old controller running until managed resource teardown or migration is complete.
 6. Replace any legacy `deletionPolicy: Delete` on existing `DeviceSettings` or `ZeroTrustOrganization` manifests with `Orphan` (or omit the field) before recreating or restoring them; new CRD admission rejects `Delete` on both singletons.
+7. Update any negative or fractional `connectTimeout`, `keepAliveTimeout`, or `tcpKeepAlive` durations under `spec.originRequest` on existing `GatewayClassConfig` or Gateway-mode `CloudflareTunnel` manifests to non-negative whole seconds before recreating or restoring them; new CEL admission rejects negative or fractional values.
 
 ## Version compatibility
 
