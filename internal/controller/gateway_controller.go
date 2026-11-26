@@ -248,16 +248,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
-	if tunnel != nil && tunnel.Spec.Configuration.Mode == v1alpha1.CloudflareTunnelConfigurationModeDirect {
-		reason, acceptedMessage, programmedMessage := directTunnelRejection(client.ObjectKeyFromObject(tunnel))
-		r.clearSnapshot(req.NamespacedName)
-		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.rejectGatewayAdmission(ctx, &gateway, reason, acceptedMessage, programmedMessage); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	if rejected, err := r.rejectDirectModeTunnel(ctx, req.NamespacedName, &gateway, tunnel); err != nil || rejected {
+		return ctrl.Result{}, err
 	}
 	cfg = effectiveConfig
 	inputs, routes, err := r.collectInputs(ctx, &gateway, &gatewayClass, cfg)
@@ -311,7 +303,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, err
 			}
 		}
+		if rejected, err := r.rejectDirectModeTunnel(ctx, req.NamespacedName, &gateway, tunnel); err != nil || rejected {
+			return ctrl.Result{}, err
+		}
 		cfg = effectiveConfig
+		inputs.GatewayClassConfig = cfg.DeepCopy()
 		inputs.CloudflareTunnel = tunnel
 		inputs.CloudflareAccount = account
 		if block == nil {
@@ -1457,6 +1453,26 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 		return err
 	}
 	return r.patchBackendTLSPolicyStatuses(ctx, policies, statuses.BackendTLSPolicies, key)
+}
+
+func (r *GatewayReconciler) rejectDirectModeTunnel(
+	ctx context.Context,
+	key types.NamespacedName,
+	gateway *gatewayv1.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+) (bool, error) {
+	if tunnel == nil || tunnel.Spec.Configuration.Mode != v1alpha1.CloudflareTunnelConfigurationModeDirect {
+		return false, nil
+	}
+	reason, acceptedMessage, programmedMessage := directTunnelRejection(client.ObjectKeyFromObject(tunnel))
+	r.clearSnapshot(key)
+	if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+		return false, err
+	}
+	if err := r.rejectGatewayAdmission(ctx, gateway, reason, acceptedMessage, programmedMessage); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *GatewayReconciler) failCloudflaredCompile(
