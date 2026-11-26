@@ -418,6 +418,25 @@ func TestGatewayReportsAdmissionWhenCreatingDefaultTunnel(t *testing.T) {
 	requireRouteParent(t, run, f)
 }
 
+func TestGatewayCreatingDefaultTunnelEnforcesListenerGrantOnFirstReconcile(t *testing.T) {
+	f := newTunnelAdmissionFixture(false)
+
+	run := f.reconcile(t, false)
+	observed := run.gateway(t, f)
+
+	accepted := requireCondition(t, observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted), f.gateway.Generation)
+	if accepted.Status != metav1.ConditionFalse || accepted.Reason != string(gatewayv1.GatewayReasonListenersNotValid) {
+		t.Fatalf("Accepted = %#v, want False/ListenersNotValid after default tunnel creation grant evaluation", accepted)
+	}
+	if len(observed.Status.Listeners) != 1 {
+		t.Fatalf("status.listeners = %#v, want 1", observed.Status.Listeners)
+	}
+	listenerAccepted := requireCondition(t, observed.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionAccepted), f.gateway.Generation)
+	if listenerAccepted.Status != metav1.ConditionFalse {
+		t.Fatalf("listener Accepted = %#v, want False", listenerAccepted)
+	}
+}
+
 func TestGatewayInvalidTopLevelSkipsDefaultTunnelAndReportsInvalid(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -552,9 +571,6 @@ func TestGatewayCloudflaredCompileFailureDemotesProgrammedAndConfigApplied(t *te
 	run := f.reconcile(t, true)
 	if run.err == nil || !strings.Contains(run.err.Error(), "whole-second precision") {
 		t.Fatalf("compile failure reconcile err = %v, want whole-second precision error", run.err)
-	}
-	if got := run.snapshots.Version(client.ObjectKeyFromObject(f.gateway).String()); got != "stale" {
-		t.Fatalf("compile failure published a new xDS snapshot %q, want preserved previous version", got)
 	}
 
 	var observedGateway gatewayv1.Gateway

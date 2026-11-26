@@ -1147,7 +1147,14 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 			record = records[0]
 			owned, reason := dnsRecordOwnedByGateway(record, currentOwnerMarkers)
 			if !owned {
-				owned, reason = dnsRecordOwnedByGatewayWithTargets(record, ownershipMarkers, expectedTargets)
+				markers := ownershipMarkers
+				if previous, hasPrevious := previousByHostname[host.Hostname]; hasPrevious &&
+					previous.RecordID == record.ID && previous.ZoneID == host.ZoneID {
+					if marker := checkpointOverflowSHA256Marker(previous.OwnershipComment); marker != "" {
+						markers = append(slices.Clone(markers), marker)
+					}
+				}
+				owned, reason = dnsRecordOwnedByGatewayWithTargets(record, markers, expectedTargets)
 			}
 			if !owned {
 				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (%s)", host.Hostname, reason))
@@ -1971,6 +1978,9 @@ func deleteDNSRecordIfOwned(
 	if len(comments) == 0 {
 		comments = []string{expected.OwnershipComment}
 	}
+	if marker := checkpointOverflowSHA256Marker(expected.OwnershipComment); marker != "" && !slices.Contains(comments, marker) {
+		comments = append(slices.Clone(comments), marker)
+	}
 	for _, current := range records {
 		if current.ID != expected.RecordID {
 			continue
@@ -2127,6 +2137,31 @@ func dnsRecordOwnedForTargets(record RemoteDNSRecord, markers, expectedTargets [
 		return false, fmt.Sprintf("missing matching tunnel target or Flareway ownership marker (comment %q, content %q)", record.Comment, record.Content)
 	}
 	return false, fmt.Sprintf("missing Flareway ownership marker (comment %q)", record.Comment)
+}
+
+// checkpointOverflowSHA256Marker extracts the bare "flareway sha256:<64hex>"
+// hash-only ownership marker from a tunnel status DNS checkpoint. Short names
+// include "<clusterID>/<namespace>/<ownerName>" and are verified via
+// TunnelDNSOwnershipMarkers; long identities collapse to the one-way sha256
+// digest, so callers only accept it for the specific checkpointed record ID
+// paired with the tunnel's CNAME target check.
+func checkpointOverflowSHA256Marker(comment string) string {
+	trimmed := strings.TrimSpace(comment)
+	const prefix = "flareway sha256:"
+	if !strings.HasPrefix(trimmed, prefix) {
+		return ""
+	}
+	digest, _, _ := strings.Cut(strings.TrimPrefix(trimmed, prefix), " ")
+	if len(digest) != 64 {
+		return ""
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return ""
+		}
+	}
+	return prefix + digest
 }
 
 func (r *CloudflareTunnelReconciler) clusterID(ctx context.Context) (string, error) {

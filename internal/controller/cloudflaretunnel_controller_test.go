@@ -825,6 +825,64 @@ func TestDNSOwnershipRetainedAcrossGatewayDetachmentAndDirectSwitch(t *testing.T
 		g.Expect(updatedKeep).NotTo(gomega.BeNil())
 		g.Expect(updatedKeep.OwnershipComment).To(gomega.Equal(dnsOwnershipComment(tunnel, clusterID, tunnelName)))
 	})
+
+	t.Run("long gateway hash-only checkpoint cleans up and updates with operator text", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		cf := newFakeTunnelCloudflareFactory()
+		longGateway := strings.Repeat("gw-", 30)
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: tunnelName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "platform managed"},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: tunnelID,
+			},
+		}
+		hashComment := dnsOwnershipComment(tunnel, clusterID, longGateway)
+		g.Expect(hashComment).To(gomega.HavePrefix("flareway sha256:"))
+		tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{
+			{Hostname: "keep-hash.example.test", RecordID: "rec-keep-hash", ZoneID: "zone-1", OwnershipComment: hashComment},
+			{Hostname: "stale-hash.example.test", RecordID: "rec-stale-hash", ZoneID: "zone-1", OwnershipComment: hashComment},
+		}
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-keep-hash", Name: "keep-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment, Proxied: true, TTL: 1,
+		})
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-stale-hash", Name: "stale-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment, Proxied: true, TTL: 1,
+		})
+
+		reconciler := &CloudflareTunnelReconciler{}
+		records, conflict, err := reconciler.ensureDNS(
+			context.Background(), cf, tunnel, tunnelName, clusterID, tunnelID,
+			[]publicHostname{{Hostname: "keep-hash.example.test", ZoneID: "zone-1"}},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(conflict).To(gomega.BeEmpty())
+		g.Expect(cf.HasDNSRecord("zone-1", "rec-stale-hash")).To(gomega.BeFalse())
+		g.Expect(records).To(gomega.HaveLen(1))
+		g.Expect(records[0].OwnershipComment).To(gomega.Equal(dnsOwnershipComment(tunnel, clusterID, tunnelName)))
+
+		// Detached hash-only record deletion with target verified.
+		deleteRecord := records[0]
+		deleteRecord.OwnershipComment = hashComment
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-detach-hash", Name: "detach-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment,
+		})
+		deleteRecord.Hostname = "detach-hash.example.test"
+		deleteRecord.RecordID = "rec-detach-hash"
+		remaining, delConflict, err := removeDNSRecords(
+			context.Background(), cf, dnsOwnershipMarkers(tunnel, clusterID, tunnelName), dnsRecordTargets(tunnel, ""),
+			[]v1alpha1.CloudflareTunnelDNSRecordStatus{deleteRecord},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(delConflict).To(gomega.BeEmpty())
+		g.Expect(remaining).To(gomega.BeEmpty())
+		g.Expect(cf.HasDNSRecord("zone-1", "rec-detach-hash")).To(gomega.BeFalse())
+	})
 }
 
 func TestTunnelGatewayBindingsRequireHostnameAndZone(t *testing.T) {

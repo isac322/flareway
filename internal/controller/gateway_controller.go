@@ -61,7 +61,6 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
-	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/gatewayapi"
@@ -301,7 +300,50 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.prepareGatewayStatus(&statuses.Gateway, &gateway)
-	if accepted := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted)); accepted != nil && accepted.Status == metav1.ConditionFalse {
+	accepted := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if (accepted == nil || accepted.Status != metav1.ConditionFalse) && !compiled.ConformanceMode && tunnel == nil && (block == nil || accountMissing) {
+		tunnel, account, effectiveConfig, block, err = r.resolveCloudflareContextWithOptions(ctx, &gateway, cfg, true)
+		if err != nil {
+			var missingAccount *missingCloudflareAccountError
+			if errors.As(err, &missingAccount) {
+				accountMissing = true
+			} else {
+				return ctrl.Result{}, err
+			}
+		}
+		cfg = effectiveConfig
+		inputs.CloudflareTunnel = tunnel
+		inputs.CloudflareAccount = account
+		if block == nil {
+			if err := r.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		compiled, statuses = gatewayapi.Translate(inputs)
+		if compiled == nil {
+			return ctrl.Result{}, errors.New("gateway API translator returned a nil Gateway")
+		}
+		if block != nil {
+			compiled.Cloudflare = nil
+		}
+		retainAccessRevocationDomains(compiled, tunnel, inputs.AccessApplications)
+		compiled, _, err = accessBlockFirstGateway(compiled, tunnel)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("prepare Access block-first transition: %w", err)
+		}
+		blockDomainsForUnreadyDNS(compiled, tunnel)
+		if !compiled.ConformanceMode && block == nil {
+			privateState, err = r.reconcilePrivatePrerequisites(ctx, compiled, tunnel, account, privateInputsView(
+				inputs.Namespaces, inputs.VirtualNetworks, inputs.NetworkRoutes, inputs.HostnameRoutes, inputs.AccessApplications,
+			))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		r.prepareGatewayStatus(&statuses.Gateway, &gateway)
+		accepted = meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	}
+	if accepted != nil && accepted.Status == metav1.ConditionFalse {
 		// A Gateway the translator rejected can never be programmed: retract
 		// the published snapshot and the owned dataplane in every mode —
 		// including conformance mode — and record the rejection without
@@ -361,18 +403,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{}, nil
 	}
-	if !compiled.ConformanceMode && tunnel == nil && block == nil {
-		tunnel, account, effectiveConfig, block, err = r.resolveCloudflareContextWithOptions(ctx, &gateway, cfg, true)
-		if err != nil {
-			var missingAccount *missingCloudflareAccountError
-			if errors.As(err, &missingAccount) {
-				accountMissing = true
-			} else {
-				return ctrl.Result{}, err
-			}
-		}
-		cfg = effectiveConfig
-	}
 	if !compiled.ConformanceMode && block != nil {
 		// The tunnel cannot be programmed by this Gateway, but admission,
 		// listener, and route status are already translated and still owed.
@@ -420,9 +450,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		tunnel = currentTunnel
-		if _, _, err := cloudflaredconfig.Compile(compiled); err != nil {
-			return ctrl.Result{}, r.failCloudflaredCompile(ctx, req.NamespacedName, compiled, tunnel, &gateway, routes, inputs.BackendTLSPolicies, &statuses, err)
-		}
 	}
 
 	if err := r.ensureXDSClientCertificate(ctx, &gateway); err != nil {

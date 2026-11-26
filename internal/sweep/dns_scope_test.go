@@ -132,13 +132,16 @@ func TestDNSSweepRetainsOwnershipAcrossDirectTransition(t *testing.T) {
 	// reporting a false mismatch.
 	priorGatewayMarker := probeMarker("prior-gateway")
 	checkpoint := v1alpha1Checkpoint("app.zone-a.example.com", "rec-1", "zone-a", priorGatewayMarker+" platform managed")
-	tunnel := probeTunnel("shared-tunnel", checkpoint)
+	longGatewayHashComment := flarecloudflare.SignDNSRecordComment(probeOwnershipKey, probeClusterID, "ns", strings.Repeat("gw-", 30)) + " platform managed"
+	hashCheckpoint := v1alpha1Checkpoint("hash.zone-a.example.com", "rec-2", "zone-a", longGatewayHashComment)
+	tunnel := probeTunnel("shared-tunnel", checkpoint, hashCheckpoint)
 	tunnel.Status.GatewayRef = nil
 	remote := healthyRecord("rec-1", "app.zone-a.example.com", "shared-tunnel", priorGatewayMarker+" platform managed")
+	hashRemote := healthyRecord("rec-2", "hash.zone-a.example.com", "shared-tunnel", longGatewayHashComment)
 
 	f := newDNSProbeFixture(t, dnsProbeConfig{
 		zones: []probeZone{
-			{id: "zone-a", records: []flarecloudflare.DNSRecord{remote}},
+			{id: "zone-a", records: []flarecloudflare.DNSRecord{remote, hashRemote}},
 		},
 		grantZones: []string{"zone-a.example.com"},
 		objects:    []client.Object{tunnel},
