@@ -366,9 +366,10 @@ spec:
                               || has(self.service.unix) || has(self.service.unixTLS)'
                           - message: originRequest.ipRules requires Bastion or SOCKS5
                               proxy service
-                            rule: '!has(self.originRequest) || size(self.originRequest.ipRules)
-                              == 0 || has(self.service.bastion) || (has(self.originRequest.proxyType)
-                              && self.originRequest.proxyType == ''SOCKS5'')'
+                            rule: '!has(self.originRequest) || !has(self.originRequest.ipRules)
+                              || size(self.originRequest.ipRules) == 0 || has(self.service.bastion)
+                              || (has(self.originRequest.proxyType) && self.originRequest.proxyType
+                              == ''SOCKS5'')'
                         maxItems: 200
                         minItems: 1
                         type: array

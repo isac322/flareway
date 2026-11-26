@@ -378,7 +378,7 @@ The Secret uses `CF-Access-Client-Id` and `CF-Access-Client-Secret`. During a gr
 
 ### `DeviceSettings`
 
-`DeviceSettings` is a namespaced account singleton and must be named `default`. It manages Gateway proxy, UDP proxy, root-certificate installation, Zero Trust virtual IP, and disable-duration settings. Its default `managementPolicy` is `ObserveOnly`; status reports observed values and the exact non-secret changes Managed mode would apply.
+`DeviceSettings` is a namespaced account singleton and must be named `default`. It manages Gateway proxy, UDP proxy, root-certificate installation, Zero Trust virtual IP, and disable-duration settings. Its default `managementPolicy` is `ObserveOnly`; status reports observed values and the exact non-secret changes Managed mode would apply. Cloudflare exposes no device-settings delete operation, so `deletionPolicy` is always `Orphan`.
 
 ## Tunnel configuration
 

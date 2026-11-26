@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Guard optional CRD CEL fields with `has(...)` before calling `size(...)` on
+  `CloudflareTunnelIngressRule.originRequest.ipRules`,
+  `DevicePostureRule.input.certificateId`, and
+  `DevicePostureIntegration.config.{apiUrl,authUrl,clientId,customerId}` (#184).
+- Restrict `DeviceSettings` and `ZeroTrustOrganization` `deletionPolicy` to
+  `Orphan` at CRD admission via `OrphanOnlyDeletionPolicy` (#185).
 - Isolate Access block-first transitions, listener DNS readiness, and private
   routing prerequisites per listener or protection domain while keeping
   persisted public Envoy ports sticky across listener additions, removals, and

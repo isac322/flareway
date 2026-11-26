@@ -221,31 +221,36 @@ spec:
             - message: AdoptById requires externalRef
               rule: self.adoption.mode != 'AdoptById' || has(self.externalRef)
             - message: WorkspaceOne requires apiUrl, authUrl, clientId, and clientSecretRef
-              rule: self.type != 'WorkspaceOne' || (size(self.config.apiUrl) > 0 &&
-                size(self.config.authUrl) > 0 && size(self.config.clientId) > 0 &&
-                has(self.config.clientSecretRef))
+              rule: self.type != 'WorkspaceOne' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.authUrl) && size(self.config.authUrl) > 0 &&
+                has(self.config.clientId) && size(self.config.clientId) > 0 && has(self.config.clientSecretRef))
             - message: CrowdstrikeS2S requires apiUrl, clientId, customerId, and clientSecretRef
-              rule: self.type != 'CrowdstrikeS2S' || (size(self.config.apiUrl) > 0
-                && size(self.config.clientId) > 0 && size(self.config.customerId)
-                > 0 && has(self.config.clientSecretRef))
+              rule: self.type != 'CrowdstrikeS2S' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.clientId) && size(self.config.clientId) > 0
+                && has(self.config.customerId) && size(self.config.customerId) > 0
+                && has(self.config.clientSecretRef))
             - message: Uptycs requires apiUrl, customerId, clientKeyRef, and clientSecretRef
-              rule: self.type != 'Uptycs' || (size(self.config.apiUrl) > 0 && size(self.config.customerId)
+              rule: self.type != 'Uptycs' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.customerId) && size(self.config.customerId)
                 > 0 && has(self.config.clientKeyRef) && has(self.config.clientSecretRef))
             - message: Intune requires clientId, customerId, and clientSecretRef
-              rule: self.type != 'Intune' || (size(self.config.clientId) > 0 && size(self.config.customerId)
+              rule: self.type != 'Intune' || (has(self.config.clientId) && size(self.config.clientId)
+                > 0 && has(self.config.customerId) && size(self.config.customerId)
                 > 0 && has(self.config.clientSecretRef))
             - message: Kolide requires clientId and clientSecretRef
-              rule: self.type != 'Kolide' || (size(self.config.clientId) > 0 && has(self.config.clientSecretRef))
+              rule: self.type != 'Kolide' || (has(self.config.clientId) && size(self.config.clientId)
+                > 0 && has(self.config.clientSecretRef))
             - message: TaniumS2S requires apiUrl and clientSecretRef; Access credentials
                 must be supplied together
-              rule: self.type != 'TaniumS2S' || (size(self.config.apiUrl) > 0 && has(self.config.clientSecretRef)
-                && (has(self.config.accessClientIdRef) == has(self.config.accessClientSecretRef)))
+              rule: self.type != 'TaniumS2S' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.clientSecretRef) && (has(self.config.accessClientIdRef)
+                == has(self.config.accessClientSecretRef)))
             - message: SentinelOneS2S requires apiUrl and clientSecretRef
-              rule: self.type != 'SentinelOneS2S' || (size(self.config.apiUrl) > 0
-                && has(self.config.clientSecretRef))
+              rule: self.type != 'SentinelOneS2S' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.clientSecretRef))
             - message: CustomS2S requires apiUrl and Access client credential references
-              rule: self.type != 'CustomS2S' || (size(self.config.apiUrl) > 0 && has(self.config.accessClientIdRef)
-                && has(self.config.accessClientSecretRef))
+              rule: self.type != 'CustomS2S' || (has(self.config.apiUrl) && size(self.config.apiUrl)
+                > 0 && has(self.config.accessClientIdRef) && has(self.config.accessClientSecretRef))
           status:
             description: DevicePostureIntegrationStatus defines the observed state
               without credentials.

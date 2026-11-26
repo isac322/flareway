@@ -52,8 +52,9 @@ type DeviceSettingsSpec struct {
 	DisableForTime *int64 `json:"disableForTime,omitempty"`
 	// +kubebuilder:default=ObserveOnly
 	ManagementPolicy ManagementPolicy `json:"managementPolicy,omitempty"`
+	// Device settings deletion is always orphaning because Cloudflare exposes no delete endpoint.
 	// +kubebuilder:default=Orphan
-	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
+	DeletionPolicy OrphanOnlyDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // DeviceSettingsStatus records observed values and the pending ObserveOnly diff.

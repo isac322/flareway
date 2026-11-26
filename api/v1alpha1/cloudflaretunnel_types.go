@@ -87,6 +87,15 @@ const (
 	DeletionPolicyOrphan DeletionPolicy = "Orphan"
 )
 
+// OrphanOnlyDeletionPolicy restricts resources with no remote delete endpoint to Orphan.
+// +kubebuilder:validation:Enum=Orphan
+type OrphanOnlyDeletionPolicy string
+
+const (
+	// OrphanOnlyDeletionPolicyOrphan leaves the managed remote resource in place.
+	OrphanOnlyDeletionPolicyOrphan OrphanOnlyDeletionPolicy = "Orphan"
+)
+
 // AdoptionExpect declares remote attributes that must match before adoption.
 type AdoptionExpect struct {
 	// +kubebuilder:validation:MaxLength=100
@@ -321,7 +330,7 @@ type CloudflareTunnelWARPRouting struct {
 
 // CloudflareTunnelIngressRule is one ordered direct-mode ingress rule.
 // +kubebuilder:validation:XValidation:rule="!has(self.originRequest) || !has(self.originRequest.access) || has(self.service.http) || has(self.service.https) || has(self.service.unix) || has(self.service.unixTLS)",message="originRequest.access is only valid for HTTP origins"
-// +kubebuilder:validation:XValidation:rule="!has(self.originRequest) || size(self.originRequest.ipRules) == 0 || has(self.service.bastion) || (has(self.originRequest.proxyType) && self.originRequest.proxyType == 'SOCKS5')",message="originRequest.ipRules requires Bastion or SOCKS5 proxy service"
+// +kubebuilder:validation:XValidation:rule="!has(self.originRequest) || !has(self.originRequest.ipRules) || size(self.originRequest.ipRules) == 0 || has(self.service.bastion) || (has(self.originRequest.proxyType) && self.originRequest.proxyType == 'SOCKS5')",message="originRequest.ipRules requires Bastion or SOCKS5 proxy service"
 type CloudflareTunnelIngressRule struct {
 	// Hostname may be omitted only for the final catch-all rule.
 	// +kubebuilder:validation:MaxLength=253

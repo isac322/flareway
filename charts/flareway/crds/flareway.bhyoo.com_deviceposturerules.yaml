@@ -453,9 +453,9 @@ spec:
                 && has(self.input.operator))
             - message: ClientCertificateV2 requires certificateId, checkPrivateKey,
                 and operatingSystem
-              rule: self.type != 'ClientCertificateV2' || (has(self.input) && has(self.input.checkPrivateKey)
-                && has(self.input.operatingSystem) && size(self.input.certificateId)
-                > 0)
+              rule: self.type != 'ClientCertificateV2' || (has(self.input) && has(self.input.certificateId)
+                && size(self.input.certificateId) > 0 && has(self.input.checkPrivateKey)
+                && has(self.input.operatingSystem))
           status:
             description: DevicePostureRuleStatus records the remote rule identity
               and observed state.
