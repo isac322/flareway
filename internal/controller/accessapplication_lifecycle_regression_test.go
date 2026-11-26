@@ -680,7 +680,7 @@ func TestAccessApplicationNoTargetsResolvedReleasesCompletedTombstoneAndRecovers
 		return application, tunnel, remote, r, kube
 	}
 
-	t.Run("NoTargetsResolved marks latch released and frees tombstones", func(t *testing.T) {
+	t.Run("NoTargetsResolved marks controller revocation released, frees tombstones, and restores hold on config invalid", func(t *testing.T) {
 		application, tunnel, remote, r, kube := makeWorld()
 		invalid := gatewayapi.AccessApplicationCompilation{
 			Accepted: false, Reason: "TargetNotFound", Message: "no targetRef or destination resolves to this Gateway", NoTargetsResolved: true,
@@ -695,16 +695,46 @@ func TestAccessApplicationNoTargetsResolvedReleasesCompletedTombstoneAndRecovers
 		if !remote.Has("remote-id") {
 			t.Fatal("NoTargetsResolved deleted remote application instead of keeping it for reuse")
 		}
-		latch, ok := gatewayapi.ParseAccessRevocationLatch(stored.Annotations[accessApplicationRevocationAnnotation])
-		if !ok || !latch.Acknowledged || !latch.TokensRevoked || !latch.Released {
-			t.Fatalf("latch = %+v (ok=%t), want Acknowledged=true TokensRevoked=true Released=true", latch, ok)
+		expectedDigest := gatewayapi.AccessRevocationLatchDigest(stored.UID, []gatewayapi.AccessRevocationClaim{{
+			Tunnel: "edge", ProtectionDomain: "preview-domain", Hostname: "pr-1.example", BaselineVersion: 1,
+		}})
+		if stored.Status.Revocation == nil ||
+			!stored.Status.Revocation.Acknowledged ||
+			!stored.Status.Revocation.TokensRevoked ||
+			!stored.Status.Revocation.Released ||
+			stored.Status.Revocation.ObservedGeneration != stored.Generation ||
+			stored.Status.Revocation.LatchDigest != expectedDigest {
+			t.Fatalf("status.revocation = %+v, want Acknowledged=true TokensRevoked=true Released=true Gen=%d Digest=%s", stored.Status.Revocation, stored.Generation, expectedDigest)
 		}
 		if tombstones := gatewayapi.AccessRevocationTombstones(tunnel, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 0 {
 			t.Fatalf("released NoTargetsResolved application kept tombstones: %#v", tombstones)
 		}
-		// Once the Gateway drops the released tombstone, the converged tunnel no
-		// longer lists preview-domain; the acknowledged latch still clears without
-		// deadlocking when targets return or on deletion.
+		// Moving the same object from released back to a configuration error must
+		// restore Released=false and reinstate the fail-closed tombstone.
+		configErr := gatewayapi.AccessApplicationCompilation{
+			Accepted: false, Reason: "Invalid", Message: "invalid pathScope",
+		}
+		if _, err := r.reconcileInvalidation(ctx, &stored, configErr); err != nil {
+			t.Fatalf("reconcileInvalidation (configErr): %v", err)
+		}
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(application), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status.Revocation == nil || stored.Status.Revocation.Released || !stored.Status.Revocation.Acknowledged || !stored.Status.Revocation.TokensRevoked {
+			t.Fatalf("status.revocation after configErr = %+v, want Released=false", stored.Status.Revocation)
+		}
+		if tombstones := gatewayapi.AccessRevocationTombstones(tunnel, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 1 {
+			t.Fatalf("configuration rejection did not restore tombstone: %#v", tombstones)
+		}
+
+		// Releasing again and dropping the tombstone from tunnel status must still
+		// acknowledge through controller-owned status without deadlocking.
+		if _, err := r.reconcileInvalidation(ctx, &stored, invalid); err != nil {
+			t.Fatalf("reconcileInvalidation (re-release): %v", err)
+		}
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(application), &stored); err != nil {
+			t.Fatal(err)
+		}
 		tunnel.Status.Hostnames = nil
 		if err := kube.Status().Update(ctx, tunnel); err != nil {
 			t.Fatal(err)
@@ -730,12 +760,360 @@ func TestAccessApplicationNoTargetsResolvedReleasesCompletedTombstoneAndRecovers
 		if err := kube.Get(ctx, client.ObjectKeyFromObject(application), &stored); err != nil {
 			t.Fatal(err)
 		}
-		latch, ok := gatewayapi.ParseAccessRevocationLatch(stored.Annotations[accessApplicationRevocationAnnotation])
-		if !ok || !latch.Acknowledged || !latch.TokensRevoked || latch.Released {
-			t.Fatalf("latch = %+v (ok=%t), want Acknowledged=true TokensRevoked=true Released=false", latch, ok)
+		if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || !stored.Status.Revocation.TokensRevoked || stored.Status.Revocation.Released {
+			t.Fatalf("status.revocation = %+v, want Acknowledged=true TokensRevoked=true Released=false", stored.Status.Revocation)
 		}
 		if tombstones := gatewayapi.AccessRevocationTombstones(tunnel, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 1 {
 			t.Fatalf("configuration rejection dropped tombstone: %#v", tombstones)
+		}
+	})
+}
+
+func TestAccessApplicationFirstLatchOnActiveRecoveryPreservesOldDataPlanes(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, discoveryv1.AddToScheme, v1alpha1.AddToScheme, gatewayv1.Install} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := metav1.NewTime(time.Unix(100, 0).UTC())
+	// Previously programmed on listener "old" serving old.example; now the
+	// referenced HTTPRoute moved to listener "new" (new.example) while the AUD
+	// handoff Secret is missing, so Reconcile must first latch the old claim and
+	// preserve the old DataPlanes/Destinations for tombstone generation.
+	application := &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 3,
+			Finalizers: []string{v1alpha1.AccessApplicationFinalizer},
+		},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
+			Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+				LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "HTTPRoute", Name: "moved-route"},
+			}},
+		},
+		Status: v1alpha1.AccessApplicationStatus{
+			ApplicationID: "remote-id",
+			DataPlanes:    []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "gateway", Listener: "old", ProtectionDomain: "old-domain", EnvoyPort: 18081}},
+			Destinations:  []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "old.example"}},
+			Conditions:    []metav1.Condition{{Type: accessApplicationConditionProgrammed, Status: metav1.ConditionTrue, Reason: "Programmed", ObservedGeneration: 2, LastTransitionTime: now}},
+		},
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: "token", Namespace: "tenant", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{},
+				Hostnames:         []string{"*"}, Zones: []string{"*"}, Exposures: []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				Backends: &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
+			}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{
+			Verified: v1alpha1.CloudflareAccountVerifiedStatus{
+				TeamName: "team", AuthDomain: "team.cloudflareaccess.com",
+				Zones: []v1alpha1.CloudflareVerifiedZone{{ID: "zone", Name: "example"}},
+			},
+			Conditions: []metav1.Condition{
+				{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, LastTransitionTime: now},
+				{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, LastTransitionTime: now},
+			},
+		},
+	}
+	gatewayClass := &gatewayv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "flareway"}, Spec: gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName}}
+	hostOld := gatewayv1.Hostname("old.example")
+	hostNew := gatewayv1.Hostname("new.example")
+	group := gatewayv1.Group(v1alpha1.Group)
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant", UID: "gw-uid", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Listeners: []gatewayv1.Listener{
+				{Name: "old", Hostname: &hostOld, Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "new", Hostname: &hostNew, Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{Group: group, Kind: "CloudflareTunnel", Name: "gateway"}},
+		},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway", Namespace: "tenant"},
+		Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			OwnershipVerified: true, TunnelID: "tunnel-id",
+			ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "tunnel-token"},
+			GatewayRef:              &corev1.LocalObjectReference{Name: "gateway"}, GatewayUID: "gw-uid",
+			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 5, Applied: 5},
+			Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+				Hostname: "old.example", ProtectionDomain: "old-domain", AccessApplication: "tenant/app",
+				Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 5,
+			}},
+		},
+	}
+	port := gatewayv1.PortNumber(8080)
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "moved-route", Namespace: "tenant", Generation: 2},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: new(gatewayv1.SectionName("new"))}}},
+			Hostnames:       []gatewayv1.Hostname{"new.example"},
+			Rules:           []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}}}},
+		},
+	}
+	kube := accessApplicationTestClientBuilder(scheme).
+		WithStatusSubresource(application).
+		WithObjects(
+			application, account, gatewayClass, gateway, tunnel, route,
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "tenant"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}}},
+		).Build()
+	remote := newFakeAccessApplicationCloudflare()
+	r := &AccessApplicationReconciler{
+		Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time },
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(application)}); err != nil {
+		t.Fatalf("first latch Reconcile: %v", err)
+	}
+	var stored v1alpha1.AccessApplication
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(application), &stored); err != nil {
+		t.Fatal(err)
+	}
+	latch, ok := gatewayapi.ParseAccessRevocationLatch(stored.Annotations[accessApplicationRevocationAnnotation])
+	if !ok || len(latch.Claims) != 1 || latch.Claims[0].ProtectionDomain != "old-domain" {
+		t.Fatalf("first latch = %+v (ok=%t), want old-domain claim", latch, ok)
+	}
+	if len(stored.Status.DataPlanes) != 1 || stored.Status.DataPlanes[0].ProtectionDomain != "old-domain" || stored.Status.DataPlanes[0].EnvoyPort != 18081 {
+		t.Fatalf("first latch overwrote old DataPlanes: %#v", stored.Status.DataPlanes)
+	}
+	if len(stored.Status.Destinations) != 1 || stored.Status.Destinations[0].URI != "old.example" {
+		t.Fatalf("first latch overwrote old Destinations: %#v", stored.Status.Destinations)
+	}
+}
+
+func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, discoveryv1.AddToScheme, v1alpha1.AddToScheme, gatewayv1.Install} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := metav1.NewTime(time.Unix(100, 0).UTC())
+	wildcard := gatewayv1.Hostname("*.example")
+	liveHost := gatewayv1.Hostname("live.example")
+	group := gatewayv1.Group(v1alpha1.Group)
+	port := gatewayv1.PortNumber(8080)
+
+	newAccount := func() *v1alpha1.CloudflareAccount {
+		return &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "account"},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Name: "token", Namespace: "tenant", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{},
+					Hostnames:         []string{"*"}, Zones: []string{"*"}, Exposures: []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					Backends: &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
+				}},
+			},
+			Status: v1alpha1.CloudflareAccountStatus{
+				Verified: v1alpha1.CloudflareAccountVerifiedStatus{
+					TeamName: "team", AuthDomain: "team.cloudflareaccess.com",
+					Zones: []v1alpha1.CloudflareVerifiedZone{{ID: "zone", Name: "example"}},
+				},
+				Conditions: []metav1.Condition{
+					{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, LastTransitionTime: now},
+					{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, LastTransitionTime: now},
+				},
+			},
+		}
+	}
+
+	for _, order := range []struct {
+		name string
+		refs []gatewayv1.LocalPolicyTargetReferenceWithSectionName
+	}{
+		{
+			name: "empty gateway before live gateway",
+			refs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-empty"}},
+				{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-live"}},
+			},
+		},
+		{
+			name: "live gateway before empty gateway",
+			refs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-live"}},
+				{LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "Gateway", Name: "gw-empty"}},
+			},
+		},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			app := &v1alpha1.AccessApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 2,
+					Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+					Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"tun-live","protectionDomain":"live-domain","hostname":"live.example","baselineVersion":1}]}`},
+				},
+				Spec: v1alpha1.AccessApplicationSpec{
+					AccountRef:       corev1.LocalObjectReference{Name: "account"},
+					Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+					SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+					ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+					DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+					TargetRefs:       order.refs,
+				},
+				Status: v1alpha1.AccessApplicationStatus{
+					ApplicationID: "remote-id", OwnershipVerified: true,
+					DataPlanes:   []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "tun-live", Listener: "web", ProtectionDomain: "live-domain", EnvoyPort: 18082}},
+					Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "live.example"}},
+				},
+			}
+			gwClass := &gatewayv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "flareway"}, Spec: gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName}}
+			gwEmpty := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw-empty", Namespace: "tenant", UID: "gw-empty-uid"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "flareway",
+					Listeners:        []gatewayv1.Listener{{Name: "preview", Hostname: &wildcard, Port: 443, Protocol: gatewayv1.HTTPSProtocolType}},
+					Infrastructure:   &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{Group: group, Kind: "CloudflareTunnel", Name: "tun-empty"}},
+				},
+			}
+			gwLive := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw-live", Namespace: "tenant", UID: "gw-live-uid"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "flareway",
+					Listeners:        []gatewayv1.Listener{{Name: "web", Hostname: &liveHost, Port: 443, Protocol: gatewayv1.HTTPSProtocolType}},
+					Infrastructure:   &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{Group: group, Kind: "CloudflareTunnel", Name: "tun-live"}},
+				},
+			}
+			tunEmpty := &v1alpha1.CloudflareTunnel{ObjectMeta: metav1.ObjectMeta{Name: "tun-empty", Namespace: "tenant"}, Spec: v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}}}
+			tunLive := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Name: "tun-live", Namespace: "tenant"},
+				Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}},
+				Status: v1alpha1.CloudflareTunnelStatus{
+					GatewayRef: &corev1.LocalObjectReference{Name: "gw-live"}, GatewayUID: "gw-live-uid",
+					ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 2, Applied: 2},
+					Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+						Hostname: "live.example", ProtectionDomain: "live-domain", AccessApplication: "tenant/app",
+						Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+					}},
+				},
+			}
+			route := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "live-route", Namespace: "tenant"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gw-live", SectionName: new(gatewayv1.SectionName("web"))}}},
+					Hostnames:       []gatewayv1.Hostname{"live.example"},
+					Rules:           []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}}}},
+				},
+			}
+			remote := newFakeAccessApplicationCloudflare()
+			remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+			kube := accessApplicationTestClientBuilder(scheme).
+				WithStatusSubresource(app).
+				WithObjects(
+					app, newAccount(), gwClass, gwEmpty, gwLive, tunEmpty, tunLive, route,
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+					&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
+					&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "tenant"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}}},
+				).Build()
+			r := &AccessApplicationReconciler{
+				Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time },
+				NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+			}
+			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			var stored v1alpha1.AccessApplication
+			if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || stored.Status.Revocation.Released {
+				t.Fatalf("mixed Gateway Released = %+v, want Acknowledged=true Released=false", stored.Status.Revocation)
+			}
+			if tombstones := gatewayapi.AccessRevocationTombstones(tunLive, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 1 {
+				t.Fatalf("mixed Gateway dropped live tunnel tombstone: %#v", tombstones)
+			}
+		})
+	}
+
+	t.Run("deleted sole referenced HTTPRoute releases hold through Reconcile", func(t *testing.T) {
+		for _, mode := range []v1alpha1.ManagementPolicy{v1alpha1.ManagementPolicyManaged, v1alpha1.ManagementPolicyObserveOnly} {
+			t.Run(string(mode), func(t *testing.T) {
+				app := &v1alpha1.AccessApplication{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 2,
+						Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+						Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"tun","protectionDomain":"route-domain","hostname":"app.example","baselineVersion":1}]}`},
+					},
+					Spec: v1alpha1.AccessApplicationSpec{
+						AccountRef:       corev1.LocalObjectReference{Name: "account"},
+						Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+						SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+						ManagementPolicy: mode,
+						DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+						TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.Group(gatewayv1.GroupName), Kind: "HTTPRoute", Name: "deleted-route"},
+						}},
+					},
+					Status: v1alpha1.AccessApplicationStatus{
+						ApplicationID: "remote-id", OwnershipVerified: true,
+						DataPlanes:   []v1alpha1.AccessApplicationDataPlaneStatus{{Tunnel: "tun", Listener: "web", ProtectionDomain: "route-domain", EnvoyPort: 18082}},
+						Destinations: []v1alpha1.AccessApplicationDestinationStatus{{Type: v1alpha1.AccessApplicationDestinationPublic, URI: "app.example"}},
+					},
+				}
+				tun := &v1alpha1.CloudflareTunnel{
+					ObjectMeta: metav1.ObjectMeta{Name: "tun", Namespace: "tenant"},
+					Status: v1alpha1.CloudflareTunnelStatus{
+						GatewayRef: &corev1.LocalObjectReference{Name: "gw"}, GatewayUID: "gw-uid",
+						ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{Desired: 2, Applied: 2},
+						Hostnames: []v1alpha1.CloudflareTunnelHostnameStatus{{
+							Hostname: "app.example", ProtectionDomain: "route-domain", AccessApplication: "tenant/app",
+							Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+						}},
+					},
+				}
+				gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "tenant", UID: "gw-uid"}}
+				remote := newFakeAccessApplicationCloudflare()
+				remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+				kube := accessApplicationTestClientBuilder(scheme).
+					WithStatusSubresource(app).
+					WithObjects(
+						app, newAccount(), tun, gw,
+						&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant"}},
+						&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}},
+						&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "token", Namespace: "tenant"}, Data: map[string][]byte{"token": []byte("test-token")}},
+					).Build()
+				r := &AccessApplicationReconciler{
+					Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time },
+					NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+				}
+				if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err != nil {
+					t.Fatalf("Reconcile: %v", err)
+				}
+				var stored v1alpha1.AccessApplication
+				if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+					t.Fatal(err)
+				}
+				wantTokensRevoked := mode != v1alpha1.ManagementPolicyObserveOnly
+				if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || !stored.Status.Revocation.Released || stored.Status.Revocation.TokensRevoked != wantTokensRevoked {
+					t.Fatalf("status.revocation = %+v, want Acknowledged=true Released=true TokensRevoked=%t", stored.Status.Revocation, wantTokensRevoked)
+				}
+				if mode == v1alpha1.ManagementPolicyObserveOnly && len(remote.Calls()) != 0 {
+					t.Fatalf("ObserveOnly made remote calls: %v", remote.Calls())
+				}
+				if tombstones := gatewayapi.AccessRevocationTombstones(tun, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 0 {
+					t.Fatalf("deleted sole route retained tombstone: %#v", tombstones)
+				}
+			})
 		}
 	})
 }

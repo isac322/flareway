@@ -520,7 +520,17 @@ func TestRevokedAccessHeldHostUnderWildcardEdgeOrder(t *testing.T) {
 
 func TestReleasedAccessRevocationAllowsSuccessorTakeover(t *testing.T) {
 	inputs := hostConflictInputs(t, false, 18081)
-	inputs.AccessApplications[0].Annotations[accessApplicationRevocationAnnotation] = `{"claims":[{"tunnel":"edge","protectionDomain":"` + conflictTombstoneName + `","hostname":"` + conflictHost + `","baselineVersion":1}],"acknowledged":true,"tokensRevoked":true,"released":true}`
+	claims := []gatewayapi.AccessRevocationClaim{{
+		Tunnel: "edge", ProtectionDomain: conflictTombstoneName, Hostname: conflictHost, BaselineVersion: 1,
+	}}
+	inputs.AccessApplications[0].Annotations[accessApplicationRevocationAnnotation] = `{"claims":[{"tunnel":"edge","protectionDomain":"` + conflictTombstoneName + `","hostname":"` + conflictHost + `","baselineVersion":1}],"tokensRevoked":true}`
+	inputs.AccessApplications[0].Status.Revocation = &v1alpha1.AccessApplicationRevocationStatus{
+		LatchDigest:        gatewayapi.AccessRevocationLatchDigest(inputs.AccessApplications[0].UID, claims),
+		ObservedGeneration: inputs.AccessApplications[0].Generation,
+		Acknowledged:       true,
+		TokensRevoked:      true,
+		Released:           true,
+	}
 
 	blocked, statuses := buildRevokedGateway(t, inputs)
 	if tombstone := domainOf(blocked, "default/app-a"); tombstone != nil {

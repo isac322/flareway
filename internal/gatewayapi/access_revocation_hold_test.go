@@ -108,7 +108,11 @@ func TestRevokedAccessHoldKeepsDerivedDomainNames(t *testing.T) {
 }
 
 func TestReleasedRevocationLatchReleasesTombstoneWhenNotForwarding(t *testing.T) {
-	baseInputs := func(annotation string, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) Inputs {
+	claims := []AccessRevocationClaim{{Tunnel: "edge", ProtectionDomain: "old-api", Hostname: "api.example.com", BaselineVersion: 1}}
+	appUID := types.UID("app-old-uid")
+	validDigest := AccessRevocationLatchDigest(appUID, claims)
+
+	baseInputs := func(annotation string, rev *v1alpha1.AccessApplicationRevocationStatus, policy v1alpha1.ManagementPolicy, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) Inputs {
 		in := accessInputs(true)
 		in.CloudflareTunnel.Name = "edge"
 		in.CloudflareTunnel.Status.Hostnames = hostnames
@@ -120,16 +124,26 @@ func TestReleasedRevocationLatchReleasesTombstoneWhenNotForwarding(t *testing.T)
 		route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
 		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
 		appOld := accessApplication("app-old", "Gateway", "gateway", "gone")
+		appOld.UID = appUID
+		appOld.Generation = 3
+		appOld.Spec.ManagementPolicy = policy
 		appOld.Annotations = map[string]string{AccessRevocationAnnotation: annotation}
 		appOld.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
 			Tunnel: "edge", Listener: "http", ProtectionDomain: "old-api", EnvoyPort: 18090,
 		}}
 		appOld.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{Hostname: "api.example.com"}}
+		appOld.Status.Revocation = rev
 		in.AccessApplications = []v1alpha1.AccessApplication{appOld}
 		return in
 	}
 
-	releasedLatch := `{"claims":[{"tunnel":"edge","protectionDomain":"old-api","hostname":"api.example.com","baselineVersion":1}],"acknowledged":true,"tokensRevoked":true,"released":true}`
+	latchJSON := `{"claims":[{"tunnel":"edge","protectionDomain":"old-api","hostname":"api.example.com","baselineVersion":1}],"tokensRevoked":true}`
+	validRev := &v1alpha1.AccessApplicationRevocationStatus{
+		LatchDigest: validDigest, ObservedGeneration: 3, Acknowledged: true, TokensRevoked: true, Released: true,
+	}
+	observeOnlyRev := &v1alpha1.AccessApplicationRevocationStatus{
+		LatchDigest: validDigest, ObservedGeneration: 3, Acknowledged: true, TokensRevoked: false, Released: true,
+	}
 	blockedEntry := []v1alpha1.CloudflareTunnelHostnameStatus{{
 		Hostname: "api.example.com", ProtectionDomain: "old-api", AccessApplication: "default/app-old",
 		Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
@@ -139,8 +153,8 @@ func TestReleasedRevocationLatchReleasesTombstoneWhenNotForwarding(t *testing.T)
 		Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
 	}}
 
-	t.Run("released and blocked drops tombstone", func(t *testing.T) {
-		in := baseInputs(releasedLatch, blockedEntry)
+	t.Run("released controller status and blocked drops tombstone", func(t *testing.T) {
+		in := baseInputs(latchJSON, validRev, v1alpha1.ManagementPolicyManaged, blockedEntry)
 		if tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil); len(tombstones) != 0 {
 			t.Fatalf("tombstones = %#v, want empty once released and blocked", tombstones)
 		}
@@ -152,28 +166,96 @@ func TestReleasedRevocationLatchReleasesTombstoneWhenNotForwarding(t *testing.T)
 		}
 	})
 
-	t.Run("released and absent drops tombstone", func(t *testing.T) {
-		in := baseInputs(releasedLatch, nil)
+	t.Run("released controller status and absent drops tombstone", func(t *testing.T) {
+		in := baseInputs(latchJSON, validRev, v1alpha1.ManagementPolicyManaged, nil)
 		if tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil); len(tombstones) != 0 {
 			t.Fatalf("tombstones = %#v, want empty once released and absent from tunnel", tombstones)
 		}
 	})
 
-	t.Run("released while tunnel still forwarding stays fail-closed", func(t *testing.T) {
-		in := baseInputs(releasedLatch, forwardingEntry)
+	t.Run("ObserveOnly allows release without TokensRevoked", func(t *testing.T) {
+		in := baseInputs(`{"claims":[{"tunnel":"edge","protectionDomain":"old-api","hostname":"api.example.com","baselineVersion":1}]}`, observeOnlyRev, v1alpha1.ManagementPolicyObserveOnly, blockedEntry)
+		if tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil); len(tombstones) != 0 {
+			t.Fatalf("tombstones = %#v, want empty for released ObserveOnly application", tombstones)
+		}
+	})
+
+	t.Run("released status while tunnel still forwarding stays fail-closed", func(t *testing.T) {
+		in := baseInputs(latchJSON, validRev, v1alpha1.ManagementPolicyManaged, forwardingEntry)
 		tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil)
 		if len(tombstones) != 1 || tombstones[0].Application != "default/app-old" {
 			t.Fatalf("tombstones = %#v, want fail-closed retention while Forwarding remains", tombstones)
 		}
 	})
 
-	t.Run("unreleased JSON and legacy sentinel retain tombstone", func(t *testing.T) {
-		for _, ann := range []string{`{"claims":[],"acknowledged":true,"tokensRevoked":true}`, "latched"} {
-			in := baseInputs(ann, blockedEntry)
-			tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil)
-			if len(tombstones) != 1 || tombstones[0].Application != "default/app-old" {
-				t.Fatalf("annotation %q tombstones = %#v, want tombstone retained", ann, tombstones)
-			}
+	t.Run("missing or mismatched controller-owned proof retains tombstone", func(t *testing.T) {
+		cases := []struct {
+			name string
+			ann  string
+			rev  *v1alpha1.AccessApplicationRevocationStatus
+		}{
+			{
+				name: "forged annotation without controller status",
+				ann:  `{"claims":[{"tunnel":"edge","protectionDomain":"old-api","hostname":"api.example.com","baselineVersion":1}],"acknowledged":true,"tokensRevoked":true,"released":true}`,
+				rev:  nil,
+			},
+			{
+				name: "stale generation",
+				ann:  latchJSON,
+				rev:  &v1alpha1.AccessApplicationRevocationStatus{LatchDigest: validDigest, ObservedGeneration: 2, Acknowledged: true, TokensRevoked: true, Released: true},
+			},
+			{
+				name: "digest mismatch",
+				ann:  latchJSON,
+				rev:  &v1alpha1.AccessApplicationRevocationStatus{LatchDigest: "wrong-digest", ObservedGeneration: 3, Acknowledged: true, TokensRevoked: true, Released: true},
+			},
+			{
+				name: "Managed without TokensRevoked",
+				ann:  latchJSON,
+				rev:  &v1alpha1.AccessApplicationRevocationStatus{LatchDigest: validDigest, ObservedGeneration: 3, Acknowledged: true, TokensRevoked: false, Released: true},
+			},
+			{
+				name: "Released false",
+				ann:  latchJSON,
+				rev:  &v1alpha1.AccessApplicationRevocationStatus{LatchDigest: validDigest, ObservedGeneration: 3, Acknowledged: true, TokensRevoked: true, Released: false},
+			},
+			{
+				name: "legacy non-JSON sentinel",
+				ann:  "latched",
+				rev:  validRev,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				in := baseInputs(tc.ann, tc.rev, v1alpha1.ManagementPolicyManaged, blockedEntry)
+				tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil)
+				if len(tombstones) != 1 || tombstones[0].Application != "default/app-old" {
+					t.Fatalf("%s tombstones = %#v, want fail-closed retention", tc.name, tombstones)
+				}
+			})
 		}
 	})
+}
+
+func TestEmptyTargetCompilationDoesNotReleaseOnAllowedRoutesRejection(t *testing.T) {
+	in := accessInputs(true)
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"allowed": "true"}}
+	in.Gateway.Spec.Listeners[0].AllowedRoutes = &gatewayv1.AllowedRoutes{
+		Namespaces: &gatewayv1.RouteNamespaces{From: new(gatewayv1.NamespacesFromSelector), Selector: selector},
+	}
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+	in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+	route := routeWithBackend("rejected", "backend", 8080)
+	route.Spec.Hostnames = []gatewayv1.Hostname{"app.example.com"}
+	route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+	app := accessApplication("app", "Gateway", "gateway", "http")
+	compiled := CompileAccessApplication(in, &app)
+	if compiled.Accepted || compiled.Reason != "TargetNotFound" {
+		t.Fatalf("compiled = %+v, want TargetNotFound rejection", compiled)
+	}
+	if compiled.NoTargetsResolved {
+		t.Fatalf("NoTargetsResolved = true when HTTPRoute attachment was rejected by allowedRoutes, want false")
+	}
 }

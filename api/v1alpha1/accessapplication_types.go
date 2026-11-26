@@ -657,6 +657,24 @@ type AccessBypassApplicationStatus struct {
 	DeletionPolicy DeletionPolicy                `json:"deletionPolicy,omitempty"`
 }
 
+// AccessApplicationRevocationStatus records controller-owned revocation proof
+// and hold-release eligibility bound to an AccessApplication UID, latch digest,
+// and evaluated generation.
+type AccessApplicationRevocationStatus struct {
+	// LatchDigest is the SHA-256 hex digest binding application UID and canonical
+	// revocation latch claims.
+	LatchDigest string `json:"latchDigest,omitempty"`
+	// ObservedGeneration is the AccessApplication generation evaluated for Released.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// Acknowledged reports that every latched claim stopped forwarding on the tunnel.
+	Acknowledged bool `json:"acknowledged,omitempty"`
+	// TokensRevoked reports that remote Access tokens were revoked for this latch.
+	TokensRevoked bool `json:"tokensRevoked,omitempty"`
+	// Released reports whether completed revocation tombstones may be released
+	// for the evaluated generation when no Forwarding entry remains on the tunnel.
+	Released bool `json:"released,omitempty"`
+}
+
 // AccessApplicationStatus records the remote application without exposing its AUD.
 type AccessApplicationStatus struct {
 	ApplicationID     string                `json:"applicationId,omitempty"`
@@ -686,6 +704,10 @@ type AccessApplicationStatus struct {
 	// AppliedAt is when AppliedHash was last recorded; nil means never applied.
 	// +optional
 	AppliedAt *metav1.Time `json:"appliedAt,omitempty"`
+	// Revocation records controller-owned revocation acknowledgment and
+	// hold-release eligibility for an active revocation latch.
+	// +optional
+	Revocation *AccessApplicationRevocationStatus `json:"revocation,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -94,29 +94,10 @@ Procedure:
 2. Compile fail-closed: a protected domain with no verified, ready AUD — or with
    a blocked guard — produces a deny rule, never an open pass-through. Keep the
    "requires teamName and at least one non-empty audTag" validation intact.
-3. Treat revocation as a latch, not an event. A deleted or distrusted handoff
-   latches the (gateway, application) identity; the latch releases only after the
-   tunnel reports a fresh `Blocked` status above the recorded baseline with
-   desired == applied config version (or, on a converged tunnel with
-   `desired == applied > 0`, when an absent claim is either already
-   `acknowledged`/`tokensRevoked` with `applied >= baselineVersion` or an orphan
-   claim missing from `status.dataPlanes` with `applied > baselineVersion`, and
-   neither that claim nor any recorded `status.dataPlanes` entry remains
-   `Forwarding`). Until acknowledged, active recovery preserves existing
-   `status.dataPlanes` and `status.destinations`, and the handoff stays
-   `Ready=false` even if a new Secret appears.
+3. Treat Gateway AUD handoff revocation (`audRevocationApplied` on `CloudflareTunnel.status`) as a latch, not an event. A deleted or distrusted handoff latches the `(gateway, application)` identity; `audRevocationApplied` releases that latch only when at least one matching hostname entry exists on the tunnel and every matching entry reports `Blocked` above the recorded baseline with `desired == applied` config version. Until then the handoff stays `Ready=false` even if a new Secret appears.
 4. Only a Secret that passes the full live-binding check may latch or unlatch —
    a tenant-forged Secret in a tenant namespace must be ignored entirely.
-5. Token revocation runs only after every protection domain has acknowledged
-   revocation (`Blocked` or converged absence with no remaining `Forwarding`),
-   is skipped under `ObserveOnly`, and is recorded in the latch
-   (`acknowledged` and `tokensRevoked`) so retries are idempotent. After token
-   revocation, retained `NoTargetsResolved` and target-loss applications set
-   `released: true` so `AccessRevocationTombstones` drops tombstones once no
-   `Forwarding` entry remains on the tunnel; configuration, policy, and grant
-   rejections keep `released: false` until fixed. Revocation still goes
-   through the normal grant-gated client construction; it is a narrower
-   operation, not an authorization exemption.
+5. For `AccessApplication` lifecycle revocation (`revocationAcknowledged` and deletion/invalidation), acknowledgment requires each claim on `CloudflareTunnel.status.hostnames` to report `Blocked` above its baseline with `desired == applied` (or, on a converged tunnel with `desired == applied > 0`, converged absence when the claim is either already controller-acknowledged in `status.revocation` with `applied >= baselineVersion` or an orphan claim absent from `status.dataPlanes` with `applied > baselineVersion`, and neither the claim nor any recorded `status.dataPlanes` entry for that application remains `Forwarding`). While active recovery waits for acknowledgment or first latches a missing handoff, preserve existing `status.dataPlanes` and `status.destinations`. Token revocation runs only after every protection domain acknowledges revocation, is skipped under `ObserveOnly`, and persists `tokensRevoked` in the latch annotation. Controller-owned release eligibility lives in `status.revocation` (bound to application UID, canonical claim digest, `observedGeneration`, acknowledgment, and token revocation — or `ObserveOnly`): `NoTargetsResolved` (zero route claims and zero declared destinations across the whole application) and target-loss applications set `Released=true` on the current evaluation, whereas configuration, policy, grant, or `allowedRoutes` rejections reset `Released=false`. `AccessRevocationTombstones` drops a tombstone only when `status.revocation` proves current-generation release and the tunnel has no remaining `Forwarding` entry for that protection domain and application (an unrelated domain on the same tunnel may continue forwarding). Revocation still goes through the normal grant-gated client construction; it is a narrower operation, not an authorization exemption.
 6. Deletion ordering: remove the AUD handoff, wait for `Blocked` acknowledgment,
    then delete bypass children, then the parent. Never delete the remote
    application while a data plane may still serve its AUD.

@@ -210,12 +210,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		}
 		if !acknowledged {
 			status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
-			if len(application.Status.DataPlanes) > 0 {
-				status.DataPlanes = slices.Clone(application.Status.DataPlanes)
-			}
-			if len(application.Status.Destinations) > 0 {
-				status.Destinations = slices.Clone(application.Status.Destinations)
-			}
+			preserveLatchedDataPlaneStatus(&status, application)
 			if reason == "" {
 				reason = "RevocationPending"
 			}
@@ -242,6 +237,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			return ctrl.Result{}, err
 		}
 		status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
+		preserveLatchedDataPlaneStatus(&status, application)
 		setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, "RevocationPending", "AUD handoff disappeared; waiting for a fresh blocked data-plane version", r.now())
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
 	}
@@ -410,6 +406,13 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 	status := r.desiredStatus(application, retained, application.Status.ApplicationID, application.Status.BypassApplications, false)
 	setApplicationStatusCondition(&status, application, accessApplicationConditionProgrammed, metav1.ConditionFalse, invalid.Reason, invalid.Message, r.now())
 	if !acknowledged {
+		if status.Revocation != nil {
+			revCopy := *status.Revocation
+			revCopy.ObservedGeneration = application.Generation
+			revCopy.Acknowledged = false
+			revCopy.Released = false
+			status.Revocation = &revCopy
+		}
 		cleanupStatus := metav1.ConditionFalse
 		if reason != accessRevocationPublisherUnavailable {
 			reason = "RevocationPending"
@@ -422,10 +425,9 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
 		return ctrl.Result{}, err
 	}
-	switch {
-	case targetInfrastructureUnavailable(invalid) &&
+	if targetInfrastructureUnavailable(invalid) &&
 		effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
-		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete:
+		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
 		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -439,16 +441,25 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 		status.Domain = ""
 		status.ZoneID = ""
 		status.Tags = nil
+		status.Revocation = nil
 		if err := r.clearRevocationLatch(ctx, application); err != nil {
 			return ctrl.Result{}, err
 		}
-	case targetInfrastructureUnavailable(invalid) || invalid.NoTargetsResolved:
-		if err := r.markRevocationLatchState(ctx, application, true, true); err != nil {
-			return ctrl.Result{}, err
+	} else {
+		var latchDigest string
+		if latch, ok := gatewayapi.ParseAccessRevocationLatch(application.Annotations[accessApplicationRevocationAnnotation]); ok {
+			latchDigest = gatewayapi.AccessRevocationLatchDigest(application.UID, latch.Claims)
 		}
-	default:
-		if err := r.markRevocationLatchState(ctx, application, true, false); err != nil {
-			return ctrl.Result{}, err
+		if latchDigest != "" {
+			status.Revocation = &v1alpha1.AccessApplicationRevocationStatus{
+				LatchDigest:        latchDigest,
+				ObservedGeneration: application.Generation,
+				Acknowledged:       true,
+				TokensRevoked:      effectiveManagementPolicy(application.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyObserveOnly,
+				Released:           targetInfrastructureUnavailable(invalid) || invalid.NoTargetsResolved,
+			}
+		} else {
+			status.Revocation = nil
 		}
 	}
 	return ctrl.Result{RequeueAfter: accessApplicationRequeue}, r.patchStatus(ctx, application, status)
@@ -507,6 +518,15 @@ func statusCompilation(application *v1alpha1.AccessApplication, invalid gatewaya
 	return compilation
 }
 
+func preserveLatchedDataPlaneStatus(status *v1alpha1.AccessApplicationStatus, application *v1alpha1.AccessApplication) {
+	if len(application.Status.DataPlanes) > 0 {
+		status.DataPlanes = slices.Clone(application.Status.DataPlanes)
+	}
+	if len(application.Status.Destinations) > 0 {
+		status.Destinations = slices.Clone(application.Status.Destinations)
+	}
+}
+
 func applicationProgrammed(application *v1alpha1.AccessApplication) bool {
 	return gatewaystatus.ConditionTrue(application.Status.Conditions, accessApplicationConditionProgrammed)
 }
@@ -560,13 +580,17 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		}, nil
 	}
 
-	gatewayKeys, err := r.targetGatewayKeys(ctx, application)
+	targetRes, err := r.resolveTargetGateways(ctx, application)
 	if err != nil {
+		return accessApplicationContext{}, err
+	}
+	if targetRes.invalidMessage != "" {
 		return accessApplicationContext{
 			account: &account, scope: scope,
-			compilation: rejectedCompilation("TargetNotFound", err.Error()),
+			compilation: rejectedCompilation("Invalid", targetRes.invalidMessage),
 		}, nil
 	}
+	gatewayKeys := targetRes.gatewayKeys
 	result := accessApplicationContext{
 		account: &account,
 		scope:   scope,
@@ -584,11 +608,33 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		}
 	}
 	if len(gatewayKeys) == 0 {
+		if len(targetRes.missingRoutes) > 0 {
+			if len(application.Spec.Destinations) > 0 {
+				compiled := gatewayapi.CompileAccessApplication(privateInputs, application)
+				if !compiled.Accepted {
+					result.compilation = compiled
+					return result, nil
+				}
+			}
+			failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("the HTTPRoute %s was not found", targetRes.missingRoutes[0]))
+			failure.NoTargetsResolved = len(application.Spec.Destinations) == 0 && !targetRes.unattachedRoute
+			result.compilation = failure
+			return result, nil
+		}
+		if targetRes.unattachedRoute && len(application.Spec.Destinations) == 0 {
+			result.compilation = rejectedCompilation("TargetNotFound", "target HTTPRoute has no Gateway parentRefs")
+			return result, nil
+		}
 		compiled := gatewayapi.CompileAccessApplication(privateInputs, application)
 		result.compilation = compiled
 		return result, nil
 	}
 
+	var (
+		hardFailure        *gatewayapi.AccessApplicationCompilation
+		emptyFailure       *gatewayapi.AccessApplicationCompilation
+		anyResolvedTargets = len(application.Spec.Destinations) > 0
+	)
 	for _, gatewayKey := range gatewayKeys {
 		var gateway gatewayv1.Gateway
 		if err := r.Get(ctx, gatewayKey, &gateway); err != nil {
@@ -658,14 +704,47 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		if !found {
 			continue
 		}
+		if len(compiled.Destinations) > 0 || len(compiled.DataPlanes) > 0 {
+			anyResolvedTargets = true
+		}
 		mergeAccessCompilation(&result.compilation, compiled)
 		if !compiled.Accepted {
-			result.compilation = compiled
-			break
+			if compiled.NoTargetsResolved {
+				if emptyFailure == nil {
+					copied := compiled
+					emptyFailure = &copied
+				}
+				continue
+			}
+			if hardFailure == nil {
+				copied := compiled
+				hardFailure = &copied
+			}
+			continue
 		}
 	}
+	if hardFailure != nil {
+		failure := *hardFailure
+		failure.NoTargetsResolved = false
+		result.compilation = failure
+		return result, nil
+	}
+	if len(targetRes.missingRoutes) > 0 {
+		failure := rejectedCompilation("TargetNotFound", fmt.Sprintf("the HTTPRoute %s was not found", targetRes.missingRoutes[0]))
+		failure.NoTargetsResolved = !anyResolvedTargets && !targetRes.unattachedRoute
+		result.compilation = failure
+		return result, nil
+	}
+	if emptyFailure != nil {
+		failure := *emptyFailure
+		failure.NoTargetsResolved = !anyResolvedTargets && !targetRes.unattachedRoute
+		result.compilation = failure
+		return result, nil
+	}
 	if len(result.compilation.Destinations) == 0 && result.compilation.Accepted {
-		result.compilation = rejectedCompilation("TargetNotFound", "no targetRef or destination resolves to an Access destination")
+		failure := rejectedCompilation("TargetNotFound", "no targetRef or destination resolves to an Access destination")
+		failure.NoTargetsResolved = !anyResolvedTargets && !targetRes.unattachedRoute
+		result.compilation = failure
 	}
 	return result, nil
 }
@@ -878,8 +957,16 @@ func (r *AccessApplicationReconciler) setPrivateTunnelLedger(ctx context.Context
 	return nil
 }
 
-func (r *AccessApplicationReconciler) targetGatewayKeys(ctx context.Context, application *v1alpha1.AccessApplication) ([]types.NamespacedName, error) {
+type targetGatewayResolution struct {
+	gatewayKeys     []types.NamespacedName
+	missingRoutes   []string
+	unattachedRoute bool
+	invalidMessage  string
+}
+
+func (r *AccessApplicationReconciler) resolveTargetGateways(ctx context.Context, application *v1alpha1.AccessApplication) (targetGatewayResolution, error) {
 	keys := make(map[types.NamespacedName]struct{})
+	var res targetGatewayResolution
 	for _, target := range application.Spec.TargetRefs {
 		group := string(target.Group)
 		if group == "" {
@@ -890,7 +977,8 @@ func (r *AccessApplicationReconciler) targetGatewayKeys(ctx context.Context, app
 			kind = "Gateway"
 		}
 		if group != "gateway.networking.k8s.io" {
-			return nil, fmt.Errorf("unsupported targetRef group %q", group)
+			res.invalidMessage = fmt.Sprintf("unsupported targetRef group %q", group)
+			return res, nil
 		}
 		switch kind {
 		case "Gateway":
@@ -899,8 +987,13 @@ func (r *AccessApplicationReconciler) targetGatewayKeys(ctx context.Context, app
 			var route gatewayv1.HTTPRoute
 			key := types.NamespacedName{Namespace: application.Namespace, Name: string(target.Name)}
 			if err := r.Get(ctx, key, &route); err != nil {
-				return nil, fmt.Errorf("the HTTPRoute %s was not found", key)
+				if apierrors.IsNotFound(err) {
+					res.missingRoutes = append(res.missingRoutes, key.String())
+					continue
+				}
+				return targetGatewayResolution{}, fmt.Errorf("get target HTTPRoute %s: %w", key, err)
 			}
+			matchedGateway := false
 			for _, parent := range route.Spec.ParentRefs {
 				parentGroup := "gateway.networking.k8s.io"
 				if parent.Group != nil && *parent.Group != "" {
@@ -916,18 +1009,23 @@ func (r *AccessApplicationReconciler) targetGatewayKeys(ctx context.Context, app
 				}
 				if parentGroup == "gateway.networking.k8s.io" && parentKind == "Gateway" && parentNamespace == application.Namespace {
 					keys[types.NamespacedName{Namespace: parentNamespace, Name: string(parent.Name)}] = struct{}{}
+					matchedGateway = true
 				}
 			}
+			if !matchedGateway {
+				res.unattachedRoute = true
+			}
 		default:
-			return nil, fmt.Errorf("unsupported targetRef kind %q", kind)
+			res.invalidMessage = fmt.Sprintf("unsupported targetRef kind %q", kind)
+			return res, nil
 		}
 	}
-	result := make([]types.NamespacedName, 0, len(keys))
+	res.gatewayKeys = make([]types.NamespacedName, 0, len(keys))
 	for key := range keys {
-		result = append(result, key)
+		res.gatewayKeys = append(res.gatewayKeys, key)
 	}
-	slices.SortFunc(result, func(left, right types.NamespacedName) int { return strings.Compare(left.String(), right.String()) })
-	return result, nil
+	slices.SortFunc(res.gatewayKeys, func(left, right types.NamespacedName) int { return strings.Compare(left.String(), right.String()) })
+	return res, nil
 }
 
 func (r *AccessApplicationReconciler) gatewayTunnel(ctx context.Context, gateway *gatewayv1.Gateway) (*v1alpha1.CloudflareTunnel, error) {
@@ -1476,6 +1574,10 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 			return false, "Waiting for the Access AUD handoff to remain absent", "", nil
 		}
 	}
+	previouslyAcknowledged := application.UID != "" &&
+		application.Status.Revocation != nil &&
+		application.Status.Revocation.Acknowledged &&
+		application.Status.Revocation.LatchDigest == gatewayapi.AccessRevocationLatchDigest(application.UID, latch.Claims)
 	applicationKey := application.Namespace + "/" + application.Name
 	tunnels := make(map[string]*v1alpha1.CloudflareTunnel)
 	for _, claim := range latch.Claims {
@@ -1509,7 +1611,7 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 				break
 			}
 		}
-		if !acknowledged && revocationClaimAbsentFromConvergedTunnel(tunnel, application, latch, claim, applicationKey) {
+		if !acknowledged && revocationClaimAbsentFromConvergedTunnel(tunnel, application, previouslyAcknowledged, claim, applicationKey) {
 			acknowledged = true
 		}
 		if !acknowledged {
@@ -1558,7 +1660,7 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 func revocationClaimAbsentFromConvergedTunnel(
 	tunnel *v1alpha1.CloudflareTunnel,
 	application *v1alpha1.AccessApplication,
-	latch accessRevocationLatch,
+	previouslyAcknowledged bool,
 	claim accessRevocationClaim,
 	applicationKey string,
 ) bool {
@@ -1566,7 +1668,7 @@ func revocationClaimAbsentFromConvergedTunnel(
 		tunnel.Status.ConfigVersion.Desired != tunnel.Status.ConfigVersion.Applied {
 		return false
 	}
-	if latch.Acknowledged || latch.TokensRevoked {
+	if previouslyAcknowledged {
 		if tunnel.Status.ConfigVersion.Applied < claim.BaselineVersion {
 			return false
 		}
@@ -1740,10 +1842,9 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
 		return fmt.Errorf("decode Access revocation latch: %w", err)
 	}
-	if latch.TokensRevoked && latch.Acknowledged {
+	if latch.TokensRevoked {
 		return nil
 	}
-	latch.Acknowledged = true
 	latch.TokensRevoked = true
 	payload, err := json.Marshal(latch)
 	if err != nil {
@@ -1753,34 +1854,6 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
 	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
 		return fmt.Errorf("persist Access token revocation: %w", err)
-	}
-	return nil
-}
-
-func (r *AccessApplicationReconciler) markRevocationLatchState(ctx context.Context, application *v1alpha1.AccessApplication, acknowledged, released bool) error {
-	raw := application.Annotations[accessApplicationRevocationAnnotation]
-	if raw == "" {
-		return nil
-	}
-	latch, ok := gatewayapi.ParseAccessRevocationLatch(raw)
-	if !ok {
-		return nil
-	}
-	nextAcknowledged := latch.Acknowledged || acknowledged
-	nextReleased := latch.Released || released
-	if latch.Acknowledged == nextAcknowledged && latch.Released == nextReleased {
-		return nil
-	}
-	latch.Acknowledged = nextAcknowledged
-	latch.Released = nextReleased
-	payload, err := json.Marshal(latch)
-	if err != nil {
-		return fmt.Errorf("encode Access revocation latch: %w", err)
-	}
-	before := application.DeepCopy()
-	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
-	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("persist Access revocation latch state: %w", err)
 	}
 	return nil
 }
@@ -2087,6 +2160,9 @@ func (r *AccessApplicationReconciler) desiredStatus(application *v1alpha1.Access
 		})
 	}
 	status.BypassApplications = slices.Clone(children)
+	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
+		status.Revocation = nil
+	}
 	acceptedStatus := metav1.ConditionFalse
 	programmedStatus := metav1.ConditionFalse
 	originStatus := metav1.ConditionFalse

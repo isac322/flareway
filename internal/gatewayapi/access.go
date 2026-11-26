@@ -159,14 +159,18 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 	base := in
 	base.AccessApplications = nil
 	base.AUDSecrets = nil
-	gateway, _ := Translate(base)
+	gateway, baseStatuses := Translate(base)
 	if gateway == nil {
 		if len(application.Spec.TargetRefs) > 0 {
 			return accessLossFailure("Gateway target was not found", AccessTargetLossGateway)
 		}
 		return compileDeclaredAccessDestinations(in, application)
 	}
-	return compileAccessApplicationAgainstIR(in, gateway, application)
+	compiled := compileAccessApplicationAgainstIR(in, gateway, application)
+	if compiled.NoTargetsResolved && targetAttachmentRejected(in, gateway, &baseStatuses, application) {
+		compiled.NoTargetsResolved = false
+	}
+	return compiled
 }
 
 // isWildcardHostname reports whether a virtual host stands for a pattern
@@ -414,6 +418,9 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 		application := &applications[index]
 		key := types.NamespacedName{Namespace: application.Namespace, Name: application.Name}
 		compiled := compileAccessApplicationAgainstIR(in, gateway, application)
+		if compiled.NoTargetsResolved && targetAttachmentRejected(in, gateway, statuses, application) {
+			compiled.NoTargetsResolved = false
+		}
 		if compiled.Accepted {
 			for _, claim := range compiled.claims {
 				for _, existing := range acceptedClaims[claim.hostname] {
@@ -1045,6 +1052,92 @@ func accessFailure(reason, message string) AccessApplicationCompilation {
 // permanently unusable; TargetLoss carries the structured discriminator.
 func accessLossFailure(message string, loss AccessTargetLoss) AccessApplicationCompilation {
 	return AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
+}
+
+func targetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses, application *v1alpha1.AccessApplication) bool {
+	if gateway == nil || statuses == nil || application == nil {
+		return false
+	}
+	for _, target := range application.Spec.TargetRefs {
+		group := string(target.Group)
+		if group == "" {
+			group = gatewayGroup
+		}
+		kind := string(target.Kind)
+		if kind == "" {
+			kind = "Gateway"
+		}
+		switch {
+		case group == gatewayGroup && kind == "Gateway":
+			if string(target.Name) != gateway.Key.Name {
+				continue
+			}
+			if gatewayTargetAttachmentRejected(in, statuses, target.SectionName) {
+				return true
+			}
+		case group == gatewayGroup && kind == "HTTPRoute":
+			key := types.NamespacedName{Namespace: application.Namespace, Name: string(target.Name)}
+			routeStatus, ok := statuses.HTTPRoutes[key]
+			if !ok {
+				continue
+			}
+			for _, parentStatus := range routeStatus.Parents {
+				if parentStatus.ControllerName != ControllerName ||
+					!parentTargetsGateway(parentStatus.ParentRef, application.Namespace, in.Gateway) {
+					continue
+				}
+				for _, cond := range parentStatus.Conditions {
+					if cond.Type == string(gatewayv1.RouteConditionAccepted) &&
+						cond.Status == metav1.ConditionFalse {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func gatewayTargetAttachmentRejected(in Inputs, statuses *Statuses, sectionName *gatewayv1.SectionName) bool {
+	var targetPort *gatewayv1.PortNumber
+	if sectionName != nil && in.Gateway != nil {
+		for _, listener := range in.Gateway.Spec.Listeners {
+			if listener.Name == *sectionName {
+				port := listener.Port
+				targetPort = &port
+				break
+			}
+		}
+	}
+	for index := range in.HTTPRoutes {
+		route := &in.HTTPRoutes[index]
+		routeStatus, ok := statuses.HTTPRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}]
+		if !ok {
+			continue
+		}
+		for _, parentStatus := range routeStatus.Parents {
+			if parentStatus.ControllerName != ControllerName ||
+				!parentTargetsGateway(parentStatus.ParentRef, route.Namespace, in.Gateway) {
+				continue
+			}
+			if sectionName != nil && parentStatus.ParentRef.SectionName != nil &&
+				*parentStatus.ParentRef.SectionName != *sectionName {
+				continue
+			}
+			if targetPort != nil && parentStatus.ParentRef.Port != nil &&
+				*parentStatus.ParentRef.Port != *targetPort {
+				continue
+			}
+			for _, cond := range parentStatus.Conditions {
+				if cond.Type == string(gatewayv1.RouteConditionAccepted) &&
+					cond.Status == metav1.ConditionFalse &&
+					cond.Reason == string(gatewayv1.RouteReasonNotAllowedByListeners) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func accessRegionsToMatches(regions []accessRegion) []ir.PathMatch {

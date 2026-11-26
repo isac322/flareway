@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -35,13 +36,11 @@ import (
 // every issued token is revoked and the data plane blocks its hosts.
 const AccessRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
 
-// AccessRevocationLatch is the persisted JSON state stored in
+// AccessRevocationLatch is the persisted JSON claim set stored in
 // AccessRevocationAnnotation across AccessApplication and Gateway reconciles.
 type AccessRevocationLatch struct {
 	Claims        []AccessRevocationClaim `json:"claims"`
-	Acknowledged  bool                    `json:"acknowledged,omitempty"`
 	TokensRevoked bool                    `json:"tokensRevoked,omitempty"`
-	Released      bool                    `json:"released,omitempty"`
 }
 
 // AccessRevocationClaim records one host/protection-domain pair that must stop
@@ -65,6 +64,34 @@ func ParseAccessRevocationLatch(raw string) (AccessRevocationLatch, bool) {
 		return AccessRevocationLatch{}, false
 	}
 	return latch, true
+}
+
+// AccessRevocationLatchDigest returns the deterministic SHA-256 hex digest
+// binding application UID to canonicalized revocation latch claims. Returns ""
+// when uid is empty so callers fail closed.
+func AccessRevocationLatchDigest(uid types.UID, claims []AccessRevocationClaim) string {
+	if uid == "" {
+		return ""
+	}
+	canonical := slices.Clone(claims)
+	slices.SortFunc(canonical, func(left, right AccessRevocationClaim) int {
+		return strings.Compare(
+			fmt.Sprintf("%s\x00%s\x00%s\x00%d", left.Tunnel, left.ProtectionDomain, left.Hostname, left.BaselineVersion),
+			fmt.Sprintf("%s\x00%s\x00%s\x00%d", right.Tunnel, right.ProtectionDomain, right.Hostname, right.BaselineVersion),
+		)
+	})
+	canonical = slices.Compact(canonical)
+	if canonical == nil {
+		canonical = []AccessRevocationClaim{}
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%s\x00", uid)
+	_, _ = h.Write(encoded)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // AccessRevocationTombstone is a data plane of a revoked AccessApplication
@@ -104,8 +131,7 @@ func AccessRevocationTombstones(tunnel *v1alpha1.CloudflareTunnel, applications 
 		if application.DeletionTimestamp.IsZero() && rawLatch == "" {
 			continue
 		}
-		latch, latchParsed := ParseAccessRevocationLatch(rawLatch)
-		released := latchParsed && latch.Released
+		released := accessRevocationHoldReleased(application, rawLatch)
 		applicationKey := application.Namespace + "/" + application.Name
 		for _, dataPlane := range application.Status.DataPlanes {
 			if dataPlane.Tunnel != tunnel.Name || dataPlane.ProtectionDomain == "" {
@@ -132,6 +158,25 @@ func AccessRevocationTombstones(tunnel *v1alpha1.CloudflareTunnel, applications 
 		return strings.Compare(left.Key, right.Key)
 	})
 	return tombstones
+}
+
+func accessRevocationHoldReleased(application *v1alpha1.AccessApplication, rawLatch string) bool {
+	if application == nil || !application.DeletionTimestamp.IsZero() || application.UID == "" {
+		return false
+	}
+	latch, ok := ParseAccessRevocationLatch(rawLatch)
+	if !ok {
+		return false
+	}
+	rev := application.Status.Revocation
+	if rev == nil || !rev.Acknowledged || !rev.Released || rev.ObservedGeneration != application.Generation {
+		return false
+	}
+	digest := AccessRevocationLatchDigest(application.UID, latch.Claims)
+	if digest == "" || rev.LatchDigest != digest {
+		return false
+	}
+	return application.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly || rev.TokensRevoked
 }
 
 func tunnelProtectionDomainForwarding(tunnel *v1alpha1.CloudflareTunnel, protectionDomain, applicationKey string) bool {
