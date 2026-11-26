@@ -778,6 +778,11 @@ func collectDeltaWatchChanges(
 		_, replayRequested := rs.replay[name]
 		rejVer, wasRejected := rs.rejectedVersion(name)
 		if wasRejected && effectiveVer == rejVer && !replayRequested {
+			if found {
+				nextVersionMap[name] = prevVer
+			} else {
+				delete(nextVersionMap, name)
+			}
 			return
 		}
 		item := deltaCachedResource{name: name, version: effectiveVer, resource: res}
