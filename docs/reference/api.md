@@ -10,7 +10,7 @@ The CRDs in `config/crd/bases/` define validation, defaults, limits, and status 
 - Resources that call Cloudflare require `spec.accountRef.name`.
 - `managementPolicy` is `Managed` or `ObserveOnly`.
 - `adoption.mode` is `None` or `AdoptById`. `AdoptById` requires an `externalRef`; matching a remote name is never enough.
-- `deletionPolicy` is `Delete` or `Orphan`.
+- `deletionPolicy` is `Delete` or `Orphan` (`DeviceSettings` and `ZeroTrustOrganization` singletons permit only `Orphan`).
 - A namespaced object reference contains `name` and an optional `namespace`; an omitted namespace means the referencing object's namespace.
 - Secret values are accepted only through Secret references or written to controller-owned Secrets. Status never contains API tokens, client secrets, passwords, bearer tokens, Tunnel tokens, WARP Connector tokens, or Access AUDs.
 
