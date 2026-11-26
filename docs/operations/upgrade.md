@@ -10,12 +10,13 @@ Upgrade CRDs before the controller. Helm installs files in a chart's `crds/` dir
 4. Check for resources with `CleanupBlocked`, `Conflict`, or `Programmed=False`; resolve them before changing controller ownership.
 5. Keep the old controller running until managed resource teardown or migration is complete.
 6. Replace any legacy `deletionPolicy: Delete` on existing `DeviceSettings` or `ZeroTrustOrganization` manifests with `Orphan` (or omit the field) before recreating or restoring them; new CRD admission rejects `Delete` on both singletons.
+7. Update any negative or fractional `connectTimeout`, `keepAliveTimeout`, or `tcpKeepAlive` durations under `spec.originRequest` on existing `GatewayClassConfig` or Gateway-mode `CloudflareTunnel` manifests to non-negative whole seconds before recreating or restoring them; new CEL admission rejects negative or fractional values.
 
 ## Version compatibility
 
 | Flareway version | Gateway API Standard CRDs | Kubernetes API / client-go | Envoy data plane | cloudflared connector |
 |---|---|---|---|---|
-| `v0.4.0` - `v0.4.1` | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
+| `v0.4.0` - `v0.5.0` | v1.7.0 (backward-compatible with v1.6.x) | v1.37 (client-go v0.37.1) | `distroless-v1.40.0` | `2026.10.2` |
 | `v0.3.3` | v1.6.3 | v1.37 (client-go v0.37.1) | `distroless-v1.39.3` | `2026.10.0` |
 | `v0.1.0` - `v0.3.1` | v1.6.2 | v1.37 (client-go v0.37.0) | `distroless-v1.39.0` | `2026.9.0` |
 
