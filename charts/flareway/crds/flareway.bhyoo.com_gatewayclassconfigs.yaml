@@ -233,6 +233,11 @@ spec:
                 properties:
                   connectTimeout:
                     type: string
+                    x-kubernetes-validations:
+                    - message: connectTimeout must be non-negative
+                      rule: duration(self) >= duration('0s')
+                    - message: connectTimeout must use whole-second precision
+                      rule: timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())
                   disableChunkedEncoding:
                     type: boolean
                   http2Origin:
@@ -243,10 +248,20 @@ spec:
                     type: integer
                   keepAliveTimeout:
                     type: string
+                    x-kubernetes-validations:
+                    - message: keepAliveTimeout must be non-negative
+                      rule: duration(self) >= duration('0s')
+                    - message: keepAliveTimeout must use whole-second precision
+                      rule: timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())
                   noHappyEyeballs:
                     type: boolean
                   tcpKeepAlive:
                     type: string
+                    x-kubernetes-validations:
+                    - message: tcpKeepAlive must be non-negative
+                      rule: duration(self) >= duration('0s')
+                    - message: tcpKeepAlive must use whole-second precision
+                      rule: timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())
                 type: object
               privateDNS:
                 default: {}

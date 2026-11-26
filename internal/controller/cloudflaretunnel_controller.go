@@ -706,7 +706,7 @@ func (r *CloudflareTunnelReconciler) reconcileDelete(ctx context.Context, tunnel
 
 	if manageDNS && hasManagedDNS {
 		var expectedComments []string
-		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect || owner != nil {
+		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeDirect || owner != nil || len(tunnel.Status.DNSRecords) > 0 {
 			clusterID, err := r.clusterID(ctx)
 			if err != nil {
 				return r.cleanupFailure(ctx, tunnel, status, clearIntent, "DNSOwnershipUnavailable", err)
@@ -1066,6 +1066,7 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 	previousByHostname := make(map[string]v1alpha1.CloudflareTunnelDNSRecordStatus, len(tunnel.Status.DNSRecords))
 	desiredHostnames := make(map[string]bool, len(hosts))
 	ownershipComment := dnsOwnershipComment(tunnel, clusterID, gatewayName)
+	currentOwnerMarkers := flarecloudflare.DNSRecordOwnershipMarkers(nil, clusterID, tunnel.Namespace, gatewayName)
 	ownershipMarkers := dnsOwnershipMarkers(tunnel, clusterID, gatewayName)
 	expectedTargets := dnsRecordTargets(tunnel, tunnelID)
 	for _, previous := range tunnel.Status.DNSRecords {
@@ -1144,7 +1145,10 @@ func (r *CloudflareTunnelReconciler) ensureDNS(ctx context.Context, cf TunnelClo
 			}
 		} else {
 			record = records[0]
-			owned, reason := dnsRecordOwnedByGateway(record, ownershipMarkers)
+			owned, reason := dnsRecordOwnedByGateway(record, currentOwnerMarkers)
+			if !owned {
+				owned, reason = dnsRecordOwnedByGatewayWithTargets(record, ownershipMarkers, expectedTargets)
+			}
 			if !owned {
 				conflicts = append(conflicts, fmt.Sprintf("DNS record %s is not owned by this Tunnel configuration (%s)", host.Hostname, reason))
 				appendConflict(host)
@@ -2051,7 +2055,18 @@ func dnsOwnershipComment(tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayNa
 // accepts both shapes. Passing the text-bearing comment here would make a
 // record written before spec.dns.recordComment changed look unowned.
 func dnsOwnershipMarkers(tunnel *v1alpha1.CloudflareTunnel, clusterID, gatewayName string) []string {
-	return []string{flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, gatewayName)}
+	ownerNames := make([]string, 0, 3)
+	ownerNames = append(ownerNames, gatewayName, tunnel.Name)
+	if tunnel.Status.GatewayRef != nil && tunnel.Status.GatewayRef.Name != "" {
+		ownerNames = append(ownerNames, tunnel.Status.GatewayRef.Name)
+	}
+	checkpoints := make([]string, 0, len(tunnel.Status.DNSRecords))
+	for _, record := range tunnel.Status.DNSRecords {
+		if record.OwnershipComment != "" {
+			checkpoints = append(checkpoints, record.OwnershipComment)
+		}
+	}
+	return flarecloudflare.TunnelDNSOwnershipMarkers(nil, clusterID, tunnel.Namespace, ownerNames, checkpoints)
 }
 
 // dnsRecordTargets returns the CNAME targets this Tunnel may legitimately
@@ -2077,22 +2092,41 @@ func dnsRecordTargets(tunnel *v1alpha1.CloudflareTunnel, currentTunnelID string)
 // content to match a managed tunnel target. The second return value explains
 // a denial for the conflict status.
 func dnsRecordOwnedByGateway(record RemoteDNSRecord, markers []string) (bool, string) {
-	owned := false
-	for _, marker := range markers {
-		if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
-			Record: record, ExpectedComment: marker,
-		}) {
-			owned = true
-			break
-		}
+	return dnsRecordOwnedForTargets(record, markers, nil)
+}
+
+func dnsRecordOwnedByGatewayWithTargets(record RemoteDNSRecord, markers, expectedTargets []string) (bool, string) {
+	if len(expectedTargets) == 0 {
+		return false, "tunnel CNAME target is unavailable to verify previous owner transition"
 	}
-	if !owned {
-		return false, fmt.Sprintf("missing Flareway ownership marker (comment %q)", record.Comment)
-	}
+	return dnsRecordOwnedForTargets(record, markers, expectedTargets)
+}
+
+func dnsRecordOwnedForTargets(record RemoteDNSRecord, markers, expectedTargets []string) (bool, string) {
 	if !strings.EqualFold(record.Type, "CNAME") {
 		return false, fmt.Sprintf("record type %s is not a managed CNAME", record.Type)
 	}
-	return true, ""
+	for _, marker := range markers {
+		if len(expectedTargets) == 0 {
+			if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
+				Record: record, ExpectedComment: marker,
+			}) {
+				return true, ""
+			}
+			continue
+		}
+		for _, target := range expectedTargets {
+			if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
+				Record: record, ExpectedComment: marker, ExpectedTarget: target,
+			}) {
+				return true, ""
+			}
+		}
+	}
+	if len(expectedTargets) > 0 {
+		return false, fmt.Sprintf("missing matching tunnel target or Flareway ownership marker (comment %q, content %q)", record.Comment, record.Content)
+	}
+	return false, fmt.Sprintf("missing Flareway ownership marker (comment %q)", record.Comment)
 }
 
 func (r *CloudflareTunnelReconciler) clusterID(ctx context.Context) (string, error) {

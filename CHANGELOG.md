@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Enforce non-negative whole-second CEL validation on `GatewayOriginRequestSpec` durations (`connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`) and demote `CloudflareTunnel` `ConfigApplied=False` (`ConfigurationError`) plus `Gateway`/`Listener` `Programmed=False` (`Invalid`) if runtime `cloudflared` configuration compilation fails (#182).
+- Prevent invalid top-level `Gateway` specs (`Accepted=False` on `spec.addresses`, `spec.allowedListeners`, or `spec.tls`) from auto-creating a default `CloudflareTunnel` or overwriting `Programmed` `Invalid` with a requeuing `Pending` status (#186).
+- Retain verified DNS ownership authorization across `Gateway` detachment, `Gateway -> Direct` switches, and deletion when a `CloudflareTunnel` previously created DNS records under a differently named `Gateway` (#187).
 - Roll back the pending `ServiceToken` create journal, empty reserved destination
   Secret, and attempt finalizer when `CreateServiceToken` fails with a
   definite non-creation HTTP `4xx` error (excluding `408`, `409`, and `429`),

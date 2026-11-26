@@ -108,10 +108,11 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 		if tunnel.Status.GatewayRef != nil && tunnel.Status.GatewayRef.Name != "" {
 			ownerNames = append(ownerNames, tunnel.Status.GatewayRef.Name)
 		}
-		for _, ownerName := range ownerNames {
-			info.markers = append(info.markers, dnsOwnershipMarkers(tunnel, key, clusterID, ownerName)...)
-		}
+		checkpointComments := make([]string, 0, len(tunnel.Status.DNSRecords))
 		for _, checkpoint := range tunnel.Status.DNSRecords {
+			if checkpoint.OwnershipComment != "" {
+				checkpointComments = append(checkpointComments, checkpoint.OwnershipComment)
+			}
 			if checkpoint.RecordID == "" {
 				continue
 			}
@@ -119,6 +120,7 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 			claimed[checkpoint.RecordID] = true
 			checkpointZones[checkpoint.ZoneID] = true
 		}
+		info.markers = flarecloudflare.TunnelDNSOwnershipMarkers(key, clusterID, tunnel.Namespace, ownerNames, checkpointComments)
 		tunnels = append(tunnels, info)
 	}
 
@@ -259,20 +261,6 @@ func zoneFailureIsolatable(err error) bool {
 		// 401, 429, and every other 4xx abort the pass.
 		return false
 	}
-}
-
-// dnsOwnershipMarkers returns every marker a reader must accept for one
-// tunnel/owner-name pair, mirroring the controller's dnsOwnershipMarkers:
-// the signed marker first, then the legacy plaintext marker. The marker is
-// comment-prefix only — IsOwnedDNSRecord accepts an optional " | text"
-// suffix, so the checkpointed human comment never has to be recomputed.
-func dnsOwnershipMarkers(tunnel *v1alpha1.CloudflareTunnel, key []byte, clusterID, ownerName string) []string {
-	signed := flarecloudflare.SignDNSRecordComment(key, clusterID, tunnel.Namespace, ownerName)
-	legacy := flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, ownerName)
-	if signed == legacy {
-		return []string{signed}
-	}
-	return []string{signed, legacy}
 }
 
 // dnsRecordOwned reports whether the remote record carries the checkpointed

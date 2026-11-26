@@ -417,3 +417,175 @@ func TestGatewayReportsAdmissionWhenCreatingDefaultTunnel(t *testing.T) {
 	}
 	requireRouteParent(t, run, f)
 }
+
+func TestGatewayInvalidTopLevelSkipsDefaultTunnelAndReportsInvalid(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*gatewayv1.Gateway)
+	}{
+		{
+			name: "invalid addresses",
+			mutate: func(gw *gatewayv1.Gateway) {
+				addrType := gatewayv1.IPAddressType
+				gw.Spec.Addresses = []gatewayv1.GatewaySpecAddress{{Type: &addrType, Value: "192.0.2.10"}}
+			},
+		},
+		{
+			name: "invalid allowedListeners",
+			mutate: func(gw *gatewayv1.Gateway) {
+				same := gatewayv1.NamespacesFromSame
+				gw.Spec.AllowedListeners = &gatewayv1.AllowedListeners{Namespaces: &gatewayv1.ListenerNamespaces{From: &same}}
+			},
+		},
+		{
+			name: "invalid spec tls",
+			mutate: func(gw *gatewayv1.Gateway) {
+				gw.Spec.TLS = &gatewayv1.GatewayTLSConfig{
+					Backend: &gatewayv1.GatewayBackendTLS{ClientCertificateRef: &gatewayv1.SecretObjectReference{Name: "client-cert"}},
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTunnelAdmissionFixture(true)
+			tc.mutate(f.gateway)
+
+			run := f.reconcile(t, false)
+			observed := run.gateway(t, f)
+
+			if run.result != (ctrl.Result{}) {
+				t.Fatalf("invalid Gateway result = %#v, want no requeue", run.result)
+			}
+			accepted := requireCondition(t, observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted), f.gateway.Generation)
+			if accepted.Status != metav1.ConditionFalse {
+				t.Fatalf("Accepted = %#v, want False", accepted)
+			}
+			programmed := requireCondition(t, observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), f.gateway.Generation)
+			if programmed.Status != metav1.ConditionFalse || programmed.Reason != string(gatewayv1.GatewayReasonInvalid) {
+				t.Fatalf("Programmed = %#v, want False/Invalid", programmed)
+			}
+			var tunnels v1alpha1.CloudflareTunnelList
+			if err := run.kube.List(context.Background(), &tunnels, client.InNamespace(f.namespace.Name)); err != nil {
+				t.Fatal(err)
+			}
+			if len(tunnels.Items) != 0 {
+				t.Fatalf("invalid Gateway auto-created CloudflareTunnels: %#v", tunnels.Items)
+			}
+		})
+	}
+
+	t.Run("invalid top-level fields with existing unready tunnel still report Invalid without requeue", func(t *testing.T) {
+		f := newTunnelAdmissionFixture(true)
+		f.referenceTunnelExplicitly()
+		addrType := gatewayv1.IPAddressType
+		f.gateway.Spec.Addresses = []gatewayv1.GatewaySpecAddress{{Type: &addrType, Value: "192.0.2.10"}}
+
+		run := f.reconcile(t, true)
+		observed := run.gateway(t, f)
+
+		if run.result != (ctrl.Result{}) {
+			t.Fatalf("invalid top-level Gateway with existing tunnel result = %#v, want no requeue", run.result)
+		}
+		accepted := requireCondition(t, observed.Status.Conditions, string(gatewayv1.GatewayConditionAccepted), f.gateway.Generation)
+		if accepted.Status != metav1.ConditionFalse {
+			t.Fatalf("Accepted = %#v, want False", accepted)
+		}
+		programmed := requireCondition(t, observed.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), f.gateway.Generation)
+		if programmed.Status != metav1.ConditionFalse || programmed.Reason != string(gatewayv1.GatewayReasonInvalid) {
+			t.Fatalf("Programmed = %#v, want False/Invalid", programmed)
+		}
+	})
+}
+
+func TestGatewayCloudflaredCompileFailureDemotesProgrammedAndConfigApplied(t *testing.T) {
+	f := newTunnelAdmissionFixture(true)
+	f.account.Spec.AccountID = "account-id"
+	f.tunnel.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(f.gateway, gatewayControllerGVK())}
+	f.gateway.Status = gatewayv1.GatewayStatus{
+		Addresses: []gatewayv1.GatewayStatusAddress{{Value: "tunnel-id.cfargotunnel.com"}},
+		Conditions: []metav1.Condition{
+			{
+				Type:               string(gatewayv1.GatewayConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.GatewayReasonAccepted),
+				ObservedGeneration: f.gateway.Generation,
+				LastTransitionTime: metav1.NewTime(time.Unix(100, 0)),
+			},
+			{
+				Type:               string(gatewayv1.GatewayConditionProgrammed),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.GatewayReasonProgrammed),
+				ObservedGeneration: f.gateway.Generation,
+				LastTransitionTime: metav1.NewTime(time.Unix(100, 0)),
+			},
+		},
+	}
+	f.tunnel.Status = v1alpha1.CloudflareTunnelStatus{
+		TunnelID:                "tunnel-id",
+		OwnershipVerified:       true,
+		ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "connector-token"},
+		GatewayRef:              &corev1.LocalObjectReference{Name: f.gateway.Name},
+		GatewayUID:              f.gateway.UID,
+		Conditions: []metav1.Condition{
+			{
+				Type:               v1alpha1.CloudflareTunnelConditionConfigApplied,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Applied",
+				ObservedGeneration: f.tunnel.Generation,
+				LastTransitionTime: metav1.NewTime(time.Unix(100, 0)),
+			},
+			{
+				Type:               v1alpha1.CloudflareTunnelConditionReady,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				ObservedGeneration: f.tunnel.Generation,
+				LastTransitionTime: metav1.NewTime(time.Unix(100, 0)),
+			},
+		},
+	}
+	// Sub-second duration injected directly to simulate a pre-admission or corrupted
+	// spec reaching runtime cloudflared config compilation.
+	f.config.Spec.OriginRequest.ConnectTimeout = &metav1.Duration{Duration: 500 * time.Millisecond}
+
+	run := f.reconcile(t, true)
+	if run.err == nil || !strings.Contains(run.err.Error(), "whole-second precision") {
+		t.Fatalf("compile failure reconcile err = %v, want whole-second precision error", run.err)
+	}
+	if got := run.snapshots.Version(client.ObjectKeyFromObject(f.gateway).String()); got != "stale" {
+		t.Fatalf("compile failure published a new xDS snapshot %q, want preserved previous version", got)
+	}
+
+	var observedGateway gatewayv1.Gateway
+	if err := run.kube.Get(context.Background(), client.ObjectKeyFromObject(f.gateway), &observedGateway); err != nil {
+		t.Fatal(err)
+	}
+	programmed := requireCondition(t, observedGateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), f.gateway.Generation)
+	if programmed.Status != metav1.ConditionFalse || programmed.Reason != string(gatewayv1.GatewayReasonInvalid) {
+		t.Fatalf("Gateway Programmed = %#v, want False/Invalid", programmed)
+	}
+	if len(observedGateway.Status.Addresses) != 0 {
+		t.Fatalf("Gateway kept addresses after compile failure: %#v", observedGateway.Status.Addresses)
+	}
+	if len(observedGateway.Status.Listeners) != 1 {
+		t.Fatalf("status.listeners = %#v, want 1", observedGateway.Status.Listeners)
+	}
+	listenerProgrammed := requireCondition(t, observedGateway.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed), f.gateway.Generation)
+	if listenerProgrammed.Status != metav1.ConditionFalse || listenerProgrammed.Reason != string(gatewayv1.ListenerReasonInvalid) {
+		t.Fatalf("listener Programmed = %#v, want False/Invalid", listenerProgrammed)
+	}
+
+	var observedTunnel v1alpha1.CloudflareTunnel
+	if err := run.kube.Get(context.Background(), client.ObjectKeyFromObject(f.tunnel), &observedTunnel); err != nil {
+		t.Fatal(err)
+	}
+	configApplied := requireCondition(t, observedTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, f.tunnel.Generation)
+	if configApplied.Status != metav1.ConditionFalse || configApplied.Reason != "ConfigurationError" {
+		t.Fatalf("Tunnel ConfigApplied = %#v, want False/ConfigurationError", configApplied)
+	}
+	ready := requireCondition(t, observedTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, f.tunnel.Generation)
+	if ready.Status != metav1.ConditionFalse {
+		t.Fatalf("Tunnel Ready = %#v, want False when ConfigApplied is False", ready)
+	}
+}

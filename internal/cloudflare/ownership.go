@@ -155,6 +155,93 @@ func DNSRecordOwnershipMarkers(key []byte, clusterID, namespace, gatewayName str
 	return []string{signed, legacy}
 }
 
+// TunnelDNSOwnershipMarkers returns every valid DNS ownership marker a
+// CloudflareTunnel controller or sweeper may authorize for this tunnel: all
+// supplied ownerNames (typically current owner, tunnel name, and recorded
+// status.gatewayRef, including any overflow hash forms derived from those names)
+// plus any identity-verifiable markers extracted from
+// status.dnsRecords[].ownershipComment for the same (clusterID, namespace).
+// Foreign-cluster, foreign-namespace, tampered, unkeyed HMAC, or unverified
+// hash-only checkpoint comments are ignored so checkpoint corruption cannot
+// widen ownership authority.
+func TunnelDNSOwnershipMarkers(key []byte, clusterID, namespace string, ownerNames, checkpointComments []string) []string {
+	markers := make([]string, 0, len(ownerNames)*2+len(checkpointComments))
+	seenMarker := make(map[string]bool, len(ownerNames)*2+len(checkpointComments))
+	addMarker := func(marker string) {
+		if marker == "" || seenMarker[marker] {
+			return
+		}
+		seenMarker[marker] = true
+		markers = append(markers, marker)
+	}
+	addOwner := func(ownerName string) {
+		if ownerName == "" {
+			return
+		}
+		for _, marker := range DNSRecordOwnershipMarkers(key, clusterID, namespace, ownerName) {
+			addMarker(marker)
+		}
+	}
+
+	for _, ownerName := range ownerNames {
+		addOwner(ownerName)
+	}
+	for _, comment := range checkpointComments {
+		for _, marker := range extractValidatedCheckpointMarkers(comment, key, clusterID, namespace) {
+			addMarker(marker)
+		}
+	}
+	return markers
+}
+
+func extractValidatedCheckpointMarkers(comment string, key []byte, clusterID, namespace string) []string {
+	trimmed := strings.TrimSpace(comment)
+	if trimmed == "" || clusterID == "" || namespace == "" {
+		return nil
+	}
+
+	if strings.HasPrefix(trimmed, hmacMarkerPrefix) {
+		rest := strings.TrimPrefix(trimmed, hmacMarkerPrefix)
+		if len(rest) <= hmacMarkerHexLength+1 || rest[hmacMarkerHexLength] != ' ' ||
+			!isLowerHex(rest[:hmacMarkerHexLength]) || len(key) == 0 {
+			return nil
+		}
+		markerPrefix := hmacMarkerPrefix + rest[:hmacMarkerHexLength]
+		token, _, _ := strings.Cut(rest[hmacMarkerHexLength+1:], " ")
+		ns, ownerName, ok := strings.Cut(token, "/")
+		if ok && ns == namespace && ownerName != "" && !strings.Contains(ownerName, "/") &&
+			SignDNSRecordComment(key, clusterID, namespace, ownerName) == markerPrefix+" "+token {
+			return DNSRecordOwnershipMarkers(key, clusterID, namespace, ownerName)
+		}
+		return nil
+	}
+
+	prefix := "flareway " + clusterID + "/" + namespace + "/"
+	if strings.HasPrefix(trimmed, prefix) {
+		afterPrefix := strings.TrimPrefix(trimmed, prefix)
+		ownerName, _, _ := strings.Cut(afterPrefix, " ")
+		if ownerName != "" && !strings.Contains(ownerName, "/") {
+			return DNSRecordOwnershipMarkers(key, clusterID, namespace, ownerName)
+		}
+		return nil
+	}
+
+	return nil
+}
+
+func isLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // SignPrivateResourceComment returns the HMAC-signed ownership prefix for
 // Cloudflare network resources, whose APIs do not support tags. Without a key
 // it falls back to PrivateResourceComment.

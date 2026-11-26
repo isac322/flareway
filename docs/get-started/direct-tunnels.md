@@ -196,7 +196,7 @@ kubectl -n flareway-platform get cloudflaretunnel direct-services \
 
 Exactly one writer owns a tunnel's configuration: the Gateway in Gateway mode, or the `CloudflareTunnel` itself in Direct mode. The API server rejects a Direct tunnel that also sets the Gateway-mode fields `connector`, `proxy`, `privateDNS`, `originRequest`, or `listeners`. If admission reports this, remove those fields or set the mode back to `Gateway`.
 
-Do not attach a Direct tunnel to a Gateway. To move a tunnel from Gateway mode to Direct mode, set the mode and the `direct` block together; do not copy the generated Gateway ingress into it while a Gateway still references the tunnel. Flareway first drains the connector Pods of the Gateway that owned the tunnel and reports `Accepted=False` with reason `WaitingForDrain` until they are gone. Only then does Direct mode write the configuration.
+Do not attach a Direct tunnel to a Gateway. To move a tunnel from Gateway mode to Direct mode, set the mode and the `direct` block together; do not copy the generated Gateway ingress into it while a Gateway still references the tunnel. Flareway first drains the connector Pods of the Gateway that owned the tunnel and reports `Accepted=False` with reason `WaitingForDrain` until they are gone. Only then does Direct mode write the configuration. Any managed DNS records created under the previous bound Gateway name remain authorized for update or cleanup when verified against the tunnel's CNAME target and recorded ownership checkpoints.
 
 ## DNS for Direct tunnels
 

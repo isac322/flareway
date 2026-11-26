@@ -158,24 +158,10 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 
 	publicPorts := newPublicEnvoyPorts(in, holds.reservedPorts(), conformanceMode)
 	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, publicPorts)
-	globalInvalid := false
-	if len(in.Gateway.Spec.Addresses) > 0 {
-		globalInvalid = true
-		gatewayReason = gatewayv1.GatewayReasonUnsupportedAddress
-		gatewayMessage = "spec.addresses is not supported"
-	}
-	if in.Gateway.Spec.AllowedListeners != nil &&
-		(in.Gateway.Spec.AllowedListeners.Namespaces == nil ||
-			in.Gateway.Spec.AllowedListeners.Namespaces.From == nil ||
-			*in.Gateway.Spec.AllowedListeners.Namespaces.From != gatewayv1.NamespacesFromNone) {
-		globalInvalid = true
-		gatewayReason = gatewayv1.GatewayReasonListenersNotValid
-		gatewayMessage = "spec.allowedListeners is not supported"
-	}
-	if in.Gateway.Spec.TLS != nil && (in.Gateway.Spec.TLS.Backend != nil || in.Gateway.Spec.TLS.Frontend != nil) {
-		globalInvalid = true
-		gatewayReason = gatewayv1.GatewayReasonListenersNotValid
-		gatewayMessage = "spec.tls is not supported"
+	topLevelReason, topLevelMessage, globalInvalid := ValidateTopLevelGateway(in.Gateway)
+	if globalInvalid {
+		gatewayReason = topLevelReason
+		gatewayMessage = topLevelMessage
 	}
 	if infrastructure := in.Gateway.Spec.Infrastructure; infrastructure != nil && infrastructure.ParametersRef != nil {
 		ref := infrastructure.ParametersRef
@@ -600,6 +586,39 @@ func resolveListenerSecret(in Inputs, ref gatewayv1.SecretObjectReference) (*cor
 		}
 	}
 	return nil, gatewayv1.ListenerReasonInvalidCertificateRef, fmt.Sprintf("certificate Secret %s/%s was not found", namespace, ref.Name)
+}
+
+// ValidateTopLevelGateway reports whether top-level Gateway fields unsupported
+// by Flareway (spec.addresses, spec.allowedListeners, spec.tls) make the
+// Gateway invalid regardless of tunnel state.
+func ValidateTopLevelGateway(gateway *gatewayv1.Gateway) (gatewayv1.GatewayConditionReason, string, bool) {
+	if gateway == nil {
+		return "", "", false
+	}
+	var (
+		reason  gatewayv1.GatewayConditionReason
+		message string
+		invalid bool
+	)
+	if len(gateway.Spec.Addresses) > 0 {
+		invalid = true
+		reason = gatewayv1.GatewayReasonUnsupportedAddress
+		message = "spec.addresses is not supported"
+	}
+	if gateway.Spec.AllowedListeners != nil &&
+		(gateway.Spec.AllowedListeners.Namespaces == nil ||
+			gateway.Spec.AllowedListeners.Namespaces.From == nil ||
+			*gateway.Spec.AllowedListeners.Namespaces.From != gatewayv1.NamespacesFromNone) {
+		invalid = true
+		reason = gatewayv1.GatewayReasonListenersNotValid
+		message = "spec.allowedListeners is not supported"
+	}
+	if gateway.Spec.TLS != nil && (gateway.Spec.TLS.Backend != nil || gateway.Spec.TLS.Frontend != nil) {
+		invalid = true
+		reason = gatewayv1.GatewayReasonListenersNotValid
+		message = "spec.tls is not supported"
+	}
+	return reason, message, invalid
 }
 
 func compileHTTPRoutes(in Inputs, out *ir.Gateway, listeners []*listenerTranslation, statuses *Statuses, now metav1.Time) {
