@@ -133,12 +133,16 @@ func accountScopeListed(ref localRef) bool {
 }
 
 // accessScopeListed returns a predicate requiring both the target spec scope
-// and any distinct checkpointed status.zoneId scope to appear in listed. A
-// cross-scope transition whose prior zone failed to list cannot be judged
-// safely or confirmed during a partial pass.
-func accessScopeListed(listed map[string]bool) func(localRef) bool {
+// and any distinct checkpointed status.zoneId scope to appear in listed. When
+// partial is true, refs carrying unverifiedScope (unhealthy Ready/Accepted
+// conditions such as inherited pre-observation error checkpoints) are withheld
+// until a complete pass or fresh observation establishes the binding.
+func accessScopeListed(listed map[string]bool, partial bool) func(localRef) bool {
 	return func(ref localRef) bool {
 		if !listed[ref.scope] {
+			return false
+		}
+		if partial && ref.unverifiedScope {
 			return false
 		}
 		return ref.recordedScope == "" || ref.recordedScope == ref.scope || listed[ref.recordedScope]

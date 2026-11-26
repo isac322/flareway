@@ -63,8 +63,11 @@ limitations under the License.
 // Account-scope failures on Access targets still abort fail-closed. Scopes that
 // did not list contribute no records and no judgement, and Access objects with
 // a distinct checkpointed `status.zoneId` require both target and checkpointed
-// scopes in `listed` (`accessScopeListed`), so an unlisted zone can never
-// produce a false missing verdict. All other targets keep the strict contract.
+// scopes in `listed` (`accessScopeListed`), while partial passes also withhold
+// judgement for objects whose `Accepted`/`Ready` conditions do not confirm the
+// recorded binding (`unverifiedScope`), so an unlisted zone or inherited error
+// checkpoint can never produce a false missing verdict. All other targets keep
+// the strict contract.
 //
 // # Content confirmation
 //

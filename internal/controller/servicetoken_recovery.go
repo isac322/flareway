@@ -498,6 +498,8 @@ func (r *ServiceTokenReconciler) resumePreparedServiceToken(ctx context.Context,
 // The dispatched phase is committed before the request so a crash afterwards
 // resumes through recovery rather than re-creating blindly.
 func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
+	attemptedUID := object.UID
+	attemptedGeneration := object.Generation
 	issued, createErr := api.CreateServiceToken(ctx, scope, flarecloudflare.ServiceTokenInput{
 		Name:     journal.attemptName,
 		Duration: input.Duration,
@@ -507,18 +509,18 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 		if flarecloudflare.IsDefiniteNonCreationClientError(createErr) {
 			persistedSecret, persistErr := r.persistRejectedServiceTokenJournal(ctx, object, journalSecret, journal)
 			if persistErr != nil {
-				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, persistErr))
+				return ctrl.Result{}, r.finishRemoteErrorForAttempt(ctx, object, errors.Join(createErr, persistErr), attemptedUID, attemptedGeneration)
 			}
-			delay := r.recordServiceTokenCreateBackoff(object, account, input.Name, r.now())
+			delay := r.recordServiceTokenCreateBackoff(client.ObjectKeyFromObject(object), attemptedGeneration, account.ResourceVersion, input.Name, r.now())
 			if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, persistedSecret, journal, true); rbErr != nil {
-				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, rbErr))
+				return ctrl.Result{}, r.finishRemoteErrorForAttempt(ctx, object, errors.Join(createErr, rbErr), attemptedUID, attemptedGeneration)
 			}
-			if patchErr := r.patchRemoteError(ctx, object, createErr); patchErr != nil {
+			if patchErr := r.patchRemoteErrorForAttempt(ctx, object, createErr, attemptedUID, attemptedGeneration); patchErr != nil {
 				return ctrl.Result{}, errors.Join(createErr, patchErr)
 			}
 			return ctrl.Result{RequeueAfter: delay}, nil
 		}
-		return ctrl.Result{}, r.finishRemoteError(ctx, object, createErr)
+		return ctrl.Result{}, r.finishRemoteErrorForAttempt(ctx, object, createErr, attemptedUID, attemptedGeneration)
 	}
 	journal.issuedID = issued.ID
 	if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
@@ -541,6 +543,20 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 		remote = refreshed
 	}
 	return r.convergeCapturedServiceToken(ctx, object, api, scope, input, journal.attemptName, journalSecret, remote)
+}
+
+func (journal *serviceTokenJournal) sameAttemptBinding(other *serviceTokenJournal) bool {
+	return journal.crUID == other.crUID &&
+		journal.clusterUID == other.clusterUID &&
+		journal.accountName == other.accountName &&
+		journal.accountUID == other.accountUID &&
+		journal.accountID == other.accountID &&
+		journal.specZone == other.specZone &&
+		journal.zoneID == other.zoneID &&
+		journal.specName == other.specName &&
+		journal.destination == other.destination &&
+		journal.nonce == other.nonce &&
+		journal.attemptName == other.attemptName
 }
 
 func (journal *serviceTokenJournal) validateRejected() error {
@@ -575,6 +591,7 @@ func (r *ServiceTokenReconciler) persistRejectedServiceTokenJournal(ctx context.
 		return journalSecret, err
 	}
 
+	expectedUID := journalSecret.UID
 	persistedSecret := journalSecret
 	lastErr := err
 	backoff := wait.Backoff{Steps: 3, Duration: 25 * time.Millisecond, Factor: 2.0}
@@ -591,8 +608,8 @@ func (r *ServiceTokenReconciler) persistRejectedServiceTokenJournal(ctx context.
 			persistedSecret = nil
 			return true, nil
 		}
-		if freshJournal.crUID != journal.crUID || freshJournal.nonce != journal.nonce || freshJournal.attemptName != journal.attemptName {
-			lastErr = errors.New("service token journal changed identity during rejection retry")
+		if freshSecret.UID != expectedUID || !journal.sameAttemptBinding(freshJournal) {
+			lastErr = errors.New("service token journal was replaced or changed identity during rejection retry")
 			return false, lastErr
 		}
 		if bad := freshJournal.validateRejected(); bad != nil {
@@ -1019,8 +1036,7 @@ func (r *ServiceTokenReconciler) serviceTokenCreateRetryAfter(object *v1alpha1.S
 	return entry.until.Sub(now)
 }
 
-func (r *ServiceTokenReconciler) recordServiceTokenCreateBackoff(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, inputName string, now time.Time) time.Duration {
-	key := client.ObjectKeyFromObject(object)
+func (r *ServiceTokenReconciler) recordServiceTokenCreateBackoff(key types.NamespacedName, generation int64, accountRV, inputName string, now time.Time) time.Duration {
 	r.createBackoffMu.Lock()
 	defer r.createBackoffMu.Unlock()
 	if r.createBackoff == nil {
@@ -1028,7 +1044,7 @@ func (r *ServiceTokenReconciler) recordServiceTokenCreateBackoff(object *v1alpha
 	}
 	prev := r.createBackoff[key]
 	failures := 1
-	if prev.generation == object.Generation && prev.accountRV == account.ResourceVersion && prev.inputName == inputName {
+	if prev.generation == generation && prev.accountRV == accountRV && prev.inputName == inputName {
 		failures = prev.failures + 1
 	}
 	delay := serviceTokenCreateBackoffBase << min(failures-1, 6)
@@ -1038,8 +1054,8 @@ func (r *ServiceTokenReconciler) recordServiceTokenCreateBackoff(object *v1alpha
 	r.createBackoff[key] = serviceTokenCreateBackoff{
 		until:      now.Add(delay),
 		failures:   failures,
-		generation: object.Generation,
-		accountRV:  account.ResourceVersion,
+		generation: generation,
+		accountRV:  accountRV,
 		inputName:  inputName,
 	}
 	return delay

@@ -628,6 +628,103 @@ func TestAccessSweepCrossScopeSkipsJudgementWhenRecordedScopeUnlisted(t *testing
 	}
 }
 
+func TestAccessGroupPartialSweepWithholdsUnverifiedLegacyUpgradeBinding(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name           string
+		denyZoneDenied bool
+		readyStatus    metav1.ConditionStatus
+		reason         string
+		wantResult     string
+		wantItems      int
+	}{
+		{
+			name:           "partial_sweep_withholds_unestablished_legacy_binding",
+			denyZoneDenied: true,
+			readyStatus:    metav1.ConditionFalse,
+			reason:         "RefNotPermitted",
+			wantResult:     observability.SweepResultPartial,
+			wantItems:      0,
+		},
+		{
+			name:           "partial_sweep_judges_once_scoped_observation_establishes_ready",
+			denyZoneDenied: true,
+			readyStatus:    metav1.ConditionTrue,
+			reason:         "Ready",
+			wantResult:     observability.SweepResultPartial,
+			wantItems:      1,
+		},
+		{
+			name:           "complete_sweep_judges_unestablished_binding_safely",
+			denyZoneDenied: false,
+			readyStatus:    metav1.ConditionFalse,
+			reason:         "RefNotPermitted",
+			wantResult:     observability.SweepResultOK,
+			wantItems:      1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			stub := cfstub.New(t)
+			stub.State.AddZone(cfstub.Zone{ID: "zone-denied", Name: "denied.example.com", AccountID: "account-1"})
+			stub.State.AddZone(cfstub.Zone{ID: "zone-ok", Name: "ok.example.com", AccountID: "account-1"})
+			if tc.denyZoneDenied {
+				stub.Fault(http.MethodGet, "^/zones/zone-denied/access/groups$", cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+			}
+
+			// Legacy v0.4.1 upgrade state: remote group actually lives in zone-denied,
+			// while a rule-resolution failure under v0.4.1 paired GroupID with zone-ok and
+			// stamped Accepted=False / Ready=False. Once observation succeeds, Ready=True.
+			group := &v1alpha1.AccessGroup{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "legacy-upgraded", UID: "uid-legacy-grp"},
+				Spec: v1alpha1.AccessGroupSpec{
+					AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+					Zone:             "ok.example.com",
+					Name:             "legacy-upgraded",
+					ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				},
+				Status: v1alpha1.AccessGroupStatus{
+					GroupID:           "remote-grp-a",
+					ZoneID:            "zone-ok",
+					OwnershipVerified: true,
+					Conditions: []metav1.Condition{
+						{Type: "Accepted", Status: tc.readyStatus, Reason: tc.reason},
+						{Type: "Ready", Status: tc.readyStatus, Reason: tc.reason},
+					},
+				},
+			}
+
+			fixture := newDNSProbeFixture(t, dnsProbeConfig{objects: []client.Object{probeAccount([]string{"*"}), group}})
+			sweeper := NewAccountSweeper(AccountSweeperOptions{
+				AccountName:       probeAccountName,
+				AccountID:         "account-1",
+				Token:             "token",
+				Factory:           flarecloudflare.NewFactory(logr.Discard(), flarecloudflare.WithBaseURL(stub.URL)),
+				Client:            fixture.kube,
+				APIReader:         fixture.kube,
+				OperatorNamespace: probeOperatorNamespace,
+				RateLimit:         1e9,
+				RateBurst:         1,
+				Logger:            logr.Discard(),
+			})
+
+			groupTarget := TargetDescriptor{Kind: "AccessGroup", Grade: freshness.GradeAuthz, SweepFunc: sweepAccessGroups}
+			items, result, err := sweeper.RunTargetOnce(ctx, groupTarget)
+			if result != tc.wantResult {
+				t.Fatalf("result = %q, want %q (err=%v)", result, tc.wantResult, err)
+			}
+			if len(items) != tc.wantItems {
+				t.Fatalf("len(items) = %d (%#v), want %d", len(items), items, tc.wantItems)
+			}
+			if tc.wantItems == 1 && (items[0].Case != DriftCaseMissing || items[0].NamespacedName.Name != "legacy-upgraded") {
+				t.Fatalf("unexpected drift item = %#v, want Missing for legacy-upgraded", items)
+			}
+		})
+	}
+}
+
 func TestAccessSweepFailsClosedOnAccountOrNonIsolatableZoneError(t *testing.T) {
 	t.Parallel()
 
