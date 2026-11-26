@@ -81,27 +81,27 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		}
 		return ctrl.Result{}, nil
 	}
-	scope := flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}
+	recordedScope := flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}
 	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
-		_ = r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), err.Error())
+		_ = r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, privateErrorReason(err), err.Error())
 		return ctrl.Result{}, err
 	}
-	scope, err = accessGroupScope(object.Spec.Zone, account.Status.Verified.Zones)
+	scope, err := accessGroupScope(object.Spec.Zone, account.Status.Verified.Zones)
 	if err != nil {
-		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "Invalid", err.Error())
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "Invalid", err.Error())
 	}
 	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
 	if err != nil {
-		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 	require, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Require)
 	if err != nil {
-		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 	exclude, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Exclude)
 	if err != nil {
-		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	name := object.Spec.Name

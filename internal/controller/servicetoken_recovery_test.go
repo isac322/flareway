@@ -1295,6 +1295,299 @@ func TestServiceTokenDefinite4xxBackoffEscalatesAndResets(t *testing.T) {
 	serviceTokenReady(ctx, t, world)
 }
 
+type serviceTokenRejectWriteFaultClient struct {
+	client.Client
+	journalName string
+	failUpdates int
+	updatesSeen int
+}
+
+func (c *serviceTokenRejectWriteFaultClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if secret, ok := obj.(*corev1.Secret); ok && secret.Name == c.journalName &&
+		string(secret.Data[serviceTokenJournalKeyPhase]) == serviceTokenJournalPhaseRejected {
+		c.updatesSeen++
+		if c.updatesSeen <= c.failUpdates {
+			return errors.New("transient apiserver connection reset")
+		}
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func TestServiceTokenRejectedCheckpointRetriesRecoverableFailures(t *testing.T) {
+	t.Run("transient_write_failure_recovers_on_retry", func(t *testing.T) {
+		ctx := context.Background()
+		clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+		api := &serviceTokenFakeAPI{
+			now:       func() time.Time { return clock },
+			tokens:    make(map[string]flarecloudflare.ServiceToken),
+			secrets:   make(map[string]string),
+			createErr: cloudflareStatusError(http.StatusForbidden),
+		}
+		world := newServiceTokenWorld(t, api, clock)
+		var token v1alpha1.ServiceToken
+		if err := world.kube.Get(ctx, world.request.NamespacedName, &token); err != nil {
+			t.Fatal(err)
+		}
+		fault := &serviceTokenRejectWriteFaultClient{
+			Client:      world.kube,
+			journalName: serviceTokenJournalName(&token),
+			failUpdates: 2,
+		}
+		world.restart(fault)
+		world.reconciler.Now = func() time.Time { return clock }
+
+		res, err := world.reconciler.Reconcile(ctx, world.request)
+		if err != nil {
+			t.Fatalf("reconcile failed despite recoverable checkpoint retry: %v", err)
+		}
+		if res.RequeueAfter != serviceTokenCreateBackoffBase {
+			t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, serviceTokenCreateBackoffBase)
+		}
+		if fault.updatesSeen != 3 {
+			t.Fatalf("expected 3 rejected journal update attempts (2 failures + 1 retry), got %d", fault.updatesSeen)
+		}
+		journals, err := serviceTokenJournalSecrets(ctx, world.kube, &token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(journals) != 0 {
+			t.Fatalf("expected journal cleaned up after retry, found %d", len(journals))
+		}
+	})
+
+	t.Run("exhausted_checkpoint_retries_preserve_dispatched_fail_closed", func(t *testing.T) {
+		ctx := context.Background()
+		clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+		api := &serviceTokenFakeAPI{
+			now:       func() time.Time { return clock },
+			tokens:    make(map[string]flarecloudflare.ServiceToken),
+			secrets:   make(map[string]string),
+			createErr: cloudflareStatusError(http.StatusForbidden),
+		}
+		world := newServiceTokenWorld(t, api, clock)
+		var token v1alpha1.ServiceToken
+		if err := world.kube.Get(ctx, world.request.NamespacedName, &token); err != nil {
+			t.Fatal(err)
+		}
+		fault := &serviceTokenRejectWriteFaultClient{
+			Client:      world.kube,
+			journalName: serviceTokenJournalName(&token),
+			failUpdates: 10,
+		}
+		world.restart(fault)
+
+		if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+			t.Fatal("expected error when rejected checkpoint retries are exhausted")
+		}
+		journals, err := serviceTokenJournalSecrets(ctx, world.kube, &token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(journals) != 1 || string(journals[0].Data[serviceTokenJournalKeyPhase]) != serviceTokenJournalPhaseDispatched {
+			t.Fatalf("expected fail-closed dispatched journal retained, got %#v", journals)
+		}
+	})
+}
+
+type serviceTokenFinalizerFaultClient struct {
+	client.Client
+	targetName       string
+	failNextRemoval  bool
+	addFinalizerOnce string
+}
+
+func (c *serviceTokenFinalizerFaultClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if token, ok := obj.(*v1alpha1.ServiceToken); ok && token.Name == c.targetName && !controllerutil.ContainsFinalizer(token, serviceTokenAttemptFinalizer) {
+		if c.failNextRemoval {
+			c.failNextRemoval = false
+			return errors.New("injected finalizer patch failure")
+		}
+		if c.addFinalizerOnce != "" {
+			extra := c.addFinalizerOnce
+			c.addFinalizerOnce = ""
+			var latest v1alpha1.ServiceToken
+			if err := c.Get(ctx, client.ObjectKeyFromObject(token), &latest); err == nil {
+				base := client.MergeFrom(latest.DeepCopy())
+				controllerutil.AddFinalizer(&latest, extra)
+				_ = c.Client.Patch(ctx, &latest, base)
+			}
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestServiceTokenInterruptedCleanupRetainsCreateBackoff(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := &serviceTokenFakeAPI{
+		now:       func() time.Time { return clock },
+		tokens:    make(map[string]flarecloudflare.ServiceToken),
+		secrets:   make(map[string]string),
+		createErr: cloudflareStatusError(http.StatusForbidden),
+	}
+	world := newServiceTokenWorld(t, api, clock)
+	fault := &serviceTokenFinalizerFaultClient{
+		Client:          world.kube,
+		targetName:      "token",
+		failNextRemoval: true,
+	}
+	world.restart(fault)
+	world.reconciler.Now = func() time.Time { return clock }
+
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+		t.Fatal("expected first reconcile error when finalizer removal fails")
+	}
+	if api.createCalls != 1 {
+		t.Fatalf("createCalls = %d, want 1", api.createCalls)
+	}
+
+	// Second reconcile finishes the interrupted rejected cleanup and requeues after 1ms with zero remote calls.
+	callsBefore := len(api.calls)
+	res, err := world.reconciler.Reconcile(ctx, world.request)
+	if err != nil || res.RequeueAfter != time.Millisecond {
+		t.Fatalf("cleanup resume = (%v, %v), want (1ms, nil)", res, err)
+	}
+	if len(api.calls) != callsBefore {
+		t.Fatalf("cleanup resume made remote calls: %v", api.calls[callsBefore:])
+	}
+
+	// Third reconcile on the 1ms wakeup must still honor the create backoff recorded before cleanup failed.
+	res, err = world.reconciler.Reconcile(ctx, world.request)
+	if err != nil || res.RequeueAfter != serviceTokenCreateBackoffBase {
+		t.Fatalf("post-cleanup reconcile = (%v, %v), want (%v, nil)", res, err, serviceTokenCreateBackoffBase)
+	}
+	if api.createCalls != 1 {
+		t.Fatalf("interrupted cleanup bypassed create backoff: createCalls=%d, want 1", api.createCalls)
+	}
+}
+
+func TestServiceTokenAttemptFinalizerRemovalPreservesConcurrentFinalizer(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := &serviceTokenFakeAPI{
+		now:       func() time.Time { return clock },
+		tokens:    make(map[string]flarecloudflare.ServiceToken),
+		secrets:   make(map[string]string),
+		createErr: cloudflareStatusError(http.StatusForbidden),
+	}
+	world := newServiceTokenWorld(t, api, clock)
+	fault := &serviceTokenFinalizerFaultClient{
+		Client:           world.kube,
+		targetName:       "token",
+		addFinalizerOnce: "example.com/concurrent-owner",
+	}
+	world.restart(fault)
+
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+		t.Fatalf("reconcile failed on concurrent finalizer conflict retry: %v", err)
+	}
+	var current v1alpha1.ServiceToken
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&current, serviceTokenAttemptFinalizer) {
+		t.Fatal("attempt finalizer still present")
+	}
+	if !controllerutil.ContainsFinalizer(&current, "example.com/concurrent-owner") {
+		t.Fatalf("concurrently added finalizer was clobbered: finalizers=%v", current.Finalizers)
+	}
+}
+
+type serviceTokenForbidDestDeleteClient struct {
+	client.Client
+	destName string
+}
+
+func (c *serviceTokenForbidDestDeleteClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if secret, ok := obj.(*corev1.Secret); ok && secret.Name == c.destName {
+		return fmt.Errorf("unexpected delete of destination Secret %s under ObserveOnly", c.destName)
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestServiceTokenObserveOnlyDeleteSkipsDestinationSecretCleanup(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	api := &serviceTokenFakeAPI{now: func() time.Time { return clock }, tokens: make(map[string]flarecloudflare.ServiceToken), secrets: make(map[string]string)}
+	world := newServiceTokenWorld(t, api, clock)
+	journalSecret := seedRejectedServiceTokenAttempt(ctx, t, world, "token-credentials")
+
+	var obj v1alpha1.ServiceToken
+	if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj.Spec.ManagementPolicy = v1alpha1.ManagementPolicyObserveOnly
+	obj.Spec.ExternalRef = &v1alpha1.ServiceTokenExternalReference{TokenID: "ext-1"}
+	if err := world.kube.Update(ctx, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.kube.Delete(ctx, &obj); err != nil {
+		t.Fatal(err)
+	}
+
+	world.restart(&serviceTokenForbidDestDeleteClient{Client: world.kube, destName: "token-credentials"})
+	if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+		t.Fatalf("ObserveOnly delete reconcile failed: %v", err)
+	}
+	if err := world.kube.Get(ctx, client.ObjectKeyFromObject(journalSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("journal Secret still exists: %v", err)
+	}
+	if err := world.kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "token-credentials"}, &corev1.Secret{}); err != nil {
+		t.Fatalf("destination Secret should remain untouched under ObserveOnly delete: %v", err)
+	}
+}
+
+func TestServiceTokenContradictoryRejectedJournalFailsClosed(t *testing.T) {
+	for _, mode := range []string{"reconcile", "delete"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			clock := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+			api := &serviceTokenFakeAPI{now: func() time.Time { return clock }, tokens: make(map[string]flarecloudflare.ServiceToken), secrets: make(map[string]string)}
+			world := newServiceTokenWorld(t, api, clock)
+			journalSecret := seedRejectedServiceTokenAttempt(ctx, t, world, "token-credentials")
+			journalSecret.Data[serviceTokenJournalKeyIssuedID] = []byte("remote-issued-1")
+			if err := world.kube.Update(ctx, journalSecret); err != nil {
+				t.Fatal(err)
+			}
+
+			var obj v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "delete" {
+				if err := world.kube.Delete(ctx, &obj); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := world.reconciler.Reconcile(ctx, world.request); err == nil {
+					t.Fatal("expected CleanupBlocked error on contradictory rejected journal delete")
+				}
+				if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+					t.Fatal(err)
+				}
+				if blocked := serviceTokenCondition(obj.Status.Conditions, "CleanupBlocked"); blocked == nil || blocked.Status != metav1.ConditionTrue {
+					t.Fatalf("expected CleanupBlocked=True, got %#v", obj.Status.Conditions)
+				}
+			} else {
+				if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+					t.Fatalf("reconcile returned unexpected error on Conflict status patch: %v", err)
+				}
+				if err := world.kube.Get(ctx, world.request.NamespacedName, &obj); err != nil {
+					t.Fatal(err)
+				}
+				if ready := serviceTokenCondition(obj.Status.Conditions, "Ready"); ready == nil || ready.Reason != "Conflict" {
+					t.Fatalf("expected Ready=False (Conflict), got %#v", ready)
+				}
+			}
+			if err := world.kube.Get(ctx, client.ObjectKeyFromObject(journalSecret), &corev1.Secret{}); err != nil {
+				t.Fatalf("contradictory rejected journal must be preserved, got %v", err)
+			}
+			if len(api.calls) != 0 {
+				t.Fatalf("contradictory rejected journal made unexpected remote calls: %v", api.calls)
+			}
+		})
+	}
+}
+
 func TestServiceTokenAmbiguousCreateErrorsRetainRecoveryPending(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

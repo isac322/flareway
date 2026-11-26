@@ -29,6 +29,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -161,12 +163,23 @@ func (r *ServiceTokenReconciler) ensureServiceTokenAttemptFinalizer(ctx context.
 }
 
 func (r *ServiceTokenReconciler) removeServiceTokenAttemptFinalizer(ctx context.Context, object *v1alpha1.ServiceToken) error {
-	if !controllerutil.ContainsFinalizer(object, serviceTokenAttemptFinalizer) {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		current := new(v1alpha1.ServiceToken)
+		if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
+			return err
+		}
+		if !controllerutil.ContainsFinalizer(current, serviceTokenAttemptFinalizer) {
+			*object = *current
+			return nil
+		}
+		base := client.MergeFromWithOptions(current.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		controllerutil.RemoveFinalizer(current, serviceTokenAttemptFinalizer)
+		if err := r.Patch(ctx, current, base); err != nil {
+			return err
+		}
+		*object = *current
 		return nil
-	}
-	base := client.MergeFrom(object.DeepCopy())
-	controllerutil.RemoveFinalizer(object, serviceTokenAttemptFinalizer)
-	return r.Patch(ctx, object, base)
+	})
 }
 
 // authoritativeClusterID reads the kube-system Namespace UID through the
@@ -397,7 +410,10 @@ func (r *ServiceTokenReconciler) writeInitialSecret(ctx context.Context, object 
 // the journaled scope binding rather than re-resolving spec.zone.
 func (r *ServiceTokenReconciler) recoverServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
 	if journal.phase == serviceTokenJournalPhaseRejected {
-		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); err != nil {
+		if bad := journal.validateRejected(); bad != nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+		}
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, true); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
@@ -489,14 +505,14 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 	})
 	if createErr != nil {
 		if flarecloudflare.IsDefiniteNonCreationClientError(createErr) {
-			journal.phase = serviceTokenJournalPhaseRejected
-			if persistErr := r.persistServiceTokenJournal(ctx, journalSecret, journal); persistErr != nil {
+			persistedSecret, persistErr := r.persistRejectedServiceTokenJournal(ctx, object, journalSecret, journal)
+			if persistErr != nil {
 				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, persistErr))
 			}
-			if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); rbErr != nil {
+			delay := r.recordServiceTokenCreateBackoff(object, account, input.Name, r.now())
+			if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, persistedSecret, journal, true); rbErr != nil {
 				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, rbErr))
 			}
-			delay := r.recordServiceTokenCreateBackoff(object, account, input.Name, r.now())
 			if patchErr := r.patchRemoteError(ctx, object, createErr); patchErr != nil {
 				return ctrl.Result{}, errors.Join(createErr, patchErr)
 			}
@@ -527,6 +543,92 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 	return r.convergeCapturedServiceToken(ctx, object, api, scope, input, journal.attemptName, journalSecret, remote)
 }
 
+func (journal *serviceTokenJournal) validateRejected() error {
+	if journal.issuedID != "" || journal.retiringID != "" {
+		return errors.New("contradictory service token journal: rejected attempt carries an issued or retiring ID")
+	}
+	return nil
+}
+
+func recoverableJournalWriteError(err error) bool {
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!apierrors.IsNotFound(err) &&
+		!apierrors.IsForbidden(err) &&
+		!apierrors.IsUnauthorized(err) &&
+		!apierrors.IsBadRequest(err) &&
+		!apierrors.IsInvalid(err) &&
+		!errors.Is(err, errServiceTokenJournalForeign)
+}
+
+func (r *ServiceTokenReconciler) persistRejectedServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal) (*corev1.Secret, error) {
+	if err := journal.validateRejected(); err != nil {
+		return journalSecret, err
+	}
+	journal.phase = serviceTokenJournalPhaseRejected
+	err := r.persistServiceTokenJournal(ctx, journalSecret, journal)
+	if err == nil {
+		return journalSecret, nil
+	}
+	if !recoverableJournalWriteError(err) {
+		return journalSecret, err
+	}
+
+	persistedSecret := journalSecret
+	lastErr := err
+	backoff := wait.Backoff{Steps: 3, Duration: 25 * time.Millisecond, Factor: 2.0}
+	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		freshSecret, freshJournal, loadErr := r.loadServiceTokenJournal(ctx, object)
+		if loadErr != nil {
+			lastErr = loadErr
+			if !recoverableJournalWriteError(loadErr) {
+				return false, loadErr
+			}
+			return false, nil
+		}
+		if freshJournal == nil {
+			persistedSecret = nil
+			return true, nil
+		}
+		if freshJournal.crUID != journal.crUID || freshJournal.nonce != journal.nonce || freshJournal.attemptName != journal.attemptName {
+			lastErr = errors.New("service token journal changed identity during rejection retry")
+			return false, lastErr
+		}
+		if bad := freshJournal.validateRejected(); bad != nil {
+			lastErr = bad
+			return false, bad
+		}
+		if freshJournal.phase == serviceTokenJournalPhaseRejected {
+			persistedSecret = freshSecret
+			*journal = *freshJournal
+			return true, nil
+		}
+		if freshJournal.phase != serviceTokenJournalPhaseDispatched {
+			lastErr = fmt.Errorf("unexpected service token journal phase %q during rejection retry", freshJournal.phase)
+			return false, lastErr
+		}
+		freshJournal.phase = serviceTokenJournalPhaseRejected
+		if updateErr := r.persistServiceTokenJournal(ctx, freshSecret, freshJournal); updateErr != nil {
+			lastErr = updateErr
+			if !recoverableJournalWriteError(updateErr) {
+				return false, updateErr
+			}
+			return false, nil
+		}
+		persistedSecret = freshSecret
+		*journal = *freshJournal
+		return true, nil
+	})
+	if waitErr != nil {
+		if lastErr != nil {
+			return journalSecret, lastErr
+		}
+		return journalSecret, waitErr
+	}
+	return persistedSecret, nil
+}
+
 // deleteServiceTokenJournalSecret removes a journal Secret using UID and
 // ResourceVersion preconditions so a stale delete never removes a newer attempt.
 func (r *ServiceTokenReconciler) deleteServiceTokenJournalSecret(ctx context.Context, journalSecret *corev1.Secret) error {
@@ -540,27 +642,35 @@ func (r *ServiceTokenReconciler) deleteServiceTokenJournalSecret(ctx context.Con
 }
 
 // cleanupRejectedServiceTokenAttempt finishes cleaning up a create attempt
-// whose journal already moved to rejected (definite non-creation 4xx): delete
-// an empty controller-reserved destination Secret with preconditions, release
-// the attempt finalizer, and delete the version-checked journal Secret last so
-// an interrupted rollback can resume without any Cloudflare calls.
-func (r *ServiceTokenReconciler) cleanupRejectedServiceTokenAttempt(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal) error {
-	destName := object.Spec.SecretRef.Name
-	if journal != nil && journal.destination != "" {
-		destName = journal.destination
-	}
-	dest := new(corev1.Secret)
-	destKey := types.NamespacedName{Namespace: object.Namespace, Name: destName}
-	if err := r.apiReader().Get(ctx, destKey, dest); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("read reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+// whose journal already moved to rejected (definite non-creation 4xx):
+// optionally delete any empty controller-reserved destination Secret with
+// preconditions, release the attempt finalizer with an optimistic lock, and
+// delete the version-checked journal Secret last so an interrupted rollback
+// can resume without any Cloudflare calls.
+func (r *ServiceTokenReconciler) cleanupRejectedServiceTokenAttempt(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal, deleteDestination bool) error {
+	if journal != nil {
+		if err := journal.validateRejected(); err != nil {
+			return err
 		}
-	} else if metav1.IsControlledBy(dest, object) &&
-		dest.Annotations[serviceTokenReservedForAnnotation] == string(object.UID) &&
-		dest.Annotations[v1alpha1.ServiceTokenIDAnnotation] == "" &&
-		len(dest.Data) == 0 {
-		if err := r.Delete(ctx, dest, client.Preconditions{UID: &dest.UID, ResourceVersion: &dest.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete empty reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+	}
+	if deleteDestination {
+		destName := object.Spec.SecretRef.Name
+		if journal != nil && journal.destination != "" {
+			destName = journal.destination
+		}
+		dest := new(corev1.Secret)
+		destKey := types.NamespacedName{Namespace: object.Namespace, Name: destName}
+		if err := r.apiReader().Get(ctx, destKey, dest); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("read reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+			}
+		} else if metav1.IsControlledBy(dest, object) &&
+			dest.Annotations[serviceTokenReservedForAnnotation] == string(object.UID) &&
+			dest.Annotations[v1alpha1.ServiceTokenIDAnnotation] == "" &&
+			len(dest.Data) == 0 {
+			if err := r.Delete(ctx, dest, client.Preconditions{UID: &dest.UID, ResourceVersion: &dest.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete empty reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
+			}
 		}
 	}
 	if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {

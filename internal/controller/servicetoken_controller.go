@@ -99,7 +99,10 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err != nil {
 		if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Status.TokenID == "" {
 			if journalSecret, journal, journalErr := r.loadServiceTokenJournal(ctx, object); journalErr == nil && journal != nil && journal.phase == serviceTokenJournalPhaseRejected {
-				if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); rbErr != nil {
+				if bad := journal.validateRejected(); bad != nil {
+					return ctrl.Result{}, r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+				}
+				if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, true); rbErr != nil {
 					return ctrl.Result{}, errors.Join(err, rbErr)
 				}
 				return ctrl.Result{RequeueAfter: time.Millisecond}, nil
@@ -119,7 +122,10 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		journal != nil &&
 		journal.phase == serviceTokenJournalPhaseRejected &&
 		object.Status.TokenID == "" {
-		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); err != nil {
+		if bad := journal.validateRejected(); bad != nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, flarecloudflare.AccessScope{}, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", bad.Error(), serviceTokenStatusUpdate{})
+		}
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, true); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
@@ -562,7 +568,11 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 	}
 	attemptMarked := controllerutil.ContainsFinalizer(object, serviceTokenAttemptFinalizer)
 	if journal != nil && journal.phase == serviceTokenJournalPhaseRejected {
-		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); err != nil {
+		if bad := journal.validateRejected(); bad != nil {
+			return r.patchCleanupBlocked(ctx, object, "JournalError", bad)
+		}
+		deleteDestination := object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal, deleteDestination); err != nil {
 			return r.patchCleanupBlocked(ctx, object, "JournalError", err)
 		}
 		journalSecret = nil
