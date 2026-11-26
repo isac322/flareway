@@ -108,10 +108,11 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 		if tunnel.Status.GatewayRef != nil && tunnel.Status.GatewayRef.Name != "" {
 			ownerNames = append(ownerNames, tunnel.Status.GatewayRef.Name)
 		}
-		for _, ownerName := range ownerNames {
-			info.markers = append(info.markers, dnsOwnershipMarkers(tunnel, key, clusterID, ownerName)...)
-		}
+		checkpointComments := make([]string, 0, len(tunnel.Status.DNSRecords))
 		for _, checkpoint := range tunnel.Status.DNSRecords {
+			if checkpoint.OwnershipComment != "" {
+				checkpointComments = append(checkpointComments, checkpoint.OwnershipComment)
+			}
 			if checkpoint.RecordID == "" {
 				continue
 			}
@@ -119,6 +120,7 @@ func sweepDNSRecords(ctx context.Context, as *AccountSweeper) ([]DriftItem, erro
 			claimed[checkpoint.RecordID] = true
 			checkpointZones[checkpoint.ZoneID] = true
 		}
+		info.markers = flarecloudflare.TunnelDNSOwnershipMarkers(key, clusterID, tunnel.Namespace, ownerNames, checkpointComments)
 		tunnels = append(tunnels, info)
 	}
 
@@ -261,20 +263,6 @@ func zoneFailureIsolatable(err error) bool {
 	}
 }
 
-// dnsOwnershipMarkers returns every marker a reader must accept for one
-// tunnel/owner-name pair, mirroring the controller's dnsOwnershipMarkers:
-// the signed marker first, then the legacy plaintext marker. The marker is
-// comment-prefix only — IsOwnedDNSRecord accepts an optional " | text"
-// suffix, so the checkpointed human comment never has to be recomputed.
-func dnsOwnershipMarkers(tunnel *v1alpha1.CloudflareTunnel, key []byte, clusterID, ownerName string) []string {
-	signed := flarecloudflare.SignDNSRecordComment(key, clusterID, tunnel.Namespace, ownerName)
-	legacy := flarecloudflare.DNSRecordComment(clusterID, tunnel.Namespace, ownerName)
-	if signed == legacy {
-		return []string{signed}
-	}
-	return []string{signed, legacy}
-}
-
 // dnsRecordOwned reports whether the remote record carries the checkpointed
 // comment or any recomputed marker for this tunnel.
 func dnsRecordOwned(record flarecloudflare.DNSRecord, checkpointComment string, markers []string) bool {
@@ -299,15 +287,9 @@ func dnsMismatchReason(tunnel dnsTunnelInfo, checkpoint v1alpha1.CloudflareTunne
 		return fmt.Sprintf("remote record comment %q no longer carries the checkpointed ownership marker", remote.Comment)
 	}
 	if tunnel.tunnelID != "" {
-		owned := false
-		for _, marker := range tunnel.markers {
-			if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
-				Record: remote, ExpectedComment: marker,
-				ExpectedTarget: tunnelCNAMETarget(tunnel.tunnelID),
-			}) {
-				owned = true
-				break
-			}
+		owned := dnsRecordOwnedForTarget(remote, tunnel.markers, tunnel.tunnelID)
+		if !owned && checkpoint.OwnershipComment != "" {
+			owned = dnsRecordOwnedForTarget(remote, []string{checkpoint.OwnershipComment}, tunnel.tunnelID)
 		}
 		if !owned {
 			return fmt.Sprintf("remote record is not a CNAME to %s (type %s, content %q)",
@@ -361,26 +343,25 @@ func optionalBoolEqual(observed, desired *bool) bool {
 	return desired == nil || observed != nil && *observed == *desired
 }
 
+func dnsRecordOwnedForTarget(remote flarecloudflare.DNSRecord, markers []string, tunnelID string) bool {
+	target := tunnelCNAMETarget(tunnelID)
+	for _, marker := range markers {
+		if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
+			Record: remote, ExpectedComment: marker, ExpectedTarget: target,
+		}) {
+			return true
+		}
+	}
+	return false
+}
+
 // dnsOrphanCandidate judges one unclaimed remote record. A candidate must
 // carry a marker of a live tunnel in this account AND point at that
 // tunnel's CNAME target (ExpectedTarget is always populated). When the
 // tunnel ID is unknown the record is not owned and not a candidate.
 func dnsOrphanCandidate(remote flarecloudflare.DNSRecord, tunnels []dnsTunnelInfo) (DriftItem, bool) {
 	for _, tunnel := range tunnels {
-		if tunnel.tunnelID == "" {
-			continue
-		}
-		owned := false
-		for _, marker := range tunnel.markers {
-			if flarecloudflare.IsOwnedDNSRecordStrict(flarecloudflare.OwnedDNSRecordCheck{
-				Record: remote, ExpectedComment: marker,
-				ExpectedTarget: tunnelCNAMETarget(tunnel.tunnelID),
-			}) {
-				owned = true
-				break
-			}
-		}
-		if !owned {
+		if tunnel.tunnelID == "" || !dnsRecordOwnedForTarget(remote, tunnel.markers, tunnel.tunnelID) {
 			continue
 		}
 		return DriftItem{

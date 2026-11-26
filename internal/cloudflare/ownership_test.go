@@ -184,6 +184,88 @@ func TestSignedPrivateResourceComment(t *testing.T) {
 	}
 }
 
+func TestTunnelDNSOwnershipMarkers(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	const (
+		clusterID = "cluster-uid"
+		namespace = "apps"
+	)
+
+	// Plaintext checkpoint with operator text + HMAC checkpoint with operator text,
+	// plus verified overflow hash forms derived from supplied ownerNames.
+	oldPlainComment := DNSRecordCommentWithText(clusterID, namespace, "old-plain-gw", "managed by team")
+	oldHMACComment := SignDNSRecordCommentWithText(key, clusterID, namespace, "old-hmac-gw", "managed by team")
+	longGateway := strings.Repeat("gw-", 30)
+	overflowHMAC := SignDNSRecordComment(key, clusterID, namespace, longGateway)
+	overflowPlain := DNSRecordComment(clusterID, namespace, longGateway)
+	unverifiedOverflowHMAC := SignDNSRecordComment(key, "other-cluster", "other-ns", longGateway)
+	unverifiedSHA256 := DNSRecordComment("other-cluster", "other-ns", longGateway)
+
+	checkpoints := []string{
+		oldPlainComment,
+		oldHMACComment,
+		// Negative cases that must all be ignored:
+		unverifiedOverflowHMAC,
+		unverifiedOverflowHMAC + " team/platform",
+		unverifiedSHA256,
+		"flareway hmac:00112233445566778899aabbccddeeff",
+		"flareway hmac:00112233445566778899aabbccddeeff note",
+		DNSRecordCommentWithText("other-cluster", namespace, "foreign-cluster-gw", "note"),
+		DNSRecordCommentWithText(clusterID, "other-ns", "foreign-ns-gw", "note"),
+		SignDNSRecordComment([]byte("wrong-key-0123456789abcdef012345"), clusterID, namespace, "forged-hmac-gw"),
+		"flareway hmac:00112233445566778899aabbccddeeff " + namespace + "/tampered-gw",
+		"flareway sha256:not-64-hex",
+		"external-dns:heritage=external-dns",
+	}
+
+	markers := TunnelDNSOwnershipMarkers(key, clusterID, namespace, []string{"tunnel-name", "gateway-ref", longGateway}, checkpoints)
+	for _, want := range []string{
+		SignDNSRecordComment(key, clusterID, namespace, "tunnel-name"),
+		DNSRecordComment(clusterID, namespace, "tunnel-name"),
+		SignDNSRecordComment(key, clusterID, namespace, "gateway-ref"),
+		DNSRecordComment(clusterID, namespace, "gateway-ref"),
+		DNSRecordComment(clusterID, namespace, "old-plain-gw"),
+		SignDNSRecordComment(key, clusterID, namespace, "old-plain-gw"),
+		SignDNSRecordComment(key, clusterID, namespace, "old-hmac-gw"),
+		DNSRecordComment(clusterID, namespace, "old-hmac-gw"),
+		overflowHMAC,
+		overflowPlain,
+	} {
+		if !slicesContains(markers, want) {
+			t.Fatalf("TunnelDNSOwnershipMarkers() missing %q; got %v", want, markers)
+		}
+	}
+
+	for _, reject := range []string{
+		unverifiedOverflowHMAC,
+		unverifiedSHA256,
+		DNSRecordComment("other-cluster", namespace, "foreign-cluster-gw"),
+		DNSRecordComment(clusterID, "other-ns", "foreign-ns-gw"),
+		SignDNSRecordComment([]byte("wrong-key-0123456789abcdef012345"), clusterID, namespace, "forged-hmac-gw"),
+		"flareway hmac:00112233445566778899aabbccddeeff",
+		"external-dns:heritage=external-dns",
+	} {
+		if slicesContains(markers, reject) {
+			t.Fatalf("TunnelDNSOwnershipMarkers() unexpectedly accepted %q", reject)
+		}
+	}
+
+	// Without a key, HMAC checkpoint comments cannot be verified and must be rejected.
+	keyless := TunnelDNSOwnershipMarkers(nil, clusterID, namespace, []string{"tunnel-name"}, []string{oldHMACComment, overflowHMAC})
+	if slicesContains(keyless, overflowHMAC) || slicesContains(keyless, SignDNSRecordComment(key, clusterID, namespace, "old-hmac-gw")) {
+		t.Fatalf("keyless TunnelDNSOwnershipMarkers() accepted unverified HMAC markers: %v", keyless)
+	}
+}
+
+func slicesContains(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
 func sha256Digest(identity string) string {
 	sum := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("%x", sum)

@@ -389,13 +389,15 @@ The Secret uses `CF-Access-Client-Id` and `CF-Access-Client-Secret`. During a gr
 - `connector`: image, replicas, `Auto|QUIC|HTTP2`, grace period, resources;
 - `proxy`: image, resources, stream idle timeout, concurrency;
 - `privateDNS`: image and resources;
-- `originRequest`: `connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`, `keepAliveConnections`, `noHappyEyeballs`, `disableChunkedEncoding`, and `http2Origin`, the subset valid for a loopback Envoy origin;
+- `originRequest`: `connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`, `keepAliveConnections`, `noHappyEyeballs`, `disableChunkedEncoding`, and `http2Origin`, the subset valid for a loopback Envoy origin; `connectTimeout`, `keepAliveTimeout`, and `tcpKeepAlive` must be non-negative and use whole-second precision;
 - `listeners[]`: listener name, `Public|Private`, optional virtual network, automatic hostname-route creation;
 - `dns` and optional `managementToken.resources: [Logs]`.
 
 Dataplane pod placement is not a tunnel override. It is configured at class level through `GatewayClassConfig.spec.scheduling`.
 
 Gateway ownership is sticky and bound to both `status.gatewayRef.name` and `status.gatewayUid`. A later Gateway cannot preempt the live owner. Flareway drains the previous owner’s connector before admitting a successor. `ObserveOnly` Tunnels never issue connector tokens or create connector Secrets, and a non-empty `status.deletedAt` blocks Gateway publication, addresses, private routing, and configuration writes while cleanup drains the data plane.
+
+Invalid top-level `Gateway` specs (`spec.addresses`, `spec.allowedListeners`, or `spec.tls`, which set `Accepted=False`) report `Programmed=False` with reason `Invalid` without provisioning a default `CloudflareTunnel`. If `cloudflared` configuration compilation fails at runtime after admission, Flareway demotes `CloudflareTunnel` `ConfigApplied=False` (`ConfigurationError`) and sets the Gateway and its listeners `Programmed=False` (`Invalid`).
 
 While a Gateway cannot program its Tunnel (not yet owned, owned by another Gateway, draining, `ObserveOnly`, remotely deleted, waiting for connector credentials, or rejected by the Tunnel controller), the Gateway still reports `Accepted`, `status.listeners`, and HTTPRoute `status.parents` for its current generation. `Programmed=False` names the blocking state; when the Tunnel's own `Accepted=False` condition is current, the message carries its reason and message. Listener grant checks run against the Tunnel's `CloudflareAccount`, so a namespace or hostname that is not granted shows up as listener `Accepted=False`. Nothing is published or written to the Tunnel in this state.
 

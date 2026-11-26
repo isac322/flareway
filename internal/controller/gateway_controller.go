@@ -227,7 +227,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if rejected {
 		return ctrl.Result{}, nil
 	}
-	tunnel, account, effectiveConfig, block, err := r.resolveCloudflareContext(ctx, &gateway, cfg)
+	tunnel, account, effectiveConfig, block, err := r.resolveCloudflareContextWithOptions(ctx, &gateway, cfg, false)
 	accountMissing := false
 	if err != nil {
 		var missingTunnel *missingExplicitTunnelError
@@ -248,16 +248,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
-	if tunnel != nil && tunnel.Spec.Configuration.Mode == v1alpha1.CloudflareTunnelConfigurationModeDirect {
-		reason, acceptedMessage, programmedMessage := directTunnelRejection(client.ObjectKeyFromObject(tunnel))
-		r.clearSnapshot(req.NamespacedName)
-		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.rejectGatewayAdmission(ctx, &gateway, reason, acceptedMessage, programmedMessage); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	if rejected, err := r.rejectDirectModeTunnel(ctx, req.NamespacedName, &gateway, tunnel); err != nil || rejected {
+		return ctrl.Result{}, err
 	}
 	cfg = effectiveConfig
 	inputs, routes, err := r.collectInputs(ctx, &gateway, &gatewayClass, cfg)
@@ -300,18 +292,70 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.prepareGatewayStatus(&statuses.Gateway, &gateway)
-	if accepted := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted)); accepted != nil && accepted.Status == metav1.ConditionFalse {
+	accepted := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if (accepted == nil || accepted.Status != metav1.ConditionFalse) && !compiled.ConformanceMode && tunnel == nil && (block == nil || accountMissing) {
+		tunnel, account, effectiveConfig, block, err = r.resolveCloudflareContextWithOptions(ctx, &gateway, cfg, true)
+		if err != nil {
+			var missingAccount *missingCloudflareAccountError
+			if errors.As(err, &missingAccount) {
+				accountMissing = true
+			} else {
+				return ctrl.Result{}, err
+			}
+		}
+		if rejected, err := r.rejectDirectModeTunnel(ctx, req.NamespacedName, &gateway, tunnel); err != nil || rejected {
+			return ctrl.Result{}, err
+		}
+		cfg = effectiveConfig
+		inputs.GatewayClassConfig = cfg.DeepCopy()
+		inputs.CloudflareTunnel = tunnel
+		inputs.CloudflareAccount = account
+		if block == nil {
+			if err := r.applyAUDRevocationLatches(ctx, &gateway, tunnel, &inputs); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		compiled, statuses = gatewayapi.Translate(inputs)
+		if compiled == nil {
+			return ctrl.Result{}, errors.New("gateway API translator returned a nil Gateway")
+		}
+		if block != nil {
+			compiled.Cloudflare = nil
+		}
+		retainAccessRevocationDomains(compiled, tunnel, inputs.AccessApplications)
+		compiled, _, err = accessBlockFirstGateway(compiled, tunnel)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("prepare Access block-first transition: %w", err)
+		}
+		blockDomainsForUnreadyDNS(compiled, tunnel)
+		if !compiled.ConformanceMode && block == nil {
+			privateState, err = r.reconcilePrivatePrerequisites(ctx, compiled, tunnel, account, privateInputsView(
+				inputs.Namespaces, inputs.VirtualNetworks, inputs.NetworkRoutes, inputs.HostnameRoutes, inputs.AccessApplications,
+			))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		r.prepareGatewayStatus(&statuses.Gateway, &gateway)
+		accepted = meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	}
+	if accepted != nil && accepted.Status == metav1.ConditionFalse {
 		// A Gateway the translator rejected can never be programmed: retract
 		// the published snapshot and the owned dataplane in every mode —
 		// including conformance mode — and record the rejection without
 		// publishing a new snapshot. AUD revocation latches and owned child
 		// resources are deliberately retained.
+		_, _, topLevelInvalid := gatewayapi.ValidateTopLevelGateway(&gateway)
 		programmedReason := gatewayv1.GatewayReasonInvalid
 		programmedMessage := "Gateway configuration is invalid"
 		if block != nil {
-			// Admission already carries the config verdict; Programmed names
-			// the tunnel state the Gateway is actually waiting on.
-			programmedReason = gatewayv1.GatewayReasonPending
+			if !topLevelInvalid {
+				// Admission already carries the listener/parameter config
+				// verdict; Programmed names the tunnel state the Gateway is
+				// waiting on unless top-level Gateway fields themselves are
+				// invalid.
+				programmedReason = gatewayv1.GatewayReasonPending
+			}
 			programmedMessage += "; " + block.message
 		}
 		r.clearSnapshot(req.NamespacedName)
@@ -350,7 +394,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
-		if block != nil && !block.terminal {
+		if block != nil && !block.terminal && !topLevelInvalid {
 			return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 		}
 		return ctrl.Result{}, nil
@@ -432,6 +476,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !compiled.ConformanceMode {
 		cloudflareResult, err = r.reconcileCloudflaredConfiguration(ctx, compiled, tunnel, account)
 		if err != nil {
+			var compileErr *cloudflaredConfigCompileError
+			if errors.As(err, &compileErr) {
+				return ctrl.Result{}, r.failCloudflaredCompile(ctx, req.NamespacedName, compiled, tunnel, &gateway, routes, inputs.BackendTLSPolicies, &statuses, err)
+			}
 			return ctrl.Result{}, err
 		}
 		if cloudflareResult.drift && r.Recorder != nil {
@@ -1407,6 +1455,43 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 	return r.patchBackendTLSPolicyStatuses(ctx, policies, statuses.BackendTLSPolicies, key)
 }
 
+func (r *GatewayReconciler) rejectDirectModeTunnel(
+	ctx context.Context,
+	key types.NamespacedName,
+	gateway *gatewayv1.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+) (bool, error) {
+	if tunnel == nil || tunnel.Spec.Configuration.Mode != v1alpha1.CloudflareTunnelConfigurationModeDirect {
+		return false, nil
+	}
+	reason, acceptedMessage, programmedMessage := directTunnelRejection(client.ObjectKeyFromObject(tunnel))
+	r.clearSnapshot(key)
+	if err := r.retractGatewayDataplane(ctx, gateway); err != nil {
+		return false, err
+	}
+	if err := r.rejectGatewayAdmission(ctx, gateway, reason, acceptedMessage, programmedMessage); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *GatewayReconciler) failCloudflaredCompile(
+	ctx context.Context,
+	key types.NamespacedName,
+	compiled *ir.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	gateway *gatewayv1.Gateway,
+	routes []gatewayv1.HTTPRoute,
+	policies []gatewayv1.BackendTLSPolicy,
+	statuses *gatewayapi.Statuses,
+	compileErr error,
+) error {
+	if demoteErr := r.demoteTunnelConfigApplied(ctx, compiled, tunnel, r.gatewayNow(), "ConfigurationError", compileErr.Error()); demoteErr != nil {
+		return fmt.Errorf("%w (recording ConfigApplied=False also failed: %v)", compileErr, demoteErr)
+	}
+	return r.handleGatewayCompileFailure(ctx, key, gateway, routes, policies, statuses, compileErr.Error(), compileErr.Error(), compileErr)
+}
+
 func (r *GatewayReconciler) handleSnapshotBuildFailure(
 	ctx context.Context,
 	key types.NamespacedName,
@@ -1414,6 +1499,25 @@ func (r *GatewayReconciler) handleSnapshotBuildFailure(
 	routes []gatewayv1.HTTPRoute,
 	policies []gatewayv1.BackendTLSPolicy,
 	statuses *gatewayapi.Statuses,
+	buildErr error,
+) error {
+	return r.handleGatewayCompileFailure(
+		ctx, key, gateway, routes, policies, statuses,
+		"Gateway configuration could not be compiled",
+		"Listener configuration could not be compiled",
+		buildErr,
+	)
+}
+
+func (r *GatewayReconciler) handleGatewayCompileFailure(
+	ctx context.Context,
+	key types.NamespacedName,
+	gateway *gatewayv1.Gateway,
+	routes []gatewayv1.HTTPRoute,
+	policies []gatewayv1.BackendTLSPolicy,
+	statuses *gatewayapi.Statuses,
+	gatewayMessage string,
+	listenerMessage string,
 	buildErr error,
 ) error {
 	statuses.Gateway.Addresses = nil
@@ -1426,7 +1530,7 @@ func (r *GatewayReconciler) handleSnapshotBuildFailure(
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: gateway.Generation,
 		Reason:             string(gatewayv1.GatewayReasonInvalid),
-		Message:            "Gateway configuration could not be compiled",
+		Message:            gatewayMessage,
 		LastTransitionTime: now,
 	})
 	for index := range statuses.Gateway.Listeners {
@@ -1435,7 +1539,7 @@ func (r *GatewayReconciler) handleSnapshotBuildFailure(
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: gateway.Generation,
 			Reason:             string(gatewayv1.ListenerReasonInvalid),
-			Message:            "Listener configuration could not be compiled",
+			Message:            listenerMessage,
 			LastTransitionTime: now,
 		})
 	}

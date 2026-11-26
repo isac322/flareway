@@ -64,6 +64,18 @@ var errTunnelConvergenceLost = errors.New("tunnel convergence evidence lost")
 // demote ConfigApplied and still surface the error.
 var errTunnelGateObservation = errors.New("tunnel gate observation failed")
 
+type cloudflaredConfigCompileError struct {
+	err error
+}
+
+func (e *cloudflaredConfigCompileError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cloudflaredConfigCompileError) Unwrap() error {
+	return e.err
+}
+
 type cloudflareConfigResult struct {
 	hash            string
 	version         int64
@@ -256,6 +268,15 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 	gateway *gatewayv1.Gateway,
 	cfg *v1alpha1.GatewayClassConfig,
 ) (*v1alpha1.CloudflareTunnel, *v1alpha1.CloudflareAccount, *v1alpha1.GatewayClassConfig, *tunnelProgrammingBlock, error) {
+	return r.resolveCloudflareContextWithOptions(ctx, gateway, cfg, true)
+}
+
+func (r *GatewayReconciler) resolveCloudflareContextWithOptions(
+	ctx context.Context,
+	gateway *gatewayv1.Gateway,
+	cfg *v1alpha1.GatewayClassConfig,
+	createDefault bool,
+) (*v1alpha1.CloudflareTunnel, *v1alpha1.CloudflareAccount, *v1alpha1.GatewayClassConfig, *tunnelProgrammingBlock, error) {
 	if cfg.Spec.ConformanceMode {
 		return nil, nil, cfg, nil, nil
 	}
@@ -278,6 +299,16 @@ func (r *GatewayReconciler) resolveCloudflareContext(
 		}
 		if cfg.Spec.AccountRef == nil || cfg.Spec.AccountRef.Name == "" {
 			return nil, nil, cfg, nil, errors.New("the GatewayClassConfig accountRef is required in Cloudflare mode")
+		}
+		if !createDefault {
+			var account v1alpha1.CloudflareAccount
+			if err := r.Get(ctx, types.NamespacedName{Name: cfg.Spec.AccountRef.Name}, &account); err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil, nil, cfg, nil, &missingCloudflareAccountError{name: cfg.Spec.AccountRef.Name}
+				}
+				return nil, nil, cfg, nil, fmt.Errorf("get CloudflareAccount %q: %w", cfg.Spec.AccountRef.Name, err)
+			}
+			return nil, &account, cfg, nil, nil
 		}
 		tunnel = v1alpha1.CloudflareTunnel{
 			TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.GroupVersion.String(), Kind: "CloudflareTunnel"},
@@ -663,7 +694,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	tunnel = currentTunnel
 	params, hash, err := cloudflaredconfig.Compile(gateway)
 	if err != nil {
-		return cloudflareConfigResult{}, err
+		return cloudflareConfigResult{}, &cloudflaredConfigCompileError{err: err}
 	}
 	// Desired-hash gate (D11): evaluated outside the tunnel lock and before
 	// the Cloudflare client is built. An open gate skips client creation,

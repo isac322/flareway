@@ -127,9 +127,15 @@ type GatewayClassOriginJWTConfig struct {
 
 // GatewayOriginRequestSpec contains only origin settings valid for cloudflared's loopback Envoy origin.
 type GatewayOriginRequestSpec struct {
-	ConnectTimeout   *metav1.Duration `json:"connectTimeout,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="connectTimeout must be non-negative"
+	// +kubebuilder:validation:XValidation:rule="timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())",message="connectTimeout must use whole-second precision"
+	ConnectTimeout *metav1.Duration `json:"connectTimeout,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="keepAliveTimeout must be non-negative"
+	// +kubebuilder:validation:XValidation:rule="timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())",message="keepAliveTimeout must use whole-second precision"
 	KeepAliveTimeout *metav1.Duration `json:"keepAliveTimeout,omitempty"`
-	TCPKeepAlive     *metav1.Duration `json:"tcpKeepAlive,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="tcpKeepAlive must be non-negative"
+	// +kubebuilder:validation:XValidation:rule="timestamp(0) + duration(self) == timestamp(duration(self).getSeconds())",message="tcpKeepAlive must use whole-second precision"
+	TCPKeepAlive *metav1.Duration `json:"tcpKeepAlive,omitempty"`
 	// +kubebuilder:validation:Minimum=0
 	KeepAliveConnections   *int64 `json:"keepAliveConnections,omitempty"`
 	NoHappyEyeballs        *bool  `json:"noHappyEyeballs,omitempty"`

@@ -124,6 +124,37 @@ func TestDNSSweepScopedToGrantedZones(t *testing.T) {
 	requireDNSCalls(t, f.api, "zone-a")
 }
 
+func TestDNSSweepRetainsOwnershipAcrossDirectTransition(t *testing.T) {
+	t.Parallel()
+	// After Gateway -> Direct transition clears status.gatewayRef, the tunnel's
+	// recorded checkpoint may still carry the prior bound Gateway marker (with
+	// optional operator text). The sweeper must recognize that marker instead of
+	// reporting a false mismatch.
+	priorGatewayMarker := probeMarker("prior-gateway")
+	checkpoint := v1alpha1Checkpoint("app.zone-a.example.com", "rec-1", "zone-a", priorGatewayMarker+" platform managed")
+	longGatewayHashComment := flarecloudflare.SignDNSRecordComment(probeOwnershipKey, probeClusterID, "ns", strings.Repeat("gw-", 30)) + " platform managed"
+	hashCheckpoint := v1alpha1Checkpoint("hash.zone-a.example.com", "rec-2", "zone-a", longGatewayHashComment)
+	tunnel := probeTunnel("shared-tunnel", checkpoint, hashCheckpoint)
+	tunnel.Status.GatewayRef = nil
+	remote := healthyRecord("rec-1", "app.zone-a.example.com", "shared-tunnel", priorGatewayMarker+" platform managed")
+	hashRemote := healthyRecord("rec-2", "hash.zone-a.example.com", "shared-tunnel", longGatewayHashComment)
+
+	f := newDNSProbeFixture(t, dnsProbeConfig{
+		zones: []probeZone{
+			{id: "zone-a", records: []flarecloudflare.DNSRecord{remote, hashRemote}},
+		},
+		grantZones: []string{"zone-a.example.com"},
+		objects:    []client.Object{tunnel},
+	})
+	items, result, err := f.sweeper.RunTargetOnce(context.Background(), dnsTarget())
+	if result != observability.SweepResultOK || err != nil {
+		t.Fatalf("sweep = (%v, %q, %v), want ok", items, result, err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("sweep reported false drift after Direct transition: %#v", items)
+	}
+}
+
 // A denial on a granted zone is a real token/grant mismatch and keeps the
 // isolated partial; the ungranted zone is still never called.
 func TestDNSSweepGrantedZoneDeniedStaysPartial(t *testing.T) {

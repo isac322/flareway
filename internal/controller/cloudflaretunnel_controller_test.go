@@ -725,6 +725,166 @@ func TestRemoveDNSRecordsDeletesRecordWithOperatorComment(t *testing.T) {
 	g.Expect(cf.Calls()).To(gomega.ContainElement("DeleteDNSRecord"))
 }
 
+func TestDNSOwnershipRetainedAcrossGatewayDetachmentAndDirectSwitch(t *testing.T) {
+	const (
+		clusterID   = "cluster"
+		namespace   = "tenant"
+		tunnelID    = "tunnel-uuid"
+		gatewayName = "public-gateway"
+		tunnelName  = "shared-tunnel"
+	)
+
+	t.Run("removeDNSRecords cleans gateway-marked record after Gateway-to-Direct switch", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		cf := newFakeTunnelCloudflareFactory()
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: tunnelName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "platform managed"},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: tunnelID,
+			},
+		}
+		gatewayComment := dnsOwnershipComment(&v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: tunnelName},
+			Spec:       v1alpha1.CloudflareTunnelSpec{DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "platform managed"}},
+		}, clusterID, gatewayName)
+		expected := v1alpha1.CloudflareTunnelDNSRecordStatus{
+			Hostname:         "app.example.test",
+			RecordID:         "record-1",
+			ZoneID:           "zone-1",
+			OwnershipComment: gatewayComment,
+		}
+		tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{expected}
+		cf.PutDNS(expected.ZoneID, RemoteDNSRecord{
+			ID: expected.RecordID, Name: expected.Hostname, Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: gatewayComment,
+		})
+
+		markers := dnsOwnershipMarkers(tunnel, clusterID, tunnelName)
+		remaining, conflict, err := removeDNSRecords(
+			context.Background(), cf, markers, dnsRecordTargets(tunnel, ""), tunnel.Status.DNSRecords,
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(conflict).To(gomega.BeEmpty())
+		g.Expect(remaining).To(gomega.BeEmpty())
+		g.Expect(cf.HasDNSRecord(expected.ZoneID, expected.RecordID)).To(gomega.BeFalse())
+	})
+
+	t.Run("ensureDNS updates retained and removes stale gateway-marked records while rejecting foreign targets", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		cf := newFakeTunnelCloudflareFactory()
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: tunnelName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "platform managed"},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: tunnelID,
+			},
+		}
+		gatewayComment := dnsOwnershipComment(tunnel, clusterID, gatewayName)
+		tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{
+			{Hostname: "keep.example.test", RecordID: "rec-keep", ZoneID: "zone-1", OwnershipComment: gatewayComment},
+			{Hostname: "stale.example.test", RecordID: "rec-stale", ZoneID: "zone-1", OwnershipComment: gatewayComment},
+		}
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-keep", Name: "keep.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: gatewayComment, Proxied: true, TTL: 1,
+		})
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-stale", Name: "stale.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: gatewayComment, Proxied: true, TTL: 1,
+		})
+		// A CNAME pointing to a different tunnel that carries the old Gateway marker
+		// must fail closed as a conflict rather than being overwritten.
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-other", Name: "hijack-guard.example.test", Type: "CNAME",
+			Content: "other-tunnel-uuid.cfargotunnel.com", Comment: gatewayComment, Proxied: true, TTL: 1,
+		})
+
+		reconciler := &CloudflareTunnelReconciler{}
+		records, conflict, err := reconciler.ensureDNS(
+			context.Background(), cf, tunnel, tunnelName, clusterID, tunnelID,
+			[]publicHostname{
+				{Hostname: "keep.example.test", ZoneID: "zone-1"},
+				{Hostname: "hijack-guard.example.test", ZoneID: "zone-1"},
+			},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(conflict).To(gomega.ContainSubstring("hijack-guard.example.test"))
+		g.Expect(cf.HasDNSRecord("zone-1", "rec-stale")).To(gomega.BeFalse())
+		g.Expect(cf.Calls()).To(gomega.ContainElement("UpdateCNAME"))
+		var updatedKeep *v1alpha1.CloudflareTunnelDNSRecordStatus
+		for i := range records {
+			if records[i].Hostname == "keep.example.test" {
+				updatedKeep = &records[i]
+			}
+		}
+		g.Expect(updatedKeep).NotTo(gomega.BeNil())
+		g.Expect(updatedKeep.OwnershipComment).To(gomega.Equal(dnsOwnershipComment(tunnel, clusterID, tunnelName)))
+	})
+
+	t.Run("long gateway hash-only checkpoint cleans up and updates with operator text", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		cf := newFakeTunnelCloudflareFactory()
+		longGateway := strings.Repeat("gw-", 30)
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: tunnelName},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				DNS: v1alpha1.CloudflareTunnelDNSConfig{RecordComment: "platform managed"},
+			},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: tunnelID,
+			},
+		}
+		hashComment := dnsOwnershipComment(tunnel, clusterID, longGateway)
+		g.Expect(hashComment).To(gomega.HavePrefix("flareway sha256:"))
+		tunnel.Status.DNSRecords = []v1alpha1.CloudflareTunnelDNSRecordStatus{
+			{Hostname: "keep-hash.example.test", RecordID: "rec-keep-hash", ZoneID: "zone-1", OwnershipComment: hashComment},
+			{Hostname: "stale-hash.example.test", RecordID: "rec-stale-hash", ZoneID: "zone-1", OwnershipComment: hashComment},
+		}
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-keep-hash", Name: "keep-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment, Proxied: true, TTL: 1,
+		})
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-stale-hash", Name: "stale-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment, Proxied: true, TTL: 1,
+		})
+
+		reconciler := &CloudflareTunnelReconciler{}
+		records, conflict, err := reconciler.ensureDNS(
+			context.Background(), cf, tunnel, tunnelName, clusterID, tunnelID,
+			[]publicHostname{{Hostname: "keep-hash.example.test", ZoneID: "zone-1"}},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(conflict).To(gomega.BeEmpty())
+		g.Expect(cf.HasDNSRecord("zone-1", "rec-stale-hash")).To(gomega.BeFalse())
+		g.Expect(records).To(gomega.HaveLen(1))
+		g.Expect(records[0].OwnershipComment).To(gomega.Equal(dnsOwnershipComment(tunnel, clusterID, tunnelName)))
+
+		// Detached hash-only record deletion with target verified.
+		deleteRecord := records[0]
+		deleteRecord.OwnershipComment = hashComment
+		cf.PutDNS("zone-1", RemoteDNSRecord{
+			ID: "rec-detach-hash", Name: "detach-hash.example.test", Type: "CNAME",
+			Content: tunnelCNAMETarget(tunnelID), Comment: hashComment,
+		})
+		deleteRecord.Hostname = "detach-hash.example.test"
+		deleteRecord.RecordID = "rec-detach-hash"
+		remaining, delConflict, err := removeDNSRecords(
+			context.Background(), cf, dnsOwnershipMarkers(tunnel, clusterID, tunnelName), dnsRecordTargets(tunnel, ""),
+			[]v1alpha1.CloudflareTunnelDNSRecordStatus{deleteRecord},
+		)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(delConflict).To(gomega.BeEmpty())
+		g.Expect(remaining).To(gomega.BeEmpty())
+		g.Expect(cf.HasDNSRecord("zone-1", "rec-detach-hash")).To(gomega.BeFalse())
+	})
+}
+
 func TestTunnelGatewayBindingsRequireHostnameAndZone(t *testing.T) {
 	g := gomega.NewWithT(t)
 	tunnel := &v1alpha1.CloudflareTunnel{}
