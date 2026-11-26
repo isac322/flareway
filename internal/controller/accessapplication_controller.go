@@ -756,7 +756,7 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 	if targetLossFailure != nil {
 		failure := *targetLossFailure
 		failure.NoTargetsResolved = false
-		if anyResolvedTargets {
+		if anyResolvedTargets || targetRes.unattachedRoute {
 			failure.TargetLoss = gatewayapi.AccessTargetLossNone
 		}
 		result.compilation = failure
@@ -1874,6 +1874,9 @@ func (r *AccessApplicationReconciler) revokeApplicationTokensWithClient(
 	scope flarecloudflare.AccessScope,
 	application *v1alpha1.AccessApplication,
 ) error {
+	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		return nil
+	}
 	revoked, err := revocationTokensAlreadyRevoked(application)
 	if err != nil || revoked {
 		return err
@@ -1900,6 +1903,9 @@ func revocationTokensAlreadyRevoked(application *v1alpha1.AccessApplication) (bo
 }
 
 func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	if effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		return nil
+	}
 	raw := application.Annotations[accessApplicationRevocationAnnotation]
 	if raw == "" {
 		return errors.New("cannot mark Access tokens revoked without a revocation latch")
@@ -1934,11 +1940,11 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	}
 	status := *application.Status.DeepCopy()
 	revStatus := v1alpha1.AccessApplicationRevocationStatus{
-		LatchDigest:        latchDigest,
-		ObservedGeneration: application.Generation,
-		TokensRevoked:      true,
+		LatchDigest:   latchDigest,
+		TokensRevoked: true,
 	}
 	if status.Revocation != nil && status.Revocation.LatchDigest == latchDigest {
+		revStatus.ObservedGeneration = status.Revocation.ObservedGeneration
 		revStatus.Acknowledged = status.Revocation.Acknowledged
 		revStatus.Released = status.Revocation.Released
 	}

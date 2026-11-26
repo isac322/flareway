@@ -315,4 +315,23 @@ func TestEmptyTargetCompilationDoesNotReleaseOnNoMatchingParentOrInvalidListener
 			t.Fatalf("NoTargetsResolved = true when targeted spec listener was rejected/dropped, want false")
 		}
 	})
+
+	t.Run("deleted target listener with unrelated rejected Gateway-wide route leaves NoTargetsResolved true", func(t *testing.T) {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+		route := routeWithBackend("unrelated-domain", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"other.otherdomain.test"}
+		route.Spec.ParentRefs[0].SectionName = nil
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+		app := accessApplication("app", "Gateway", "gateway", "gone")
+		compiled := CompileAccessApplication(in, &app)
+		if compiled.Accepted || compiled.Reason != "TargetNotFound" {
+			t.Fatalf("compiled = %+v, want TargetNotFound rejection", compiled)
+		}
+		if !compiled.NoTargetsResolved {
+			t.Fatalf("NoTargetsResolved = false when targeted listener was deleted despite unrelated Gateway-wide route, want true")
+		}
+	})
 }

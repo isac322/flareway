@@ -1148,7 +1148,7 @@ func gatewayTargetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *S
 				*parentStatus.ParentRef.Port != *targetPort {
 				continue
 			}
-			if parentStatus.ParentRef.SectionName == nil && len(targetListeners) > 0 {
+			if parentStatus.ParentRef.SectionName == nil {
 				applicable := false
 				for _, listener := range targetListeners {
 					if parentStatus.ParentRef.Port != nil && *parentStatus.ParentRef.Port != listener.Port {
