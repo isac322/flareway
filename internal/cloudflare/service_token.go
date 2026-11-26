@@ -22,6 +22,7 @@ import (
 	"time"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
+	"github.com/cloudflare/cloudflare-go/v7/option"
 	"github.com/cloudflare/cloudflare-go/v7/zero_trust"
 )
 
@@ -69,7 +70,7 @@ func (client *Client) CreateServiceToken(ctx context.Context, scope AccessScope,
 	if input.Duration != "" {
 		params.Duration = cloudflaresdk.F(input.Duration)
 	}
-	result, err := client.sdk.ZeroTrust.Access.ServiceTokens.New(ctx, params)
+	result, err := client.sdk.ZeroTrust.Access.ServiceTokens.New(ctx, params, option.WithMaxRetries(0))
 	if err != nil {
 		return ServiceTokenSecret{}, fmt.Errorf("create Access service token: %w", err)
 	}

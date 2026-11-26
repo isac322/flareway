@@ -21,7 +21,9 @@ A DNS listing failure must have a narrower scope than a whole pass. The decision
 
 ## Decision
 
-The DNS target isolates listing failures per zone and returns a typed scoped partial. Every other sweep target keeps the strict account-wide contract.
+> **Extension note:** The typed `*scopedListingError` partial contract introduced by this ADR for DNS was later extended to zone-scoped Access targets (`AccessApplication`, `AccessStandaloneApplication`, `AccessGroup`, `ServiceToken` in `internal/sweep/targets_access.go`), while account-scope Access calls and all other sweep targets keep the strict fail-closed contract.
+
+The DNS target isolates listing failures per zone and returns a typed scoped partial. Every other sweep target outside DNS and zone-scoped Access keeps the strict account-wide contract.
 
 ### Zone scope
 
@@ -103,7 +105,7 @@ Account-wide calls keep the generic contract. A failed zone inventory call (`Lis
 - Operators see degradation through metrics: a stale `flareway_sweep_last_success_timestamp` with rising `result="partial"` counts for the DNS kind. The Info log names each failed zone and its cause.
 - A DNS pass with a zone failure reports `partial`, not `error`. Alerts for DNS access problems watch `result="partial"` and last-success staleness.
 - While a zone stays unreadable, records in it get no drift detection and no orphan cleanup. The pass stays partial until the token can read the zone again or the zone leaves scope.
-- The sweep package carries a second partial contract. It is confined to the DNS target and enforced by the ordering in `RunTargetOnce`.
+- The sweep package uses this typed scoped-partial contract for DNS and zone-scoped Access targets (`AccessApplication`, `AccessStandaloneApplication`, `AccessGroup`, `ServiceToken`), enforced by `RunTargetOnce` and `accessScopeListed` (which requires both `spec.zone` and any distinct `status.zoneId` scope to be listed before judging).
 
 ## Alternatives considered
 
@@ -112,7 +114,7 @@ Account-wide calls keep the generic contract. A failed zone inventory call (`Lis
 | List only zones that hold a checkpoint | Loses account-wide orphan discovery in granted zones that have no checkpoint yet. The adopted zone scope (grants plus checkpoint zones) keeps orphan discovery in every zone Flareway can write to and skips zones it could never have written. |
 | Keep aborting and add a debounce or wider reconcile predicate | The pass would still discard every finding. Suppressing the failure hides it instead of isolating it. |
 | Require a token with DNS read on every zone in the account | Contradicts least-privilege tokens and the per-zone grant model. Read access alone does not show provisioning intent. |
-| Refactor the Access sweeper to the same per-scope model | Out of scope. Other targets keep the strict contract; extending it needs its own decision. |
+| Refactor the Access sweeper to the same per-scope model | Deferred at the time of this ADR; later implemented for zone-scoped Access targets (`listAccessScoped` + `accessScopeListed`) with account-scope failures still aborting fail-closed. |
 | Extend the public API, metrics labels, or `SweepFunc` signature | Unnecessary. A private typed error carries the scoped result with the smallest surface change. |
 | Signal a zone failure with the plain `errIncompleteListing` sentinel | The sentinel carries no zone ID or cause, and the generic partial path drops the safe items. |
 | Label a scoped partial `result="error"` | A single-zone account would label every denied pass as an error, and the label could not separate "listing incomplete" from "request rejected". |

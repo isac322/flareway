@@ -17,13 +17,17 @@ limitations under the License.
 package cloudflare
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	cloudflaresdk "github.com/cloudflare/cloudflare-go/v7"
+	"github.com/go-logr/logr"
+	"golang.org/x/time/rate"
 )
 
 func sdkError(status int) error {
@@ -61,5 +65,38 @@ func TestIsDefiniteNonCreationClientError(t *testing.T) {
 				t.Fatalf("IsDefiniteNonCreationClientError(%v) = %t, want %t", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCreateServiceTokenNeverRetriesTransient5xx(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":500,"message":"internal error"}],"messages":[],"result":null}`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":403,"message":"forbidden"}],"messages":[],"result":null}`))
+	}))
+	defer server.Close()
+
+	client := New("token", "acct-1", logr.Discard(), WithBaseURL(server.URL), WithLimiter(rate.NewLimiter(rate.Inf, 0)))
+	_, err := client.CreateServiceToken(context.Background(), AccessScope{}, ServiceTokenInput{Name: "attempt-1", Enabled: true})
+	if err == nil {
+		t.Fatal("CreateServiceToken unexpectedly succeeded on HTTP 500")
+	}
+	if got, ok := StatusCode(err); !ok || got != http.StatusInternalServerError {
+		t.Fatalf("StatusCode(err) = (%d, %t), want (%d, true) (err=%v)", got, ok, http.StatusInternalServerError, err)
+	}
+	if IsDefiniteNonCreationClientError(err) {
+		t.Fatalf("HTTP 500 was misclassified as definite non-creation 4xx: %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("CreateServiceToken sent %d HTTP requests, want 1 (retries must be disabled on non-idempotent POST)", got)
 	}
 }

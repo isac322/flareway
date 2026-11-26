@@ -441,6 +441,193 @@ func TestAccessSweepIsolatesZoneForbiddenPreservingAccountAndPermittedZones(t *t
 	}
 }
 
+func TestAccessSweepCrossScopeSkipsJudgementWhenRecordedScopeUnlisted(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name           string
+		target         TargetDescriptor
+		deniedZonePath string
+		specZone       string
+		objects        func(specZone string) []client.Object
+	}{
+		{
+			name:           "AccessApplication_cross_zone",
+			target:         accessApplicationTarget(),
+			deniedZonePath: "/zones/zone-denied/access/apps",
+			specZone:       "ok.example.com",
+			objects: func(specZone string) []client.Object {
+				return []client.Object{
+					&v1alpha1.AccessApplication{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "cross-app", UID: "uid-cross-app"},
+						Spec: v1alpha1.AccessApplicationSpec{
+							AccountRef: corev1.LocalObjectReference{Name: probeAccountName},
+							Zone:       specZone,
+							Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+							Application: v1alpha1.AccessApplicationSettings{
+								Name:           "cross-app",
+								AllowedIDPRefs: []v1alpha1.AccessIdentityProviderReference{{ExternalID: "idp-missing"}},
+								CustomPageRefs: []v1alpha1.AccessCustomPageReference{{ExternalID: "page-missing"}},
+							},
+							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						},
+						Status: v1alpha1.AccessApplicationStatus{ApplicationID: "remote-cross-app", ZoneID: "zone-denied"},
+					},
+				}
+			},
+		},
+		{
+			name:           "AccessApplication_to_account",
+			target:         accessApplicationTarget(),
+			deniedZonePath: "/zones/zone-denied/access/apps",
+			specZone:       "",
+			objects: func(specZone string) []client.Object {
+				return []client.Object{
+					&v1alpha1.AccessApplication{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "cross-acct-app", UID: "uid-cross-acct-app"},
+						Spec: v1alpha1.AccessApplicationSpec{
+							AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+							Zone:             specZone,
+							Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+							Application:      v1alpha1.AccessApplicationSettings{Name: "cross-acct-app"},
+							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						},
+						Status: v1alpha1.AccessApplicationStatus{ApplicationID: "remote-cross-acct-app", ZoneID: "zone-denied"},
+					},
+				}
+			},
+		},
+		{
+			name: "AccessStandaloneApplication_cross_zone",
+			target: TargetDescriptor{
+				Kind:      "AccessStandaloneApplication",
+				Grade:     freshness.GradeAuthz,
+				SweepFunc: sweepAccessStandaloneApplications,
+			},
+			deniedZonePath: "/zones/zone-denied/access/apps",
+			specZone:       "ok.example.com",
+			objects: func(specZone string) []client.Object {
+				return []client.Object{
+					&v1alpha1.AccessStandaloneApplication{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "cross-sa", UID: "uid-cross-sa"},
+						Spec: v1alpha1.AccessStandaloneApplicationSpec{
+							AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+							Zone:             specZone,
+							Type:             v1alpha1.AccessStandaloneApplicationTypeBookmark,
+							Application:      v1alpha1.AccessApplicationSettings{Name: "cross-sa"},
+							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						},
+						Status: v1alpha1.AccessStandaloneApplicationStatus{ApplicationID: "remote-cross-sa", ZoneID: "zone-denied"},
+					},
+				}
+			},
+		},
+		{
+			name: "AccessGroup_cross_zone",
+			target: TargetDescriptor{
+				Kind:      "AccessGroup",
+				Grade:     freshness.GradeAuthz,
+				SweepFunc: sweepAccessGroups,
+			},
+			deniedZonePath: "/zones/zone-denied/access/groups",
+			specZone:       "ok.example.com",
+			objects: func(specZone string) []client.Object {
+				return []client.Object{
+					&v1alpha1.AccessGroup{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "cross-grp", UID: "uid-cross-grp"},
+						Spec: v1alpha1.AccessGroupSpec{
+							AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+							Zone:             specZone,
+							Name:             "cross-grp",
+							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						},
+						Status: v1alpha1.AccessGroupStatus{GroupID: "remote-cross-grp", ZoneID: "zone-denied"},
+					},
+				}
+			},
+		},
+		{
+			name: "ServiceToken_cross_zone",
+			target: TargetDescriptor{
+				Kind:      "ServiceToken",
+				Grade:     freshness.GradeAuthz,
+				SweepFunc: sweepServiceTokens,
+			},
+			deniedZonePath: "/zones/zone-denied/access/service_tokens",
+			specZone:       "ok.example.com",
+			objects: func(specZone string) []client.Object {
+				return []client.Object{
+					&v1alpha1.ServiceToken{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "cross-st", UID: "uid-cross-st"},
+						Spec: v1alpha1.ServiceTokenSpec{
+							AccountRef:       corev1.LocalObjectReference{Name: probeAccountName},
+							Zone:             specZone,
+							Name:             "cross-st",
+							SecretRef:        corev1.LocalObjectReference{Name: "cross-st-secret"},
+							ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+						},
+						Status: v1alpha1.ServiceTokenStatus{TokenID: "remote-cross-st", ZoneID: "zone-denied"},
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			stub := cfstub.New(t)
+			stub.State.AddZone(cfstub.Zone{ID: "zone-denied", Name: "denied.example.com", AccountID: "account-1"})
+			stub.State.AddZone(cfstub.Zone{ID: "zone-ok", Name: "ok.example.com", AccountID: "account-1"})
+			stub.Fault(http.MethodGet, "^"+tc.deniedZonePath+"$", cfstub.Fault{Status: http.StatusForbidden, Times: -1})
+
+			var refCalls int
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/accounts/account-1/access/identity_providers" || r.URL.Path == "/accounts/account-1/access/custom_pages" {
+					refCalls++
+				}
+				target, _ := url.Parse(stub.URL)
+				httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
+			}))
+			defer proxy.Close()
+
+			objs := append(tc.objects(tc.specZone), probeAccount([]string{"*"}))
+			fixture := newDNSProbeFixture(t, dnsProbeConfig{objects: objs})
+			latch := freshness.NewLatch()
+			key := types.NamespacedName{Namespace: "tenant", Name: tc.objects(tc.specZone)[0].GetName()}
+			if tc.target.Kind == "AccessApplication" {
+				latch.SetBaseline("AccessApplication", key, "h1", func(any) bool { return true })
+			}
+			sweeper := NewAccountSweeper(AccountSweeperOptions{
+				AccountName:       probeAccountName,
+				AccountID:         "account-1",
+				Token:             "token",
+				Factory:           flarecloudflare.NewFactory(logr.Discard(), flarecloudflare.WithBaseURL(proxy.URL)),
+				Client:            fixture.kube,
+				APIReader:         fixture.kube,
+				Invalidator:       latch,
+				OperatorNamespace: probeOperatorNamespace,
+				RateLimit:         1e9,
+				RateBurst:         1,
+				Logger:            logr.Discard(),
+			})
+
+			items, result, err := sweeper.RunTargetOnce(ctx, tc.target)
+			if result != observability.SweepResultPartial {
+				t.Fatalf("result = %q, want %q (err=%v)", result, observability.SweepResultPartial, err)
+			}
+			if len(items) != 0 {
+				t.Fatalf("cross-scope CR touching unlisted recordedScope produced unexpected drift: %#v", items)
+			}
+			if refCalls != 0 {
+				t.Fatalf("expected 0 provider/page reference list calls when only ineligible cross-scope app referenced them, got %d", refCalls)
+			}
+			if _, confirmed := latch.ConfirmedAt("AccessApplication", key, "h1"); confirmed {
+				t.Fatal("cross-scope AccessApplication with unlisted recordedScope must not confirm")
+			}
+		})
+	}
+}
+
 func TestAccessSweepFailsClosedOnAccountOrNonIsolatableZoneError(t *testing.T) {
 	t.Parallel()
 

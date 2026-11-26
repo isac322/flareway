@@ -49,7 +49,7 @@ The name is capped at 200 characters by truncating `spec.name`. The prefix up to
 1. List tokens in scope. Any token whose name starts with this ServiceToken's attempt prefix, or equals the canonical name, is an untracked collision: report `Conflict` and stop.
 2. Generate a nonce, add the attempt finalizer `flareway.bhyoo.com/service-token-attempt`, and create the journal in phase `prepared`. The finalizer covers the window before the journal exists.
 3. Reserve the destination: create an empty Secret controlled by the ServiceToken and annotated as reserved. An existing Secret must be controlled by this ServiceToken, mutable, and accept a versioned metadata update. Otherwise report `Conflict`.
-4. Persist phase `dispatched`, then call `CreateServiceToken` with the attempt name. If Cloudflare returns a definite non-creation `4xx` response (any `4xx` except `408`, `409`, and `429`), delete the journal Secret, remove an empty controller-reserved destination Secret carrying the pending-reservation annotation, release the attempt finalizer, and surface the API error (`RemoteError`, or `RemoteMissing` for `404`) instead of entering `RecoveryPending`.
+4. Persist phase `dispatched`, then call `CreateServiceToken` with the attempt name and client retries disabled (`WithMaxRetries(0)`). If Cloudflare returns a definite non-creation `4xx` response (any `4xx` except `408`, `409`, and `429`), first persist phase `rejected`, then remove any empty controller-reserved destination Secret carrying the pending-reservation annotation, release the attempt finalizer, delete the journal Secret with `UID` and `ResourceVersion` preconditions, record per-CR exponential create backoff (reset when `ServiceToken` generation, `CloudflareAccount` resource version, or resolved remote name changes), and surface the API error (`RemoteError`, or `RemoteMissing` for `404`) with `RequeueAfter` instead of entering `RecoveryPending`.
 5. Record the issued token ID in the journal.
 6. Write the credential to the destination Secret. If the returned name differs from the attempt name, write the credential anyway and report `Conflict`; the create is never repeated.
 7. Align mutable fields and the canonical name, patch `status.tokenId` with `Ready=True`, then delete the journal and remove the attempt finalizer.
@@ -72,6 +72,7 @@ Otherwise the phase decides:
 | `dispatched`, one exact match, account scope | Record its ID, then `RotateServiceToken` to obtain a fresh credential, capture it, and converge. A failed rotate stays journaled for retry; there is no delete fallback. |
 | `dispatched`, one exact match, zone scope | Zone-scoped tokens cannot rotate. Record the token as retiring and move to `retiring`. |
 | `retiring` | Delete the retiring token and report `RecoveryPending`. Once `GetServiceToken` returns 404 and the listing no longer shows it, draw a new nonce and return to `prepared`. |
+| `rejected` | Complete rollback locally with no Cloudflare calls: remove any empty reserved destination Secret, release the attempt finalizer, delete the journal Secret with `UID`/`ResourceVersion` preconditions, and requeue. |
 
 A journal that remains after `status.tokenId` is recorded only needs removal: the controller deletes it and the attempt finalizer, and never uses it to resume or rotate.
 

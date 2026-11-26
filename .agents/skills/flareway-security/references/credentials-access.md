@@ -131,7 +131,7 @@ Discovery hints:
   `internal/controller/servicetoken_controller.go`; journal and recovery
   helpers (`createServiceTokenJournal`, `recoverServiceToken`,
   `resumePreparedServiceToken`, `dispatchServiceTokenCreate`,
-  `rollbackUncreatedServiceTokenAttempt`,
+  `cleanupRejectedServiceTokenAttempt`, `deleteServiceTokenJournalSecret`,
   `resumeDispatchedServiceToken`, `resumeRetiringServiceToken`,
   `reserveServiceTokenDestination`, `writeInitialSecret`,
   `committedServiceTokenCredential`, `cleanupPendingServiceTokenJournal`,
@@ -164,11 +164,18 @@ Procedure:
    `flareway/<clusterUID>/<namespace>/<crUID>/<specName>-<nonce>`; the journal
    commits `dispatched` before the request is sent, so a crash between the
    remote create and the credential write resumes through
-   `recoverServiceToken` instead of blindly re-creating. Definite
+   `recoverServiceToken` instead of blindly re-creating. `CreateServiceToken`
+   disables SDK retries (`option.WithMaxRetries(0)`) so non-idempotent POST
+   attempts never retry silently after ambiguous errors. Definite
    non-creation `4xx` create responses (`IsDefiniteNonCreationClientError`,
-   excluding `408`, `409`, and `429`) roll back the journal, empty reserved
-   destination Secret, and attempt finalizer via
-   `rollbackUncreatedServiceTokenAttempt` and surface the API error immediately.
+   excluding `408`, `409`, and `429`) persist journal phase `rejected`, remove
+   the empty reserved destination Secret, release the attempt finalizer, delete
+   the journal Secret with `UID`/`ResourceVersion` preconditions via
+   `cleanupRejectedServiceTokenAttempt`, record per-CR exponential backoff
+   (reset when CR generation, `CloudflareAccount` RV, or resolved remote name
+   changes), and surface the API error without entering `RecoveryPending`. An
+   interrupted `rejected` rollback finishes locally in `recoverServiceToken` or
+   `reconcileDelete` with zero remote calls.
    For ambiguous or `dispatched` attempts, resume is fail-closed: `prepared` +
    zero remote candidates is the only state that may send a create;
    `dispatched` + zero candidates blocks with `RecoveryPending` (absence is

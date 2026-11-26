@@ -143,10 +143,6 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		if !ok {
 			continue
 		}
-		if listed[scope] {
-			needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
-			needPages = needPages || len(app.Spec.Application.CustomPageRefs) > 0
-		}
 		expectedName := app.Spec.Application.Name
 		if expectedName == "" {
 			expectedName = app.Namespace + "/" + app.Name
@@ -154,7 +150,11 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		ref := localRef{
 			kind: "AccessApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
-			specName: app.Name, scope: scope,
+			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
+		}
+		if accessScopeListed(listed)(ref) {
+			needProviders = needProviders || len(app.Spec.Application.AllowedIDPRefs) > 0 || app.Spec.Application.SCIMConfig != nil
+			needPages = needPages || len(app.Spec.Application.CustomPageRefs) > 0
 		}
 		refs = append(refs, ref)
 		markers[ref.key] = accessOwnerMarkers(key, clusterID, app.Namespace, app.Name, app.UID)
@@ -204,7 +204,7 @@ func sweepAccessApplications(ctx context.Context, as *AccountSweeper) ([]DriftIt
 		kind:    "AccessApplication",
 		content: content,
 		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed),
 		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		extra: func(ref localRef, remote flarecloudflare.AccessApplication) string {
 			mine := markers[ref.key]
@@ -283,7 +283,7 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 		refs = append(refs, localRef{
 			kind: "AccessStandaloneApplication", key: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
 			uid: app.UID, remoteID: app.Status.ApplicationID, expectedName: expectedName,
-			specName: app.Name, scope: scope,
+			specName: app.Name, scope: scope, recordedScope: app.Status.ZoneID,
 		})
 	}
 
@@ -291,7 +291,7 @@ func sweepAccessStandaloneApplications(ctx context.Context, as *AccountSweeper) 
 		kind:    "AccessStandaloneApplication",
 		content: contentCheck[flarecloudflare.AccessApplication](ctx, as),
 		idOf:    func(a flarecloudflare.AccessApplication) string { return a.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed),
 		nameOf:  func(a flarecloudflare.AccessApplication) string { return a.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(a flarecloudflare.AccessApplication) string { return a.ID },
@@ -413,14 +413,14 @@ func sweepAccessGroups(ctx context.Context, as *AccountSweeper) ([]DriftItem, er
 			kind: "AccessGroup", key: types.NamespacedName{Namespace: group.Namespace, Name: group.Name},
 			uid: group.UID, remoteID: group.Status.GroupID,
 			expectedName: accessRemoteNameValue(clusterID, group.Namespace, group.Spec.Name),
-			specName:     group.Spec.Name, scope: scope,
+			specName:     group.Spec.Name, scope: scope, recordedScope: group.Status.ZoneID,
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.AccessGroup]{
 		kind:    "AccessGroup",
 		content: contentCheck[flarecloudflare.AccessGroup](ctx, as),
 		idOf:    func(g flarecloudflare.AccessGroup) string { return g.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed),
 		nameOf:  func(g flarecloudflare.AccessGroup) string { return g.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(g flarecloudflare.AccessGroup) string { return g.ID },
@@ -466,14 +466,14 @@ func sweepServiceTokens(ctx context.Context, as *AccountSweeper) ([]DriftItem, e
 			kind: "ServiceToken", key: types.NamespacedName{Namespace: token.Namespace, Name: token.Name},
 			uid: token.UID, remoteID: token.Status.TokenID,
 			expectedName: accessRemoteNameValue(clusterID, token.Namespace, token.Spec.Name),
-			specName:     token.Spec.Name, scope: scope,
+			specName:     token.Spec.Name, scope: scope, recordedScope: token.Status.ZoneID,
 		})
 	}
 	return classify(refs, remotes, classifyOptions[flarecloudflare.ServiceToken]{
 		kind:    "ServiceToken",
 		content: contentCheck[flarecloudflare.ServiceToken](ctx, as),
 		idOf:    func(t flarecloudflare.ServiceToken) string { return t.ID },
-		listed:  scopeListed(listed),
+		listed:  accessScopeListed(listed),
 		nameOf:  func(t flarecloudflare.ServiceToken) string { return t.Name },
 		orphan: accessNamedOrphan(clusterID, refs,
 			func(t flarecloudflare.ServiceToken) string { return t.ID },

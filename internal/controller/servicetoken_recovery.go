@@ -64,6 +64,10 @@ const (
 	serviceTokenJournalPhasePrepared   = "prepared"
 	serviceTokenJournalPhaseDispatched = "dispatched"
 	serviceTokenJournalPhaseRetiring   = "retiring"
+	serviceTokenJournalPhaseRejected   = "rejected"
+
+	serviceTokenCreateBackoffBase = 5 * time.Second
+	serviceTokenCreateBackoffMax  = 5 * time.Minute
 
 	// serviceTokenReservedForAnnotation marks a destination Secret that was
 	// reserved by a pending create attempt and carries no credential yet.
@@ -392,6 +396,12 @@ func (r *ServiceTokenReconciler) writeInitialSecret(ctx context.Context, object 
 // runs after normal grant authorization and before the freshness gate, using
 // the journaled scope binding rather than re-resolving spec.zone.
 func (r *ServiceTokenReconciler) recoverServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
+	if journal.phase == serviceTokenJournalPhaseRejected {
+		if err := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+	}
 	if err := r.ensureServiceTokenAttemptFinalizer(ctx, object); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -421,11 +431,11 @@ func (r *ServiceTokenReconciler) recoverServiceToken(ctx context.Context, object
 
 	switch journal.phase {
 	case serviceTokenJournalPhasePrepared:
-		return r.resumePreparedServiceToken(ctx, object, api, scope, input, clusterID, journalSecret, journal, "", nil)
+		return r.resumePreparedServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal, "", nil)
 	case serviceTokenJournalPhaseDispatched:
-		return r.resumeDispatchedServiceToken(ctx, object, api, scope, input, journalSecret, journal)
+		return r.resumeDispatchedServiceToken(ctx, object, api, account, scope, input, journalSecret, journal)
 	case serviceTokenJournalPhaseRetiring:
-		return r.resumeRetiringServiceToken(ctx, object, api, scope, input, clusterID, journalSecret, journal)
+		return r.resumeRetiringServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal)
 	default:
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal is incomplete or malformed", serviceTokenStatusUpdate{})
 	}
@@ -434,7 +444,7 @@ func (r *ServiceTokenReconciler) recoverServiceToken(ctx context.Context, object
 // resumePreparedServiceToken continues a journaled attempt whose create was
 // never durably dispatched. Zero remote matches is the only state that
 // justifies sending the create.
-func (r *ServiceTokenReconciler) resumePreparedServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal, excludeID string, tokens []flarecloudflare.ServiceToken) (ctrl.Result, error) {
+func (r *ServiceTokenReconciler) resumePreparedServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal, excludeID string, tokens []flarecloudflare.ServiceToken) (ctrl.Result, error) {
 	if journal.nonce == "" || journal.attemptName == "" {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal is incomplete or malformed", serviceTokenStatusUpdate{})
 	}
@@ -465,13 +475,13 @@ func (r *ServiceTokenReconciler) resumePreparedServiceToken(ctx context.Context,
 	if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.dispatchServiceTokenCreate(ctx, object, api, scope, input, journalSecret, journal)
+	return r.dispatchServiceTokenCreate(ctx, object, api, account, scope, input, journalSecret, journal)
 }
 
 // dispatchServiceTokenCreate sends the remote create for a dispatched journal.
 // The dispatched phase is committed before the request so a crash afterwards
 // resumes through recovery rather than re-creating blindly.
-func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
+func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
 	issued, createErr := api.CreateServiceToken(ctx, scope, flarecloudflare.ServiceTokenInput{
 		Name:     journal.attemptName,
 		Duration: input.Duration,
@@ -479,9 +489,18 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 	})
 	if createErr != nil {
 		if flarecloudflare.IsDefiniteNonCreationClientError(createErr) {
-			if rbErr := r.rollbackUncreatedServiceTokenAttempt(ctx, object, journalSecret); rbErr != nil {
+			journal.phase = serviceTokenJournalPhaseRejected
+			if persistErr := r.persistServiceTokenJournal(ctx, journalSecret, journal); persistErr != nil {
+				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, persistErr))
+			}
+			if rbErr := r.cleanupRejectedServiceTokenAttempt(ctx, object, journalSecret, journal); rbErr != nil {
 				return ctrl.Result{}, r.finishRemoteError(ctx, object, errors.Join(createErr, rbErr))
 			}
+			delay := r.recordServiceTokenCreateBackoff(object, account, input.Name, r.now())
+			if patchErr := r.patchRemoteError(ctx, object, createErr); patchErr != nil {
+				return ctrl.Result{}, errors.Join(createErr, patchErr)
+			}
+			return ctrl.Result{RequeueAfter: delay}, nil
 		}
 		return ctrl.Result{}, r.finishRemoteError(ctx, object, createErr)
 	}
@@ -508,19 +527,30 @@ func (r *ServiceTokenReconciler) dispatchServiceTokenCreate(ctx context.Context,
 	return r.convergeCapturedServiceToken(ctx, object, api, scope, input, journal.attemptName, journalSecret, remote)
 }
 
-// rollbackUncreatedServiceTokenAttempt cleans up a pending create attempt when
-// Cloudflare definitely rejected creation before issuing any token (e.g. HTTP
-// 403/400/422): reap the journal first so retries never enter RecoveryPending,
-// delete an empty controller-reserved destination Secret with preconditions, and
-// release the attempt finalizer so deletion is never wedged in CleanupBlocked.
-func (r *ServiceTokenReconciler) rollbackUncreatedServiceTokenAttempt(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret) error {
-	if journalSecret != nil {
-		if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete service token attempt journal: %w", err)
-		}
+// deleteServiceTokenJournalSecret removes a journal Secret using UID and
+// ResourceVersion preconditions so a stale delete never removes a newer attempt.
+func (r *ServiceTokenReconciler) deleteServiceTokenJournalSecret(ctx context.Context, journalSecret *corev1.Secret) error {
+	if journalSecret == nil {
+		return nil
+	}
+	if err := r.Delete(ctx, journalSecret, client.Preconditions{UID: &journalSecret.UID, ResourceVersion: &journalSecret.ResourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete service token attempt journal: %w", err)
+	}
+	return nil
+}
+
+// cleanupRejectedServiceTokenAttempt finishes cleaning up a create attempt
+// whose journal already moved to rejected (definite non-creation 4xx): delete
+// an empty controller-reserved destination Secret with preconditions, release
+// the attempt finalizer, and delete the version-checked journal Secret last so
+// an interrupted rollback can resume without any Cloudflare calls.
+func (r *ServiceTokenReconciler) cleanupRejectedServiceTokenAttempt(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal) error {
+	destName := object.Spec.SecretRef.Name
+	if journal != nil && journal.destination != "" {
+		destName = journal.destination
 	}
 	dest := new(corev1.Secret)
-	destKey := types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}
+	destKey := types.NamespacedName{Namespace: object.Namespace, Name: destName}
 	if err := r.apiReader().Get(ctx, destKey, dest); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("read reserved destination Secret %s/%s: %w", destKey.Namespace, destKey.Name, err)
@@ -536,13 +566,13 @@ func (r *ServiceTokenReconciler) rollbackUncreatedServiceTokenAttempt(ctx contex
 	if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {
 		return fmt.Errorf("remove service token attempt finalizer: %w", err)
 	}
-	return nil
+	return r.deleteServiceTokenJournalSecret(ctx, journalSecret)
 }
 
 // resumeDispatchedServiceToken resumes an attempt whose create was dispatched.
 // Exactly one verified candidate (full binding plus exact attempt-name match)
 // allows recovery; zero matches is unproven and blocks without mutation.
-func (r *ServiceTokenReconciler) resumeDispatchedServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
+func (r *ServiceTokenReconciler) resumeDispatchedServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
 	if journal.nonce == "" || journal.attemptName == "" {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal is incomplete or malformed", serviceTokenStatusUpdate{})
 	}
@@ -594,7 +624,7 @@ func (r *ServiceTokenReconciler) resumeDispatchedServiceToken(ctx context.Contex
 		if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
 			return ctrl.Result{}, err
 		}
-		return r.resumeRetiringServiceToken(ctx, object, api, scope, input, journal.clusterUID, journalSecret, journal)
+		return r.resumeRetiringServiceToken(ctx, object, api, account, scope, input, journal.clusterUID, journalSecret, journal)
 	}
 	grace, parseErr := time.ParseDuration(object.Spec.Rotation.GraceDuration)
 	if parseErr != nil || grace < 0 {
@@ -621,7 +651,7 @@ func (r *ServiceTokenReconciler) resumeDispatchedServiceToken(ctx context.Contex
 
 // resumeRetiringServiceToken finishes a zone-scope recovery: the retiring
 // token must be positively gone before a replacement attempt is prepared.
-func (r *ServiceTokenReconciler) resumeRetiringServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
+func (r *ServiceTokenReconciler) resumeRetiringServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string, journalSecret *corev1.Secret, journal *serviceTokenJournal) (ctrl.Result, error) {
 	if journal.retiringID == "" {
 		return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "Conflict", "service token journal is incomplete or malformed", serviceTokenStatusUpdate{})
 	}
@@ -667,7 +697,7 @@ func (r *ServiceTokenReconciler) resumeRetiringServiceToken(ctx context.Context,
 	if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.resumePreparedServiceToken(ctx, object, api, scope, input, clusterID, journalSecret, journal, retiredID, tokens)
+	return r.resumePreparedServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal, retiredID, tokens)
 }
 
 // convergeCommittedServiceToken finishes a journaled attempt whose credential
@@ -699,10 +729,8 @@ func (r *ServiceTokenReconciler) convergeCapturedServiceToken(ctx context.Contex
 	if err := r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true}); err != nil {
 		return ctrl.Result{}, err
 	}
-	if journalSecret != nil {
-		if err := r.Delete(ctx, journalSecret); err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+	if err := r.deleteServiceTokenJournalSecret(ctx, journalSecret); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := r.removeServiceTokenAttemptFinalizer(ctx, object); err != nil {
 		return ctrl.Result{}, err
@@ -714,6 +742,9 @@ func (r *ServiceTokenReconciler) convergeCapturedServiceToken(ctx context.Contex
 // untracked collisions, journal intent, destination reservation, dispatched
 // checkpoint, remote create, credential capture, then convergence.
 func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object *v1alpha1.ServiceToken, api flarecloudflare.AccessAPI, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, input flarecloudflare.ServiceTokenInput, clusterID string) (ctrl.Result, error) {
+	if remaining := r.serviceTokenCreateRetryAfter(object, account, input.Name, r.now()); remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
 	tokens, err := api.ListServiceTokens(ctx, scope)
 	if err != nil {
 		return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
@@ -735,7 +766,7 @@ func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	return r.resumePreparedServiceToken(ctx, object, api, scope, input, clusterID, journalSecret, journal, "", tokens)
+	return r.resumePreparedServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal, "", tokens)
 }
 
 // cleanupPendingServiceTokenJournal removes remote tokens recorded by a
@@ -850,4 +881,62 @@ func (r *ServiceTokenReconciler) cleanupUntrackedServiceTokenAttempts(ctx contex
 
 func authzRequestForJournal(journal *serviceTokenJournal) authz.Request {
 	return authz.Request{Zone: journal.specZone, PlatformObject: true}
+}
+
+type serviceTokenCreateBackoff struct {
+	until      time.Time
+	failures   int
+	generation int64
+	accountRV  string
+	inputName  string
+}
+
+func (r *ServiceTokenReconciler) serviceTokenCreateRetryAfter(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, inputName string, now time.Time) time.Duration {
+	key := client.ObjectKeyFromObject(object)
+	r.createBackoffMu.Lock()
+	defer r.createBackoffMu.Unlock()
+	entry, ok := r.createBackoff[key]
+	if !ok {
+		return 0
+	}
+	if entry.generation != object.Generation || entry.accountRV != account.ResourceVersion || entry.inputName != inputName {
+		delete(r.createBackoff, key)
+		return 0
+	}
+	if !now.Before(entry.until) {
+		return 0
+	}
+	return entry.until.Sub(now)
+}
+
+func (r *ServiceTokenReconciler) recordServiceTokenCreateBackoff(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, inputName string, now time.Time) time.Duration {
+	key := client.ObjectKeyFromObject(object)
+	r.createBackoffMu.Lock()
+	defer r.createBackoffMu.Unlock()
+	if r.createBackoff == nil {
+		r.createBackoff = make(map[types.NamespacedName]serviceTokenCreateBackoff)
+	}
+	prev := r.createBackoff[key]
+	failures := 1
+	if prev.generation == object.Generation && prev.accountRV == account.ResourceVersion && prev.inputName == inputName {
+		failures = prev.failures + 1
+	}
+	delay := serviceTokenCreateBackoffBase << min(failures-1, 6)
+	if delay > serviceTokenCreateBackoffMax {
+		delay = serviceTokenCreateBackoffMax
+	}
+	r.createBackoff[key] = serviceTokenCreateBackoff{
+		until:      now.Add(delay),
+		failures:   failures,
+		generation: object.Generation,
+		accountRV:  account.ResourceVersion,
+		inputName:  inputName,
+	}
+	return delay
+}
+
+func (r *ServiceTokenReconciler) clearServiceTokenCreateBackoff(key types.NamespacedName) {
+	r.createBackoffMu.Lock()
+	defer r.createBackoffMu.Unlock()
+	delete(r.createBackoff, key)
 }
