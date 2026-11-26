@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -332,6 +333,29 @@ func TestEmptyTargetCompilationDoesNotReleaseOnNoMatchingParentOrInvalidListener
 		}
 		if !compiled.NoTargetsResolved {
 			t.Fatalf("NoTargetsResolved = false when targeted listener was deleted despite unrelated Gateway-wide route, want true")
+		}
+	})
+
+	t.Run("live public HTTPRoute alongside missing private HostnameRoute preserves HasResolvedTargets and clears TargetLoss", func(t *testing.T) {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+		route := routeWithBackend("public-route", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"app.example.com"}
+		route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+		app := accessApplication("app", "Gateway", "gateway", "http")
+		app.Spec.Destinations = []v1alpha1.AccessApplicationDestinationSpec{{
+			Type: v1alpha1.AccessApplicationDestinationPrivate,
+			Private: &v1alpha1.AccessPrivateDestinationSpec{
+				HostnameRouteRef: &corev1.LocalObjectReference{Name: "missing-hostname-route"},
+				PortRange:        "443",
+			},
+		}}
+		compiled := CompileAccessApplication(in, &app)
+		if compiled.Accepted || compiled.TargetLoss != AccessTargetLossNone || !compiled.HasResolvedTargets || compiled.NoTargetsResolved {
+			t.Fatalf("compiled = %+v, want Accepted=false TargetLoss=None HasResolvedTargets=true NoTargetsResolved=false", compiled)
 		}
 	})
 }

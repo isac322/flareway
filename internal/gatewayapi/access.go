@@ -107,6 +107,11 @@ type AccessApplicationCompilation struct {
 	// may be released once Blocked is acknowledged and tokens are revoked.
 	NoTargetsResolved bool
 
+	// HasResolvedTargets reports that at least one route or declared
+	// destination resolved, even when another target or destination failed
+	// compilation.
+	HasResolvedTargets bool
+
 	claims []accessClaim
 }
 
@@ -313,6 +318,12 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 
 	declared := CompileDeclaredAccessDestinations(in, application)
 	if !declared.Accepted {
+		hasResolved := declared.HasResolvedTargets || len(result.Destinations) > 0 || len(result.DataPlanes) > 0
+		declared.HasResolvedTargets = hasResolved
+		declared.NoTargetsResolved = false
+		if hasResolved {
+			declared.TargetLoss = AccessTargetLossNone
+		}
 		return declared
 	}
 	for _, destination := range declared.Destinations {
@@ -354,9 +365,32 @@ func accessApplicationPathScope(application *v1alpha1.AccessApplication) (access
 // CompileDeclaredAccessDestinations compiles explicit spec.destinations entries
 // independent of Gateway route targets.
 func CompileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
-	result := CompilePrivateDestinations(in, application)
-	if !result.Accepted {
+	result := AccessApplicationCompilation{Accepted: true, Reason: "Accepted", Message: "Declared destinations are valid"}
+	if application == nil {
 		return result
+	}
+	priv := CompilePrivateDestinations(in, application)
+	var (
+		nonLossFailure    *AccessApplicationCompilation
+		targetLossFailure *AccessApplicationCompilation
+		hasResolved       = priv.HasResolvedTargets || (priv.Accepted && len(priv.Destinations) > 0)
+	)
+	recordFailure := func(candidate AccessApplicationCompilation) {
+		copied := candidate
+		if copied.TargetLoss != AccessTargetLossNone {
+			if targetLossFailure == nil {
+				targetLossFailure = &copied
+			}
+			return
+		}
+		if nonLossFailure == nil {
+			nonLossFailure = &copied
+		}
+	}
+	if priv.Accepted {
+		result = priv
+	} else {
+		recordFailure(priv)
 	}
 	seen := make(map[string]struct{}, len(result.Destinations))
 	for _, destination := range result.Destinations {
@@ -367,36 +401,61 @@ func CompileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 		case v1alpha1.AccessApplicationDestinationPrivate:
 			continue
 		case v1alpha1.AccessApplicationDestinationPublic:
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] cannot declare a public destination", index))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d] cannot declare a public destination", index)))
 		case v1alpha1.AccessApplicationDestinationViaMCPServerPortal:
 			if destination.ViaMCPServerPortal == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].viaMcpServerPortal is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].viaMcpServerPortal is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationViaMCPServerPortal, MCPServerID: destination.ViaMCPServerPortal.MCPServerID,
 			})
 		case v1alpha1.AccessApplicationDestinationWorker:
 			if destination.Worker == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].worker is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].worker is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationWorker, WorkerID: destination.Worker.WorkerID,
 			})
 		case v1alpha1.AccessApplicationDestinationPreviewWorker:
 			if destination.PreviewWorker == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].previewWorker is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].previewWorker is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationPreviewWorker, WorkerID: destination.PreviewWorker.WorkerID,
 			})
 		case v1alpha1.AccessApplicationDestinationAllWorkers:
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllWorkers})
 		case v1alpha1.AccessApplicationDestinationAllPreviewWorkers:
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllPreviewWorkers})
 		default:
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] uses unsupported type %q", index, destination.Type))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d] uses unsupported type %q", index, destination.Type)))
 		}
 	}
+	if nonLossFailure != nil {
+		failure := *nonLossFailure
+		failure.NoTargetsResolved = false
+		failure.TargetLoss = AccessTargetLossNone
+		failure.HasResolvedTargets = hasResolved
+		return failure
+	}
+	if targetLossFailure != nil {
+		failure := *targetLossFailure
+		failure.NoTargetsResolved = false
+		failure.HasResolvedTargets = hasResolved
+		if hasResolved {
+			failure.TargetLoss = AccessTargetLossNone
+		}
+		return failure
+	}
+	result.HasResolvedTargets = hasResolved || len(result.Destinations) > 0
 	sortAccessCompilation(&result)
 	return result
 }

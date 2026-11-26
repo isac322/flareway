@@ -56,39 +56,65 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 	}
 	seenDestination := make(map[string]struct{})
 	seenAncestor := make(map[string]struct{})
+	var (
+		nonLossFailure    *AccessApplicationCompilation
+		targetLossFailure *AccessApplicationCompilation
+		hasResolved       bool
+	)
+	recordFailure := func(candidate AccessApplicationCompilation) {
+		copied := candidate
+		if copied.TargetLoss != AccessTargetLossNone {
+			if targetLossFailure == nil {
+				targetLossFailure = &copied
+			}
+			return
+		}
+		if nonLossFailure == nil {
+			nonLossFailure = &copied
+		}
+	}
 	for index, destination := range application.Spec.Destinations {
 		if destination.Type != v1alpha1.AccessApplicationDestinationPrivate {
 			continue
 		}
 		if destination.Private == nil {
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private is required", index))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].private is required", index)))
+			continue
 		}
 		private := destination.Private
 		if (private.NetworkRouteRef == nil) == (private.HostnameRouteRef == nil) {
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private must reference exactly one route", index))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].private must reference exactly one route", index)))
+			continue
 		}
 		if private.PortRange == "" {
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d].private.portRange is required", index))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].private.portRange is required", index)))
+			continue
 		}
 
 		if private.NetworkRouteRef != nil {
 			route := networkRouteByName(in.NetworkRoutes, application.Namespace, private.NetworkRouteRef.Name)
 			if route == nil {
-				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s was not found", application.Namespace, private.NetworkRouteRef.Name), AccessTargetLossNetworkRoute)
+				recordFailure(accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s was not found", application.Namespace, private.NetworkRouteRef.Name), AccessTargetLossNetworkRoute))
+				continue
 			}
 			if !route.DeletionTimestamp.IsZero() {
-				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossNetworkRoute)
+				recordFailure(accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossNetworkRoute))
+				continue
 			}
 			if failure := authorizePrivateRoute(in, application, applicationNamespace, route.Namespace, route.Spec.AccountRef.Name, route.Spec.AllowedNamespaces, authz.PrivateRouteNetwork, route.Labels); failure != nil {
-				return *failure
+				recordFailure(*failure)
+				continue
 			}
 			if !networkRouteAppliedCurrent(route) {
-				return accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossNetworkRoute)
+				recordFailure(accessLossFailure(fmt.Sprintf("NetworkRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossNetworkRoute))
+				continue
 			}
 			cidr, err := resolvedPrivateCIDR(route.Status.Applied.Network, private.CIDR)
 			if err != nil {
-				return accessFailure("RefNotPermitted", fmt.Sprintf("NetworkRoute %s/%s: %v", route.Namespace, route.Name, err))
+				recordFailure(accessFailure("RefNotPermitted", fmt.Sprintf("NetworkRoute %s/%s: %v", route.Namespace, route.Name, err)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seenDestination, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationPrivate, CIDR: cidr, PortRange: private.PortRange,
 				L4Protocol: cloneAccessL4Protocol(private.L4Protocol), VNetID: route.Status.Applied.VirtualNetworkID,
@@ -99,23 +125,43 @@ func CompilePrivateDestinations(in Inputs, application *v1alpha1.AccessApplicati
 
 		route := hostnameRouteByName(in.HostnameRoutes, application.Namespace, private.HostnameRouteRef.Name)
 		if route == nil {
-			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s was not found", application.Namespace, private.HostnameRouteRef.Name), AccessTargetLossHostnameRoute)
+			recordFailure(accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s was not found", application.Namespace, private.HostnameRouteRef.Name), AccessTargetLossHostnameRoute))
+			continue
 		}
 		if !route.DeletionTimestamp.IsZero() {
-			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossHostnameRoute)
+			recordFailure(accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is deleting", route.Namespace, route.Name), AccessTargetLossHostnameRoute))
+			continue
 		}
 		if failure := authorizePrivateRoute(in, application, applicationNamespace, route.Namespace, route.Spec.AccountRef.Name, route.Spec.AllowedNamespaces, authz.PrivateRouteHostname, route.Labels); failure != nil {
-			return *failure
+			recordFailure(*failure)
+			continue
 		}
 		if !hostnameRouteAppliedCurrent(route) {
-			return accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossHostnameRoute)
+			recordFailure(accessLossFailure(fmt.Sprintf("HostnameRoute %s/%s is not ready", route.Namespace, route.Name), AccessTargetLossHostnameRoute))
+			continue
 		}
+		hasResolved = true
 		appendCompiledDestination(&result, seenDestination, AccessDestination{
 			Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: normalizePrivateHostname(route.Status.Applied.Hostname), PortRange: private.PortRange,
 			L4Protocol: cloneAccessL4Protocol(private.L4Protocol),
 		})
 		appendAccessAncestor(&result, seenAncestor, AccessAncestor{Group: v1alpha1.Group, Kind: "HostnameRoute", Namespace: route.Namespace, Name: route.Name})
 	}
+	if nonLossFailure != nil {
+		failure := *nonLossFailure
+		failure.HasResolvedTargets = hasResolved
+		failure.TargetLoss = AccessTargetLossNone
+		return failure
+	}
+	if targetLossFailure != nil {
+		failure := *targetLossFailure
+		failure.HasResolvedTargets = hasResolved
+		if hasResolved {
+			failure.TargetLoss = AccessTargetLossNone
+		}
+		return failure
+	}
+	result.HasResolvedTargets = hasResolved || len(result.Destinations) > 0
 	result.OriginJWTEnforced = false
 	sortAccessCompilation(&result)
 	return result

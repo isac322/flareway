@@ -309,6 +309,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		if err := r.persistParentID(ctx, application, observed.ID); err != nil {
 			return ctrl.Result{}, err
 		}
+		application.Status.Revocation = nil
 		application.Status.ApplicationID = observed.ID
 	}
 	children, bypassState, err := r.reconcileBypassApplications(ctx, remote, resolved.scope, application, resolved.compilation.Bypass, ownerTag, clusterID)
@@ -617,6 +618,9 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			if len(application.Spec.Destinations) > 0 {
 				compiled := gatewayapi.CompileDeclaredAccessDestinations(privateInputs, application)
 				if !compiled.Accepted {
+					if targetRes.unattachedRoute || compiled.HasResolvedTargets {
+						compiled.TargetLoss = gatewayapi.AccessTargetLossNone
+					}
 					result.compilation = compiled
 					return result, nil
 				}
@@ -626,7 +630,16 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 			result.compilation = failure
 			return result, nil
 		}
-		if targetRes.unattachedRoute && len(application.Spec.Destinations) == 0 {
+		if targetRes.unattachedRoute {
+			if len(application.Spec.Destinations) > 0 {
+				compiled := gatewayapi.CompileDeclaredAccessDestinations(privateInputs, application)
+				if !compiled.Accepted {
+					compiled.NoTargetsResolved = false
+					compiled.TargetLoss = gatewayapi.AccessTargetLossNone
+					result.compilation = compiled
+					return result, nil
+				}
+			}
 			result.compilation = rejectedCompilation("TargetNotFound", "target HTTPRoute has no Gateway parentRefs")
 			return result, nil
 		}
@@ -656,8 +669,11 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 	if len(application.Spec.Destinations) > 0 {
 		declared := gatewayapi.CompileDeclaredAccessDestinations(privateInputs, application)
 		if !declared.Accepted {
+			if declared.HasResolvedTargets {
+				anyResolvedTargets = true
+			}
 			recordHardFailure(declared)
-		} else if len(declared.Destinations) > 0 {
+		} else if len(declared.Destinations) > 0 || declared.HasResolvedTargets {
 			anyResolvedTargets = true
 		}
 	}
@@ -730,7 +746,7 @@ func (r *AccessApplicationReconciler) resolveApplication(ctx context.Context, ap
 		if !found {
 			continue
 		}
-		if len(compiled.Destinations) > 0 || len(compiled.DataPlanes) > 0 {
+		if len(compiled.Destinations) > 0 || len(compiled.DataPlanes) > 0 || compiled.HasResolvedTargets {
 			anyResolvedTargets = true
 		}
 		mergeAccessCompilation(&result.compilation, compiled)
@@ -1522,6 +1538,14 @@ func (r *AccessApplicationReconciler) latchRevocation(ctx context.Context, appli
 	if application.Annotations[accessApplicationRevocationAnnotation] != "" {
 		return nil
 	}
+	if application.Status.Revocation != nil {
+		status := *application.Status.DeepCopy()
+		status.Revocation = nil
+		if err := r.patchStatus(ctx, application, status); err != nil {
+			return fmt.Errorf("clear stale Access revocation status proof before latching: %w", err)
+		}
+		application.Status = status
+	}
 	applicationKey := application.Namespace + "/" + application.Name
 	claims := make([]accessRevocationClaim, 0)
 	hostnames := accessStatusHostnames(application.Status.Destinations)
@@ -1957,6 +1981,14 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 }
 
 func (r *AccessApplicationReconciler) clearRevocationLatch(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	if application.Status.Revocation != nil {
+		status := *application.Status.DeepCopy()
+		status.Revocation = nil
+		if err := r.patchStatus(ctx, application, status); err != nil {
+			return fmt.Errorf("clear Access revocation status proof: %w", err)
+		}
+		application.Status = status
+	}
 	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
 		return nil
 	}
