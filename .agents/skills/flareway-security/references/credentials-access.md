@@ -97,15 +97,26 @@ Procedure:
 3. Treat revocation as a latch, not an event. A deleted or distrusted handoff
    latches the (gateway, application) identity; the latch releases only after the
    tunnel reports a fresh `Blocked` status above the recorded baseline with
-   desired == applied config version. Until then the handoff stays `Ready=false`
-   even if a new Secret appears.
+   desired == applied config version (or, on a converged tunnel with
+   `desired == applied > 0`, when an absent claim is either already
+   `acknowledged`/`tokensRevoked` with `applied >= baselineVersion` or an orphan
+   claim missing from `status.dataPlanes` with `applied > baselineVersion`, and
+   neither that claim nor any recorded `status.dataPlanes` entry remains
+   `Forwarding`). Until acknowledged, active recovery preserves existing
+   `status.dataPlanes` and `status.destinations`, and the handoff stays
+   `Ready=false` even if a new Secret appears.
 4. Only a Secret that passes the full live-binding check may latch or unlatch —
    a tenant-forged Secret in a tenant namespace must be ignored entirely.
 5. Token revocation runs only after every protection domain has acknowledged
-   `Blocked`, is skipped under `ObserveOnly`, and is recorded in the latch so
-   retries are idempotent. Revocation still goes through the normal
-   grant-gated client construction; it is a narrower operation, not an
-   authorization exemption.
+   revocation (`Blocked` or converged absence with no remaining `Forwarding`),
+   is skipped under `ObserveOnly`, and is recorded in the latch
+   (`acknowledged` and `tokensRevoked`) so retries are idempotent. After token
+   revocation, retained `NoTargetsResolved` and target-loss applications set
+   `released: true` so `AccessRevocationTombstones` drops tombstones once no
+   `Forwarding` entry remains on the tunnel; configuration, policy, and grant
+   rejections keep `released: false` until fixed. Revocation still goes
+   through the normal grant-gated client construction; it is a narrower
+   operation, not an authorization exemption.
 6. Deletion ordering: remove the AUD handoff, wait for `Blocked` acknowledgment,
    then delete bypass children, then the parent. Never delete the remote
    application while a data plane may still serve its AUD.
