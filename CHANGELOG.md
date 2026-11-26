@@ -2,9 +2,16 @@
 
 ## Unreleased
 
+## v0.5.0 - 2026-11-26
+
+### Changed
+
+- Tighten `DeviceSettings` and `ZeroTrustOrganization` `spec.deletionPolicy` from `DeletionPolicy` to `OrphanOnlyDeletionPolicy` (`Enum=Orphan`) in `api/v1alpha1` and CRD admission (#185); see [the upgrade guide](docs/operations/upgrade.md) to remove legacy `deletionPolicy: Delete` values before restoring manifests.
+- Reject negative and sub-second `GatewayOriginRequestSpec` durations (`connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`) at CRD admission via CEL on `GatewayClassConfig` and `CloudflareTunnel` (#182).
+
 ### Fixed
 
-- Enforce non-negative whole-second CEL validation on `GatewayOriginRequestSpec` durations (`connectTimeout`, `keepAliveTimeout`, `tcpKeepAlive`) and demote `CloudflareTunnel` `ConfigApplied=False` (`ConfigurationError`) plus `Gateway`/`Listener` `Programmed=False` (`Invalid`) if runtime `cloudflared` configuration compilation fails (#182).
+- Demote `CloudflareTunnel` `ConfigApplied=False` (`ConfigurationError`) and `Gateway`/`Listener` `Programmed=False` (`Invalid`) if runtime `cloudflared` configuration compilation fails on `GatewayOriginRequestSpec` (#182).
 - Prevent invalid top-level `Gateway` specs (`Accepted=False` on `spec.addresses`, `spec.allowedListeners`, or `spec.tls`) from auto-creating a default `CloudflareTunnel` or overwriting `Programmed` `Invalid` with a requeuing `Pending` status (#186).
 - Retain verified DNS ownership authorization across `Gateway` detachment, `Gateway -> Direct` switches, and deletion when a `CloudflareTunnel` previously created DNS records under a differently named `Gateway` (#187).
 - Roll back the pending `ServiceToken` create journal, empty reserved destination
@@ -25,8 +32,6 @@
   `DevicePostureRule.input.certificateId`,
   `DevicePostureIntegration.config.{apiUrl,authUrl,clientId,customerId}`, and
   `DeviceProfile.spec.splitTunnel.routeSources.privateHostnameRange` (#184).
-- Restrict `DeviceSettings` and `ZeroTrustOrganization` `deletionPolicy` to
-  `Orphan` at CRD admission via `OrphanOnlyDeletionPolicy` (#185).
 - Isolate Access block-first transitions, listener DNS readiness, and private
   routing prerequisites per listener or protection domain while keeping
   persisted public Envoy ports sticky across listener additions, removals, and
@@ -34,6 +39,10 @@
   - Keep `(listener, protectionDomain) -> envoyPort` bindings sticky across
     reconciles and upgrades, and assign deterministic unused hash ports to new
     domains instead of shifting unrelated listeners' ports.
+  - Record `CloudflareTunnel.status.hostnames[].accessBinding` digests and run a
+    one-time fail-closed `AccessTransition` (`403`) checkpoint for legacy
+    protected hostnames lacking `accessBinding` on upgrade, then resume
+    forwarding once converged.
   - Model domain blocking with explicit `BlockReason` states so Access
     block-first transitions, unready Access applications, and revocation holds
     keep only the affected listeners and Gateway `Programmed=False` (`Pending`)
