@@ -16,6 +16,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -2116,6 +2117,86 @@ func TestAccessApplicationApplicationWideTargetAbsenceThroughReconcile(t *testin
 		}
 		if tombstones := gatewayapi.AccessRevocationTombstones(tunLive, []v1alpha1.AccessApplication{stored}, nil); len(tombstones) != 1 {
 			t.Fatalf("live public route + missing private route dropped live tunnel tombstone: %#v", tombstones)
+		}
+	})
+
+	t.Run("failed annotation removal in clearRevocationLatch preserves Status.Revocation proof so retry skips duplicate Revoke", func(t *testing.T) {
+		claimDigest := gatewayapi.AccessRevocationLatchDigest("app-uid", []gatewayapi.AccessRevocationClaim{{
+			Tunnel: "tun", ProtectionDomain: "route-domain", Hostname: "app.example", BaselineVersion: 1,
+		}})
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "app", Namespace: "tenant", UID: "app-uid", Generation: 2,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{accessApplicationRevocationAnnotation: `{"claims":[{"tunnel":"tun","protectionDomain":"route-domain","hostname":"app.example","baselineVersion":1}]}`},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: "account"},
+				Type:             v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:       &v1alpha1.AccessSelfHostedApplicationSpec{},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+			Status: v1alpha1.AccessApplicationStatus{
+				ApplicationID: "remote-id", OwnershipVerified: true,
+				Revocation: &v1alpha1.AccessApplicationRevocationStatus{
+					LatchDigest: claimDigest, ObservedGeneration: 2, Acknowledged: true,
+				},
+			},
+		}
+		remote := newFakeAccessApplicationCloudflare()
+		remote.Put(flarecloudflare.AccessApplication{ID: "remote-id", Name: "tenant/app", Type: flarecloudflare.AccessApplicationTypeSelfHosted})
+		failClear := true
+		kube := accessApplicationTestClientBuilder(scheme).
+			WithStatusSubresource(app).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if target, ok := obj.(*v1alpha1.AccessApplication); ok && failClear && target.Annotations[accessApplicationRevocationAnnotation] == "" {
+						return errors.New("transient metadata patch error")
+					}
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			}).
+			WithObjects(app).
+			Build()
+		r := &AccessApplicationReconciler{Client: kube, APIReader: kube, Scheme: scheme, Now: func() time.Time { return now.Time }}
+		if err := r.revokeApplicationTokensWithClient(ctx, remote, flarecloudflare.AccessScope{}, app); err != nil {
+			t.Fatalf("revokeApplicationTokensWithClient: %v", err)
+		}
+		if err := r.clearRevocationLatch(ctx, app); err == nil {
+			t.Fatal("first clearRevocationLatch succeeded, want injected metadata patch error")
+		}
+		var stored v1alpha1.AccessApplication
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Annotations[accessApplicationRevocationAnnotation] == "" {
+			t.Fatal("latch annotation removed despite injected error")
+		}
+		if stored.Status.Revocation == nil || !stored.Status.Revocation.Acknowledged || !stored.Status.Revocation.TokensRevoked {
+			t.Fatalf("status.revocation = %+v, want Acknowledged=true TokensRevoked=true preserved on failed metadata clear", stored.Status.Revocation)
+		}
+		failClear = false
+		if err := r.revokeApplicationTokensWithClient(ctx, remote, flarecloudflare.AccessScope{}, &stored); err != nil {
+			t.Fatalf("retry revokeApplicationTokensWithClient: %v", err)
+		}
+		if err := r.clearRevocationLatch(ctx, &stored); err != nil {
+			t.Fatalf("retry clearRevocationLatch: %v", err)
+		}
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(app), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Annotations[accessApplicationRevocationAnnotation] != "" || stored.Status.Revocation != nil {
+			t.Fatalf("after retry: ann=%q revocation=%+v, want both cleared", stored.Annotations[accessApplicationRevocationAnnotation], stored.Status.Revocation)
+		}
+		revokeCount := 0
+		for _, call := range remote.Calls() {
+			if call == "Revoke:remote-id" {
+				revokeCount++
+			}
+		}
+		if revokeCount != 1 {
+			t.Fatalf("Revoke calls = %d (%v), want 1 when failed metadata clear preserved TokensRevoked", revokeCount, remote.Calls())
 		}
 	})
 }

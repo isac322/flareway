@@ -358,4 +358,20 @@ func TestEmptyTargetCompilationDoesNotReleaseOnNoMatchingParentOrInvalidListener
 			t.Fatalf("compiled = %+v, want Accepted=false TargetLoss=None HasResolvedTargets=true NoTargetsResolved=false", compiled)
 		}
 	})
+
+	t.Run("successful Gateway compilation sets HasResolvedTargets", func(t *testing.T) {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("*.example.com"))
+		route := routeWithBackend("public-route", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"app.example.com"}
+		route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+
+		app := accessApplication("app", "Gateway", "gateway", "http")
+		compiled := CompileAccessApplication(in, &app)
+		if !compiled.Accepted || !compiled.HasResolvedTargets || compiled.NoTargetsResolved {
+			t.Fatalf("compiled = %+v, want Accepted=true HasResolvedTargets=true NoTargetsResolved=false", compiled)
+		}
+	})
 }

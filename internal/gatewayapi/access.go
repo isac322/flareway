@@ -335,6 +335,7 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		failure.NoTargetsResolved = true
 		return failure
 	}
+	result.HasResolvedTargets = true
 	result.OriginJWTEnforced = len(result.claims) > 0 && effectiveOriginJWTMode(application) == v1alpha1.AccessOriginJWTModeRequired
 	sortAccessCompilation(&result)
 	return result

@@ -1981,6 +1981,13 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 }
 
 func (r *AccessApplicationReconciler) clearRevocationLatch(ctx context.Context, application *v1alpha1.AccessApplication) error {
+	if application.Annotations[accessApplicationRevocationAnnotation] != "" {
+		before := application.DeepCopy()
+		delete(application.Annotations, accessApplicationRevocationAnnotation)
+		if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
+			return fmt.Errorf("clear Access revocation latch: %w", err)
+		}
+	}
 	if application.Status.Revocation != nil {
 		status := *application.Status.DeepCopy()
 		status.Revocation = nil
@@ -1988,14 +1995,6 @@ func (r *AccessApplicationReconciler) clearRevocationLatch(ctx context.Context, 
 			return fmt.Errorf("clear Access revocation status proof: %w", err)
 		}
 		application.Status = status
-	}
-	if application.Annotations[accessApplicationRevocationAnnotation] == "" {
-		return nil
-	}
-	before := application.DeepCopy()
-	delete(application.Annotations, accessApplicationRevocationAnnotation)
-	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("clear Access revocation latch: %w", err)
 	}
 	return nil
 }
