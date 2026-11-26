@@ -106,3 +106,74 @@ func TestRevokedAccessHoldKeepsDerivedDomainNames(t *testing.T) {
 		t.Fatalf("xDS snapshot must build with the retained tombstone: %v", err)
 	}
 }
+
+func TestReleasedRevocationLatchReleasesTombstoneWhenNotForwarding(t *testing.T) {
+	baseInputs := func(annotation string, hostnames []v1alpha1.CloudflareTunnelHostnameStatus) Inputs {
+		in := accessInputs(true)
+		in.CloudflareTunnel.Name = "edge"
+		in.CloudflareTunnel.Status.Hostnames = hostnames
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com", "api.example.com"}
+		in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com", "api.example.com"}
+		in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("api.example.com"))
+		route := routeWithBackend("api", "backend", 8080)
+		route.Spec.Hostnames = []gatewayv1.Hostname{"api.example.com"}
+		route.Spec.ParentRefs[0].SectionName = new(gatewayv1.SectionName("http"))
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{route}
+		appOld := accessApplication("app-old", "Gateway", "gateway", "gone")
+		appOld.Annotations = map[string]string{AccessRevocationAnnotation: annotation}
+		appOld.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel: "edge", Listener: "http", ProtectionDomain: "old-api", EnvoyPort: 18090,
+		}}
+		appOld.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{Hostname: "api.example.com"}}
+		in.AccessApplications = []v1alpha1.AccessApplication{appOld}
+		return in
+	}
+
+	releasedLatch := `{"claims":[{"tunnel":"edge","protectionDomain":"old-api","hostname":"api.example.com","baselineVersion":1}],"acknowledged":true,"tokensRevoked":true,"released":true}`
+	blockedEntry := []v1alpha1.CloudflareTunnelHostnameStatus{{
+		Hostname: "api.example.com", ProtectionDomain: "old-api", AccessApplication: "default/app-old",
+		Guard: v1alpha1.HostnameGuardBlocked, AppliedVersion: 2,
+	}}
+	forwardingEntry := []v1alpha1.CloudflareTunnelHostnameStatus{{
+		Hostname: "api.example.com", ProtectionDomain: "old-api", AccessApplication: "default/app-old",
+		Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
+	}}
+
+	t.Run("released and blocked drops tombstone", func(t *testing.T) {
+		in := baseInputs(releasedLatch, blockedEntry)
+		if tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil); len(tombstones) != 0 {
+			t.Fatalf("tombstones = %#v, want empty once released and blocked", tombstones)
+		}
+		gateway, _ := Translate(in)
+		for _, domain := range gateway.Domains {
+			if domain.AccessApplication == "default/app-old" {
+				t.Fatalf("released app-old kept domain in translated gateway: %#v", domain)
+			}
+		}
+	})
+
+	t.Run("released and absent drops tombstone", func(t *testing.T) {
+		in := baseInputs(releasedLatch, nil)
+		if tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil); len(tombstones) != 0 {
+			t.Fatalf("tombstones = %#v, want empty once released and absent from tunnel", tombstones)
+		}
+	})
+
+	t.Run("released while tunnel still forwarding stays fail-closed", func(t *testing.T) {
+		in := baseInputs(releasedLatch, forwardingEntry)
+		tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil)
+		if len(tombstones) != 1 || tombstones[0].Application != "default/app-old" {
+			t.Fatalf("tombstones = %#v, want fail-closed retention while Forwarding remains", tombstones)
+		}
+	})
+
+	t.Run("unreleased JSON and legacy sentinel retain tombstone", func(t *testing.T) {
+		for _, ann := range []string{`{"claims":[],"acknowledged":true,"tokensRevoked":true}`, "latched"} {
+			in := baseInputs(ann, blockedEntry)
+			tombstones := AccessRevocationTombstones(in.CloudflareTunnel, in.AccessApplications, nil)
+			if len(tombstones) != 1 || tombstones[0].Application != "default/app-old" {
+				t.Fatalf("annotation %q tombstones = %#v, want tombstone retained", ann, tombstones)
+			}
+		}
+	})
+}

@@ -100,6 +100,13 @@ type AccessApplicationCompilation struct {
 	// application.
 	TargetLoss AccessTargetLoss
 
+	// NoTargetsResolved reports that no route or concrete host resolved to
+	// the application's targetRefs or declared destinations (for example, a
+	// wildcard Gateway listener with zero attached HTTPRoutes). Because no
+	// live route remains to forward traffic, completed revocation tombstones
+	// may be released once Blocked is acknowledged and tokens are revoked.
+	NoTargetsResolved bool
+
 	claims []accessClaim
 }
 
@@ -309,7 +316,9 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 	}
 	result.Ancestors = append(result.Ancestors, declared.Ancestors...)
 	if len(result.claims) == 0 && len(result.Destinations) == 0 {
-		return accessFailure("TargetNotFound", "no targetRef or destination resolves to this Gateway")
+		failure := accessFailure("TargetNotFound", "no targetRef or destination resolves to this Gateway")
+		failure.NoTargetsResolved = true
+		return failure
 	}
 	result.OriginJWTEnforced = len(result.claims) > 0 && effectiveOriginJWTMode(application) == v1alpha1.AccessOriginJWTModeRequired
 	sortAccessCompilation(&result)

@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -33,6 +34,38 @@ import (
 // AccessRevocationAnnotation latches an AccessApplication revocation until
 // every issued token is revoked and the data plane blocks its hosts.
 const AccessRevocationAnnotation = "flareway.bhyoo.com/access-revocation"
+
+// AccessRevocationLatch is the persisted JSON state stored in
+// AccessRevocationAnnotation across AccessApplication and Gateway reconciles.
+type AccessRevocationLatch struct {
+	Claims        []AccessRevocationClaim `json:"claims"`
+	Acknowledged  bool                    `json:"acknowledged,omitempty"`
+	TokensRevoked bool                    `json:"tokensRevoked,omitempty"`
+	Released      bool                    `json:"released,omitempty"`
+}
+
+// AccessRevocationClaim records one host/protection-domain pair that must stop
+// forwarding before token revocation and latch clearance may finish.
+type AccessRevocationClaim struct {
+	Tunnel           string `json:"tunnel"`
+	ProtectionDomain string `json:"protectionDomain"`
+	Hostname         string `json:"hostname"`
+	BaselineVersion  int64  `json:"baselineVersion"`
+}
+
+// ParseAccessRevocationLatch decodes the JSON latch payload in
+// AccessRevocationAnnotation. Non-JSON placeholder strings return (zero, false)
+// so callers continue to treat unparsed latches as unreleased.
+func ParseAccessRevocationLatch(raw string) (AccessRevocationLatch, bool) {
+	if raw == "" {
+		return AccessRevocationLatch{}, false
+	}
+	var latch AccessRevocationLatch
+	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
+		return AccessRevocationLatch{}, false
+	}
+	return latch, true
+}
 
 // AccessRevocationTombstone is a data plane of a revoked AccessApplication
 // that keeps serving its hosts as a Blocked protection domain. The applied
@@ -67,12 +100,18 @@ func AccessRevocationTombstones(tunnel *v1alpha1.CloudflareTunnel, applications 
 	tombstones := make([]AccessRevocationTombstone, 0)
 	for index := range applications {
 		application := &applications[index]
-		if application.DeletionTimestamp.IsZero() && application.Annotations[AccessRevocationAnnotation] == "" {
+		rawLatch := application.Annotations[AccessRevocationAnnotation]
+		if application.DeletionTimestamp.IsZero() && rawLatch == "" {
 			continue
 		}
+		latch, latchParsed := ParseAccessRevocationLatch(rawLatch)
+		released := latchParsed && latch.Released
 		applicationKey := application.Namespace + "/" + application.Name
 		for _, dataPlane := range application.Status.DataPlanes {
 			if dataPlane.Tunnel != tunnel.Name || dataPlane.ProtectionDomain == "" {
+				continue
+			}
+			if released && !tunnelProtectionDomainForwarding(tunnel, dataPlane.ProtectionDomain, applicationKey) {
 				continue
 			}
 			key := dataPlane.ProtectionDomain + "\x00" + applicationKey
@@ -93,6 +132,17 @@ func AccessRevocationTombstones(tunnel *v1alpha1.CloudflareTunnel, applications 
 		return strings.Compare(left.Key, right.Key)
 	})
 	return tombstones
+}
+
+func tunnelProtectionDomainForwarding(tunnel *v1alpha1.CloudflareTunnel, protectionDomain, applicationKey string) bool {
+	for _, status := range tunnel.Status.Hostnames {
+		if status.ProtectionDomain == protectionDomain &&
+			status.AccessApplication == applicationKey &&
+			status.Guard == v1alpha1.HostnameGuardForwarding {
+			return true
+		}
+	}
+	return false
 }
 
 // accessRevocationHolds is what the retained revocation tombstones hold in a

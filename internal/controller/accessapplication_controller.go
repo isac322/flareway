@@ -210,6 +210,12 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		}
 		if !acknowledged {
 			status := r.desiredStatus(application, resolved.compilation, application.Status.ApplicationID, application.Status.BypassApplications, false)
+			if len(application.Status.DataPlanes) > 0 {
+				status.DataPlanes = slices.Clone(application.Status.DataPlanes)
+			}
+			if len(application.Status.Destinations) > 0 {
+				status.Destinations = slices.Clone(application.Status.Destinations)
+			}
 			if reason == "" {
 				reason = "RevocationPending"
 			}
@@ -416,9 +422,10 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 	if err := r.revokeApplicationTokensAfterHandoff(ctx, application); err != nil {
 		return ctrl.Result{}, err
 	}
-	if targetInfrastructureUnavailable(invalid) &&
+	switch {
+	case targetInfrastructureUnavailable(invalid) &&
 		effectiveManagementPolicy(application.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged &&
-		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete {
+		effectiveDeletionPolicy(application.Spec.DeletionPolicy) == v1alpha1.DeletionPolicyDelete:
 		if err := r.deleteManagedRemoteApplications(ctx, application); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -433,6 +440,14 @@ func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context,
 		status.ZoneID = ""
 		status.Tags = nil
 		if err := r.clearRevocationLatch(ctx, application); err != nil {
+			return ctrl.Result{}, err
+		}
+	case targetInfrastructureUnavailable(invalid) || invalid.NoTargetsResolved:
+		if err := r.markRevocationLatchState(ctx, application, true, true); err != nil {
+			return ctrl.Result{}, err
+		}
+	default:
+		if err := r.markRevocationLatchState(ctx, application, true, false); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1368,17 +1383,9 @@ func (r *AccessApplicationReconciler) authoritativeApplicationUID(ctx context.Co
 	return application.UID, nil
 }
 
-type accessRevocationLatch struct {
-	Claims        []accessRevocationClaim `json:"claims"`
-	TokensRevoked bool                    `json:"tokensRevoked,omitempty"`
-}
+type accessRevocationLatch = gatewayapi.AccessRevocationLatch
 
-type accessRevocationClaim struct {
-	Tunnel           string `json:"tunnel"`
-	ProtectionDomain string `json:"protectionDomain"`
-	Hostname         string `json:"hostname"`
-	BaselineVersion  int64  `json:"baselineVersion"`
-}
+type accessRevocationClaim = gatewayapi.AccessRevocationClaim
 
 func (r *AccessApplicationReconciler) latchRevocation(ctx context.Context, application *v1alpha1.AccessApplication) error {
 	if application.Annotations[accessApplicationRevocationAnnotation] != "" {
@@ -1502,6 +1509,9 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 				break
 			}
 		}
+		if !acknowledged && revocationClaimAbsentFromConvergedTunnel(tunnel, application, latch, claim, applicationKey) {
+			acknowledged = true
+		}
 		if !acknowledged {
 			publisherAvailable, err := accessRevocationPublisherAvailable(ctx, r.Client, tunnel)
 			if err != nil {
@@ -1513,7 +1523,79 @@ func (r *AccessApplicationReconciler) revocationAcknowledged(ctx context.Context
 			return false, fmt.Sprintf("Waiting for %s/%s on CloudflareTunnel %s to acknowledge Blocked after version %d", claim.Hostname, claim.ProtectionDomain, claim.Tunnel, claim.BaselineVersion), "", nil
 		}
 	}
+	for _, dataPlane := range application.Status.DataPlanes {
+		if dataPlane.Tunnel == "" || dataPlane.ProtectionDomain == "" {
+			continue
+		}
+		tunnel, found := tunnels[dataPlane.Tunnel]
+		if !found {
+			current := &v1alpha1.CloudflareTunnel{}
+			err := r.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: dataPlane.Tunnel}, current)
+			if apierrors.IsNotFound(err) {
+				tunnels[dataPlane.Tunnel] = nil
+				continue
+			}
+			if err != nil {
+				return false, "", "", fmt.Errorf("get CloudflareTunnel while waiting for Access revocation: %w", err)
+			}
+			tunnel = current
+			tunnels[dataPlane.Tunnel] = tunnel
+		}
+		if tunnel == nil {
+			continue
+		}
+		for _, status := range tunnel.Status.Hostnames {
+			if status.ProtectionDomain == dataPlane.ProtectionDomain &&
+				status.AccessApplication == applicationKey &&
+				status.Guard == v1alpha1.HostnameGuardForwarding {
+				return false, fmt.Sprintf("Waiting for %s/%s on CloudflareTunnel %s to stop forwarding before releasing revocation", status.Hostname, dataPlane.ProtectionDomain, dataPlane.Tunnel), "", nil
+			}
+		}
+	}
 	return true, "Every Access protection domain acknowledged a fresh Blocked version", "", nil
+}
+
+func revocationClaimAbsentFromConvergedTunnel(
+	tunnel *v1alpha1.CloudflareTunnel,
+	application *v1alpha1.AccessApplication,
+	latch accessRevocationLatch,
+	claim accessRevocationClaim,
+	applicationKey string,
+) bool {
+	if tunnel == nil || tunnel.Status.ConfigVersion.Applied <= 0 ||
+		tunnel.Status.ConfigVersion.Desired != tunnel.Status.ConfigVersion.Applied {
+		return false
+	}
+	if latch.Acknowledged || latch.TokensRevoked {
+		if tunnel.Status.ConfigVersion.Applied < claim.BaselineVersion {
+			return false
+		}
+	} else if tunnel.Status.ConfigVersion.Applied <= claim.BaselineVersion ||
+		dataPlaneRecorded(application, claim.Tunnel, claim.ProtectionDomain) {
+		return false
+	}
+	for _, status := range tunnel.Status.Hostnames {
+		if status.AccessApplication != applicationKey {
+			continue
+		}
+		if status.ProtectionDomain == claim.ProtectionDomain {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSuffix(status.Hostname, "."), claim.Hostname) &&
+			status.Guard == v1alpha1.HostnameGuardForwarding {
+			return false
+		}
+	}
+	return true
+}
+
+func dataPlaneRecorded(application *v1alpha1.AccessApplication, tunnelName, protectionDomain string) bool {
+	for _, dp := range application.Status.DataPlanes {
+		if dp.Tunnel == tunnelName && dp.ProtectionDomain == protectionDomain {
+			return true
+		}
+	}
+	return false
 }
 
 // versionAcknowledged reports whether the tunnel has published the Blocked
@@ -1658,9 +1740,10 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	if err := json.Unmarshal([]byte(raw), &latch); err != nil {
 		return fmt.Errorf("decode Access revocation latch: %w", err)
 	}
-	if latch.TokensRevoked {
+	if latch.TokensRevoked && latch.Acknowledged {
 		return nil
 	}
+	latch.Acknowledged = true
 	latch.TokensRevoked = true
 	payload, err := json.Marshal(latch)
 	if err != nil {
@@ -1670,6 +1753,34 @@ func (r *AccessApplicationReconciler) markRevocationTokensRevoked(ctx context.Co
 	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
 	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
 		return fmt.Errorf("persist Access token revocation: %w", err)
+	}
+	return nil
+}
+
+func (r *AccessApplicationReconciler) markRevocationLatchState(ctx context.Context, application *v1alpha1.AccessApplication, acknowledged, released bool) error {
+	raw := application.Annotations[accessApplicationRevocationAnnotation]
+	if raw == "" {
+		return nil
+	}
+	latch, ok := gatewayapi.ParseAccessRevocationLatch(raw)
+	if !ok {
+		return nil
+	}
+	nextAcknowledged := latch.Acknowledged || acknowledged
+	nextReleased := latch.Released || released
+	if latch.Acknowledged == nextAcknowledged && latch.Released == nextReleased {
+		return nil
+	}
+	latch.Acknowledged = nextAcknowledged
+	latch.Released = nextReleased
+	payload, err := json.Marshal(latch)
+	if err != nil {
+		return fmt.Errorf("encode Access revocation latch: %w", err)
+	}
+	before := application.DeepCopy()
+	application.Annotations[accessApplicationRevocationAnnotation] = string(payload)
+	if err := r.Patch(ctx, application, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("persist Access revocation latch state: %w", err)
 	}
 	return nil
 }

@@ -517,3 +517,25 @@ func TestRevokedAccessHeldHostUnderWildcardEdgeOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestReleasedAccessRevocationAllowsSuccessorTakeover(t *testing.T) {
+	inputs := hostConflictInputs(t, false, 18081)
+	inputs.AccessApplications[0].Annotations[accessApplicationRevocationAnnotation] = `{"claims":[{"tunnel":"edge","protectionDomain":"` + conflictTombstoneName + `","hostname":"` + conflictHost + `","baselineVersion":1}],"acknowledged":true,"tokensRevoked":true,"released":true}`
+
+	blocked, statuses := buildRevokedGateway(t, inputs)
+	if tombstone := domainOf(blocked, "default/app-a"); tombstone != nil {
+		t.Fatalf("released revocation kept tombstone: %#v", tombstone)
+	}
+	if compiled := appBCompilation(statuses); !compiled.Accepted || strings.Contains(compiled.Message, "default/app-a") {
+		t.Fatalf("app-b compilation = accepted %t %q %q, want no tombstone hold note", compiled.Accepted, compiled.Reason, compiled.Message)
+	}
+	if live := domainOf(blocked, "default/app-b"); live == nil || live.Guard != ir.GuardBlocked {
+		t.Fatalf("new app-b binding = %#v, want initial Blocked handshake", live)
+	}
+
+	inputs.CloudflareTunnel.Status.ConfigVersion.Desired = 4
+	inputs.CloudflareTunnel.Status.ConfigVersion.Applied = 4
+	inputs.CloudflareTunnel.Status.Hostnames = desiredTunnelHostnames(blocked, 4)
+	gateway, statuses := buildRevokedGateway(t, inputs)
+	assertAppBForwarding(t, gateway, statuses)
+}
