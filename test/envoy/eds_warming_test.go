@@ -221,7 +221,7 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 		t.Fatalf("initial TLS SAN match failed: %v\nlogs:\n%s", err, containerLogs(containerID))
 	}
 
-	beforeSANFailures, err := readEnvoySANFailureCount(waitCtx, adminAddr)
+	beforeSANFailures, _, err := readEnvoySANFailureCount(waitCtx, adminAddr)
 	if err != nil {
 		t.Fatalf("read initial ssl.fail_verify_san: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 			return 0, "", mismatchCtx.Err()
 		}
 		if status == http.StatusServiceUnavailable {
-			afterSANFailures, err := readEnvoySANFailureCount(mismatchCtx, adminAddr)
+			afterSANFailures, _, err := readEnvoySANFailureCount(mismatchCtx, adminAddr)
 			if err != nil {
 				return 0, "", err
 			}
@@ -270,12 +270,15 @@ func TestEnvoyActivatesUpdatedTLSClusterWithoutEDSTimeout(t *testing.T) {
 	}
 	statCtx, statCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer statCancel()
-	updateTimeouts, err := readEnvoyStatCount(statCtx, adminAddr, `cluster\..*\.update_timeout`)
+	initFetchTimeouts, matched, err := readEnvoyStatCount(statCtx, adminAddr, `cluster\..*\.init_fetch_timeout`)
 	if err != nil {
-		t.Fatalf("read Envoy cluster update_timeout stats: %v", err)
+		t.Fatalf("read Envoy cluster init_fetch_timeout stats: %v", err)
 	}
-	if updateTimeouts != 0 {
-		t.Fatalf("Envoy logged %d cluster update_timeout(s)", updateTimeouts)
+	if matched == 0 {
+		t.Fatal("Envoy stats returned no cluster.*.init_fetch_timeout series")
+	}
+	if initFetchTimeouts != 0 {
+		t.Fatalf("Envoy logged %d cluster init_fetch_timeout(s)", initFetchTimeouts)
 	}
 
 	cancel()
@@ -338,45 +341,47 @@ func requireContainerLogs(t *testing.T, target string) string {
 	return string(out)
 }
 
-func readEnvoySANFailureCount(ctx context.Context, adminAddr string) (int64, error) {
+func readEnvoySANFailureCount(ctx context.Context, adminAddr string) (int64, int, error) {
 	return readEnvoyStatCount(ctx, adminAddr, `cluster\..*\.ssl\.fail_verify_san`)
 }
 
-func readEnvoyStatCount(ctx context.Context, adminAddr, filter string) (int64, error) {
+func readEnvoyStatCount(ctx context.Context, adminAddr, filter string) (int64, int, error) {
 	q := url.Values{}
 	q.Set("filter", filter)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+adminAddr+"/stats?"+q.Encode(), nil)
 	if err != nil {
-		return 0, fmt.Errorf("build Envoy stats request: %w", err)
+		return 0, 0, fmt.Errorf("build Envoy stats request: %w", err)
 	}
 	resp, err := (&http.Client{Transport: &http.Transport{DisableKeepAlives: true}}).Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("query Envoy stats: %w", err)
+		return 0, 0, fmt.Errorf("query Envoy stats: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, fmt.Errorf("read Envoy stats: %w", err)
+		return 0, 0, fmt.Errorf("read Envoy stats: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("Envoy stats status %d: %s", resp.StatusCode, string(raw))
+		return 0, 0, fmt.Errorf("Envoy stats status %d: %s", resp.StatusCode, string(raw))
 	}
 	var total int64
+	matched := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
 		if line == "" {
 			continue
 		}
 		sep := strings.LastIndexByte(line, ':')
 		if sep < 0 {
-			return 0, fmt.Errorf("unexpected Envoy stat line %q", line)
+			return 0, 0, fmt.Errorf("unexpected Envoy stat line %q", line)
 		}
 		n, err := strconv.ParseInt(strings.TrimSpace(line[sep+1:]), 10, 64)
 		if err != nil {
-			return 0, fmt.Errorf("parse Envoy stat line %q: %w", line, err)
+			return 0, 0, fmt.Errorf("parse Envoy stat line %q: %w", line, err)
 		}
 		total += n
+		matched++
 	}
-	return total, nil
+	return total, matched, nil
 }
 
 func resolveDockerHostGatewayIP(t *testing.T) string {

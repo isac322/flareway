@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -52,9 +53,12 @@ type openDeltaWatch struct {
 type deltaStreamState struct {
 	node                string
 	streamID            int64
+	streamSeq           int64
 	value               chan cachev3.DeltaResponse
 	watches             map[string]openDeltaWatch
 	sentClusterVersions map[string]string
+	pendingEndpoints    map[string]map[string]string
+	rejectedEndpoints   map[string]string
 	cdsSeen             bool
 }
 
@@ -144,7 +148,8 @@ type orderedDeltaCache struct {
 	base cachev3.SnapshotCache
 	hash cachev3.NodeHash
 
-	nextWatchID atomic.Int64
+	nextWatchID   atomic.Int64
+	nextStreamSeq atomic.Int64
 
 	mu               sync.Mutex
 	snapshots        map[string]*orderedSnapshot
@@ -202,6 +207,60 @@ func (c *orderedDeltaCache) BindRequestStream(req *discoveryv3.DeltaDiscoveryReq
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pendingReqStream[req] = streamID
+}
+
+// OnResponse records the delivered Endpoint resource versions by nonce so an
+// eventual NACK can mark all assignments from that batch eligible for replay
+// once a subsequent snapshot introduces a correction.
+func (c *orderedDeltaCache) OnResponse(streamID int64, _ *discoveryv3.DeltaDiscoveryRequest, resp *discoveryv3.DeltaDiscoveryResponse) {
+	if streamID == 0 || resp == nil || resp.GetNonce() == "" || resp.GetTypeUrl() != resourcev3.EndpointType {
+		return
+	}
+	resources := resp.GetResources()
+	if len(resources) == 0 {
+		return
+	}
+	sent := make(map[string]string, len(resources))
+	for _, res := range resources {
+		if res.GetName() != "" {
+			sent[res.GetName()] = res.GetVersion()
+		}
+	}
+	if len(sent) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st, ok := c.streamByID[streamID]; ok {
+		st.pendingEndpoints[resp.GetNonce()] = sent
+	}
+}
+
+// OnRequest reconciles delivered Endpoint batch state on ACK or NACK.
+func (c *orderedDeltaCache) OnRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) {
+	if streamID == 0 || req == nil || req.GetTypeUrl() != resourcev3.EndpointType || req.GetResponseNonce() == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.streamByID[streamID]
+	if !ok {
+		return
+	}
+	sent, ok := st.pendingEndpoints[req.GetResponseNonce()]
+	if !ok {
+		return
+	}
+	delete(st.pendingEndpoints, req.GetResponseNonce())
+	if req.GetErrorDetail() != nil {
+		for name, ver := range sent {
+			st.rejectedEndpoints[name] = ver
+		}
+		return
+	}
+	for name := range sent {
+		delete(st.rejectedEndpoints, name)
+	}
 }
 
 func (c *orderedDeltaCache) OnStreamClosed(streamID int64) {
@@ -323,9 +382,12 @@ func (c *orderedDeltaCache) CreateDeltaWatch(request *cachev3.DeltaRequest, sub 
 		st = &deltaStreamState{
 			node:                nodeID,
 			streamID:            streamID,
+			streamSeq:           c.nextStreamSeq.Add(1),
 			value:               value,
 			watches:             make(map[string]openDeltaWatch),
 			sentClusterVersions: make(map[string]string),
+			pendingEndpoints:    make(map[string]map[string]string),
+			rejectedEndpoints:   make(map[string]string),
 		}
 		c.streams[value] = st
 	} else {
@@ -415,6 +477,8 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	resources := snap.snapshot.GetResources(resourcev3.EndpointType)
 	sub := watch.sub
 	prevMap := sub.ReturnedResources()
+	subscribed := sub.SubscribedResources()
+	hasCorrection := hasRejectedEndpointCorrection(st, snap, resources, sub.IsWildcard(), subscribed, prevMap)
 
 	var (
 		filtered       []deltaCachedResource
@@ -434,7 +498,10 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 				continue
 			}
 			nextVersionMap[name] = effectiveVer
-			if !found || prevVer != effectiveVer {
+			rejVer, wasRejected := st.rejectedEndpoints[name]
+			suppressRejected := wasRejected && effectiveVer == rejVer && !hasCorrection
+			replayRejected := wasRejected && effectiveVer == rejVer && hasCorrection
+			if !suppressRejected && (!found || prevVer != effectiveVer || replayRejected) {
 				filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
 			}
 		}
@@ -444,7 +511,6 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 			}
 		}
 	} else {
-		subscribed := sub.SubscribedResources()
 		nextVersionMap = make(map[string]string, len(subscribed))
 		for name := range subscribed {
 			prevVer, found := prevMap[name]
@@ -457,7 +523,10 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 					continue
 				}
 				nextVersionMap[name] = effectiveVer
-				if !found || prevVer != effectiveVer {
+				rejVer, wasRejected := st.rejectedEndpoints[name]
+				suppressRejected := wasRejected && effectiveVer == rejVer && !hasCorrection
+				replayRejected := wasRejected && effectiveVer == rejVer && hasCorrection
+				if !suppressRejected && (!found || prevVer != effectiveVer || replayRejected) {
 					filtered = append(filtered, deltaCachedResource{name: name, version: effectiveVer, resource: res})
 				}
 			} else if found {
@@ -467,6 +536,9 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	}
 
 	if len(filtered) == 0 && len(removed) == 0 && (!sub.IsWildcard() || watch.request.GetResponseNonce() != "") {
+		if hasCorrection {
+			pruneGoneRejectedEndpoints(st.rejectedEndpoints, resources, sub.IsWildcard(), subscribed)
+		}
 		return false, nil
 	}
 
@@ -492,14 +564,52 @@ func (c *orderedDeltaCache) evaluateEndpointWatchLocked(ctx context.Context, st 
 	}
 	select {
 	case st.value <- resp:
+		if hasCorrection {
+			pruneGoneRejectedEndpoints(st.rejectedEndpoints, resources, sub.IsWildcard(), subscribed)
+		}
 		return true, nil
 	case <-ctx.Done():
 		return false, context.Canceled
 	}
 }
 
-func provisionalEndpointVersion(targetVer string) string {
-	sum := sha256.Sum256([]byte("provisional\x00" + targetVer))
+func hasRejectedEndpointCorrection(st *deltaStreamState, snap *orderedSnapshot, resources map[string]cachetypes.Resource, isWildcard bool, subscribed map[string]struct{}, prevMap map[string]string) bool {
+	if len(st.rejectedEndpoints) == 0 {
+		return false
+	}
+	for name, rejVer := range st.rejectedEndpoints {
+		if _, ok := resources[name]; !ok {
+			return true
+		}
+		if !isWildcard {
+			if _, ok := subscribed[name]; !ok {
+				return true
+			}
+		}
+		effectiveVer, deferUpdate := effectiveEndpointVersionForStream(st, snap, name, prevMap)
+		if !deferUpdate && effectiveVer != rejVer {
+			return true
+		}
+	}
+	return false
+}
+
+func pruneGoneRejectedEndpoints(rejected map[string]string, resources map[string]cachetypes.Resource, isWildcard bool, subscribed map[string]struct{}) {
+	for name := range rejected {
+		if _, ok := resources[name]; !ok {
+			delete(rejected, name)
+			continue
+		}
+		if !isWildcard {
+			if _, ok := subscribed[name]; !ok {
+				delete(rejected, name)
+			}
+		}
+	}
+}
+
+func provisionalEndpointVersion(streamSeq int64, targetVer string) string {
+	sum := sha256.Sum256([]byte("provisional\x00" + strconv.FormatInt(streamSeq, 10) + "\x00" + targetVer))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -534,17 +644,15 @@ func effectiveEndpointVersionForStream(st *deltaStreamState, snap *orderedSnapsh
 		return targetVer, false
 	}
 
-	// Stream has no recorded CDS state for this cluster yet. Serve targetVer
-	// when the client already holds it or when CDS is not active on this stream;
-	// otherwise serve a deterministic provisional version so reconnecting warming
-	// clusters unblock paused CDS without consuming the final CDS-bound version.
+	// Stream has no recorded CDS state for this cluster yet. Only pass through
+	// targetVer when the client already holds that exact final CDS-bound version;
+	// otherwise issue a unique provisional version once for this stream so any
+	// warming or reconnecting cluster unblocks paused CDS while reserving
+	// targetVer until matching CDS arrives.
 	if hasPrev && prevVer == targetVer {
 		return targetVer, false
 	}
-	if !hasPrev && !st.cdsSeen {
-		return targetVer, false
-	}
-	prov := provisionalEndpointVersion(targetVer)
+	prov := provisionalEndpointVersion(st.streamSeq, targetVer)
 	if hasPrev && prevVer == prov {
 		return prov, true
 	}

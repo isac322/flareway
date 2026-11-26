@@ -29,6 +29,7 @@ import (
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	streamv3 "github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/isac322/flareway/internal/xds/translator"
@@ -464,4 +465,518 @@ func TestOrderedDeltaCacheServesProvisionalEDSBeforeCDSOnReconnect(t *testing.T)
 			}
 		})
 	}
+
+	t.Run("omitted_initial_version_and_repeated_reconnect_issue_fresh_provisional_versions", func(t *testing.T) {
+		cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
+		node := "default/gw"
+		if err := cache.SetSnapshot(context.Background(), node, v2); err != nil {
+			t.Fatal(err)
+		}
+		targetVer := v2.GetVersionMap(resourcev3.EndpointType)["cluster-a"]
+
+		// Stream 1 reconnects omitting initial version (awaiting first assignment) while CDS is paused.
+		ch1 := make(chan cachev3.DeltaResponse, 8)
+		edsSub1 := streamv3.NewDeltaSubscription([]string{"cluster-a"}, nil, nil, false)
+		cancel1, err := cache.CreateDeltaWatch(&discoveryv3.DeltaDiscoveryRequest{
+			Node:                   &corev3.Node{Cluster: node},
+			TypeUrl:                resourcev3.EndpointType,
+			ResourceNamesSubscribe: []string{"cluster-a"},
+		}, &edsSub1, ch1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel1()
+
+		early1 := drainDeltaResponses(ch1)
+		if len(early1) != 1 || early1[0].GetResponseVersion() != "" {
+			t.Fatalf("stream 1 initial EDS = %v, want single provisional response", early1)
+		}
+		proto1, err := early1[0].GetDeltaDiscoveryResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		prov1 := proto1.Resources[0].Version
+		if prov1 == targetVer {
+			t.Fatalf("stream 1 leaked final targetVer %q before CDS arrived", targetVer)
+		}
+
+		// Stream 2 reconnects holding prov1 from stream 1 while CDS is still paused.
+		ch2 := make(chan cachev3.DeltaResponse, 8)
+		edsInitial2 := map[string]string{"cluster-a": prov1}
+		edsSub2 := streamv3.NewDeltaSubscription([]string{"cluster-a"}, nil, edsInitial2, false)
+		cancel2, err := cache.CreateDeltaWatch(&discoveryv3.DeltaDiscoveryRequest{
+			Node:                    &corev3.Node{Cluster: node},
+			TypeUrl:                 resourcev3.EndpointType,
+			ResourceNamesSubscribe:  []string{"cluster-a"},
+			InitialResourceVersions: edsInitial2,
+		}, &edsSub2, ch2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel2()
+
+		early2 := drainDeltaResponses(ch2)
+		if len(early2) != 1 || early2[0].GetResponseVersion() != "" {
+			t.Fatalf("stream 2 initial EDS = %v, want fresh provisional response", early2)
+		}
+		proto2, err := early2[0].GetDeltaDiscoveryResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		prov2 := proto2.Resources[0].Version
+		if prov2 == prov1 || prov2 == targetVer {
+			t.Fatalf("stream 2 provisional version %q collided with prov1=%q or target=%q", prov2, prov1, targetVer)
+		}
+
+		// Same-stream ACK suppresses resends until CDS arrives, then targetVer ships.
+		edsSub2.SetReturnedResources(early2[0].GetNextVersionMap())
+		cancel2, err = cache.CreateDeltaWatch(&discoveryv3.DeltaDiscoveryRequest{
+			Node:          &corev3.Node{Cluster: node},
+			TypeUrl:       resourcev3.EndpointType,
+			ResponseNonce: "eds-prov-2",
+		}, &edsSub2, ch2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel2()
+		if dup := drainDeltaResponses(ch2); len(dup) != 0 {
+			t.Fatalf("stream 2 re-sent prov2 after ACK: %d response(s)", len(dup))
+		}
+
+		cdsInitial := map[string]string{"cluster-a": v2.GetVersionMap(resourcev3.ClusterType)["cluster-a"]}
+		cdsSub := streamv3.NewDeltaSubscription(nil, nil, cdsInitial, true)
+		cancelCDS, err := cache.CreateDeltaWatch(&discoveryv3.DeltaDiscoveryRequest{
+			Node:                    &corev3.Node{Cluster: node},
+			TypeUrl:                 resourcev3.ClusterType,
+			InitialResourceVersions: cdsInitial,
+		}, &cdsSub, ch2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+
+		ordered := drainDeltaResponses(ch2)
+		if len(ordered) != 2 || ordered[1].GetResponseVersion() != "v2" {
+			t.Fatalf("final ordered reconnect responses = %v, want CDS then v2 EDS", ordered)
+		}
+		finalEDS, err := ordered[1].GetDeltaDiscoveryResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(finalEDS.Resources) != 1 || finalEDS.Resources[0].Version != targetVer {
+			t.Fatalf("final EDS resources = %v, want %q", finalEDS.Resources, targetVer)
+		}
+	})
+}
+
+func TestOrderedDeltaCacheReplaysUnprovenEndpointsWhenRejectedBatchCorrected(t *testing.T) {
+	publish := func(t *testing.T, cache *orderedDeltaCache, tracker *AckTracker, node, ver string, snap *cachev3.Snapshot) {
+		t.Helper()
+		fps := make(map[string]string, 2)
+		expRes := make(map[string]map[string]string, 2)
+		for _, typeURL := range []string{resourcev3.ClusterType, resourcev3.EndpointType} {
+			vm := snap.GetVersionMap(typeURL)
+			fp, err := fingerprintVersionMap(vm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fps[typeURL] = fp
+			expRes[typeURL] = vm
+		}
+		tracker.ExpectSnapshotResources(node, ver, fps, snapshotRequiredTypes(snap), expRes)
+		if err := cache.SetSnapshot(context.Background(), node, snap); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deliver := func(t *testing.T, cache *orderedDeltaCache, tracker *AckTracker, streamID int64, req *discoveryv3.DeltaDiscoveryRequest, resp cachev3.DeltaResponse, nonce string) *discoveryv3.DeltaDiscoveryResponse {
+		t.Helper()
+		proto, err := resp.GetDeltaDiscoveryResponse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		proto.Nonce = nonce
+		fp, hasFP := cache.ConsumeResponseFingerprint(proto)
+		cache.OnResponse(streamID, req, proto)
+		tracker.OnResponseWithFingerprint(streamID, req, proto, fp, hasFP)
+		return proto
+	}
+
+	t.Run("correcting_sibling_replays_unchanged_unproven_assignment", func(t *testing.T) {
+		cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
+		tracker := NewAckTracker()
+		node := "default/gw"
+		streamID := int64(11)
+		ch := make(chan cachev3.DeltaResponse, 16)
+
+		v1 := buildBoundClusterSnapshot(t, "v1", map[string]string{"cluster-a": "a1.example", "cluster-b": "b1.example"})
+		publish(t, cache, tracker, node, "v1", v1)
+
+		cdsReq := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ClusterType}
+		cache.BindRequestStream(cdsReq, streamID)
+		tracker.OnRequest(streamID, cdsReq)
+		cdsSub := streamv3.NewDeltaSubscription(nil, nil, nil, true)
+		cancelCDS, err := cache.CreateDeltaWatch(cdsReq, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+		cdsResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, cdsReq, cdsResp, "c1")
+		cdsSub.SetReturnedResources(cdsResp.GetNextVersionMap())
+		cdsAck := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c1"}
+		cache.BindRequestStream(cdsAck, streamID)
+		cache.OnRequest(streamID, cdsAck)
+		tracker.OnRequest(streamID, cdsAck)
+		cancelCDS, err = cache.CreateDeltaWatch(cdsAck, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+
+		// EDS sends both cluster-a and cluster-b together.
+		edsReq := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResourceNamesSubscribe: []string{"cluster-a", "cluster-b"}}
+		cache.BindRequestStream(edsReq, streamID)
+		tracker.OnRequest(streamID, edsReq)
+		edsSub := streamv3.NewDeltaSubscription([]string{"cluster-a", "cluster-b"}, nil, nil, false)
+		cancelEDS, err := cache.CreateDeltaWatch(edsReq, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		edsResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, edsReq, edsResp, "e1")
+		edsSub.SetReturnedResources(edsResp.GetNextVersionMap())
+
+		// Envoy NACKs the batch. Cache must suppress automatic retries of unchanged v1.
+		edsNack := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl:       resourcev3.EndpointType,
+			ResponseNonce: "e1",
+			ErrorDetail:   &statuspb.Status{Message: "rejected eds batch"},
+		}
+		cache.BindRequestStream(edsNack, streamID)
+		cache.OnRequest(streamID, edsNack)
+		tracker.OnRequest(streamID, edsNack)
+		cancelEDS, err = cache.CreateDeltaWatch(edsNack, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if retries := drainDeltaResponses(ch); len(retries) != 0 {
+			t.Fatalf("unchanged rejected EDS batch auto-retried %d time(s)", len(retries))
+		}
+		if tracker.IsACKed(node, "v1") {
+			t.Fatal("NACKed v1 converged")
+		}
+
+		// v2 corrects cluster-b while cluster-a keeps identical version EA1.
+		v2 := buildBoundClusterSnapshot(t, "v2", map[string]string{"cluster-a": "a1.example", "cluster-b": "b2.example"})
+		publish(t, cache, tracker, node, "v2", v2)
+
+		// SetSnapshot emits CDS update first and corrected+replayed EDS right behind it.
+		resps := drainDeltaResponses(ch)
+		if len(resps) != 2 || resps[0].GetDeltaRequest().GetTypeUrl() != resourcev3.ClusterType || resps[1].GetDeltaRequest().GetTypeUrl() != resourcev3.EndpointType {
+			t.Fatalf("expected CDS then EDS replay+fix responses, got %v", resps)
+		}
+		deliver(t, cache, tracker, streamID, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType}, resps[0], "c2")
+		cdsSub.SetReturnedResources(resps[0].GetNextVersionMap())
+		cdsAck2 := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c2"}
+		cache.BindRequestStream(cdsAck2, streamID)
+		cache.OnRequest(streamID, cdsAck2)
+		tracker.OnRequest(streamID, cdsAck2)
+		cancelCDS, err = cache.CreateDeltaWatch(cdsAck2, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+
+		// Corrected EDS must include BOTH cluster-b@EB2 and replayed unproven cluster-a@EA1.
+		edsProto2 := deliver(t, cache, tracker, streamID, edsNack, resps[1], "e2")
+		if len(edsProto2.Resources) != 2 {
+			t.Fatalf("EDS resources = %v, want both cluster-a replay and cluster-b fix", edsProto2.Resources)
+		}
+		edsAck := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "e2"}
+		cache.BindRequestStream(edsAck, streamID)
+		cache.OnRequest(streamID, edsAck)
+		tracker.OnRequest(streamID, edsAck)
+		if !tracker.IsACKed(node, "v2") {
+			t.Fatalf("corrected batch ACK failed to converge: %s", tracker.ConvergenceDetails(node, "v2"))
+		}
+		if _, hasNACK := tracker.LastNACK(node); hasNACK {
+			t.Fatal("resolved batch still reported LastNACK")
+		}
+
+		// After EB2 is ACKed, stale EB1 must be cleared: reverting cluster-b to b1.example
+		// must still ship EA/EB1 (no rollback suppression), and a later NACK must not loop.
+		edsSub.SetReturnedResources(resps[1].GetNextVersionMap())
+		edsAckOpen := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "e2"}
+		cache.BindRequestStream(edsAckOpen, streamID)
+		cancelEDS, err = cache.CreateDeltaWatch(edsAckOpen, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+
+		publish(t, cache, tracker, node, "v3", v1)
+		revertResps := drainDeltaResponses(ch)
+		if len(revertResps) != 2 || revertResps[1].GetDeltaRequest().GetTypeUrl() != resourcev3.EndpointType {
+			t.Fatalf("revert to v1 failed to deliver EDS (rollback suppressed?): %v", revertResps)
+		}
+		deliver(t, cache, tracker, streamID, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType}, revertResps[0], "c3")
+		cdsSub.SetReturnedResources(revertResps[0].GetNextVersionMap())
+		cdsAck3 := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c3"}
+		cache.BindRequestStream(cdsAck3, streamID)
+		cache.OnRequest(streamID, cdsAck3)
+		tracker.OnRequest(streamID, cdsAck3)
+
+		deliver(t, cache, tracker, streamID, edsAckOpen, revertResps[1], "e3")
+		edsSub.SetReturnedResources(revertResps[1].GetNextVersionMap())
+		edsNack3 := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl:       resourcev3.EndpointType,
+			ResponseNonce: "e3",
+			ErrorDetail:   &statuspb.Status{Message: "unrelated revert nack"},
+		}
+		cache.BindRequestStream(edsNack3, streamID)
+		cache.OnRequest(streamID, edsNack3)
+		tracker.OnRequest(streamID, edsNack3)
+		cancelEDS, err = cache.CreateDeltaWatch(edsNack3, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if retries := drainDeltaResponses(ch); len(retries) != 0 {
+			t.Fatalf("stale rejected entry triggered retry loop after NACK: %d response(s)", len(retries))
+		}
+	})
+
+	t.Run("removing_rejected_sibling_replays_unchanged_unproven_assignment_without_loop", func(t *testing.T) {
+		cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
+		tracker := NewAckTracker()
+		node := "default/gw"
+		streamID := int64(12)
+		ch := make(chan cachev3.DeltaResponse, 16)
+
+		v1 := buildBoundClusterSnapshot(t, "v1", map[string]string{"cluster-a": "a1.example", "cluster-b": "b1.example"})
+		publish(t, cache, tracker, node, "v1", v1)
+
+		cdsReq := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ClusterType}
+		cache.BindRequestStream(cdsReq, streamID)
+		tracker.OnRequest(streamID, cdsReq)
+		cdsSub := streamv3.NewDeltaSubscription(nil, nil, nil, true)
+		cancelCDS, err := cache.CreateDeltaWatch(cdsReq, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+		cdsResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, cdsReq, cdsResp, "c1")
+		cdsSub.SetReturnedResources(cdsResp.GetNextVersionMap())
+		cdsAck := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c1"}
+		cache.BindRequestStream(cdsAck, streamID)
+		cache.OnRequest(streamID, cdsAck)
+		tracker.OnRequest(streamID, cdsAck)
+		cancelCDS, err = cache.CreateDeltaWatch(cdsAck, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+
+		edsReq := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResourceNamesSubscribe: []string{"cluster-a", "cluster-b"}}
+		cache.BindRequestStream(edsReq, streamID)
+		tracker.OnRequest(streamID, edsReq)
+		edsSub := streamv3.NewDeltaSubscription([]string{"cluster-a", "cluster-b"}, nil, nil, false)
+		cancelEDS, err := cache.CreateDeltaWatch(edsReq, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		edsResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, edsReq, edsResp, "e1")
+		edsSub.SetReturnedResources(edsResp.GetNextVersionMap())
+
+		edsNack := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl:       resourcev3.EndpointType,
+			ResponseNonce: "e1",
+			ErrorDetail:   &statuspb.Status{Message: "rejected batch"},
+		}
+		cache.BindRequestStream(edsNack, streamID)
+		cache.OnRequest(streamID, edsNack)
+		tracker.OnRequest(streamID, edsNack)
+		cancelEDS, err = cache.CreateDeltaWatch(edsNack, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if retries := drainDeltaResponses(ch); len(retries) != 0 {
+			t.Fatalf("unexpected retry on unchanged NACKed batch: %v", retries)
+		}
+
+		// v2 removes cluster-b while keeping cluster-a at EA1.
+		v2 := buildBoundClusterSnapshot(t, "v2", map[string]string{"cluster-a": "a1.example"})
+		publish(t, cache, tracker, node, "v2", v2)
+
+		var cdsMsg, edsMsg cachev3.DeltaResponse
+		for _, r := range drainDeltaResponses(ch) {
+			switch r.GetDeltaRequest().GetTypeUrl() {
+			case resourcev3.ClusterType:
+				cdsMsg = r
+			case resourcev3.EndpointType:
+				edsMsg = r
+			}
+		}
+		if cdsMsg == nil || edsMsg == nil {
+			t.Fatalf("expected CDS removal and EDS replay+removal, got cds=%v eds=%v", cdsMsg, edsMsg)
+		}
+		deliver(t, cache, tracker, streamID, &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType}, cdsMsg, "c2")
+		cdsAck2 := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c2"}
+		cache.BindRequestStream(cdsAck2, streamID)
+		cache.OnRequest(streamID, cdsAck2)
+		tracker.OnRequest(streamID, cdsAck2)
+
+		edsProto2 := deliver(t, cache, tracker, streamID, edsNack, edsMsg, "e2")
+		if len(edsProto2.Resources) != 1 || edsProto2.Resources[0].Name != "cluster-a" {
+			t.Fatalf("expected cluster-a replay alongside cluster-b removal, got resources=%v", edsProto2.Resources)
+		}
+		edsSub.SetReturnedResources(edsMsg.GetNextVersionMap())
+
+		// Re-NACKing e2 must not trigger an infinite retry loop once removed cluster-b was pruned.
+		edsNack2 := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl:       resourcev3.EndpointType,
+			ResponseNonce: "e2",
+			ErrorDetail:   &statuspb.Status{Message: "still failing a"},
+		}
+		cache.BindRequestStream(edsNack2, streamID)
+		cache.OnRequest(streamID, edsNack2)
+		tracker.OnRequest(streamID, edsNack2)
+		cancelEDS, err = cache.CreateDeltaWatch(edsNack2, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if retries := drainDeltaResponses(ch); len(retries) != 0 {
+			t.Fatalf("infinite retry loop after pruned rejection: %d response(s)", len(retries))
+		}
+	})
+
+	t.Run("unsubscribing_single_rejected_resource_prunes_stale_rejection", func(t *testing.T) {
+		cache := newOrderedDeltaCache(cachev3.NewSnapshotCache(true, gatewayNodeHash{}, nil), gatewayNodeHash{})
+		tracker := NewAckTracker()
+		node := "default/gw"
+		streamID := int64(13)
+		ch := make(chan cachev3.DeltaResponse, 16)
+
+		v1 := buildBoundClusterSnapshot(t, "v1", map[string]string{"cluster-a": "a1.example", "cluster-b": "b1.example"})
+		publish(t, cache, tracker, node, "v1", v1)
+
+		cdsReq := &discoveryv3.DeltaDiscoveryRequest{Node: &corev3.Node{Cluster: node}, TypeUrl: resourcev3.ClusterType}
+		cache.BindRequestStream(cdsReq, streamID)
+		tracker.OnRequest(streamID, cdsReq)
+		cdsSub := streamv3.NewDeltaSubscription(nil, nil, nil, true)
+		cancelCDS, err := cache.CreateDeltaWatch(cdsReq, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+		cdsResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, cdsReq, cdsResp, "c1")
+		cdsSub.SetReturnedResources(cdsResp.GetNextVersionMap())
+		cdsAck := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.ClusterType, ResponseNonce: "c1"}
+		cache.BindRequestStream(cdsAck, streamID)
+		cache.OnRequest(streamID, cdsAck)
+		tracker.OnRequest(streamID, cdsAck)
+		cancelCDS, err = cache.CreateDeltaWatch(cdsAck, &cdsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelCDS()
+
+		// Cluster-a converges first; cluster-b is subscribed separately and NACKed.
+		edsAReq := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResourceNamesSubscribe: []string{"cluster-a"}}
+		cache.BindRequestStream(edsAReq, streamID)
+		tracker.OnRequest(streamID, edsAReq)
+		edsSub := streamv3.NewDeltaSubscription([]string{"cluster-a"}, nil, nil, false)
+		cancelEDS, err := cache.CreateDeltaWatch(edsAReq, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		edsAResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, edsAReq, edsAResp, "ea1")
+		edsSub.SetReturnedResources(edsAResp.GetNextVersionMap())
+		ackA := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResponseNonce: "ea1"}
+		cache.BindRequestStream(ackA, streamID)
+		cache.OnRequest(streamID, ackA)
+		tracker.OnRequest(streamID, ackA)
+
+		cancelEDS()
+		edsSub.UpdateResourceSubscriptions([]string{"cluster-b"}, nil)
+		edsBReq := &discoveryv3.DeltaDiscoveryRequest{TypeUrl: resourcev3.EndpointType, ResourceNamesSubscribe: []string{"cluster-b"}, ResponseNonce: "ea1"}
+		cache.BindRequestStream(edsBReq, streamID)
+		tracker.OnRequest(streamID, edsBReq)
+		cancelEDS, err = cache.CreateDeltaWatch(edsBReq, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		edsBResp := drainDeltaResponses(ch)[0]
+		deliver(t, cache, tracker, streamID, edsBReq, edsBResp, "eb1")
+		edsSub.SetReturnedResources(edsBResp.GetNextVersionMap())
+
+		nackB := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl: resourcev3.EndpointType, ResponseNonce: "eb1",
+			ErrorDetail: &statuspb.Status{Message: "bad b"},
+		}
+		cache.BindRequestStream(nackB, streamID)
+		cache.OnRequest(streamID, nackB)
+		tracker.OnRequest(streamID, nackB)
+
+		// Envoy unsubscribes cluster-b before any response (filtered/removed both empty),
+		// which must prune cluster-b from rejectedEndpoints.
+		edsSub.UpdateResourceSubscriptions(nil, []string{"cluster-b"})
+		unsubB := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl: resourcev3.EndpointType, ResourceNamesUnsubscribe: []string{"cluster-b"}, ResponseNonce: "eb1",
+		}
+		cache.BindRequestStream(unsubB, streamID)
+		cache.OnRequest(streamID, unsubB)
+		tracker.OnRequest(streamID, unsubB)
+		cancelEDS, err = cache.CreateDeltaWatch(unsubB, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if empty := drainDeltaResponses(ch); len(empty) != 0 {
+			t.Fatalf("expected no response on unsubscribe of healthy cluster-a, got %v", empty)
+		}
+
+		// Later update & NACK of cluster-a must NOT retry endlessly from unpruned cluster-b.
+		v2 := buildBoundClusterSnapshot(t, "v2", map[string]string{"cluster-a": "a2.example"})
+		publish(t, cache, tracker, node, "v2", v2)
+		edsSub.UpdateResourceSubscriptions(nil, nil)
+		var v2EDS cachev3.DeltaResponse
+		for _, r := range drainDeltaResponses(ch) {
+			if r.GetDeltaRequest().GetTypeUrl() == resourcev3.EndpointType {
+				v2EDS = r
+			}
+		}
+		if v2EDS == nil {
+			t.Fatal("expected cluster-a@EA2 EDS response on v2")
+		}
+		deliver(t, cache, tracker, streamID, unsubB, v2EDS, "ea2")
+		edsSub.SetReturnedResources(v2EDS.GetNextVersionMap())
+		nackA2 := &discoveryv3.DeltaDiscoveryRequest{
+			TypeUrl: resourcev3.EndpointType, ResponseNonce: "ea2",
+			ErrorDetail: &statuspb.Status{Message: "bad a2"},
+		}
+		cache.BindRequestStream(nackA2, streamID)
+		cache.OnRequest(streamID, nackA2)
+		tracker.OnRequest(streamID, nackA2)
+		cancelEDS, err = cache.CreateDeltaWatch(nackA2, &edsSub, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancelEDS()
+		if retries := drainDeltaResponses(ch); len(retries) != 0 {
+			t.Fatalf("stale unsubscribed cluster-b rejection triggered retry loop: %d response(s)", len(retries))
+		}
+	})
 }

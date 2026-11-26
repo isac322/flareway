@@ -184,11 +184,13 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 		StreamDeltaRequestFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest) error {
 			s.cache.BindRequestStream(req, streamID)
+			s.cache.OnRequest(streamID, req)
 			s.tracker.OnRequest(streamID, req)
 			return nil
 		},
 		StreamDeltaResponseFunc: func(streamID int64, req *discoverygrpc.DeltaDiscoveryRequest, resp *discoverygrpc.DeltaDiscoveryResponse) {
 			fp, ok := s.cache.ConsumeResponseFingerprint(resp)
+			s.cache.OnResponse(streamID, req, resp)
 			s.tracker.OnResponseWithFingerprint(streamID, req, resp, fp, ok)
 		},
 	}
