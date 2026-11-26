@@ -9,6 +9,7 @@ Upgrade CRDs before the controller. Helm installs files in a chart's `crds/` dir
 3. Back up Flareway custom resources and the values used for the current release.
 4. Check for resources with `CleanupBlocked`, `Conflict`, or `Programmed=False`; resolve them before changing controller ownership.
 5. Keep the old controller running until managed resource teardown or migration is complete.
+6. Replace any legacy `deletionPolicy: Delete` on existing `DeviceSettings` or `ZeroTrustOrganization` manifests with `Orphan` (or omit the field) before recreating or restoring them; new CRD admission rejects `Delete` on both singletons.
 
 ## Version compatibility
 

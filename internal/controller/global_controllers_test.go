@@ -1413,3 +1413,131 @@ func cleanupGlobalFixture(fixture deviceProfileFixture) {
 		ginkgo.Fail(err.Error())
 	}
 }
+
+var _ = ginkgo.Describe("CRD CEL and singleton admission validation", func() {
+	ginkgo.It("evaluates optional-field CEL rules cleanly without missing-key runtime errors and enforces Orphan on singletons", func() {
+		namespace := "crd-cel-validation"
+		err := testClient.Create(testContext, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
+
+		// Issue #184: tcp + originRequest.access without ipRules should fail with the access error, never "no such key: ipRules".
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "tcp-access-no-iprules", Namespace: namespace},
+			Spec: v1alpha1.CloudflareTunnelSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "acct"},
+				Configuration: v1alpha1.CloudflareTunnelConfiguration{
+					Mode: v1alpha1.CloudflareTunnelConfigurationModeDirect,
+					Direct: &v1alpha1.CloudflareTunnelDirectConfiguration{
+						Ingress: []v1alpha1.CloudflareTunnelIngressRule{
+							{
+								Hostname: "tcp.example.test",
+								Service:  v1alpha1.CloudflareTunnelIngressService{TCP: &v1alpha1.CloudflareTunnelAddressService{Address: "localhost:22"}},
+								OriginRequest: &v1alpha1.CloudflareTunnelOriginRequest{
+									Access: &v1alpha1.CloudflareTunnelOriginAccess{TeamName: "team", AUDTags: []string{"aud-1"}},
+								},
+							},
+							{Service: v1alpha1.CloudflareTunnelIngressService{HTTPStatus: &v1alpha1.CloudflareTunnelHTTPStatusService{Code: 404}}},
+						},
+					},
+				},
+			},
+		}
+		err = testClient.Create(testContext, tunnel)
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("originRequest.access is only valid for HTTP origins"))
+		gomega.Expect(err.Error()).NotTo(gomega.ContainSubstring("no such key"))
+
+		// Issue #184 sibling: ClientCertificateV2 without certificateId must return the domain error cleanly.
+		postureRule := &v1alpha1.DevicePostureRule{
+			ObjectMeta: metav1.ObjectMeta{Name: "certv2-missing-id", Namespace: namespace},
+			Spec: v1alpha1.DevicePostureRuleSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "acct"},
+				Type:       v1alpha1.DevicePostureRuleTypeClientCertificateV2,
+				Name:       "certv2",
+				Input: v1alpha1.DevicePostureInput{
+					CheckPrivateKey: new(true),
+					OperatingSystem: v1alpha1.DevicePosturePlatformLinux,
+				},
+			},
+		}
+		err = testClient.Create(testContext, postureRule)
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("ClientCertificateV2 requires certificateId, checkPrivateKey, and operatingSystem"))
+		gomega.Expect(err.Error()).NotTo(gomega.ContainSubstring("no such key"))
+
+		// Issue #184 sibling: DevicePostureIntegration WorkspaceOne missing optional apiUrl must return the domain error cleanly.
+		integration := &v1alpha1.DevicePostureIntegration{
+			ObjectMeta: metav1.ObjectMeta{Name: "wsone-missing-apiurl", Namespace: namespace},
+			Spec: v1alpha1.DevicePostureIntegrationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "acct"},
+				Type:       v1alpha1.DevicePostureIntegrationTypeWorkspaceOne,
+				Name:       "wsone",
+				Interval:   "1h",
+				Config: v1alpha1.DevicePostureIntegrationConfig{
+					AuthURL:         "https://auth.example.test",
+					ClientID:        "client-1",
+					ClientSecretRef: &v1alpha1.DevicePostureIntegrationSecretReference{Name: "sec", Key: "secret"},
+				},
+			},
+		}
+		err = testClient.Create(testContext, integration)
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("WorkspaceOne requires apiUrl, authUrl, clientId, and clientSecretRef"))
+		gomega.Expect(err.Error()).NotTo(gomega.ContainSubstring("no such key"))
+
+		// Issue #185: Singletons with no remote delete endpoint must reject deletionPolicy: Delete at CRD admission.
+		devSettings := &v1alpha1.DeviceSettings{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace},
+			Spec: v1alpha1.DeviceSettingsSpec{
+				AccountRef:     corev1.LocalObjectReference{Name: "acct"},
+				DeletionPolicy: v1alpha1.OrphanOnlyDeletionPolicy("Delete"),
+			},
+		}
+		err = testClient.Create(testContext, devSettings)
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("deletionPolicy"))
+
+		ztOrg := &v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace},
+			Spec: v1alpha1.ZeroTrustOrganizationSpec{
+				AccountRef:     corev1.LocalObjectReference{Name: "acct"},
+				DeletionPolicy: v1alpha1.OrphanOnlyDeletionPolicy("Delete"),
+			},
+		}
+		err = testClient.Create(testContext, ztOrg)
+		gomega.Expect(apierrors.IsInvalid(err)).To(gomega.BeTrue())
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring("deletionPolicy"))
+
+		// Issue #184 sibling: Exclude mode DeviceProfile omitting optional privateHostnameRange must admit cleanly.
+		deviceProfile := &v1alpha1.DeviceProfile{
+			ObjectMeta: metav1.ObjectMeta{Name: "exclude-no-private-range", Namespace: namespace},
+			Spec: v1alpha1.DeviceProfileSpec{
+				AccountRef: corev1.LocalObjectReference{Name: "acct"},
+				Profile: v1alpha1.DeviceProfileTarget{
+					Kind: v1alpha1.DeviceProfileKindDefault,
+				},
+				SplitTunnel: v1alpha1.DeviceProfileSplitTunnel{
+					Mode: v1alpha1.DeviceProfileSplitTunnelModeExclude,
+					RouteSources: v1alpha1.DeviceProfileRouteSources{
+						NetworkRoutes: &v1alpha1.DeviceProfileRouteSelector{
+							Selector: metav1.LabelSelector{MatchLabels: map[string]string{"env": "prod"}},
+						},
+					},
+				},
+			},
+		}
+		gomega.Expect(testClient.Create(testContext, deviceProfile)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, deviceProfile)).To(gomega.Succeed())
+
+		// Positive admission with valid Orphan deletionPolicy and HTTPS+Access without ipRules.
+		validTunnel := tunnel.DeepCopy()
+		validTunnel.Name = "https-access-no-iprules"
+		validTunnel.Spec.Configuration.Direct.Ingress[0].Service = v1alpha1.CloudflareTunnelIngressService{
+			HTTPS: &v1alpha1.CloudflareTunnelAddressService{Address: "localhost:443"},
+		}
+		gomega.Expect(testClient.Create(testContext, validTunnel)).To(gomega.Succeed())
+		gomega.Expect(testClient.Delete(testContext, validTunnel)).To(gomega.Succeed())
+	})
+})

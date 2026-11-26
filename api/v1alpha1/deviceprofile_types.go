@@ -149,7 +149,7 @@ type DeviceProfileRouteSources struct {
 }
 
 // DeviceProfileSplitTunnel configures the active whole-list split-tunnel mode.
-// +kubebuilder:validation:XValidation:rule="self.mode == 'Include' || !has(self.routeSources) || (!self.routeSources.privateHostnameRange && !has(self.routeSources.accessApplications))",message="privateHostnameRange and accessApplications are only valid in Include mode"
+// +kubebuilder:validation:XValidation:rule="self.mode == 'Include' || !has(self.routeSources) || ((!has(self.routeSources.privateHostnameRange) || !self.routeSources.privateHostnameRange) && !has(self.routeSources.accessApplications))",message="privateHostnameRange and accessApplications are only valid in Include mode"
 type DeviceProfileSplitTunnel struct {
 	Mode DeviceProfileSplitTunnelMode `json:"mode"`
 	// +kubebuilder:validation:MaxItems=1000

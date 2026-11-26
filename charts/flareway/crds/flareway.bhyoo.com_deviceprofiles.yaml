@@ -537,8 +537,8 @@ spec:
                 x-kubernetes-validations:
                 - message: privateHostnameRange and accessApplications are only valid
                     in Include mode
-                  rule: self.mode == 'Include' || !has(self.routeSources) || (!self.routeSources.privateHostnameRange
-                    && !has(self.routeSources.accessApplications))
+                  rule: self.mode == 'Include' || !has(self.routeSources) || ((!has(self.routeSources.privateHostnameRange)
+                    || !self.routeSources.privateHostnameRange) && !has(self.routeSources.accessApplications))
             required:
             - accountRef
             - profile

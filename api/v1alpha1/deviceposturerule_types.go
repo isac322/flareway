@@ -308,7 +308,7 @@ type DevicePostureRuleExternalReference struct {
 // +kubebuilder:validation:XValidation:rule="(self.type in ['Tanium','TaniumS2S','CrowdstrikeS2S','Intune','WorkspaceOne','Kolide','SentinelOneS2S','CustomS2S']) || !has(self.input) || !has(self.input.integrationRef)",message="input.integrationRef is only valid for integration-backed posture rules"
 // +kubebuilder:validation:XValidation:rule="self.type != 'Firewall' || (has(self.input) && has(self.input.enabled) && has(self.input.operatingSystem))",message="Firewall requires enabled and operatingSystem"
 // +kubebuilder:validation:XValidation:rule="self.type != 'CustomS2S' || (has(self.input) && has(self.input.score) && has(self.input.operator))",message="CustomS2S requires score and operator"
-// +kubebuilder:validation:XValidation:rule="self.type != 'ClientCertificateV2' || (has(self.input) && has(self.input.checkPrivateKey) && has(self.input.operatingSystem) && size(self.input.certificateId) > 0)",message="ClientCertificateV2 requires certificateId, checkPrivateKey, and operatingSystem"
+// +kubebuilder:validation:XValidation:rule="self.type != 'ClientCertificateV2' || (has(self.input) && has(self.input.certificateId) && size(self.input.certificateId) > 0 && has(self.input.checkPrivateKey) && has(self.input.operatingSystem))",message="ClientCertificateV2 requires certificateId, checkPrivateKey, and operatingSystem"
 type DevicePostureRuleSpec struct {
 	AccountRef corev1.LocalObjectReference `json:"accountRef"`
 	Type       DevicePostureRuleType       `json:"type"`

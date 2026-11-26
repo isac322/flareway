@@ -208,9 +208,8 @@ type ZeroTrustOrganizationSpec struct {
 	// +kubebuilder:default=ObserveOnly
 	ManagementPolicy ManagementPolicy `json:"managementPolicy,omitempty"`
 	// Organization deletion is always orphaning because Cloudflare exposes no delete endpoint.
-	// +kubebuilder:validation:Enum=Orphan
 	// +kubebuilder:default=Orphan
-	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
+	DeletionPolicy OrphanOnlyDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // ZeroTrustOrganizationStatus records bounded, non-secret observed state.

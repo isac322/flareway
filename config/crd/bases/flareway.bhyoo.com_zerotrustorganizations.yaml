@@ -115,7 +115,6 @@ spec:
                 description: Organization deletion is always orphaning because Cloudflare
                   exposes no delete endpoint.
                 enum:
-                - Delete
                 - Orphan
                 type: string
               denyUnmatchedRequests:

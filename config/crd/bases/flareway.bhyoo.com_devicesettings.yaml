@@ -66,10 +66,9 @@ spec:
                 x-kubernetes-map-type: atomic
               deletionPolicy:
                 default: Orphan
-                description: DeletionPolicy controls whether a managed remote resource
-                  is deleted or orphaned.
+                description: Device settings deletion is always orphaning because
+                  Cloudflare exposes no delete endpoint.
                 enum:
-                - Delete
                 - Orphan
                 type: string
               disableForTime:

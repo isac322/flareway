@@ -10,7 +10,7 @@ The CRDs in `config/crd/bases/` define validation, defaults, limits, and status 
 - Resources that call Cloudflare require `spec.accountRef.name`.
 - `managementPolicy` is `Managed` or `ObserveOnly`.
 - `adoption.mode` is `None` or `AdoptById`. `AdoptById` requires an `externalRef`; matching a remote name is never enough.
-- `deletionPolicy` is `Delete` or `Orphan`.
+- `deletionPolicy` is `Delete` or `Orphan` (`DeviceSettings` and `ZeroTrustOrganization` singletons permit only `Orphan`).
 - A namespaced object reference contains `name` and an optional `namespace`; an omitted namespace means the referencing object's namespace.
 - Secret values are accepted only through Secret references or written to controller-owned Secrets. Status never contains API tokens, client secrets, passwords, bearer tokens, Tunnel tokens, WARP Connector tokens, or Access AUDs.
 
@@ -378,7 +378,7 @@ The Secret uses `CF-Access-Client-Id` and `CF-Access-Client-Secret`. During a gr
 
 ### `DeviceSettings`
 
-`DeviceSettings` is a namespaced account singleton and must be named `default`. It manages Gateway proxy, UDP proxy, root-certificate installation, Zero Trust virtual IP, and disable-duration settings. Its default `managementPolicy` is `ObserveOnly`; status reports observed values and the exact non-secret changes Managed mode would apply.
+`DeviceSettings` is a namespaced account singleton and must be named `default`. It manages Gateway proxy, UDP proxy, root-certificate installation, Zero Trust virtual IP, and disable-duration settings. Its default `managementPolicy` is `ObserveOnly`; status reports observed values and the exact non-secret changes Managed mode would apply. Cloudflare exposes no device-settings delete operation, so `deletionPolicy` is always `Orphan`.
 
 ## Tunnel configuration
 
