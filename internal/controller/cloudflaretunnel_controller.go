@@ -528,7 +528,11 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed Cloudflare Tunnel %s without adopting it", remote.ID), tunnel.Generation, now), now)
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, "ObserveOnly", "ObserveOnly does not manage DNS records", tunnel.Generation, now), now)
 		setTunnelReadyPolicy(&status, tunnel, now)
-		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, observeClear)
+		if err := r.patchOwnedStatus(ctx, tunnel, status, observeClear); err != nil {
+			return ctrl.Result{}, err
+		}
+		clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 	}
 
 	checkpoint := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
@@ -576,6 +580,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	}
 	setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionTrue, "Ready", fmt.Sprintf("Cloudflare Tunnel %s exists", remote.ID), tunnel.Generation, now), now)
 
+	dnsHealthy := true
 	switch {
 	case tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal:
 		remainingRecords, cleanupConflict, err := removeDNSRecords(ctx, cf, dnsOwnershipMarkers(tunnel, clusterID, dnsOwnerName), dnsRecordTargets(tunnel, remote.ID), tunnel.Status.DNSRecords)
@@ -584,6 +589,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 		status.DNSRecords = remainingRecords
 		if cleanupConflict != "" {
+			dnsHealthy = false
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Conflict", cleanupConflict, tunnel.Generation, now), now)
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConflict, metav1.ConditionTrue, "DNSOwnership", cleanupConflict, tunnel.Generation, now), now)
 			break
@@ -600,6 +606,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 		status.DNSRecords = remainingRecords
 		if cleanupConflict != "" {
+			dnsHealthy = false
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Conflict", cleanupConflict, tunnel.Generation, now), now)
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConflict, metav1.ConditionTrue, "DNSOwnership", cleanupConflict, tunnel.Generation, now), now)
 			break
@@ -617,6 +624,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		}
 		status.DNSRecords = dnsRecords
 		if dnsConflict != "" {
+			dnsHealthy = false
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionFalse, "Conflict", dnsConflict, tunnel.Generation, now), now)
 			setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionConflict, metav1.ConditionTrue, "DNSOwnership", dnsConflict, tunnel.Generation, now), now)
 		} else {
@@ -637,9 +645,10 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if err := r.patchOwnedStatus(ctx, tunnel, status, clearIntent); err != nil {
 		return ctrl.Result{}, err
 	}
-	if mode == v1alpha1.CloudflareTunnelConfigurationModeDirect && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
-		// The Direct configuration was confirmed or written on this pass;
-		// the Gateway reconciler records Gateway-mode verifies itself.
+	if dnsHealthy && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
+		// Record the remote verification timestamp for both Direct and Gateway
+		// modes so an expired Gateway-mode tunnel also renews its gate without
+		// rewriting Gateway-owned status.configVersion.appliedAt.
 		r.Invalidator.MarkVerified("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), status.ConfigVersion.DesiredHash, now.Time)
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil

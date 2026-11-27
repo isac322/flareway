@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -1379,6 +1380,31 @@ func (r *GatewayReconciler) activeDataplaneEnvoyNodeIDs(ctx context.Context, gat
 	return nodeIDs, nil
 }
 
+func buildTunnelGatewayDataStatusMap(
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+) (map[string]any, error) {
+	statusValue := v1alpha1.CloudflareTunnelStatus{
+		ConfigVersion: config,
+		Hostnames:     hostnames,
+		Listeners:     listeners,
+	}
+	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&statusValue)
+	if err != nil {
+		return nil, fmt.Errorf("convert Gateway-owned CloudflareTunnel status: %w", err)
+	}
+	// Force empty lists into the apply document so removing the last hostname or
+	// listener releases stale status instead of omitting the field.
+	if len(hostnames) == 0 {
+		statusMap["hostnames"] = []any{}
+	}
+	if len(listeners) == 0 {
+		statusMap["listeners"] = []any{}
+	}
+	return statusMap, nil
+}
+
 // patchTunnelGatewayData applies the Gateway-owned data fields
 // (configVersion, hostnames, listeners) under the flareway-gateway manager.
 // The document deliberately omits status.conditions: they are owned by the
@@ -1396,22 +1422,9 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeGateway {
 		return errors.New("the Gateway reconciler cannot own Direct-mode CloudflareTunnel status")
 	}
-	statusValue := v1alpha1.CloudflareTunnelStatus{
-		ConfigVersion: config,
-		Hostnames:     hostnames,
-		Listeners:     listeners,
-	}
-	statusMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&statusValue)
+	statusMap, err := buildTunnelGatewayDataStatusMap(config, hostnames, listeners)
 	if err != nil {
-		return fmt.Errorf("convert Gateway-owned CloudflareTunnel status: %w", err)
-	}
-	// Force empty lists into the apply document so removing the last hostname or
-	// listener releases stale status instead of omitting the field.
-	if len(hostnames) == 0 {
-		statusMap["hostnames"] = []any{}
-	}
-	if len(listeners) == 0 {
-		statusMap["listeners"] = []any{}
+		return err
 	}
 	key := client.ObjectKeyFromObject(tunnel)
 	validate := r.gatewayTunnelConditionGuard(ctx, gateway, tunnel)
@@ -1432,7 +1445,7 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		if err := validate(&live); err != nil {
 			return err
 		}
-		if tunnelGatewayDataUnchanged(&live, config, hostnames, listeners) {
+		if tunnelGatewayDataUnchangedWithMap(&live, statusMap, config, hostnames, listeners) {
 			return nil
 		}
 		apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
@@ -1459,7 +1472,21 @@ func tunnelGatewayDataUnchanged(
 	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
 	listeners []v1alpha1.CloudflareTunnelListenerStatus,
 ) bool {
-	if !equality.Semantic.DeepEqual(live.Status.ConfigVersion, config) {
+	statusMap, err := buildTunnelGatewayDataStatusMap(config, hostnames, listeners)
+	if err != nil {
+		return false
+	}
+	return tunnelGatewayDataUnchangedWithMap(live, statusMap, config, hostnames, listeners)
+}
+
+func tunnelGatewayDataUnchangedWithMap(
+	live *v1alpha1.CloudflareTunnel,
+	statusMap map[string]any,
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+) bool {
+	if !tunnelConfigVersionEqual(live.Status.ConfigVersion, config) {
 		return false
 	}
 	if len(live.Status.Hostnames) != len(hostnames) || (len(hostnames) > 0 && !equality.Semantic.DeepEqual(live.Status.Hostnames, hostnames)) {
@@ -1468,12 +1495,122 @@ func tunnelGatewayDataUnchanged(
 	if len(live.Status.Listeners) != len(listeners) || (len(listeners) > 0 && !equality.Semantic.DeepEqual(live.Status.Listeners, listeners)) {
 		return false
 	}
+	return gatewayDataOwnershipPresent(live, statusMap)
+}
+
+var tunnelDataListMapKeys = map[string][]string{
+	"hostnames":         {"hostname", "protectionDomain", "accessApplication"},
+	"listeners":         {"name"},
+	"protectionDomains": {"name"},
+}
+
+func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[string]any) bool {
+	hasCleanApply := false
 	for _, mf := range live.ManagedFields {
-		if mf.Manager == gatewayFieldManager && mf.Subresource == "status" {
-			return true
+		if mf.Manager != gatewayFieldManager || mf.Subresource != "status" || mf.FieldsV1 == nil {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(mf.FieldsV1.GetRawBytes(), &fields); err != nil {
+			continue
+		}
+		statusFields, _ := fields["f:status"].(map[string]any)
+		if statusFields == nil {
+			continue
+		}
+		// Shed legacy co-ownership of status.conditions per ADR 0004 before skipping.
+		if _, hasConditions := statusFields["f:conditions"]; hasConditions {
+			return false
+		}
+		if mf.Operation == metav1.ManagedFieldsOperationApply && fieldsV1CoversMap(statusFields, statusMap) {
+			hasCleanApply = true
 		}
 	}
-	return false
+	return hasCleanApply
+}
+
+func fieldsV1CoversMap(owned map[string]any, desired map[string]any) bool {
+	for fieldName, desiredVal := range desired {
+		switch typed := desiredVal.(type) {
+		case map[string]any:
+			if len(typed) == 0 {
+				continue
+			}
+			ownedChild, ok := owned["f:"+fieldName].(map[string]any)
+			if !ok || !fieldsV1CoversMap(ownedChild, typed) {
+				return false
+			}
+		case []any:
+			ownedList, ok := owned["f:"+fieldName].(map[string]any)
+			if !ok {
+				return false
+			}
+			keyFields := tunnelDataListMapKeys[fieldName]
+			if len(keyFields) == 0 && len(typed) > 0 {
+				return false
+			}
+			for _, elemRaw := range typed {
+				elem, ok := elemRaw.(map[string]any)
+				if !ok {
+					return false
+				}
+				ownedItem, ok := fieldsV1FindKeyedItem(ownedList, elem, keyFields)
+				if !ok || !fieldsV1CoversMap(ownedItem, elem) {
+					return false
+				}
+			}
+		default:
+			if _, ok := owned["f:"+fieldName]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func fieldsV1FindKeyedItem(ownedList map[string]any, elem map[string]any, keyFields []string) (map[string]any, bool) {
+	for mfKey, mfVal := range ownedList {
+		if !strings.HasPrefix(mfKey, "k:") {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(mfKey, "k:")), &parsed); err != nil {
+			continue
+		}
+		if len(parsed) != len(keyFields) {
+			continue
+		}
+		matched := true
+		for _, kf := range keyFields {
+			parsedVal, exists := parsed[kf]
+			if !exists || fmt.Sprint(parsedVal) != fmt.Sprint(elem[kf]) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		item, ok := mfVal.(map[string]any)
+		return item, ok
+	}
+	return nil, false
+}
+
+func tunnelConfigVersionEqual(a, b v1alpha1.CloudflareTunnelConfigVersion) bool {
+	return a.Desired == b.Desired &&
+		a.DesiredHash == b.DesiredHash &&
+		a.Applied == b.Applied &&
+		a.Remote == b.Remote &&
+		metaTimeSecondEqual(a.CreatedAt, b.CreatedAt) &&
+		metaTimeSecondEqual(a.AppliedAt, b.AppliedAt)
+}
+
+func metaTimeSecondEqual(a, b *metav1.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Truncate(time.Second).Equal(b.Truncate(time.Second))
 }
 
 // gatewayTunnelCondition stamps an authored condition with the caller's clock.

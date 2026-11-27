@@ -1838,9 +1838,16 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 		if admissionOnly {
 			merged.Addresses = slices.Clone(current.Status.Addresses)
 		}
+		var prevProg *metav1.Condition
+		if !admissionOnly {
+			prevProg = meta.FindStatusCondition(current.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		}
 		merged.Conditions = make([]metav1.Condition, 0, len(current.Status.Conditions)+len(desired.Conditions))
 		for _, condition := range desired.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				if !admissionOnly && condition.Type == string(gatewayv1.GatewayConditionProgrammed) {
+					condition.LastTransitionTime = monotonicProgrammedTransitionTime(condition, prevProg, now)
+				}
 				merged.Conditions = append(merged.Conditions, condition)
 			}
 		}
@@ -1880,22 +1887,33 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
 			for i := range desired.Listeners {
 				merged.Listeners[i] = desired.Listeners[i]
+				var currentListener *gatewayv1.ListenerStatus
+				for j := range current.Status.Listeners {
+					if current.Status.Listeners[j].Name == merged.Listeners[i].Name {
+						currentListener = &current.Status.Listeners[j]
+						break
+					}
+				}
+				var prevListenerProg *metav1.Condition
+				if !admissionOnly && currentListener != nil {
+					prevListenerProg = meta.FindStatusCondition(currentListener.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+				}
 				merged.Listeners[i].Conditions = make([]metav1.Condition, 0, len(desired.Listeners[i].Conditions))
 				for _, condition := range desired.Listeners[i].Conditions {
 					if _, owned := ownedListenerConditions[condition.Type]; owned {
+						if !admissionOnly && condition.Type == string(gatewayv1.ListenerConditionProgrammed) {
+							condition.LastTransitionTime = monotonicProgrammedTransitionTime(condition, prevListenerProg, now)
+						}
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
 				}
-				for j := range current.Status.Listeners {
-					if current.Status.Listeners[j].Name != merged.Listeners[i].Name {
-						continue
-					}
+				if currentListener != nil {
 					if admissionOnly {
-						if prev := meta.FindStatusCondition(current.Status.Listeners[j].Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
+						if prev := meta.FindStatusCondition(currentListener.Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
 							merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, *prev.DeepCopy())
 						}
 					}
-					for _, condition := range current.Status.Listeners[j].Conditions {
+					for _, condition := range currentListener.Conditions {
 						if _, owned := ownedListenerConditions[condition.Type]; owned {
 							continue
 						}
@@ -1904,7 +1922,6 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 						}
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
-					break
 				}
 				if admissionOnly {
 					merged.Listeners[i].Conditions = prepareConditions(
@@ -1944,6 +1961,22 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 	condition := meta.FindStatusCondition(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	observability.Default.SetGatewayProgrammed(key.String(), condition != nil && condition.Status == metav1.ConditionTrue)
 	return nil
+}
+
+func monotonicProgrammedTransitionTime(desired metav1.Condition, prev *metav1.Condition, now metav1.Time) metav1.Time {
+	if prev == nil {
+		return desired.LastTransitionTime
+	}
+	if prev.Status == desired.Status {
+		return prev.LastTransitionTime
+	}
+	if desired.LastTransitionTime.Before(&prev.LastTransitionTime) {
+		if now.Before(&prev.LastTransitionTime) {
+			return prev.LastTransitionTime
+		}
+		return now
+	}
+	return desired.LastTransitionTime
 }
 
 func (r *GatewayReconciler) patchHTTPRouteStatuses(

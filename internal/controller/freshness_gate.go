@@ -219,10 +219,13 @@ func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 }
 
 // forgetGate drops cached verification, sweep confirmation, and sweep baseline
-// state when a reconcile turns status unconverged (pre-gate failure or remote
-// error). Sweep confirmation must not keep the gate open while status is False.
+// state and latches a "demoted" invalidation when a reconcile turns status
+// unconverged (pre-gate failure or remote error), so a temporarily stale
+// informer cache carrying Ready=True cannot reopen the gate before the next pass
+// verifies live. Callers clear the latch via clearGate once status converges.
 func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 	latch.Forget(kind, key)
+	latch.Invalidate(kind, key, "demoted")
 }
 
 // statusConverged reports whether the object's live status is converged on the

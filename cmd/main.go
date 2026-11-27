@@ -136,13 +136,13 @@ func main() {
 	flag.DurationVar(&freshnessAuthz, "freshness-authz", 60*time.Second,
 		"Freshness TTL for T1 (Authz) resources: IdentityProvider, ServiceToken, AccessGroup. A converged object skips remote reads until this TTL expires or drift invalidates it.")
 	flag.DurationVar(&freshnessTraffic, "freshness-traffic", 300*time.Second,
-		"Freshness TTL for T2 (Traffic) resources: VirtualNetwork, NetworkRoute, HostnameRoute, ZeroTrustGatewayPolicy, ZeroTrustList.")
+		"Freshness TTL for T2 (Traffic) resources: CloudflareTunnel, Gateway tunnel configuration (CloudflareTunnelConfig), VirtualNetwork, NetworkRoute, HostnameRoute, ZeroTrustGatewayPolicy, ZeroTrustList.")
 	flag.DurationVar(&freshnessIndirect, "freshness-indirect", 1800*time.Second,
 		"Freshness TTL for T3 (Indirect) resources: DeviceProfile, DeviceSettings, DevicePostureRule, DevicePostureIntegration, ZeroTrustOrganization, WARPConnector.")
 	flag.DurationVar(&freshnessDisplay, "freshness-display", 0,
 		"Freshness TTL for T4 (Display) resources. 0 disables periodic display reads.")
 	flag.BoolVar(&disableSweep, "disable-sweep", false,
-		"Disable the periodic drift sweep worker. Out-of-band drift is then detected only by freshness TTL expiry; use this to roll back the sweep if it misbehaves.")
+		"Disable the periodic drift sweep worker. Out-of-band drift then falls back to freshness TTL expiry and watch-driven or controller-specific periodic fallbacks (such as 10s on a converged Gateway); use this to roll back the sweep if it misbehaves.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")

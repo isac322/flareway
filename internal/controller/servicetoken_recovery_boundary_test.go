@@ -74,6 +74,7 @@ import (
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
+	"github.com/isac322/flareway/internal/freshness"
 )
 
 var serviceTokenBoundaryClock = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
@@ -668,6 +669,72 @@ func TestServiceTokenEstablishedMissingSecretNeverRotates(t *testing.T) {
 	}
 	if api.rotates != 0 || api.creates != 1 || api.deletes != 0 {
 		t.Fatalf("established credential loss triggered an automatic rotation or recreate: calls=%v", api.calls)
+	}
+}
+
+// Regression test: when an established ServiceToken loses its credential Secret
+// and the operator sets spec.enabled=false (under either zero or positive
+// freshness), the controller MUST still push Enabled=false to Cloudflare and
+// keep reporting SecretMissing without rotating credentials.
+func TestServiceTokenMissingSecretStillAppliesDisabledSpecUpdate(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		freshness freshness.Policy
+	}{
+		{name: "zero freshness", freshness: freshness.Policy{}},
+		{name: "positive freshness", freshness: freshness.DefaultPolicy()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newServiceTokenBoundaryAPI()
+			world := newServiceTokenWorld(t, api, serviceTokenBoundaryClock)
+			world.reconciler.Freshness = tc.freshness
+			world.reconciler.Invalidator = freshness.NewLatch()
+			issued := world.issueToken(ctx, t)
+			// Second reconcile settles AppliedHash/AppliedAt when freshness > 0.
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+				t.Fatalf("settle reconcile: %v", err)
+			}
+
+			credential := serviceTokenCredentialSecret(ctx, t, world)
+			if err := world.kube.Delete(ctx, credential.DeepCopy()); err != nil {
+				t.Fatal(err)
+			}
+			// First detect SecretMissing while Enabled=true.
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+				t.Fatalf("reconcile on SecretMissing: %v", err)
+			}
+
+			var current v1alpha1.ServiceToken
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			current.Spec.Enabled = false
+			if err := world.kube.Update(ctx, &current); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := world.reconciler.Reconcile(ctx, world.request); err != nil {
+				t.Fatalf("reconcile disable while SecretMissing: %v", err)
+			}
+
+			remote, ok := api.tokens[issued.Status.TokenID]
+			if !ok {
+				t.Fatalf("remote token %q disappeared", issued.Status.TokenID)
+			}
+			if remote.Enabled {
+				t.Fatalf("spec.enabled=false while SecretMissing did not update Cloudflare token: remote.Enabled=%v, calls=%v", remote.Enabled, api.calls)
+			}
+			if err := world.kube.Get(ctx, world.request.NamespacedName, &current); err != nil {
+				t.Fatal(err)
+			}
+			ready := serviceTokenCondition(current.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "SecretMissing" {
+				t.Fatalf("expected Ready=False/SecretMissing after disabling token: %#v", current.Status.Conditions)
+			}
+			if api.rotates != 0 || api.creates != 1 || api.deletes != 0 {
+				t.Fatalf("unexpected rotate/create/delete during SecretMissing disable: calls=%v", api.calls)
+			}
+		})
 	}
 }
 

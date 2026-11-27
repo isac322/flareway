@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -106,14 +107,45 @@ func startPR2EnvtestManager(t *testing.T) (*envtest.Environment, ctrl.Manager, c
 func startManagerAndWait(t *testing.T, mgr ctrl.Manager) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	done := make(chan struct{})
+	var startErr error
 	go func() {
-		if err := mgr.Start(ctx); err != nil {
-			t.Logf("manager exited: %v", err)
-		}
+		defer close(done)
+		startErr = mgr.Start(ctx)
 	}()
-	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		t.Fatal("cache never synced")
+	// Registered after env.Stop() in startPR2EnvtestManager so Go's LIFO
+	// cleanup stops the manager before tearing down kube-apiserver.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+			if startErr != nil && !errors.Is(startErr, context.Canceled) {
+				t.Errorf("manager exited with error: %v", startErr)
+			}
+		case <-time.After(15 * time.Second):
+			t.Errorf("timed out waiting for manager shutdown")
+		}
+	})
+	waitCtx, waitCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer waitCancel()
+	syncedCh := make(chan bool, 1)
+	go func() {
+		syncedCh <- mgr.GetCache().WaitForCacheSync(waitCtx)
+	}()
+	select {
+	case synced := <-syncedCh:
+		if !synced {
+			select {
+			case <-done:
+				t.Fatalf("cache never synced (manager exited: %v)", startErr)
+			default:
+				t.Fatal("cache never synced")
+			}
+		}
+	case <-done:
+		t.Fatalf("manager exited before cache sync: %v", startErr)
+	case <-waitCtx.Done():
+		t.Fatal("timed out waiting for manager cache sync")
 	}
 	return ctx
 }
@@ -772,6 +804,7 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		t.Fatalf("setup CloudflareTunnelReconciler: %v", err)
 	}
 
+	tunnelSweepObs := sweeper.EventsFor("CloudflareTunnel")
 	startManagerAndWait(t, mgr)
 
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "gw-fanout", Labels: map[string]string{"tenant": "true"}}}
@@ -895,25 +928,48 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		}
 		return assertConditionTrueForCurrentGen(cur.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), cur.Generation), nil
 	})
-	// Wait briefly for in-flight status reconciles to settle, then snapshot probes
-	// and tunnel ResourceVersion (so we prove the subsequent Gateway wakeup
-	// originates from the raw SweepEvents channel, not from a tunnel status write).
-	time.Sleep(300 * time.Millisecond)
+	// Wait until both reconcilers are quiescent (0 probes and 0 tunnel API calls
+	// over 300ms), then snapshot counters and tunnel ResourceVersion so we prove
+	// the subsequent Gateway and Tunnel wakes come directly from post-invalidation
+	// sweep event publication rather than an unrelated queued pass or status watch.
+	waitUntilTrue(t, 10*time.Second, "Gateway and Tunnel reconciles quiescent", func() (bool, error) {
+		p0 := prober.probes.Load()
+		c0 := len(tunnelFake.Calls())
+		time.Sleep(300 * time.Millisecond)
+		return prober.probes.Load() == p0 && len(tunnelFake.Calls()) == c0, nil
+	})
+	for len(tunnelSweepObs) > 0 {
+		<-tunnelSweepObs
+	}
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelObj); err != nil {
 		t.Fatalf("refresh tunnel before sweep: %v", err)
 	}
 	tunnelRVBefore := tunnelObj.ResourceVersion
 	probesBefore := prober.probes.Load()
+	tunnelCallsBefore := len(tunnelFake.Calls())
 
 	emitTunnelDrift.Store(true)
-	waitUntilTrue(t, 10*time.Second, "tunnel sweep pass ran", func() (bool, error) {
-		return tunnelSweepCount.Load() >= 1, nil
+	select {
+	case ev := <-tunnelSweepObs:
+		emitTunnelDrift.Store(false)
+		u, ok := ev.Object.(*unstructured.Unstructured)
+		if !ok {
+			t.Fatalf("sweep event object type = %T, want *unstructured.Unstructured", ev.Object)
+		}
+		if gvk := u.GroupVersionKind(); gvk != v1alpha1.GroupVersion.WithKind("CloudflareTunnel") {
+			t.Fatalf("sweep event GVK = %v, want CloudflareTunnel", gvk)
+		}
+		if gotKey := client.ObjectKeyFromObject(u); gotKey != client.ObjectKeyFromObject(&tunnelObj) {
+			t.Fatalf("sweep event key = %v, want %v", gotKey, client.ObjectKeyFromObject(&tunnelObj))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for post-invalidation CloudflareTunnel sweep event publication")
+	}
+	waitUntilTrue(t, 10*time.Second, "CloudflareTunnel reconciler executed remote verify after sweep event", func() (bool, error) {
+		return len(tunnelFake.Calls()) > tunnelCallsBefore && !latch.IsInvalidated("CloudflareTunnel", client.ObjectKeyFromObject(&tunnelObj)), nil
 	})
 	waitUntilTrue(t, 10*time.Second, "GatewayReconciler woken by unstructured tunnel sweep event", func() (bool, error) {
 		return prober.probes.Load() > probesBefore, nil
-	})
-	waitUntilTrue(t, 10*time.Second, "CloudflareTunnel cleared invalidation after sweep wakeup", func() (bool, error) {
-		return !latch.IsInvalidated("CloudflareTunnel", client.ObjectKeyFromObject(&tunnelObj)), nil
 	})
 	var tunnelAfter v1alpha1.CloudflareTunnel
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelAfter); err != nil {

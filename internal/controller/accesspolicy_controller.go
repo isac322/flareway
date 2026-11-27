@@ -577,6 +577,9 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 		if err := r.Status().Patch(ctx, current, base); err != nil {
 			return err
 		}
+		if status == metav1.ConditionTrue {
+			clearGate(r.Invalidator, "AccessPolicy", client.ObjectKeyFromObject(current))
+		}
 		*object = *current
 		return nil
 	})

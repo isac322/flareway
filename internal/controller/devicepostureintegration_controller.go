@@ -362,10 +362,15 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if reflect.DeepEqual(baseObject.Status, object.Status) {
-		return nil
+	if !reflect.DeepEqual(baseObject.Status, object.Status) {
+		if err := r.Status().Patch(ctx, object, client.MergeFrom(baseObject)); err != nil {
+			return err
+		}
 	}
-	return r.Status().Patch(ctx, object, client.MergeFrom(baseObject))
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "DevicePostureIntegration", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 // finishRemoteError records the remote failure before returning it for retry.

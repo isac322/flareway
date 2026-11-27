@@ -245,7 +245,13 @@ func (r *DeviceSettingsReconciler) patchStatus(ctx context.Context, object *v1al
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "DeviceSettings", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func (r *DeviceSettingsReconciler) now() time.Time {

@@ -1101,7 +1101,13 @@ func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context,
 		accessCondition(object.Generation, "Accepted", accepted, reason, message),
 		accessCondition(object.Generation, "Ready", ready, reason, message),
 	)
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if accepted == metav1.ConditionTrue && ready == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func standaloneVariantStatus(_ *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, secretRef *corev1.LocalObjectReference) (*v1alpha1.AccessSaaSApplicationStatus, *v1alpha1.AccessBookmarkApplicationStatus, *v1alpha1.AccessInfrastructureApplicationStatus, *v1alpha1.AccessAppLauncherApplicationStatus, *v1alpha1.AccessDashSSOApplicationStatus, *v1alpha1.AccessMCPPortalApplicationStatus) {

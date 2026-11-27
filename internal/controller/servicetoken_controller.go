@@ -205,13 +205,17 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return r.recoverServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal)
 		}
 	}
+	secretPresent := true
 	if object.Status.TokenID != "" && !rotationRequested(object) {
 		var destSecret corev1.Secret
 		secretErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, &destSecret)
 		if apierrors.IsNotFound(secretErr) {
-			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "SecretMissing", "service token Secret is missing; update rotation.requestedAt to rotate explicitly", serviceTokenStatusUpdate{OwnershipVerified: object.Status.OwnershipVerified})
-		}
-		if secretErr != nil {
+			// Do not return early before UpdateServiceToken: if the user updates
+			// spec.enabled (e.g. disabling a token whose Secret is missing),
+			// keep the gate closed so the remote update still runs before
+			// SecretMissing is recorded below.
+			secretPresent = false
+		} else if secretErr != nil {
 			return ctrl.Result{}, secretErr
 		}
 	}
@@ -219,7 +223,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TokenID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
-		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready") && secretPresent,
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -667,6 +671,9 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
 	if err := r.Status().Patch(ctx, object, base); err != nil {
 		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
 	}
 	if status == metav1.ConditionTrue || remote.ID != "" {
 		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))

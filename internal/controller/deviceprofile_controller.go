@@ -1216,6 +1216,9 @@ func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alp
 	if err := r.Status().Patch(ctx, current, client.MergeFrom(before)); err != nil {
 		return fmt.Errorf("patch DeviceProfile status: %w", err)
 	}
+	if statusConverged(object.Generation, status.ObservedGeneration, status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady) {
+		clearGate(r.Invalidator, "DeviceProfile", key)
+	}
 	return nil
 }
 

@@ -356,7 +356,13 @@ func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "AccessCustomPage", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func (r *AccessCustomPageReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.AccessCustomPage, message string) error {

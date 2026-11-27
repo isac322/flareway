@@ -641,3 +641,101 @@ func TestQA2REG5GateRejectsUnconvergedStatus(t *testing.T) {
 		t.Fatal("evaluateGateWithHash with converged=false must forget verify timestamp")
 	}
 }
+
+// Regression test: when a Namespace grant label is removed (demoting Ready=False)
+// and immediately restored before the informer cache sees the demotion
+// (with --disable-sweep), the in-memory demotion latch MUST keep the gate closed
+// so the next reconcile verifies live instead of trusting stale Ready=True.
+func TestDemotionKeepsGateClosedAcrossStaleReadyCacheWithDisableSweep(t *testing.T) {
+	ctx := context.Background()
+	vnet := virtualNetworkFixture("tenant", "prod", virtualNetworkTestClock)
+	kube, scheme := virtualNetworkWriterClient(t, vnet)
+	api := newFakePrivateNetworkCloudflare()
+
+	now := virtualNetworkTestClock
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	reconciler := &VirtualNetworkReconciler{
+		Client: kube, Scheme: scheme, NewCloudflareClient: api.Client,
+		Now:         func() time.Time { return now },
+		Freshness:   policy,
+		Invalidator: latch,
+	}
+	key := client.ObjectKeyFromObject(vnet)
+
+	// 1. Converge + rebind so AppliedHash/AppliedAt are fresh.
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("create reconcile: %v", err)
+	}
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("rebind reconcile: %v", err)
+	}
+	var converged v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &converged); err != nil {
+		t.Fatal(err)
+	}
+	staleReady := converged.DeepCopy()
+
+	// 2. Remove tenant grant label -> reconcile demotes status to Ready=False.
+	var ns corev1.Namespace
+	if err := kube.Get(ctx, types.NamespacedName{Name: "tenant"}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Labels = map[string]string{}
+	if err := kube.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("demote reconcile: %v", err)
+	}
+	var demoted v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &demoted); err != nil {
+		t.Fatal(err)
+	}
+	if conditionTrueForGeneration(demoted.Status.Conditions, v1alpha1.PrivateNetworkConditionReady, demoted.Generation) {
+		t.Fatal("expected Ready=False after removing Namespace grant label")
+	}
+
+	// 3. Restore tenant grant label AND simulate a stale informer cache holding
+	// pre-demotion Ready=True (with fresh AppliedAt) by writing staleReady back
+	// into a fresh fake client sharing the same in-memory latch (no sweep worker).
+	ns.Labels = map[string]string{"tenant": "true"}
+	if err := kube.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	var accountObj v1alpha1.CloudflareAccount
+	if err := kube.Get(ctx, types.NamespacedName{Name: vnet.Spec.AccountRef.Name}, &accountObj); err != nil {
+		t.Fatal(err)
+	}
+	var secretObj corev1.Secret
+	if err := kube.Get(ctx, types.NamespacedName{Namespace: "tenant", Name: "api-token"}, &secretObj); err != nil {
+		t.Fatal(err)
+	}
+	var kubeSystem corev1.Namespace
+	if err := kube.Get(ctx, types.NamespacedName{Name: "kube-system"}, &kubeSystem); err != nil {
+		t.Fatal(err)
+	}
+	staleClient := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.VirtualNetwork{}, &v1alpha1.CloudflareAccount{}).
+		WithObjects(&kubeSystem, &ns, &secretObj, &accountObj, staleReady).
+		Build()
+	staleReconciler := &VirtualNetworkReconciler{
+		Client: staleClient, Scheme: scheme, NewCloudflareClient: api.Client,
+		Now:         func() time.Time { return now.Add(time.Second) },
+		Freshness:   policy,
+		Invalidator: latch,
+	}
+
+	callsBefore := len(api.calls)
+	if _, err := staleReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("recovery reconcile against stale Ready=True cache: %v", err)
+	}
+	if got := api.calls[callsBefore:]; len(got) == 0 {
+		t.Fatalf("stale Ready=True cache opened gate after demotion; want live Cloudflare verification")
+	}
+	if latch.IsInvalidated("VirtualNetwork", key) {
+		t.Fatal("VirtualNetwork remained invalidated after healthy recovery reconcile")
+	}
+}

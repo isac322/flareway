@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -3022,22 +3024,23 @@ func TestGatewayTunnelConfigGateRecoversAfterRemoteErrorEnvtest(t *testing.T) {
 }
 
 // QA-2-REG-4: With freshness disabled (zero policy, no Sweep running),
-// AccessApplication still schedules a periodic drift recheck (RequeueAfter > 0)
-// and detects/repairs out-of-band remote drift via the manager's timer with
-// no Kubernetes watch event.
-func TestQA2REG4ZeroFreshnessAccessApplicationPeriodicDriftEnvtest(t *testing.T) {
+// QA-2-REG-4 (AccessApplication): When --freshness-authz=0, a converged
+// AccessApplication returns RequeueAfter=0s (event-driven, zero polling) and
+// re-verifies/repairs out-of-band drift immediately on watch or explicit reconcile.
+func TestQA2REG4ZeroFreshnessAccessApplicationEventDrivenDriftEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
 
 	latch := freshness.NewLatch()
 	appFake := newFakeAccessApplicationCloudflare()
-	if err := (&AccessApplicationReconciler{
+	appReconciler := &AccessApplicationReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		OperatorNamespace:   dataplane.DefaultOperatorNamespace,
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil },
 		Freshness:           freshness.Policy{}, // zero freshness (--freshness-*=0)
 		Invalidator:         latch,
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if err := appReconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup AccessApplicationReconciler: %v", err)
 	}
 	startManagerAndWait(t, mgr)
@@ -3098,6 +3101,15 @@ func TestQA2REG4ZeroFreshnessAccessApplicationPeriodicDriftEnvtest(t *testing.T)
 		return checkObjectConverged(ctx, direct, &cur, appKey, accessApplicationConditionProgrammed, accessApplicationConditionAccepted)
 	})
 
+	// Direct Reconcile on converged AccessApplication MUST stay event-driven (RequeueAfter == 0).
+	directRes, err := appReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey})
+	if err != nil {
+		t.Fatalf("direct steady AccessApplication reconcile: %v", err)
+	}
+	if directRes.RequeueAfter != 0 {
+		t.Fatalf("zero-freshness converged AccessApplication RequeueAfter = %v, want 0 (event-driven)", directRes.RequeueAfter)
+	}
+
 	var curApp v1alpha1.AccessApplication
 	if err := direct.Get(ctx, appKey, &curApp); err != nil {
 		t.Fatalf("get app: %v", err)
@@ -3107,19 +3119,22 @@ func TestQA2REG4ZeroFreshnessAccessApplicationPeriodicDriftEnvtest(t *testing.T)
 		t.Fatal("missing ApplicationID")
 	}
 
-	// Mutate remote state out-of-band WITHOUT any Kubernetes event.
+	// Mutate remote state out-of-band: next reconcile (with gate closed at freshness=0) repairs it immediately.
 	appFake.mu.Lock()
 	remoteApp := appFake.applications[appID]
 	remoteApp.Name = "drifted-out-of-band"
 	appFake.applications[appID] = remoteApp
 	appFake.mu.Unlock()
 
-	// Manager periodic requeue timer (accessApplicationRequeue) MUST detect and repair drift.
-	waitUntilTrue(t, 12*time.Second, "zero-freshness AccessApplication periodic timer repaired remote drift", func() (bool, error) {
-		appFake.mu.Lock()
-		defer appFake.mu.Unlock()
-		return appFake.applications[appID].Name == "app-zero-fresh", nil
-	})
+	if _, err := appReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+		t.Fatalf("reconcile repair after drift: %v", err)
+	}
+	appFake.mu.Lock()
+	repairedName := appFake.applications[appID].Name
+	appFake.mu.Unlock()
+	if repairedName != "app-zero-fresh" {
+		t.Fatalf("remote drifted name = %q, want app-zero-fresh", repairedName)
+	}
 }
 
 type countingAccessExtendedAPI struct {
@@ -3960,5 +3975,320 @@ func TestDefensiveGatewayAdmissionDoesNotRepublishAStaleProgrammedCondition(t *t
 	}
 	if after.ResourceVersion != convergedRV {
 		t.Fatalf("stale pending admission no-op bumped ResourceVersion %s -> %s, want unchanged %s", convergedRV, after.ResourceVersion, convergedRV)
+	}
+}
+
+// Envtest regression test for Finding #4: if flareway-gateway still co-owns
+// status.conditions alongside matching data fields (upgraded cluster), the
+// next patchTunnelGatewayData call MUST execute an SSA Apply to shed
+// status.conditions ownership, and the subsequent pass MUST skip (0 requests).
+func TestPatchTunnelGatewayDataShedsCoOwnedConditionsEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-ssa-shed"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName},
+	}
+	if err := direct.Create(ctx, gc); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create gatewayclass: %v", err)
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "edge"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "edge",
+			}},
+			Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "edge"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: "acct"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			Configuration:    v1alpha1.CloudflareTunnelConfiguration{Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway},
+		},
+	}
+	if err := direct.Create(ctx, tunnel); err != nil {
+		t.Fatalf("create tunnel: %v", err)
+	}
+
+	appliedAt := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+	config := v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, DesiredHash: "cfg-h1", Applied: 1, Remote: 1, AppliedAt: &appliedAt}
+	hostnames := []v1alpha1.CloudflareTunnelHostnameStatus{{Hostname: "app.example.com", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1}}
+	listeners := []v1alpha1.CloudflareTunnelListenerStatus{{Name: "http", Exposure: v1alpha1.ExposurePublic}}
+
+	// Seed tunnel identity ownership under flareway-tunnel (as CloudflareTunnelReconciler does)
+	// and legacy flareway-gateway co-ownership of status.conditions + data fields.
+	identityApply := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"tunnelId":                "tunnel-1",
+			"accountId":               "0123456789abcdef0123456789abcdef",
+			"ownershipVerified":       true,
+			"connectorTokenSecretRef": map[string]any{"name": "token-secret"},
+			"gatewayRef":              map[string]any{"name": gw.Name},
+			"gatewayUid":              string(gw.UID),
+		},
+	}}
+	identityApply.SetAPIVersion(v1alpha1.GroupVersion.String())
+	identityApply.SetKind("CloudflareTunnel")
+	identityApply.SetNamespace(ns)
+	identityApply.SetName(tunnel.Name)
+	if err := direct.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(identityApply), client.FieldOwner("flareway-tunnel"), client.ForceOwnership); err != nil {
+		t.Fatalf("seed tunnel identity SSA status: %v", err)
+	}
+
+	legacyApply := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"configVersion": map[string]any{
+				"desired":     1,
+				"desiredHash": "cfg-h1",
+				"applied":     1,
+				"remote":      1,
+				"appliedAt":   appliedAt.Format(time.RFC3339),
+			},
+			"hostnames": []any{map[string]any{"hostname": "app.example.com", "protectionDomain": "", "accessApplication": "", "guard": "Forwarding", "appliedVersion": 1}},
+			"listeners": []any{map[string]any{"name": "http", "exposure": "Public"}},
+			"conditions": []any{map[string]any{
+				"type":               v1alpha1.CloudflareTunnelConditionConfigApplied,
+				"status":             "True",
+				"reason":             "Applied",
+				"message":            "ok",
+				"observedGeneration": tunnel.Generation,
+				"lastTransitionTime": appliedAt.Format(time.RFC3339),
+			}},
+		},
+	}}
+	legacyApply.SetAPIVersion(v1alpha1.GroupVersion.String())
+	legacyApply.SetKind("CloudflareTunnel")
+	legacyApply.SetNamespace(ns)
+	legacyApply.SetName(tunnel.Name)
+	if err := direct.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(legacyApply), client.FieldOwner(gatewayFieldManager), client.ForceOwnership); err != nil {
+		t.Fatalf("seed legacy flareway-gateway SSA status: %v", err)
+	}
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(tunnel), tunnel); err != nil {
+		t.Fatal(err)
+	}
+
+	var statusApplies atomic.Int64
+	countingClient := &countingSSAStatusClient{Client: direct, applies: &statusApplies}
+	reconciler := &GatewayReconciler{
+		Client:    countingClient,
+		APIReader: direct,
+		Scheme:    mgr.GetScheme(),
+	}
+	irGW := &ir.Gateway{Key: client.ObjectKeyFromObject(gw), UID: gw.UID}
+
+	// Run shared conditions stage first (as gateway_controller.go does) so conditions migrate
+	// to tunnelStatusFieldManager while flareway-gateway still retains legacy f:conditions co-ownership.
+	if err := (&GatewayReconciler{Client: direct, APIReader: direct, Scheme: mgr.GetScheme()}).patchTunnelGatewayConditions(ctx, irGW, tunnel, appliedAt); err != nil {
+		t.Fatalf("patchTunnelGatewayConditions: %v", err)
+	}
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(tunnel), tunnel); err != nil {
+		t.Fatal(err)
+	}
+
+	// First call: data matches, but flareway-gateway still owns status.conditions -> MUST SSA Apply once to shed it.
+	if err := reconciler.patchTunnelGatewayData(ctx, irGW, tunnel, config, hostnames, listeners); err != nil {
+		t.Fatalf("first patchTunnelGatewayData: %v", err)
+	}
+	if got := statusApplies.Load(); got != 1 {
+		t.Fatalf("first patchTunnelGatewayData status applies = %d, want 1 (to shed status.conditions co-ownership)", got)
+	}
+
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(tunnel), tunnel); err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range tunnel.ManagedFields {
+		if mf.Manager == gatewayFieldManager && mf.Subresource == "status" && mf.FieldsV1 != nil {
+			var fields map[string]any
+			if err := json.Unmarshal(mf.FieldsV1.GetRawBytes(), &fields); err == nil {
+				if sf, ok := fields["f:status"].(map[string]any); ok {
+					if _, hasCond := sf["f:conditions"]; hasCond {
+						t.Fatalf("flareway-gateway still owns status.conditions after patchTunnelGatewayData: %s", string(mf.FieldsV1.GetRawBytes()))
+					}
+				}
+			}
+		}
+	}
+
+	// Second call: data matches and status.conditions co-ownership is shed -> MUST skip (0 applies).
+	statusApplies.Store(0)
+	if err := reconciler.patchTunnelGatewayData(ctx, irGW, tunnel, config, hostnames, listeners); err != nil {
+		t.Fatalf("second patchTunnelGatewayData: %v", err)
+	}
+	if got := statusApplies.Load(); got != 0 {
+		t.Fatalf("second patchTunnelGatewayData status applies = %d, want 0", got)
+	}
+
+	// Third check (leaf-level ownership gap via real apiserver SSA): another manager steals
+	// exclusive ownership of a nested leaf (configVersion.remote: 1 -> 2 -> 1) while leaving
+	// final status values identical to config/hostnames/listeners.
+	// patchTunnelGatewayData MUST detect the leaf gap and apply once to reclaim it, then skip.
+	for _, val := range []int{2, 1} {
+		stealLeafApply := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"configVersion": map[string]any{
+					"remote": val,
+				},
+			},
+		}}
+		stealLeafApply.SetAPIVersion(v1alpha1.GroupVersion.String())
+		stealLeafApply.SetKind("CloudflareTunnel")
+		stealLeafApply.SetNamespace(ns)
+		stealLeafApply.SetName(tunnel.Name)
+		if err := direct.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(stealLeafApply), client.FieldOwner("foreign-status-writer"), client.ForceOwnership); err != nil {
+			t.Fatalf("steal configVersion.remote=%d leaf ownership: %v", val, err)
+		}
+	}
+	statusApplies.Store(0)
+	if err := reconciler.patchTunnelGatewayData(ctx, irGW, tunnel, config, hostnames, listeners); err != nil {
+		t.Fatalf("reclaim leaf patchTunnelGatewayData: %v", err)
+	}
+	if got := statusApplies.Load(); got != 1 {
+		t.Fatalf("reclaim leaf patchTunnelGatewayData status applies = %d, want 1", got)
+	}
+	statusApplies.Store(0)
+	if err := reconciler.patchTunnelGatewayData(ctx, irGW, tunnel, config, hostnames, listeners); err != nil {
+		t.Fatalf("post-reclaim patchTunnelGatewayData: %v", err)
+	}
+	if got := statusApplies.Load(); got != 0 {
+		t.Fatalf("post-reclaim patchTunnelGatewayData status applies = %d, want 0", got)
+	}
+}
+
+type countingSSAStatusClient struct {
+	client.Client
+	applies *atomic.Int64
+}
+
+func (c *countingSSAStatusClient) Status() client.SubResourceWriter {
+	return &countingSSASubResourceWriter{SubResourceWriter: c.Client.Status(), applies: c.applies}
+}
+
+type countingSSASubResourceWriter struct {
+	client.SubResourceWriter
+	applies *atomic.Int64
+}
+
+func (w *countingSSASubResourceWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	w.applies.Add(1)
+	return w.SubResourceWriter.Apply(ctx, obj, opts...)
+}
+
+// Regression test for Finding #7: after a generation bump, admission writes
+// Programmed=Unknown with a newer LastTransitionTime while statuses.Gateway
+// still holds the previous generation's Programmed=True timestamp; a full
+// patchGatewayStatus writing Programmed=True MUST keep monotonic timestamps
+// on both Gateway-level and listener-level Programmed conditions.
+func TestGatewayFullPatchPreservesMonotonicProgrammedTransitionTimeEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-monotonic-programmed"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	host := gatewayv1.Hostname("mono.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "mono-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+
+	t1 := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(5 * time.Second)
+	t3 := t2.Add(5 * time.Second)
+	currentClock := t1
+
+	reconciler := &GatewayReconciler{
+		Client:    direct,
+		APIReader: direct,
+		Scheme:    mgr.GetScheme(),
+		Now:       func() time.Time { return currentClock },
+	}
+	gwClass := &gatewayv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "flareway"}, Spec: gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName}}
+	gwCfg := &v1alpha1.GatewayClassConfig{ObjectMeta: metav1.ObjectMeta{Name: "flareway-cfg"}, Spec: v1alpha1.GatewayClassConfigSpec{ConformanceMode: true}}
+
+	// Gen 1 converged at t1 with Programmed=True.
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), gw); err != nil {
+		t.Fatal(err)
+	}
+	_, s1 := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway: gw, GatewayClass: gwClass, GatewayClassConfig: gwCfg,
+		Namespaces: []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&s1.Gateway, gw)
+	reconciler.setCloudflareProgrammedStatus(&s1.Gateway, gw, true, "ok", nil)
+	if err := reconciler.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gw), s1.Gateway); err != nil {
+		t.Fatalf("seed gen1 Programmed=True: %v", err)
+	}
+
+	// Gen 2 bump + snapshot captured BEFORE admission updates current to Unknown(t2).
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), gw); err != nil {
+		t.Fatal(err)
+	}
+	newHost := gatewayv1.Hostname("mono2.example.com")
+	gw.Spec.Listeners[0].Hostname = &newHost
+	if err := direct.Update(ctx, gw); err != nil {
+		t.Fatalf("bump gen2: %v", err)
+	}
+	reconcileStartGen2 := gw.DeepCopy()
+
+	// Concurrent admission pass on gen 2 records Unknown at t2 > t1.
+	currentClock = t2
+	_, admStatuses := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway: reconcileStartGen2, GatewayClass: gwClass, GatewayClassConfig: gwCfg,
+		Namespaces: []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&admStatuses.Gateway, reconcileStartGen2)
+	if err := reconciler.patchGatewayAdmissionStatus(ctx, client.ObjectKeyFromObject(gw), admStatuses.Gateway); err != nil {
+		t.Fatalf("admission Unknown at t2: %v", err)
+	}
+
+	// Now our pass converges at t3 > t2 using reconcileStartGen2 (whose status still carries True at t1!).
+	// setCloudflareProgrammedStatus calls meta.SetStatusCondition(True) onto True(t1), leaving t1 on desired.
+	currentClock = t3
+	_, convStatuses := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway: reconcileStartGen2, GatewayClass: gwClass, GatewayClassConfig: gwCfg,
+		Namespaces: []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&convStatuses.Gateway, reconcileStartGen2)
+	reconciler.setCloudflareProgrammedStatus(&convStatuses.Gateway, reconcileStartGen2, true, "ok", nil)
+	if err := reconciler.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gw), convStatuses.Gateway); err != nil {
+		t.Fatalf("full patchGatewayStatus at t3: %v", err)
+	}
+
+	var after gatewayv1.Gateway
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &after); err != nil {
+		t.Fatal(err)
+	}
+	prog := meta.FindStatusCondition(after.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if prog == nil || prog.Status != metav1.ConditionTrue {
+		t.Fatalf("Gateway Programmed = %#v, want True", prog)
+	}
+	if prog.LastTransitionTime.Time.Before(t2) {
+		t.Fatalf("Gateway Programmed.LastTransitionTime moved backward: got %v, live Unknown was %v", prog.LastTransitionTime.Time, t2)
+	}
+	lprog := meta.FindStatusCondition(after.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if lprog == nil || lprog.Status != metav1.ConditionTrue {
+		t.Fatalf("Listener Programmed = %#v, want True", lprog)
+	}
+	if lprog.LastTransitionTime.Time.Before(t2) {
+		t.Fatalf("Listener Programmed.LastTransitionTime moved backward: got %v, live Unknown was %v", lprog.LastTransitionTime.Time, t2)
 	}
 }

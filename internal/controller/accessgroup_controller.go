@@ -419,6 +419,9 @@ func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha
 		if err := r.Status().Patch(ctx, current, base); err != nil {
 			return err
 		}
+		if status == metav1.ConditionTrue {
+			clearGate(r.Invalidator, "AccessGroup", client.ObjectKeyFromObject(current))
+		}
 		*object = *current
 		return nil
 	})

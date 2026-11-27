@@ -569,7 +569,13 @@ func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "NetworkRoute", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func networkRouteFromStatus(object *v1alpha1.NetworkRoute) flarecloudflare.NetworkRoute {

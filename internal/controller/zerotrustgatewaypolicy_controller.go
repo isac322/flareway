@@ -606,7 +606,13 @@ func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, obje
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "ZeroTrustGatewayPolicy", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) now() time.Time {

@@ -327,7 +327,13 @@ func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, 
 		accessCondition(object.Generation, "Accepted", accepted, reason, message),
 		accessCondition(object.Generation, "Ready", ready, reason, message),
 	)
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if accepted == metav1.ConditionTrue && ready == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "AccessInfrastructureTarget", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func infrastructureTargetStatusIP(remote flarecloudflare.AccessInfrastructureTarget) v1alpha1.AccessInfrastructureTargetIPStatus {

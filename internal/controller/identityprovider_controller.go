@@ -954,10 +954,15 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if reflect.DeepEqual(beforeStatus, object.Status) {
-		return nil
+	if !reflect.DeepEqual(beforeStatus, object.Status) {
+		if err := r.Status().Patch(ctx, object, base); err != nil {
+			return err
+		}
 	}
-	return r.Status().Patch(ctx, object, base)
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 // finishRemoteError reports a failed remote call on the object's conditions.

@@ -397,7 +397,13 @@ func (r *VirtualNetworkReconciler) patchStatus(ctx context.Context, object *v1al
 	}
 	object.Status.ObservedGeneration = object.Generation
 	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if status == metav1.ConditionTrue {
+		clearGate(r.Invalidator, "VirtualNetwork", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func virtualNetworkFromStatus(object *v1alpha1.VirtualNetwork) flarecloudflare.VirtualNetwork {

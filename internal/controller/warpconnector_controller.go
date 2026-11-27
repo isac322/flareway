@@ -821,7 +821,13 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 		)
 	}
 	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
-	return r.Status().Patch(ctx, object, base)
+	if err := r.Status().Patch(ctx, object, base); err != nil {
+		return err
+	}
+	if len(conflicts) == 0 {
+		clearGate(r.Invalidator, "WARPConnector", client.ObjectKeyFromObject(object))
+	}
+	return nil
 }
 
 func (r *WARPConnectorReconciler) finishError(ctx context.Context, object *flarewayv1alpha1.WARPConnector, err error) (ctrl.Result, error) {
