@@ -1634,6 +1634,56 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		_, err = f.reconciler.Reconcile(f.ctx, f.request)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeZeroTTL), "repeated unchanged --freshness-traffic=0 reconcile must emit 0 CloudflareTunnel/status write requests")
+
+		// ADR 0004 regression 1: legacy-only condition ownership with identical
+		// condition values must still migrate to flareway-tunnel-status in 1 write,
+		// then settle to 0 writes on the next pass.
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		existingDegraded := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionPrivateListenerDegraded)
+		gomega.Expect(existingDegraded).NotTo(gomega.BeNil())
+		keptWithoutDegraded := make([]metav1.Condition, 0, len(tunnel.Status.Conditions))
+		for _, cond := range tunnel.Status.Conditions {
+			if cond.Type != v1alpha1.CloudflareTunnelConditionPrivateListenerDegraded {
+				keptWithoutDegraded = append(keptWithoutDegraded, cond)
+			}
+		}
+		applyTunnelConditions(f.direct, f.tunnelKey, tunnelStatusFieldManager, keptWithoutDegraded...)
+		applyTunnelConditions(f.direct, f.tunnelKey, "legacy-tunnel-controller", *existingDegraded)
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnelConditionOwners(&tunnel)[v1alpha1.CloudflareTunnelConditionPrivateListenerDegraded]).To(gomega.Equal([]string{"legacy-tunnel-controller"}))
+
+		writesBeforeMigrate := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeMigrate+1), "legacy-only condition ownership must migrate in exactly 1 condition write")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnelConditionOwners(&tunnel)[v1alpha1.CloudflareTunnelConditionPrivateListenerDegraded]).To(gomega.ContainElement(tunnelStatusFieldManager))
+
+		writesAfterMigrate := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesAfterMigrate), "post-migration steady-state reconcile must emit 0 status writes")
+
+		// ADR 0004 regression 2: torn Ready=True alongside ConfigApplied=False
+		// must clamp Ready back to False in 1 write, then settle to 0 writes.
+		applyTunnelConditions(f.direct, f.tunnelKey, "legacy-tunnel-controller",
+			tunnelCondition(v1alpha1.CloudflareTunnelConditionReady, metav1.ConditionTrue, "Ready", "torn ready", tunnel.Generation, metav1.NewTime(f.clock)))
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady).Status).To(gomega.Equal(metav1.ConditionTrue))
+
+		writesBeforeClamp := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeClamp+1), "torn Ready=True over ConfigApplied=False must clamp in exactly 1 condition write")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		readyCond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady)
+		gomega.Expect(readyCond).NotTo(gomega.BeNil())
+		gomega.Expect(readyCond.Status).To(gomega.Equal(metav1.ConditionFalse))
+
+		writesAfterClamp := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesAfterClamp), "post-clamp steady-state reconcile must emit 0 status writes")
 	})
 })
 

@@ -1404,46 +1404,6 @@ func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.Cloud
 		!apiequality.Semantic.DeepEqual(tunnel.Status.Listeners, desiredListeners)
 }
 
-func tunnelGatewayStatusUnchanged(
-	tunnel *v1alpha1.CloudflareTunnel,
-	config v1alpha1.CloudflareTunnelConfigVersion,
-	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
-	listeners []v1alpha1.CloudflareTunnelListenerStatus,
-	conditions []metav1.Condition,
-) bool {
-	if tunnel == nil {
-		return false
-	}
-	if !apiequality.Semantic.DeepEqual(tunnel.Status.ConfigVersion, config) ||
-		!apiequality.Semantic.DeepEqual(tunnel.Status.Hostnames, hostnames) ||
-		!apiequality.Semantic.DeepEqual(tunnel.Status.Listeners, listeners) {
-		return false
-	}
-	for _, want := range conditions {
-		got := meta.FindStatusCondition(tunnel.Status.Conditions, want.Type)
-		if got == nil {
-			return false
-		}
-		// Match tunnel_conditions.go normalization: a zero ObservedGeneration
-		// inherits the stored condition's ObservedGeneration, and an authored
-		// update older than the stored ObservedGeneration is ignored.
-		if want.ObservedGeneration != 0 && got.ObservedGeneration > want.ObservedGeneration {
-			continue
-		}
-		wantObservedGeneration := want.ObservedGeneration
-		if wantObservedGeneration == 0 {
-			wantObservedGeneration = got.ObservedGeneration
-		}
-		if got.Status != want.Status ||
-			got.Reason != want.Reason ||
-			got.Message != want.Message ||
-			got.ObservedGeneration != wantObservedGeneration {
-			return false
-		}
-	}
-	return true
-}
-
 func (r *GatewayReconciler) gatewayDataplaneDrained(ctx context.Context, gateway *gatewayv1.Gateway) (bool, error) {
 	if gateway == nil || gateway.UID == "" {
 		return false, nil
@@ -1563,10 +1523,8 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 					privateListenerCondition(compiled, privateState, now),
 					driftCondition,
 				}
-				if !tunnelGatewayStatusUnchanged(currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions) {
-					if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions...); err != nil {
-						return 0, err
-					}
+				if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions...); err != nil {
+					return 0, err
 				}
 			}
 			return programmedRequeue, nil
@@ -1584,10 +1542,8 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 		privateListenerCondition(compiled, privateState, now),
 		driftCondition,
 	}
-	if !tunnelGatewayStatusUnchanged(currentTunnel, config, hostnames, listeners, conditions) {
-		if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, hostnames, listeners, conditions...); err != nil {
-			return 0, err
-		}
+	if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, hostnames, listeners, conditions...); err != nil {
+		return 0, err
 	}
 	return requeueAfter, nil
 }

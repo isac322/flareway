@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -29,6 +30,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1458,6 +1460,9 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		if err := validate(&live); err != nil {
 			return err
 		}
+		if tunnelGatewayDataUnchanged(&live, config, hostnames, listeners) {
+			return nil
+		}
 		apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
 		apply.SetAPIVersion(v1alpha1.GroupVersion.String())
 		apply.SetKind("CloudflareTunnel")
@@ -1474,6 +1479,77 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		lastErr = err
 	}
 	return fmt.Errorf("apply Gateway-owned CloudflareTunnel %s status: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
+}
+
+func tunnelGatewayDataUnchanged(
+	live *v1alpha1.CloudflareTunnel,
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+) bool {
+	if live == nil {
+		return false
+	}
+	if !tunnelConfigVersionEqual(live.Status.ConfigVersion, config) ||
+		!apiequality.Semantic.DeepEqual(live.Status.Hostnames, hostnames) ||
+		!apiequality.Semantic.DeepEqual(live.Status.Listeners, listeners) {
+		return false
+	}
+	return gatewayDataOwnershipPresent(live)
+}
+
+func tunnelConfigVersionEqual(left, right v1alpha1.CloudflareTunnelConfigVersion) bool {
+	return left.Desired == right.Desired &&
+		left.DesiredHash == right.DesiredHash &&
+		left.Applied == right.Applied &&
+		left.Remote == right.Remote &&
+		tunnelTimeEqual(left.AppliedAt, right.AppliedAt) &&
+		tunnelTimeEqual(left.CreatedAt, right.CreatedAt)
+}
+
+func tunnelTimeEqual(left, right *metav1.Time) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Time.Truncate(time.Second).Equal(right.Truncate(time.Second))
+}
+
+func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel) bool {
+	if live == nil {
+		return false
+	}
+	needConfigVersion := live.Status.ConfigVersion.Desired != 0 ||
+		live.Status.ConfigVersion.DesiredHash != "" ||
+		live.Status.ConfigVersion.Applied != 0 ||
+		live.Status.ConfigVersion.Remote != 0 ||
+		live.Status.ConfigVersion.AppliedAt != nil ||
+		live.Status.ConfigVersion.CreatedAt != nil
+	for _, entry := range live.ManagedFields {
+		if entry.Manager != gatewayFieldManager || entry.FieldsV1 == nil {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields); err != nil {
+			continue
+		}
+		status, _ := fields["f:status"].(map[string]any)
+		if status == nil {
+			continue
+		}
+		if _, ok := status["f:hostnames"]; !ok {
+			continue
+		}
+		if _, ok := status["f:listeners"]; !ok {
+			continue
+		}
+		if needConfigVersion {
+			if _, ok := status["f:configVersion"]; !ok {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // gatewayTunnelCondition stamps an authored condition with the caller's clock.
