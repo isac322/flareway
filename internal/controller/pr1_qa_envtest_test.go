@@ -1760,18 +1760,63 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 
 		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
 		for _, entry := range tunnel.ManagedFields {
-			if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.FieldsV1 == nil {
+			if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.Operation != metav1.ManagedFieldsOperationApply || entry.FieldsV1 == nil {
 				continue
 			}
 			var fields map[string]any
 			gomega.Expect(json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields)).To(gomega.Succeed())
 			statusMap, _ := fields["f:status"].(map[string]any)
 			_, hasConditions := statusMap["f:conditions"]
-			gomega.Expect(hasConditions).To(gomega.BeFalse(), "flareway-gateway status ManagedFields must shed f:conditions")
+			gomega.Expect(hasConditions).To(gomega.BeFalse(), "flareway-gateway status Apply ManagedFields must shed f:conditions")
 		}
 
-		// Case 5: Non-status subresource (Subresource == "") ownership is ignored, and
-		// empty hostnames/listeners list ownership gap + zeroed ConfigVersion converges 1 -> 0.
+		// ADR 0004 Line 100: A lingering Status().Update entry under flareway-gateway
+		// owning f:conditions alongside shared flareway-tunnel-status condition ownership
+		// and flareway-gateway Apply data ownership must NOT force status writes.
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		tunnel.Status.Conditions = append(tunnel.Status.Conditions, metav1.Condition{
+			Type:               "LegacyUpdateCoOwner",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Legacy",
+			Message:            "lingering Status().Update co-owner entry",
+			ObservedGeneration: tunnel.Generation,
+			LastTransitionTime: metav1.NewTime(f.clock),
+		})
+		gomega.Expect(f.direct.Status().Update(f.ctx, &tunnel, client.FieldOwner(gatewayFieldManager))).To(gomega.Succeed())
+
+		hasGatewayUpdateConditions := func(obj *v1alpha1.CloudflareTunnel) bool {
+			for _, entry := range obj.ManagedFields {
+				if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.Operation != metav1.ManagedFieldsOperationUpdate || entry.FieldsV1 == nil {
+					continue
+				}
+				var fields map[string]any
+				if err := json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields); err != nil {
+					continue
+				}
+				statusMap, _ := fields["f:status"].(map[string]any)
+				if _, ok := statusMap["f:conditions"]; ok {
+					return true
+				}
+			}
+			return false
+		}
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(hasGatewayUpdateConditions(&tunnel)).To(gomega.BeTrue(), "Status().Update must record flareway-gateway Update entry owning f:conditions")
+
+		writesBeforeUpdateCoOwner := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeUpdateCoOwner), "lingering Status().Update f:conditions entry must emit 0 status writes")
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeUpdateCoOwner), "repeated reconcile with lingering Status().Update f:conditions entry must emit 0 status writes")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(hasGatewayUpdateConditions(&tunnel)).To(gomega.BeTrue(), "Status().Update f:conditions entry remains intact")
+
+		// Case 5: Non-status subresource (Subresource == "") ownership is ignored so missing
+		// status Apply ownership converges 1 -> 0; note Kubernetes omits empty hostnames/listeners
+		// from FieldsV1 even on an explicit [] apply (leaving f:configVersion under f:status),
+		// and nonempty -> empty transitions still take 1 write to clear both slices -> 0 writes.
 		emptyTunnel := &v1alpha1.CloudflareTunnel{
 			ObjectMeta: metav1.ObjectMeta{Name: "empty-list-tunnel", Namespace: ns},
 			Spec:       tunnel.Spec,
@@ -1823,10 +1868,36 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		}()
 
 		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
-		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "empty hostnames/listeners ownership gap must trigger 1 SSA apply even with non-status ManagedFields")
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "missing status Apply ownership must trigger 1 write even when non-status ManagedFields exists")
 		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(emptyTunnel), emptyTunnel)).To(gomega.Succeed())
 		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
-		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "steady-state empty hostnames/listeners + zeroed ConfigVersion must emit 0 writes")
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "steady-state empty lists + zeroed ConfigVersion must emit 0 writes")
+
+		// Nonempty -> empty clear transition on real API server: 1 write populates nonempty,
+		// 1 write clears both hostnames and listeners to [], and follow-up unchanged pass emits 0 writes.
+		populatedHostnames := []v1alpha1.CloudflareTunnelHostnameStatus{{
+			Hostname:         "clear-me.example.com",
+			ProtectionDomain: "http-unprotected",
+			Guard:            v1alpha1.HostnameGuardUnprotected,
+		}}
+		populatedListeners := []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "http",
+			Exposure: v1alpha1.ExposurePublic,
+		}}
+		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, populatedHostnames, populatedListeners)).To(gomega.Succeed())
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(2)), "populating hostnames and listeners must emit 1 write")
+		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(emptyTunnel), emptyTunnel)).To(gomega.Succeed())
+		gomega.Expect(emptyTunnel.Status.Hostnames).To(gomega.HaveLen(1))
+		gomega.Expect(emptyTunnel.Status.Listeners).To(gomega.HaveLen(1))
+
+		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(3)), "transitioning nonempty hostnames and listeners to empty must emit 1 write")
+		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(emptyTunnel), emptyTunnel)).To(gomega.Succeed())
+		gomega.Expect(emptyTunnel.Status.Hostnames).To(gomega.BeEmpty())
+		gomega.Expect(emptyTunnel.Status.Listeners).To(gomega.BeEmpty())
+
+		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(3)), "follow-up unchanged pass after clearing to empty must emit 0 writes")
 	})
 })
 

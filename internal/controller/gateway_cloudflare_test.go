@@ -1091,3 +1091,147 @@ func TestRetainAccessRevocationPreservesRecordedPodIPBinding(t *testing.T) {
 		}
 	}
 }
+
+func TestGatewayDataOwnershipPresentStrictMatching(t *testing.T) {
+	statusMap := map[string]any{
+		"configVersion": map[string]any{
+			"desired": int64(1),
+		},
+		"hostnames": []any{
+			map[string]any{
+				"hostname":          "app.example.com",
+				"protectionDomain":  "http-unprotected",
+				"accessApplication": "",
+				"guard":             "Unprotected",
+			},
+		},
+		"listeners": []any{},
+	}
+	validFieldsJSON := `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"accessApplication\":\"\",\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`
+
+	makeEntry := func(op metav1.ManagedFieldsOperationType, subresource, rawJSON string) metav1.ManagedFieldsEntry {
+		return metav1.ManagedFieldsEntry{
+			Manager:     gatewayFieldManager,
+			Operation:   op,
+			Subresource: subresource,
+			FieldsV1:    metav1.NewFieldsV1(rawJSON),
+		}
+	}
+
+	tests := []struct {
+		name      string
+		entries   []metav1.ManagedFieldsEntry
+		statusMap map[string]any
+		want      bool
+	}{
+		{
+			name:      "reordered JSON composite keys match",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"protectionDomain\":\"http-unprotected\",\"hostname\":\"app.example.com\",\"accessApplication\":\"\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: statusMap,
+			want:      true,
+		},
+		{
+			name:      "missing composite key (accessApplication omitted when desired empty string) fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name:      "null composite key fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"accessApplication\":null,\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name:      "unexpected extra composite key fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"accessApplication\":\"\",\"extra\":\"unexpected\",\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name:    "numeric composite key fails even when elem string matches",
+			entries: []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"accessApplication\":123,\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: map[string]any{
+				"configVersion": map[string]any{"desired": int64(1)},
+				"hostnames": []any{map[string]any{
+					"hostname":          "app.example.com",
+					"protectionDomain":  "http-unprotected",
+					"accessApplication": "123",
+					"guard":             "Unprotected",
+				}},
+			},
+			want: false,
+		},
+		{
+			name:    "bool composite key fails even when elem string matches",
+			entries: []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{\"accessApplication\":true,\"hostname\":\"app.example.com\",\"protectionDomain\":\"http-unprotected\"}":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: map[string]any{
+				"configVersion": map[string]any{"desired": int64(1)},
+				"hostnames": []any{map[string]any{
+					"hostname":          "app.example.com",
+					"protectionDomain":  "http-unprotected",
+					"accessApplication": "true",
+					"guard":             "Unprotected",
+				}},
+			},
+			want: false,
+		},
+		{
+			name:      "malformed JSON in composite key fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:desired":{}},"f:hostnames":{"k:{broken":{"f:accessApplication":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}}}}`)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name:    "unknown top-level field in statusMap fails closed",
+			entries: []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "status", validFieldsJSON)},
+			statusMap: map[string]any{
+				"configVersion": map[string]any{"desired": int64(1)},
+				"unknownField":  "value",
+			},
+			want: false,
+		},
+		{
+			name:      "non-status subresource entry alone fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationApply, "", validFieldsJSON)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name:      "Operation Update alone fails",
+			entries:   []metav1.ManagedFieldsEntry{makeEntry(metav1.ManagedFieldsOperationUpdate, "status", validFieldsJSON)},
+			statusMap: statusMap,
+			want:      false,
+		},
+		{
+			name: "Operation Update owning f:conditions alongside Apply data entry passes",
+			entries: []metav1.ManagedFieldsEntry{
+				makeEntry(metav1.ManagedFieldsOperationUpdate, "status", `{"f:status":{"f:conditions":{"k:{\"type\":\"LegacyCoOwner\"}":{".":{},"f:type":{}}}}}`),
+				makeEntry(metav1.ManagedFieldsOperationApply, "status", validFieldsJSON),
+			},
+			statusMap: statusMap,
+			want:      true,
+		},
+		{
+			name: "Operation Apply owning f:conditions alongside Apply data entry fails to shed",
+			entries: []metav1.ManagedFieldsEntry{
+				makeEntry(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:conditions":{},"f:configVersion":{"f:desired":{}}}}`),
+				makeEntry(metav1.ManagedFieldsOperationApply, "status", validFieldsJSON),
+			},
+			statusMap: statusMap,
+			want:      false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tunnel := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{ManagedFields: tc.entries},
+			}
+			got := gatewayDataOwnershipPresent(tunnel, tc.statusMap)
+			if got != tc.want {
+				t.Fatalf("gatewayDataOwnershipPresent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

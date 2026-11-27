@@ -1521,7 +1521,11 @@ func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[
 	}
 	covered := false
 	for _, entry := range live.ManagedFields {
-		if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.FieldsV1 == nil {
+		// Only status Apply entries matter: SSA Apply cannot shed fields held in
+		// a separate Status().Update entry and cannot derive data ownership from
+		// Update; ADR 0004 allows a lingering Update co-owner once shared
+		// condition ownership is established.
+		if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.Operation != metav1.ManagedFieldsOperationApply || entry.FieldsV1 == nil {
 			continue
 		}
 		var fields map[string]any
@@ -1535,10 +1539,8 @@ func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[
 		if _, hasConditions := statusFields["f:conditions"]; hasConditions {
 			return false
 		}
-		if entry.Operation == metav1.ManagedFieldsOperationApply && !covered {
-			if fieldsV1CoversStatusMap(statusFields, statusMap) {
-				covered = true
-			}
+		if fieldsV1CoversStatusMap(statusFields, statusMap) {
+			covered = true
 		}
 	}
 	return covered
@@ -1669,22 +1671,22 @@ func fieldsV1CoversMapList(ownedList map[string]any, items []any, keyFields []st
 }
 
 func mapKeysMatch(parsed, elem map[string]any, keyFields []string) bool {
+	if len(parsed) != len(keyFields) {
+		return false
+	}
 	for _, kf := range keyFields {
-		if mapKeyString(parsed[kf]) != mapKeyString(elem[kf]) {
+		parsedVal, pOk := parsed[kf]
+		elemVal, eOk := elem[kf]
+		if !pOk || !eOk {
+			return false
+		}
+		pStr, pStrOk := parsedVal.(string)
+		eStr, eStrOk := elemVal.(string)
+		if !pStrOk || !eStrOk || pStr != eStr {
 			return false
 		}
 	}
 	return true
-}
-
-func mapKeyString(v any) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return fmt.Sprint(v)
 }
 
 // gatewayTunnelCondition stamps an authored condition with the caller's clock.
