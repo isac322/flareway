@@ -1236,9 +1236,45 @@ func validateDesiredTunnelStatusLimits(gateway *ir.Gateway, tunnel *v1alpha1.Clo
 	if len(listeners) > maxTunnelStatusListeners {
 		return fmt.Errorf("desired CloudflareTunnel status.listeners count %d exceeds maximum %d", len(listeners), maxTunnelStatusListeners)
 	}
+	liveByListener := make(map[string]map[string]struct{}, len(listeners))
+	for _, domain := range gateway.Domains {
+		if domain.ShadowOnly {
+			continue
+		}
+		seen := liveByListener[domain.ListenerName]
+		if seen == nil {
+			seen = make(map[string]struct{})
+			liveByListener[domain.ListenerName] = seen
+		}
+		seen[domain.Name] = struct{}{}
+		if len(seen) > maxTunnelListenerProtectionDomains {
+			return fmt.Errorf("desired CloudflareTunnel listener %q live protectionDomains count %d exceeds maximum %d", domain.ListenerName, len(seen), maxTunnelListenerProtectionDomains)
+		}
+	}
+	listenerByName := make(map[string]v1alpha1.CloudflareTunnelListenerStatus, len(listeners))
 	for _, listener := range listeners {
 		if len(listener.ProtectionDomains) > maxTunnelListenerProtectionDomains {
 			return fmt.Errorf("desired CloudflareTunnel listener %q protectionDomains count %d exceeds maximum %d", listener.Name, len(listener.ProtectionDomains), maxTunnelListenerProtectionDomains)
+		}
+		listenerByName[string(listener.Name)] = listener
+	}
+	for _, domain := range gateway.Domains {
+		if !domain.ShadowOnly {
+			continue
+		}
+		listener, ok := listenerByName[domain.ListenerName]
+		if !ok {
+			return fmt.Errorf("desired CloudflareTunnel listener %q missing for legacy shadow domain %q (port %d)", domain.ListenerName, domain.Name, domain.EnvoyPort)
+		}
+		recoverable := false
+		for _, pd := range listener.ProtectionDomains {
+			if pd.EnvoyPort == domain.EnvoyPort && (pd.Name == domain.Name || pd.Name == domain.ListenerName) {
+				recoverable = true
+				break
+			}
+		}
+		if !recoverable {
+			return fmt.Errorf("desired CloudflareTunnel listener %q cannot retain legacy shadow domain %q (port %d) within %d protectionDomains limit", domain.ListenerName, domain.Name, domain.EnvoyPort, maxTunnelListenerProtectionDomains)
 		}
 	}
 	if hostnames := desiredTunnelHostnames(gateway, 1); len(hostnames) > maxTunnelStatusHostnames {
@@ -1268,12 +1304,15 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 	// Gateway reconcile fails before any route status is written. Report
 	// each distinct protection domain once instead.
 	//
-	// Pass 1 emits live (!ShadowOnly) domains and records basePort when the
-	// listener's literal base domain is present. Pass 2 omits ShadowOnly
-	// entries whose EnvoyPort matches basePort (Case A: base already records
-	// that port in Status.Listeners, preserving full 256-live-domain capacity)
-	// and retains Case B ShadowOnly entries only within the 256 MaxItems cap.
+	// Pass 1 collects distinct live (!ShadowOnly) domains and records basePort
+	// when the listener's literal base domain is present. Pass 2 collects
+	// distinct ShadowOnly domains that cannot piggyback on basePort (Case B).
+	// When <=256 live domains plus required shadows would exceed MaxItems=256,
+	// trailing new unprotected carve-out live status rows (!Protected && Name!=name)
+	// are deferred until connector ACK drops the legacy shadow, keeping deterministic
+	// port allocation stable with zero extra Cloudflare PUTs.
 	seen := make(map[string]struct{}, len(domains))
+	var liveList []v1alpha1.CloudflareProtectionDomainStatus
 	var basePort int32
 	for _, domain := range domains {
 		if domain.ListenerName != name || domain.ShadowOnly {
@@ -1286,8 +1325,9 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 		if domain.Name == name && domain.EnvoyPort > 0 {
 			basePort = domain.EnvoyPort
 		}
-		status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+		liveList = append(liveList, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
 	}
+	var requiredShadows []v1alpha1.CloudflareProtectionDomainStatus
 	for _, domain := range domains {
 		if domain.ListenerName != name || !domain.ShadowOnly {
 			continue
@@ -1298,11 +1338,33 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 		if _, duplicate := seen[domain.Name]; duplicate {
 			continue
 		}
-		if len(status.ProtectionDomains) >= maxTunnelListenerProtectionDomains {
+		seen[domain.Name] = struct{}{}
+		requiredShadows = append(requiredShadows, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+	}
+
+	var deferred map[int]bool
+	if len(liveList) <= maxTunnelListenerProtectionDomains && len(liveList)+len(requiredShadows) > maxTunnelListenerProtectionDomains {
+		deficit := len(liveList) + len(requiredShadows) - maxTunnelListenerProtectionDomains
+		deferred = make(map[int]bool, deficit)
+		for i := len(liveList) - 1; i >= 0 && len(deferred) < deficit; i-- {
+			if !liveList[i].Protected && liveList[i].Name != name {
+				deferred[i] = true
+			}
+		}
+	}
+
+	status.ProtectionDomains = make([]v1alpha1.CloudflareProtectionDomainStatus, 0, min(len(liveList)+len(requiredShadows), maxTunnelListenerProtectionDomains))
+	for i, pd := range liveList {
+		if deferred[i] {
 			continue
 		}
-		seen[domain.Name] = struct{}{}
-		status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+		status.ProtectionDomains = append(status.ProtectionDomains, pd)
+	}
+	for _, pd := range requiredShadows {
+		if len(status.ProtectionDomains) >= maxTunnelListenerProtectionDomains {
+			break
+		}
+		status.ProtectionDomains = append(status.ProtectionDomains, pd)
 	}
 	return status
 }

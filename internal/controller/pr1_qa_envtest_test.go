@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2875,6 +2876,316 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(cfgApplied.Status).To(gomega.Equal(metav1.ConditionFalse))
 		gomega.Expect(cfgApplied.Reason).To(gomega.Equal("ConfigurationError"))
 	})
+
+	// Case B at exact 256 live-domain boundary (no literal "web" base domain):
+	// 127 split hosts (254) + 1 protected-only (255) + 1 protected wildcard *.example.com (256)
+	// + legacy web-public:18080 must retain web-public:18080 in Status.Listeners by temporarily
+	// deferring the trailing new unprotected carve-out status row (255 live + 1 shadow = 256),
+	// keep s000 /health reachable on 18080 across Pass 1 & Pass 2 while connector holds v1,
+	// keep all 256 dedicated ports deterministic (0 extra Cloudflare PUTs), and post-ACK drop
+	// web-public, restore all 256 live domains in Status.Listeners, 403 18080, and converge to 0 writes.
+	ginkgo.It("Finding 4C: Case B 256 live-domain boundary retains shadow across v1 rollout and restores 256 live rows post-ACK", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{})
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		acct.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePublic}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		wildHost := gatewayv1.Hostname("*.example.com")
+		gw.Spec.Listeners = []gatewayv1.Listener{{
+			Name: "web", Hostname: &wildHost, Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+		}}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: ns},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8080}}},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, svc)).To(gomega.Succeed())
+
+		pathType := gatewayv1.PathMatchPathPrefix
+		adminRule := gatewayv1.SectionName("admin")
+		healthRule := gatewayv1.SectionName("health")
+		wildRule := gatewayv1.SectionName("wild")
+		port := gatewayv1.PortNumber(8080)
+
+		// 127 split hosts across 8 HTTPRoutes -> 254 live domains.
+		targetRefs := make([]gatewayv1.LocalPolicyTargetReferenceWithSectionName, 0, 10)
+		splitHosts := make([]string, 0, 127)
+		for chunk := range 8 {
+			count := 16
+			if chunk == 7 {
+				count = 15
+			}
+			hostnames := make([]gatewayv1.Hostname, 0, count)
+			for j := range count {
+				h := fmt.Sprintf("s%03d.example.com", chunk*16+j)
+				hostnames = append(hostnames, gatewayv1.Hostname(h))
+				splitHosts = append(splitHosts, h)
+			}
+			routeName := fmt.Sprintf("split-%d", chunk)
+			route := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: routeName, Namespace: ns, CreationTimestamp: metav1.NewTime(time.Unix(int64(chunk+1), 0))},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name)}}},
+					Hostnames:       hostnames,
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Name:        &adminRule,
+							Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/admin")}}},
+							BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+						},
+						{
+							Name:        &healthRule,
+							Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/health")}}},
+							BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+						},
+					},
+				},
+			}
+			gomega.Expect(f.direct.Create(f.ctx, route)).To(gomega.Succeed())
+			targetRefs = append(targetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: gatewayv1.ObjectName(routeName)},
+				SectionName:                &adminRule,
+			})
+		}
+
+		// +1 protected-only host -> 255 live domains.
+		protOnlyHost := "ponly.example.com"
+		protOnlyRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "prot-only", Namespace: ns, CreationTimestamp: metav1.NewTime(time.Unix(20, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name)}}},
+				Hostnames:       []gatewayv1.Hostname{gatewayv1.Hostname(protOnlyHost)},
+				Rules: []gatewayv1.HTTPRouteRule{{
+					Name:        &adminRule,
+					Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/admin")}}},
+					BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+				}},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, protOnlyRoute)).To(gomega.Succeed())
+		targetRefs = append(targetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+			LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "prot-only"},
+			SectionName:                &adminRule,
+		})
+
+		// +1 protected wildcard HTTPRoute (*.example.com) -> 256 live domains, NO literal "web" base domain (Case B).
+		wildRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "wild-protected", Namespace: ns, CreationTimestamp: metav1.NewTime(time.Unix(21, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name)}}},
+				Hostnames:       []gatewayv1.Hostname{wildHost},
+				Rules: []gatewayv1.HTTPRouteRule{{
+					Name:        &wildRule,
+					Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/")}}},
+					BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+				}},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, wildRoute)).To(gomega.Succeed())
+		targetRefs = append(targetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+			LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "wild-protected"},
+			SectionName:                &wildRule,
+		})
+
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-caseb", Namespace: ns},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef:  corev1.LocalObjectReference{Name: acct.Name},
+				Type:        v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs:  targetRefs,
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "app-caseb", SessionDuration: "1h"},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, app)).To(gomega.Succeed())
+
+		indexedClient := handoffIndexedClient{Client: f.direct}
+		accessReconciler := &AccessApplicationReconciler{
+			Client:              indexedClient,
+			APIReader:           indexedClient,
+			Scheme:              f.direct.Scheme(),
+			NewCloudflareClient: newFakeAccessApplicationCloudflare().Client,
+			OperatorNamespace:   accessApplicationAUDNamespace,
+			Now:                 func() time.Time { return f.clock },
+		}
+		for range 2 {
+			_, err := accessReconciler.Reconcile(f.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
+
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: acct.Name}, &acct)).To(gomega.Succeed())
+		var audSecret corev1.Secret
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{
+			Namespace: accessApplicationAUDNamespace,
+			Name:      accessAUDSecretName(app, f.gatewayKey),
+		}, &audSecret)).To(gomega.Succeed())
+		appDigest := accessBindingDigest(ir.ProtectionDomain{
+			AccessApplication: ns + "/app-caseb",
+			Protected:         true,
+			Access: &ir.AccessGuard{
+				AUDs:       []string{string(audSecret.Data["aud"])},
+				TeamName:   acct.Status.Verified.TeamName,
+				AuthDomain: acct.Status.Verified.AuthDomain,
+			},
+		})
+
+		// Pre-upgrade v0.5.0 Case B seed: web-public:18080 for s000.example.com and NO literal "web" domain.
+		seedHostnames := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0, 256)
+		appHashFor := func(h string) string {
+			sum := sha256.Sum256([]byte(ns + "/app-caseb\x00" + h))
+			return "web-access-" + ns + "-app-caseb-" + hex.EncodeToString(sum[:4])
+		}
+		pubHashFor := func(h string) string {
+			sum := sha256.Sum256([]byte("public\x00" + h))
+			return "web-public-" + hex.EncodeToString(sum[:4])
+		}
+		for idx, h := range splitHosts {
+			pubPD := pubHashFor(h)
+			if idx == 0 {
+				pubPD = "web-public"
+			}
+			seedHostnames = append(seedHostnames,
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: h, ProtectionDomain: pubPD, Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: h, ProtectionDomain: appHashFor(h), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+			)
+		}
+		seedHostnames = append(seedHostnames,
+			v1alpha1.CloudflareTunnelHostnameStatus{Hostname: protOnlyHost, ProtectionDomain: appHashFor(protOnlyHost), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+			v1alpha1.CloudflareTunnelHostnameStatus{Hostname: string(wildHost), ProtectionDomain: appHashFor(string(wildHost)), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+		)
+
+		f.remote.remoteVersion = 1
+		f.prober.version = 1
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		seedWriter := &GatewayReconciler{Client: f.direct, APIReader: f.direct, Scheme: f.direct.Scheme()}
+		seedIR := &ir.Gateway{Key: f.gatewayKey, UID: gw.UID}
+		gomega.Expect(seedWriter.patchTunnelGatewayData(
+			f.ctx, seedIR, &tunnel,
+			v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, DesiredHash: "v05-caseb-hash", Applied: 1, Remote: 1},
+			seedHostnames,
+			[]v1alpha1.CloudflareTunnelListenerStatus{{
+				Name:     "web",
+				Exposure: v1alpha1.ExposurePublic,
+				ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+					{Name: "web-public", EnvoyPort: 18080},
+				},
+			}},
+		)).To(gomega.Succeed())
+
+		inspectS000On18080 := func() (hasListener bool, hasHealthRoute bool, has403Block bool) {
+			f.snapshots.publisher.mu.RLock()
+			snap := f.snapshots.publisher.snapshots[f.gatewayKey.String()]
+			f.snapshots.publisher.mu.RUnlock()
+			gomega.Expect(snap).NotTo(gomega.BeNil())
+			var targetRoute string
+			for _, res := range snap.GetResources(resourcev3.ListenerType) {
+				l := res.(*listenerv3.Listener)
+				if l.GetAddress().GetSocketAddress().GetPortValue() != 18080 {
+					continue
+				}
+				for _, fc := range l.GetFilterChains() {
+					for _, filter := range fc.GetFilters() {
+						if filter.Name != "envoy.filters.network.http_connection_manager" {
+							continue
+						}
+						var hcm hcmv3.HttpConnectionManager
+						if err := filter.GetTypedConfig().UnmarshalTo(&hcm); err == nil {
+							if rdsName := hcm.GetRds().GetRouteConfigName(); rdsName != "" {
+								targetRoute = rdsName
+							}
+						}
+					}
+				}
+			}
+			if targetRoute == "" {
+				return false, false, false
+			}
+			rc := snap.GetResources(resourcev3.RouteType)[targetRoute].(*routev3.RouteConfiguration)
+			for _, vh := range rc.GetVirtualHosts() {
+				if !slices.Contains(vh.GetDomains(), "s000.example.com") {
+					continue
+				}
+				for _, route := range vh.GetRoutes() {
+					if route.GetDirectResponse() != nil && route.GetDirectResponse().GetStatus() == 403 {
+						has403Block = true
+					}
+					if route.GetMatch().GetPathSeparatedPrefix() == "/health" && route.GetRoute() != nil {
+						hasHealthRoute = true
+					}
+				}
+			}
+			return true, hasHealthRoute, has403Block
+		}
+
+		// Pass 1 & Pass 2 while connector holds v1:
+		// Both passes must retain web-public:18080 in Status.Listeners (256 items = 255 live + web-public),
+		// keep s000.example.com /health active on 18080 (no 403), and emit exactly 1 PUT total.
+		for pass := 1; pass <= 2; pass++ {
+			_, err := f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+			hasListener, hasHealth, has403 := inspectS000On18080()
+			gomega.Expect(hasListener).To(gomega.BeTrue(), fmt.Sprintf("Case B pass %d must keep legacy 18080 listener", pass))
+			gomega.Expect(hasHealth).To(gomega.BeTrue(), fmt.Sprintf("Case B pass %d must keep s000 /health on 18080", pass))
+			gomega.Expect(has403).To(gomega.BeFalse(), fmt.Sprintf("Case B pass %d must not 403 s000", pass))
+
+			gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+			gomega.Expect(tunnel.Status.Listeners).To(gomega.HaveLen(1))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.ContainElement(v1alpha1.CloudflareProtectionDomainStatus{
+				Name: "web-public", EnvoyPort: 18080,
+			}), fmt.Sprintf("Case B pass %d must retain web-public:18080 in Status.Listeners", pass))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).NotTo(gomega.ContainElement(gomega.HaveField("Name", "web")))
+		}
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "Case B 256-domain pre-ACK passes must emit exactly 1 remote PUT")
+		gomega.Expect(tunnel.Status.ConfigVersion.Desired).To(gomega.Equal(int64(2)))
+
+		// Connector ACKs v2 -> drops web-public from Status.Hostnames; follow-up removes shadow
+		// (closing legacy 18080 listener in Case B), drops web-public from Status.Listeners,
+		// restores all 256 live domains, and causes 0 extra PUTs.
+		f.prober.version = 2
+		_, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+		// Reconcile once after post-shadow Envoy ACK so ConfigApplied=True settles before counting steady-state writes.
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "post-ACK cleanup and 256-row restoration must cause 0 extra Cloudflare PUTs")
+		hasListener, hasHealth, _ := inspectS000On18080()
+		gomega.Expect(hasListener).To(gomega.BeFalse(), "post-ACK Case B has no base domain so legacy 18080 listener must be removed")
+		gomega.Expect(hasHealth).To(gomega.BeFalse())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Listeners).To(gomega.HaveLen(1))
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).NotTo(gomega.ContainElement(gomega.HaveField("Name", "web-public")))
+
+		// Steady-state reconcile converges to 0 writes and 0 PUTs.
+		counter := &tunnelStatusWriteCounterClient{Client: f.direct, tunnelName: tunnel.Name}
+		f.reconciler.Client = counter
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(counter.writes.Load()).To(gomega.Equal(int64(0)))
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+	})
 })
 
 // QA-1-REG-5 (controller): Mixed PodIP + Loopback and All-PodIP active Private
@@ -2924,5 +3235,67 @@ func TestPR1MixedBindingsKeepPrivateListenerDegradedTrue(t *testing.T) {
 	loopCond := privateListenerCondition(loopbackOnly, loopState, metav1.Now())
 	if loopCond.Status != metav1.ConditionFalse || loopCond.Reason != "Loopback" {
 		t.Fatalf("all-loopback condition = %#v, want False/Loopback", loopCond)
+	}
+}
+
+func TestValidateDesiredTunnelStatusLimitsShadowRecoverability(t *testing.T) {
+	makeCaseB := func(protectedCount, unprotectedCount int, withShadow bool) *ir.Gateway {
+		domains := make([]ir.ProtectionDomain, 0, protectedCount+unprotectedCount+1)
+		for i := range protectedCount {
+			domains = append(domains, ir.ProtectionDomain{
+				Name:         fmt.Sprintf("web-access-%03d", i),
+				ListenerName: "web",
+				Exposure:     ir.ExposurePublic,
+				EnvoyPort:    int32(20000 + i),
+				Protected:    true,
+			})
+		}
+		for i := range unprotectedCount {
+			domains = append(domains, ir.ProtectionDomain{
+				Name:         fmt.Sprintf("web-public-%03d", i),
+				ListenerName: "web",
+				Exposure:     ir.ExposurePublic,
+				EnvoyPort:    int32(30000 + i),
+				Protected:    false,
+			})
+		}
+		if withShadow {
+			domains = append(domains, ir.ProtectionDomain{
+				Name:         "web-public",
+				ListenerName: "web",
+				Exposure:     ir.ExposurePublic,
+				EnvoyPort:    18080,
+				ShadowOnly:   true,
+			})
+		}
+		return &ir.Gateway{
+			Listeners: []ir.Listener{{Name: "web", Exposure: ir.ExposurePublic}},
+			Domains:   domains,
+		}
+	}
+
+	// 255 Protected + 1 unprotected carve-out + 1 ShadowOnly -> defers the 1 trailing unprotected carve-out, keeps 256 items with ShadowOnly.
+	gwOK := makeCaseB(255, 1, true)
+	if err := validateDesiredTunnelStatusLimits(gwOK, nil); err != nil {
+		t.Fatalf("255 protected + 1 unprotected + 1 shadow must validate, got: %v", err)
+	}
+	statusOK := tunnelListenerStatus("web", ir.ExposurePublic, "", gwOK.Domains)
+	if len(statusOK.ProtectionDomains) != maxTunnelListenerProtectionDomains {
+		t.Fatalf("ProtectionDomains len = %d, want %d", len(statusOK.ProtectionDomains), maxTunnelListenerProtectionDomains)
+	}
+	if last := statusOK.ProtectionDomains[len(statusOK.ProtectionDomains)-1]; last.Name != "web-public" || last.EnvoyPort != 18080 {
+		t.Fatalf("last retained PD = %#v, want web-public:18080", last)
+	}
+
+	// 256 Protected + 0 unprotected + 1 ShadowOnly -> cannot defer Protected domains, fails pre-PUT representability guard.
+	gwUnrecoverable := makeCaseB(256, 0, true)
+	if err := validateDesiredTunnelStatusLimits(gwUnrecoverable, nil); err == nil || !strings.Contains(err.Error(), "cannot retain legacy shadow domain") {
+		t.Fatalf("expected unrecoverable shadow error, got: %v", err)
+	}
+
+	// 257 live domains (even with unprotected carve-outs) never defer and always fail pre-PUT representability guard.
+	gwOverflow := makeCaseB(255, 2, true)
+	if err := validateDesiredTunnelStatusLimits(gwOverflow, nil); err == nil || !strings.Contains(err.Error(), "exceeds maximum 256") {
+		t.Fatalf("expected >256 live domains error, got: %v", err)
 	}
 }
