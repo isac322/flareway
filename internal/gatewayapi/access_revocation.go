@@ -470,28 +470,36 @@ func (ports *publicEnvoyPorts) isBlocked(port int32) bool {
 	return pc
 }
 
+func (ports *publicEnvoyPorts) claimUnused(port int32) bool {
+	if _, r := ports.reserved[port]; r {
+		return false
+	}
+	if _, u := ports.used[port]; u {
+		return false
+	}
+	ports.used[port] = struct{}{}
+	return true
+}
+
 func (ports *publicEnvoyPorts) takeBase(listenerName string) int32 {
-	if port, ok := ports.stickyBase[listenerName]; ok {
-		if _, r := ports.reserved[port]; !r {
-			if _, u := ports.used[port]; !u {
-				ports.used[port] = struct{}{}
-				return port
-			}
-		}
+	if port, ok := ports.stickyBase[listenerName]; ok && ports.claimUnused(port) {
+		return port
 	}
 	return ports.takeFresh(listenerName, listenerName)
 }
 
-func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
+func (ports *publicEnvoyPorts) claimStickyDomain(listenerName, domainName string) (int32, bool) {
 	for _, candidate := range []string{domainName, domainName + "-" + disambiguateListenerHash(listenerName)} {
-		if port, ok := ports.stickyDomain[listenerName+"\x00"+candidate]; ok {
-			if _, r := ports.reserved[port]; !r {
-				if _, u := ports.used[port]; !u {
-					ports.used[port] = struct{}{}
-					return port
-				}
-			}
+		if port, ok := ports.stickyDomain[listenerName+"\x00"+candidate]; ok && ports.claimUnused(port) {
+			return port, true
 		}
+	}
+	return 0, false
+}
+
+func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
+	if port, ok := ports.claimStickyDomain(listenerName, domainName); ok {
+		return port
 	}
 	return ports.takeFresh(listenerName, domainName)
 }

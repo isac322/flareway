@@ -454,11 +454,11 @@ func TestPartitionAccessVirtualHostUsesListenerExposureAndSanitizesUnclaimedUnpr
 			in := privateWildcardInputs(t)
 			in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("api.example.com"))
 			in.CloudflareAccount.Spec.Grants = []v1alpha1.CloudflareAccountGrant{{
-				NamespaceSelector:    metav1.LabelSelector{},
-				Hostnames:            []string{"api.example.com"},
-				Zones:                []string{"example.com"},
-				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
-				Backends:             &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
+				NamespaceSelector: metav1.LabelSelector{},
+				Hostnames:         []string{"api.example.com"},
+				Zones:             []string{"example.com"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+				Backends:          &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
 			}, {
 				NamespaceSelector:    metav1.LabelSelector{},
 				Hostnames:            []string{"api.example.com"},
@@ -779,5 +779,79 @@ func TestPrivateListenerReservedPortValidationAndConformanceExemption(t *testing
 	_, statuses := Translate(in)
 	if cond := findListenerCondition(statuses.Gateway, "https", gatewayv1.ListenerConditionAccepted); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("non-reserved private port 19002 Accepted = %#v, want True", cond)
+	}
+}
+
+// Finding 1: Adding AccessApplication to one path on an exact Public hostname
+// creates a "<listener>-public" carve-out for remaining unprotected routes;
+// it must preserve the previously published base port rather than shifting off it.
+func TestExactPublicCarveOutPreservesBasePort(t *testing.T) {
+	in := accessInputs(true)
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{{
+		Name: "http", Hostname: new(gatewayv1.Hostname("app.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	}}
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"app.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"app.example.com"}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "tools", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			Rules: []gatewayv1.HTTPRouteRule{
+				namedRouteRule("admin", "/admin", "backend"),
+				namedRouteRule("health", "/health", "backend"),
+			},
+		},
+	}}
+
+	// Before AccessApplication exists, exact listener "http" publishes base port 18085.
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:              "http",
+		Exposure:          v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{Name: "http", EnvoyPort: 18085}},
+	}}
+
+	// Add AccessApplication targeting only the "admin" rule, leaving "/health" unprotected.
+	appAdmin := accessApplication("admin-app", "HTTPRoute", "tools", "admin")
+	in.AccessApplications = []v1alpha1.AccessApplication{appAdmin}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{{Namespace: "default", Name: "admin-app"}: {AUD: "aud-admin", ApplicationID: "id-admin", Ready: true}}
+
+	gw1, _ := Translate(in)
+	if _, err := translator.Build(gw1, nil); err != nil {
+		t.Fatalf("first translator.Build failed: %v", err)
+	}
+	pub := findDomain(gw1.Domains, false, ir.GuardUnprotected)
+	if pub == nil {
+		t.Fatal("expected unprotected carve-out domain")
+	}
+	prot := findAccessDomain(gw1.Domains, "default/admin-app")
+	if prot == nil {
+		t.Fatal("expected protected domain")
+	}
+	if pub.EnvoyPort != 18085 {
+		t.Fatalf("carve-out domain %q shifted from base port 18085 to %d", pub.Name, pub.EnvoyPort)
+	}
+	if prot.EnvoyPort == pub.EnvoyPort {
+		t.Fatalf("protected domain collided on base port %d", prot.EnvoyPort)
+	}
+
+	// Next reconcile sees http-public + http-access-... recorded in Status.Listeners;
+	// both must keep their exact ports cleanly.
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "http",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: pub.Name, EnvoyPort: pub.EnvoyPort},
+			{Name: prot.Name, EnvoyPort: prot.EnvoyPort, Protected: true},
+		},
+	}}
+	gw2, _ := Translate(in)
+	if _, err := translator.Build(gw2, nil); err != nil {
+		t.Fatalf("second translator.Build failed: %v", err)
+	}
+	if got := findDomain(gw2.Domains, false, ir.GuardUnprotected).EnvoyPort; got != 18085 {
+		t.Fatalf("reconciled carve-out domain shifted from 18085 to %d", got)
+	}
+	if got := findAccessDomain(gw2.Domains, "default/admin-app").EnvoyPort; got != prot.EnvoyPort {
+		t.Fatalf("reconciled protected domain shifted from %d to %d", prot.EnvoyPort, got)
 	}
 }

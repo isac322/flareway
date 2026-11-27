@@ -876,8 +876,20 @@ func assignDerivedDomainPort(gateway *ir.Gateway, publicPorts *publicEnvoyPorts,
 	}
 	if listener != nil && isWildcardHostname(listener.Hostname) {
 		domain.Name += "-" + accessHostSuffix(kind, hostname)
+		domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
+		return
 	}
-	domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
+	if port, ok := publicPorts.claimStickyDomain(listenerName, domain.Name); ok {
+		domain.EnvoyPort = port
+		return
+	}
+	if kind == "public" && listener != nil && listener.Hostname != "" && domain.EnvoyPort > 0 {
+		// Exact Public listeners host a single hostname whose base domain is not
+		// emitted once split by AccessApplication, so a newly created "-public"
+		// carve-out preserves the base port already allocated on base.EnvoyPort.
+		return
+	}
+	domain.EnvoyPort = publicPorts.takeFresh(listenerName, domain.Name)
 }
 
 func validatePrivateHostClaimCoverage(gateway *ir.Gateway, claims []accessClaim) error {

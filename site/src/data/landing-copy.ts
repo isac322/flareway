@@ -223,10 +223,10 @@ export const landingCopy: LandingCopy = {
 	how: {
 		heading: 'One Gateway, one tunnel, one data plane.',
 		ledeHtml:
-			'Traffic enters only through <code>cloudflared</code>, which dials out over QUIC/HTTP2. Envoy takes decrypted requests over loopback and applies the routes the controller streams to it over xDS.',
+			'Traffic enters only through <code>cloudflared</code>, which dials out over QUIC/HTTP2. Envoy receives public hostnames from <code>cloudflared</code> over loopback, terminates private HTTPS directly on its recorded binding, and applies the routes the controller streams to it over xDS.',
 		figure: {
 			title: 'How traffic reaches the cluster',
-			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. The outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands requests to Envoy over loopback; the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
+			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. The outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands public hostnames to Envoy over loopback, while private WARP HTTPS reaches Envoy over its recorded binding (loopback or Pod IP); the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
 			browsers: 'Browsers',
 			browsersSub: 'public hostnames',
 			warp: 'WARP devices',

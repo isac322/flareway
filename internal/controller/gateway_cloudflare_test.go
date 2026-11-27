@@ -963,7 +963,7 @@ func TestDesiredTunnelListenersReportsEachProtectionDomainOnce(t *testing.T) {
 		},
 	}
 
-	listeners := desiredTunnelListeners(gateway)
+	listeners := desiredTunnelListeners(gateway, nil)
 	if len(listeners) != 1 {
 		t.Fatalf("expected one listener status, got %d", len(listeners))
 	}
@@ -982,5 +982,112 @@ func TestDesiredTunnelListenersReportsEachProtectionDomainOnce(t *testing.T) {
 	}
 	if _, ok := seen["ws-preview-protected"]; !ok {
 		t.Error("deduplication dropped a distinct protection domain")
+	}
+}
+
+// Finding 3: When a live Private HTTPS listener shares port 443 with a deleted
+// or rejected Private listener that still holds an Access revocation tombstone
+// on port 443, retainAccessRevocationDomains must keep the GuardBlocked domain
+// for tunnel status without synthesizing a conflicting cleartext ir.Listener.
+func TestRetainAccessRevocationSkipsConflictingSharedTLSSocket(t *testing.T) {
+	now := metav1.Now()
+	for _, binding := range []string{ir.ListenerBindingLoopback, ir.ListenerBindingPodIP} {
+		t.Run(binding, func(t *testing.T) {
+			tunnelBinding := v1alpha1.ListenerBindingLoopback
+			if binding == ir.ListenerBindingPodIP {
+				tunnelBinding = v1alpha1.ListenerBindingPodIP
+			}
+			gw := &ir.Gateway{
+				Key: types.NamespacedName{Namespace: "default", Name: "gw"},
+				Secrets: []ir.TLSSecret{{
+					Name: "default/cert-a", Certificate: []byte("cert"), PrivateKey: []byte("key"),
+				}},
+				Listeners: []ir.Listener{{
+					Name: "priv-a", Hostname: "a.internal.example", Port: 443,
+					Protocol: string(gatewayv1.HTTPSProtocolType), Exposure: ir.ExposurePrivate, Binding: binding,
+					TLS: &ir.TLSRef{Secret: "default/cert-a"},
+				}},
+				Domains: []ir.ProtectionDomain{{
+					Name: "priv-a", ListenerName: "priv-a", Exposure: ir.ExposurePrivate, EnvoyPort: 443,
+					Guard: ir.GuardUnprotected, StripAccessHeaders: true,
+					VirtualHosts: []ir.VirtualHost{{Name: "a", Hostname: "a.internal.example"}},
+				}},
+			}
+			tunnel := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "tunnel"},
+				Spec: v1alpha1.CloudflareTunnelSpec{Listeners: []v1alpha1.CloudflareTunnelListener{
+					{Name: "priv-a", Exposure: v1alpha1.ExposurePrivate},
+					{Name: "priv-b", Exposure: v1alpha1.ExposurePrivate},
+				}},
+				Status: v1alpha1.CloudflareTunnelStatus{Listeners: []v1alpha1.CloudflareTunnelListenerStatus{
+					{Name: "priv-a", Exposure: v1alpha1.ExposurePrivate, Binding: tunnelBinding},
+					{Name: "priv-b", Exposure: v1alpha1.ExposurePrivate, Binding: tunnelBinding},
+				}},
+			}
+			app := v1alpha1.AccessApplication{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-b", Namespace: "default", DeletionTimestamp: &now, Finalizers: []string{v1alpha1.AccessApplicationFinalizer}},
+				Status: v1alpha1.AccessApplicationStatus{
+					DataPlanes: []v1alpha1.AccessApplicationDataPlaneStatus{{
+						Tunnel: "tunnel", Listener: "priv-b", ProtectionDomain: "priv-b-access-default-app-b", EnvoyPort: 443,
+					}},
+					Destinations: []v1alpha1.AccessApplicationDestinationStatus{{
+						Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: "b.internal.example",
+					}},
+				},
+			}
+
+			retainAccessRevocationDomains(gw, tunnel, []v1alpha1.AccessApplication{app})
+
+			if len(gw.Listeners) != 1 {
+				t.Fatalf("expected conflicting retained listener to be omitted, got %d listeners: %#v", len(gw.Listeners), gw.Listeners)
+			}
+			var foundBlocked bool
+			for _, domain := range gw.Domains {
+				if domain.Name == "priv-b-access-default-app-b" && domain.Guard == ir.GuardBlocked {
+					foundBlocked = true
+				}
+			}
+			if !foundBlocked {
+				t.Fatalf("expected GuardBlocked tombstone domain to be preserved in %#v", gw.Domains)
+			}
+			if _, err := translator.Build(gw, nil); err != nil {
+				t.Fatalf("translator.Build failed when healthy sibling shared port 443: %v", err)
+			}
+		})
+	}
+}
+
+// Finding 4: Retain recorded PodIP binding on Private listener tombstones
+// across both non-reserved synthesized listeners and omitted reserved-port ones.
+func TestRetainAccessRevocationPreservesRecordedPodIPBinding(t *testing.T) {
+	now := metav1.Now()
+	for _, port := range []int32{8443, 19000} {
+		gw := &ir.Gateway{Key: types.NamespacedName{Namespace: "default", Name: "gw"}}
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "tunnel"},
+			Spec: v1alpha1.CloudflareTunnelSpec{Listeners: []v1alpha1.CloudflareTunnelListener{
+				{Name: "priv", Exposure: v1alpha1.ExposurePrivate},
+			}},
+			Status: v1alpha1.CloudflareTunnelStatus{Listeners: []v1alpha1.CloudflareTunnelListenerStatus{
+				{Name: "priv", Exposure: v1alpha1.ExposurePrivate, Binding: v1alpha1.ListenerBindingPodIP},
+			}},
+		}
+		app := v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default", DeletionTimestamp: &now, Finalizers: []string{v1alpha1.AccessApplicationFinalizer}},
+			Status: v1alpha1.AccessApplicationStatus{
+				DataPlanes: []v1alpha1.AccessApplicationDataPlaneStatus{{
+					Tunnel: "tunnel", Listener: "priv", ProtectionDomain: "priv-access-default-app", EnvoyPort: port,
+				}},
+				Destinations: []v1alpha1.AccessApplicationDestinationStatus{{
+					Type: v1alpha1.AccessApplicationDestinationPrivate, Hostname: "podip.internal.example",
+				}},
+			},
+		}
+
+		retainAccessRevocationDomains(gw, tunnel, []v1alpha1.AccessApplication{app})
+		listeners := desiredTunnelListeners(gw, tunnel)
+		if len(listeners) != 1 || listeners[0].Binding != v1alpha1.ListenerBindingPodIP {
+			t.Fatalf("port %d retained listener = %#v, want Binding=%q", port, listeners, v1alpha1.ListenerBindingPodIP)
+		}
 	}
 }

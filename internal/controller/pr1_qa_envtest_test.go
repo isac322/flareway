@@ -29,6 +29,7 @@ import (
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -40,6 +41,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 )
@@ -881,6 +883,198 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		}
 		gomega.Expect(sawRevoked403).To(gomega.BeTrue(), "revoked Private host must answer 403 locally")
 		gomega.Expect(sawLiveForward).To(gomega.BeTrue(), "independent Private sibling host must continue forwarding")
+	})
+
+	// Finding 2 (v0.5.0 upgrade): When a Gateway's sole Private listener moves
+	// onto a newly reserved port (18000 -> Accepted=False/PortUnavailable) while
+	// holding a pre-upgrade Forwarding checkpoint, the Gateway must first retract
+	// and wait for its dataplane Deployment to drain before clearing Forwarding,
+	// acknowledging GuardBlocked, and letting deleting AccessApplication finish.
+	ginkgo.It("Finding 2: sole reserved-port Private listener waits for dataplane drain then converges Access revocation", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{
+			privateListener: true,
+		})
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"sole.internal.example"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePrivate}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		tunnel.Spec.Listeners = []v1alpha1.CloudflareTunnelListener{
+			{Name: "private", Exposure: v1alpha1.ExposurePrivate},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		// Make the sole listener a Private HTTPS listener on reserved port 18000.
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		soleHost := gatewayv1.Hostname("sole.internal.example")
+		privListener := gw.Spec.Listeners[1]
+		privListener.Hostname = &soleHost
+		privListener.Port = 18000
+		gw.Spec.Listeners = []gatewayv1.Listener{privListener}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		// Seed pre-upgrade dataplane Deployment running 1 ready replica owned by gw.
+		one := int32(1)
+		deploy := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      dataplane.ResourceName(&ir.Gateway{Key: f.gatewayKey}),
+				Namespace: ns,
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &one,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "sole"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "sole"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "envoyproxy/envoy:v1.32.0"}}},
+				},
+			},
+		}
+		gomega.Expect(ctrl.SetControllerReference(&gw, deploy, f.direct.Scheme())).To(gomega.Succeed())
+		gomega.Expect(f.direct.Create(f.ctx, deploy)).To(gomega.Succeed())
+		deploy.Status.Replicas = 1
+		deploy.Status.ReadyReplicas = 1
+		gomega.Expect(f.direct.Status().Update(f.ctx, deploy)).To(gomega.Succeed())
+
+		// Seed pre-upgrade converged Tunnel status with Forwarding checkpoint on 18000.
+		_, tunnelErr := f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		tunnel.Status.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{
+			Desired: 1, Applied: 1, Remote: 1,
+		}
+		tunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+			Hostname:          "sole.internal.example",
+			ProtectionDomain:  "private-access-default-sole-app",
+			AccessApplication: ns + "/sole-app",
+			Guard:             v1alpha1.HostnameGuardForwarding,
+			AppliedVersion:    1,
+		}}
+		tunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "private",
+			Exposure: v1alpha1.ExposurePrivate,
+			Binding:  v1alpha1.ListenerBindingLoopback,
+			ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{
+				Name: "private-access-default-sole-app", EnvoyPort: 18000, Protected: true,
+			}},
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		// Deleting AccessApplication with pre-upgrade latch at baselineVersion=1.
+		latchPayload, err := json.Marshal(gatewayapi.AccessRevocationLatch{
+			Claims: []gatewayapi.AccessRevocationClaim{{
+				Tunnel:           tunnel.Name,
+				ProtectionDomain: "private-access-default-sole-app",
+				Hostname:         "sole.internal.example",
+				BaselineVersion:  1,
+			}},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "sole-app",
+				Namespace:   ns,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{gatewayapi.AccessRevocationAnnotation: string(latchPayload)},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "Gateway", Name: gatewayv1.ObjectName(gw.Name)},
+					SectionName:                new(gatewayv1.SectionName("private")),
+				}},
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "sole-app", SessionDuration: "1h"},
+				OriginJWT:   v1alpha1.AccessOriginJWTSpec{Mode: v1alpha1.AccessOriginJWTModeRequired, AssumeGatewayTLSDecryption: true},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, app)).To(gomega.Succeed())
+		app.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel:           tunnel.Name,
+			Listener:         "private",
+			ProtectionDomain: "private-access-default-sole-app",
+			EnvoyPort:        18000,
+		}}
+		app.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+			Type:     v1alpha1.AccessApplicationDestinationPrivate,
+			Hostname: "sole.internal.example",
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, app)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, app)).To(gomega.Succeed())
+
+		// Reconcile Gateway while Deployment still has Status.ReadyReplicas=1:
+		// Deployment must be scaled to Spec.Replicas=0, snapshot cleared,
+		// Gateway Accepted=False/PortUnavailable, RequeueAfter > 0, and
+		// tunnel.Status.Hostnames must NOT yet drop Forwarding/claim Blocked.
+		res, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(res.RequeueAfter).To(gomega.BeNumerically(">", 0))
+
+		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(deploy), deploy)).To(gomega.Succeed())
+		gomega.Expect(deploy.Spec.Replicas).NotTo(gomega.BeNil())
+		gomega.Expect(*deploy.Spec.Replicas).To(gomega.Equal(int32(0)))
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Hostnames).To(gomega.HaveLen(1))
+		gomega.Expect(tunnel.Status.Hostnames[0].Guard).To(gomega.Equal(v1alpha1.HostnameGuardForwarding))
+
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		privLS := listenerStatusByName(gw.Status.Listeners, "private")
+		gomega.Expect(privLS).NotTo(gomega.BeNil())
+		privAcc := meta.FindStatusCondition(privLS.Conditions, string(gatewayv1.ListenerConditionAccepted))
+		gomega.Expect(privAcc.Status).To(gomega.Equal(metav1.ConditionFalse))
+		gomega.Expect(privAcc.Reason).To(gomega.Equal(string(gatewayv1.ListenerReasonPortUnavailable)))
+
+		// Drain Deployment replicas (Status.Replicas=0, ReadyReplicas=0) and reconcile again:
+		// tunnel.Status.Hostnames must now transition from Forwarding to Blocked.
+		deploy.Status.Replicas = 0
+		deploy.Status.ReadyReplicas = 0
+		gomega.Expect(f.direct.Status().Update(f.ctx, deploy)).To(gomega.Succeed())
+
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var sawBlocked, sawForwarding bool
+		for _, h := range tunnel.Status.Hostnames {
+			if h.Hostname == "sole.internal.example" {
+				if h.Guard == v1alpha1.HostnameGuardBlocked {
+					sawBlocked = true
+				}
+				if h.Guard == v1alpha1.HostnameGuardForwarding {
+					sawForwarding = true
+				}
+			}
+		}
+		gomega.Expect(sawForwarding).To(gomega.BeFalse(), "stale Forwarding claim must be cleared once dataplane drains: %#v", tunnel.Status.Hostnames)
+		gomega.Expect(sawBlocked).To(gomega.BeTrue(), "expected Blocked revocation status once dataplane drains: %#v", tunnel.Status.Hostnames)
+
+		// AccessApplicationReconciler now converges and finishes deleting the AccessApplication.
+		indexedClient := handoffIndexedClient{Client: f.direct}
+		accessReconciler := &AccessApplicationReconciler{
+			Client:              indexedClient,
+			APIReader:           indexedClient,
+			Scheme:              f.direct.Scheme(),
+			NewCloudflareClient: newFakeAccessApplicationCloudflare().Client,
+			OperatorNamespace:   accessApplicationAUDNamespace,
+			Now:                 func() time.Time { return f.clock },
+		}
+		_, err = accessReconciler.Reconcile(f.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		var deletedCheck v1alpha1.AccessApplication
+		err = f.direct.Get(f.ctx, client.ObjectKeyFromObject(app), &deletedCheck)
+		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "AccessApplication should finish deleting once sole rejected Gateway drains and acknowledges Blocked; err=%v", err)
 	})
 })
 

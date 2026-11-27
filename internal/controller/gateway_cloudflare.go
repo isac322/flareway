@@ -21,7 +21,9 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -198,15 +200,43 @@ func accessBindingDigest(domain ir.ProtectionDomain) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+func tunnelRecordedPrivateBindings(tunnel *v1alpha1.CloudflareTunnel) map[string]string {
+	if tunnel == nil {
+		return nil
+	}
+	bindings := make(map[string]string, len(tunnel.Status.Listeners))
+	for _, listener := range tunnel.Status.Listeners {
+		if listener.Exposure == v1alpha1.ExposurePrivate && listener.Binding != "" {
+			bindings[string(listener.Name)] = string(listener.Binding)
+		}
+	}
+	return bindings
+}
+
+func irListenerBindKey(conformanceMode bool, listener ir.Listener) string {
+	port := listener.EnvoyPort
+	if listener.Exposure == ir.ExposurePrivate && listener.Port > 0 {
+		port = listener.Port
+	}
+	address := "127.0.0.1"
+	if conformanceMode || (listener.Exposure == ir.ExposurePrivate && listener.Binding == ir.ListenerBindingPodIP) {
+		address = "0.0.0.0"
+	}
+	return net.JoinHostPort(address, strconv.Itoa(int(port)))
+}
+
 func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, applications []v1alpha1.AccessApplication) {
 	if gateway == nil || tunnel == nil {
 		return
 	}
 	tombstones := gatewayapi.AccessRevocationTombstones(tunnel, applications, gateway.Domains)
 	existingListeners := make(map[string]struct{}, len(gateway.Listeners))
+	occupiedSockets := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
 		existingListeners[listener.Name] = struct{}{}
+		occupiedSockets[irListenerBindKey(gateway.ConformanceMode, listener)] = struct{}{}
 	}
+	recordedBindings := tunnelRecordedPrivateBindings(tunnel)
 	retainedListeners := make(map[string]ir.Listener)
 	domains := make([]ir.ProtectionDomain, 0, len(tombstones))
 	for _, tombstone := range tombstones {
@@ -228,10 +258,11 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 		}
 		if _, found := existingListeners[listenerName]; !found {
 			// Skip synthesizing an Envoy listener when a retained Private
-			// tombstone records an invalid or reserved dataplane pod port:
-			// keeping the GuardBlocked domain preserves revocation proof in
-			// tunnel status while allowing translator.Build to skip the
-			// unreferenced blocked domain and publish healthy siblings.
+			// tombstone records an invalid or reserved dataplane pod port, or
+			// when its socket bind key is already occupied (for example by a
+			// healthy TLS sibling sharing the same port): keeping GuardBlocked
+			// preserves revocation proof while translator.Build skips the
+			// unreferenced domain and keeps healthy siblings publishing.
 			if exposure != ir.ExposurePrivate || (dataPlane.EnvoyPort > 0 && !dataplane.IsReservedPodPort(dataPlane.EnvoyPort)) {
 				retained := ir.Listener{
 					Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
@@ -239,8 +270,16 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 				}
 				if exposure == ir.ExposurePrivate {
 					retained.Port = dataPlane.EnvoyPort
+					retained.Binding = recordedBindings[listenerName]
+					if retained.Binding == "" {
+						retained.Binding = ir.ListenerBindingLoopback
+					}
 				}
-				retainedListeners[listenerName] = retained
+				bindKey := irListenerBindKey(gateway.ConformanceMode, retained)
+				if _, occupied := occupiedSockets[bindKey]; !occupied {
+					retainedListeners[listenerName] = retained
+					occupiedSockets[bindKey] = struct{}{}
+				}
 			}
 		}
 		domains = append(domains, ir.ProtectionDomain{
@@ -829,7 +868,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		checkpoint.Remote = result.remoteVersion
 		checkpoint.CreatedAt = result.remoteCreatedAt
 		checkpoint.AppliedAt = result.appliedAt
-		if err := r.patchTunnelGatewayData(ctx, gateway, tunnel, checkpoint, tunnel.Status.Hostnames, desiredTunnelListeners(gateway)); err != nil {
+		if err := r.patchTunnelGatewayData(ctx, gateway, tunnel, checkpoint, tunnel.Status.Hostnames, desiredTunnelListeners(gateway, tunnel)); err != nil {
 			return cloudflareConfigResult{}, fmt.Errorf("checkpoint Cloudflare Tunnel configuration version: %w", err)
 		}
 	}
@@ -1088,17 +1127,19 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 	return result
 }
 
-func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelListenerStatus {
+func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []v1alpha1.CloudflareTunnelListenerStatus {
 	result := make([]v1alpha1.CloudflareTunnelListenerStatus, 0, len(gateway.Listeners))
 	recordedListeners := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
 		recordedListeners[listener.Name] = struct{}{}
 		result = append(result, tunnelListenerStatus(listener.Name, listener.Exposure, listener.Binding, gateway.Domains))
 	}
-	// Preserve listener exposure metadata for retained GuardBlocked tombstones
-	// whose invalid/reserved Envoy listener was omitted from gateway.Listeners so
-	// xDS never binds it. Access revocation acknowledgment at an unchanged remote
-	// version reads listener.Exposure through listener.ProtectionDomains.
+	recordedBindings := tunnelRecordedPrivateBindings(tunnel)
+	// Preserve listener exposure and binding metadata for retained GuardBlocked
+	// tombstones whose Envoy listener was omitted from gateway.Listeners so xDS
+	// never binds an invalid, reserved, or socket-colliding listener. Access
+	// revocation acknowledgment at an unchanged remote version reads
+	// listener.Exposure through listener.ProtectionDomains.
 	var retainedNames []string
 	retainedExposure := make(map[string]string)
 	for _, domain := range gateway.Domains {
@@ -1124,7 +1165,10 @@ func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelList
 		exposure := retainedExposure[name]
 		binding := ""
 		if exposure == ir.ExposurePrivate {
-			binding = ir.ListenerBindingLoopback
+			binding = recordedBindings[name]
+			if binding == "" {
+				binding = ir.ListenerBindingLoopback
+			}
 		}
 		result = append(result, tunnelListenerStatus(name, exposure, binding, gateway.Domains))
 	}

@@ -36,6 +36,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -385,6 +386,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
 			return ctrl.Result{}, err
 		}
+		needsDrainRequeue := false
+		if !compiled.ConformanceMode && tunnel != nil && block == nil {
+			var syncErr error
+			needsDrainRequeue, syncErr = r.syncRejectedGatewayTunnelRevocation(ctx, compiled, &gateway, tunnel, privateState)
+			if syncErr != nil {
+				return ctrl.Result{}, syncErr
+			}
+		}
 		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -394,7 +403,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
-		if block != nil && !block.terminal && !topLevelInvalid {
+		if needsDrainRequeue || (block != nil && !block.terminal && !topLevelInvalid) {
 			return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 		}
 		return ctrl.Result{}, nil
@@ -530,7 +539,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				tunnel,
 				config,
 				tunnel.Status.Hostnames,
-				desiredTunnelListeners(compiled),
+				desiredTunnelListeners(compiled, tunnel),
 				gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, now),
 				privateListenerCondition(compiled, privateState, now),
 				driftCondition,
@@ -691,7 +700,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if err := r.patchTunnelGatewayConditions(ctx, compiled, tunnel, now); err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.patchTunnelGatewayData(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled)); err != nil {
+			if err := r.patchTunnelGatewayData(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled, tunnel)); err != nil {
 				return ctrl.Result{}, err
 			}
 			requireGate := !denySnapshotApplied || ready
@@ -722,7 +731,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		} else {
 			// Demotion commits before the data apply.
-			if err := r.patchTunnelGatewayStatus(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled), conditions...); err != nil {
+			if err := r.patchTunnelGatewayStatus(ctx, compiled, tunnel, config, hostnames, desiredTunnelListeners(compiled, tunnel), conditions...); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -1340,6 +1349,105 @@ func (r *GatewayReconciler) retractGatewayDataplane(ctx context.Context, gateway
 		return fmt.Errorf("scale dataplane Deployment %s to zero: %w", key, err)
 	}
 	return nil
+}
+
+func hasForwardingHostname(hostnames []v1alpha1.CloudflareTunnelHostnameStatus) bool {
+	for _, entry := range hostnames {
+		if entry.Guard != v1alpha1.HostnameGuardBlocked {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRetainedRevocationDomains(domains []ir.ProtectionDomain) bool {
+	for _, domain := range domains {
+		if domain.Guard == ir.GuardBlocked && domain.BlockReason == ir.BlockReasonRevocation {
+			return true
+		}
+	}
+	return false
+}
+
+func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) bool {
+	if compiled == nil || tunnel == nil {
+		return false
+	}
+	if hasForwardingHostname(tunnel.Status.Hostnames) {
+		return true
+	}
+	if !hasRetainedRevocationDomains(compiled.Domains) {
+		return false
+	}
+	desiredHostnames := desiredTunnelHostnames(compiled, tunnel.Status.ConfigVersion.Applied)
+	desiredListeners := desiredTunnelListeners(compiled, tunnel)
+	return !apiequality.Semantic.DeepEqual(tunnel.Status.Hostnames, desiredHostnames) ||
+		!apiequality.Semantic.DeepEqual(tunnel.Status.Listeners, desiredListeners)
+}
+
+func (r *GatewayReconciler) gatewayDataplaneDrained(ctx context.Context, gateway *gatewayv1.Gateway) (bool, error) {
+	if gateway == nil || gateway.UID == "" {
+		return false, nil
+	}
+	key := types.NamespacedName{
+		Namespace: gateway.Namespace,
+		Name:      dataplane.ResourceName(&ir.Gateway{Key: client.ObjectKeyFromObject(gateway)}),
+	}
+	var deployment appsv1.Deployment
+	if err := r.directReader().Get(ctx, key, &deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("get dataplane Deployment %s: %w", key, err)
+	}
+	expected := metav1.NewControllerRef(gateway, schema.GroupVersion{Group: gatewayv1.GroupVersion.Group, Version: gatewayv1.GroupVersion.Version}.WithKind("Gateway"))
+	if !sameControllerIdentity(metav1.GetControllerOf(&deployment), expected) {
+		return false, nil
+	}
+	return deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 &&
+		deployment.Status.Replicas == 0 && deployment.Status.ReadyReplicas == 0, nil
+}
+
+func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
+	ctx context.Context,
+	compiled *ir.Gateway,
+	gateway *gatewayv1.Gateway,
+	tunnel *v1alpha1.CloudflareTunnel,
+	privateState privatePrerequisiteResult,
+) (bool, error) {
+	if !needsRejectedGatewayTunnelSync(compiled, tunnel) {
+		return false, nil
+	}
+	currentTunnel, err := r.validateGatewayTunnelWriter(ctx, compiled, tunnel)
+	if err != nil {
+		return false, err
+	}
+	if !needsRejectedGatewayTunnelSync(compiled, currentTunnel) {
+		return false, nil
+	}
+	drained, err := r.gatewayDataplaneDrained(ctx, gateway)
+	if err != nil {
+		return false, err
+	}
+	if !drained {
+		return true, nil
+	}
+	hostnames := desiredTunnelHostnames(compiled, currentTunnel.Status.ConfigVersion.Applied)
+	listeners := desiredTunnelListeners(compiled, currentTunnel)
+	now := metav1.NewTime(r.gatewayNow())
+	driftCondition := gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
+	if existingDrift := meta.FindStatusCondition(currentTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionDriftDetected); existingDrift != nil {
+		driftCondition = gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, existingDrift.Status, existingDrift.Reason, existingDrift.Message, now)
+	}
+	conditions := []metav1.Condition{
+		gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, "GatewayInvalid", "Gateway configuration is invalid; dataplane retracted", now),
+		privateListenerCondition(compiled, privateState, now),
+		driftCondition,
+	}
+	if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, currentTunnel.Status.ConfigVersion, hostnames, listeners, conditions...); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // retractCloudflareListenerService deletes the conformance listener Service

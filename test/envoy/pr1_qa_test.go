@@ -778,6 +778,9 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		if err := os.WriteFile(corefilePath, []byte(corefile), 0o644); err != nil {
 			t.Fatalf("write Corefile: %v", err)
 		}
+		if err := os.Chmod(corefilePath, 0o644); err != nil {
+			t.Fatalf("make Corefile container-readable: %v", err)
+		}
 
 		name := "flareway-coredns-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
