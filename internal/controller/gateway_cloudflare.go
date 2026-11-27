@@ -219,21 +219,32 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 			})
 		}
 		listenerName := string(dataPlane.Listener)
-		if _, found := existingListeners[listenerName]; !found {
-			exposure := ir.ExposurePublic
-			for _, listener := range tunnel.Spec.Listeners {
-				if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
-					exposure = ir.ExposurePrivate
-					break
-				}
+		exposure := ir.ExposurePublic
+		for _, listener := range tunnel.Spec.Listeners {
+			if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
+				exposure = ir.ExposurePrivate
+				break
 			}
-			retainedListeners[listenerName] = ir.Listener{
-				Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
-				Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
+		}
+		if _, found := existingListeners[listenerName]; !found {
+			// Skip synthesizing an Envoy listener when a retained Private
+			// tombstone records an invalid or reserved dataplane pod port:
+			// keeping the GuardBlocked domain preserves revocation proof in
+			// tunnel status while allowing translator.Build to skip the
+			// unreferenced blocked domain and publish healthy siblings.
+			if exposure != ir.ExposurePrivate || (dataPlane.EnvoyPort > 0 && !dataplane.IsReservedPodPort(dataPlane.EnvoyPort)) {
+				retained := ir.Listener{
+					Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
+					Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
+				}
+				if exposure == ir.ExposurePrivate {
+					retained.Port = dataPlane.EnvoyPort
+				}
+				retainedListeners[listenerName] = retained
 			}
 		}
 		domains = append(domains, ir.ProtectionDomain{
-			Name: dataPlane.ProtectionDomain, ListenerName: listenerName, EnvoyPort: dataPlane.EnvoyPort,
+			Name: dataPlane.ProtectionDomain, ListenerName: listenerName, Exposure: exposure, EnvoyPort: dataPlane.EnvoyPort,
 			Protected: true, AccessApplication: tombstone.Application, Guard: ir.GuardBlocked, BlockReason: ir.BlockReasonRevocation, VirtualHosts: virtualHosts,
 		})
 	}

@@ -29,8 +29,9 @@ listeners:
 - `cloudflared` opens outbound QUIC or HTTP/2 connections to Cloudflare's edge.
 - Envoy receives decrypted requests from `cloudflared` over loopback and
   applies the routing rules the controller streams to it.
-- The CoreDNS sidecar answers private hostnames with `127.0.0.1`, so WARP
-  traffic also passes through Envoy.
+- The CoreDNS sidecar answers private hostnames with `127.0.0.1` by default (or
+  the Pod IP per listener using Pod IP fallback, with exact hostnames taking
+  precedence over wildcards), so WARP traffic also passes through Envoy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../../assets/architecture/layers-dark.svg">

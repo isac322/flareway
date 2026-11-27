@@ -219,6 +219,7 @@ type TLSRef struct {
 type ProtectionDomain struct {
 	Name              string       `json:"name"`
 	ListenerName      string       `json:"listenerName"`
+	Exposure          string       `json:"exposure,omitempty"`
 	EnvoyPort         int32        `json:"envoyPort"`
 	Protected         bool         `json:"protected"`
 	OriginJWTDisabled bool         `json:"originJWTDisabled,omitempty"`

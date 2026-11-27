@@ -320,7 +320,7 @@ export const landingCopy: LandingCopy = {
 		warp: {
 			heading: 'Private services over WARP, same Gateway',
 			bodyHtml:
-				'Set a listener’s exposure to <code>Private</code>, and WARP devices reach the Service through the same <code>Gateway</code>, <code>HTTPRoute</code>, and <code>AccessApplication</code>. Envoy terminates TLS with a certificate Secret you supply; a CoreDNS sidecar answers private hostnames with 127.0.0.1 so the traffic passes through Envoy.',
+				'Set a listener’s exposure to <code>Private</code>, and WARP devices reach the Service through the same <code>Gateway</code>, <code>HTTPRoute</code>, and <code>AccessApplication</code>. Envoy terminates TLS with a certificate Secret you supply; a CoreDNS sidecar answers private hostnames with 127.0.0.1 by default (or the Pod IP per listener using Pod IP fallback) so the traffic passes through Envoy.',
 			kinds: ['VirtualNetwork', 'NetworkRoute', 'HostnameRoute', 'WARPConnector'],
 			kindsNoteHtml: 'for WARP reachability and k8s-to-VPC site-to-site links',
 			more: { label: 'Private services over WARP', href: '/docs/get-started/private-services-over-warp/' },

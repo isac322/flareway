@@ -108,7 +108,7 @@ func compileConfig(gateway *ir.Gateway) configBody {
 	rules := make([]domainRule, 0, len(gateway.Domains))
 	order := 0
 	for _, domain := range gateway.Domains {
-		if listenerExposure[domain.ListenerName] == ir.ExposurePrivate {
+		if listenerExposure[domain.ListenerName] == ir.ExposurePrivate || domain.Exposure == ir.ExposurePrivate {
 			continue
 		}
 		audiences := domain.Access.CanonicalAUDs()

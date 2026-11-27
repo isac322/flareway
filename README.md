@@ -52,7 +52,8 @@ with no annotations.
 - Envoy runs the `HTTPRoute` rules that the controller streams to it over xDS
   (Delta ADS).
 - For a Gateway with private listeners, a CoreDNS sidecar answers private
-  hostnames with `127.0.0.1`, so WARP traffic also passes through Envoy.
+  hostnames with `127.0.0.1` by default (or the Pod IP for a listener using Pod
+  IP fallback), so WARP traffic also passes through Envoy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/layers-dark.svg">

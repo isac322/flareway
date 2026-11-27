@@ -538,12 +538,15 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listen
 	if publicPorts == nil {
 		publicPorts = newPublicEnvoyPorts(in, holds.reservedPorts(), gateway.ConformanceMode)
 	}
-	dropped := make(map[types.NamespacedName][]string)
-	remaining := make(map[types.NamespacedName]int)
+	dropped := make(map[routeListenerKey][]string)
+	remaining := make(map[routeListenerKey]int)
 	for _, domain := range original {
 		for _, virtualHost := range domain.VirtualHosts {
 			for _, route := range virtualHost.Routes {
-				remaining[types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name}]++
+				remaining[routeListenerKey{
+					route:    types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name},
+					listener: domain.ListenerName,
+				}]++
 			}
 		}
 	}
@@ -606,7 +609,12 @@ func disambiguateDerivedDomainNames(gateway *ir.Gateway, statuses *Statuses) {
 	}
 }
 
-func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, publicPorts *publicEnvoyPorts, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int) {
+type routeListenerKey struct {
+	route    types.NamespacedName
+	listener string
+}
+
+func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, publicPorts *publicEnvoyPorts, dropped map[routeListenerKey][]string, remaining map[routeListenerKey]int) {
 	claimed := make(map[string][]ir.Route)
 	public := make([]ir.Route, 0, len(host.Routes))
 	wholeHost := make(map[string]bool)
@@ -734,7 +742,10 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			}
 		}
 		if message != "" {
-			key := types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name}
+			key := routeListenerKey{
+				route:    types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name},
+				listener: base.ListenerName,
+			}
 			dropped[key] = append(dropped[key], routeRuleLabel(route)+" "+message)
 			remaining[key]--
 			continue
@@ -1022,36 +1033,74 @@ func markPublicDomainsForHeaderStripping(gateway *ir.Gateway) {
 	}
 }
 
-func applyAccessRouteDrops(statuses *Statuses, in Inputs, listeners []*listenerTranslation, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int, now metav1.Time) {
-	for key, messages := range dropped {
+func applyAccessRouteDrops(statuses *Statuses, in Inputs, listeners []*listenerTranslation, dropped map[routeListenerKey][]string, remaining map[routeListenerKey]int, now metav1.Time) {
+	droppedByRoute := make(map[types.NamespacedName]map[string][]string)
+	listenersByName := make(map[string]*listenerTranslation, len(listeners))
+	for _, listener := range listeners {
+		listenersByName[string(listener.spec.Name)] = listener
+	}
+	for rlKey, messages := range dropped {
+		byListener := droppedByRoute[rlKey.route]
+		if byListener == nil {
+			byListener = make(map[string][]string)
+			droppedByRoute[rlKey.route] = byListener
+		}
+		byListener[rlKey.listener] = append(byListener[rlKey.listener], messages...)
+		if remaining[rlKey] <= 0 {
+			if listener := listenersByName[rlKey.listener]; listener != nil {
+				delete(listener.attachedRoutes, rlKey.route)
+			}
+		}
+	}
+
+	for key, listenerMessages := range droppedByRoute {
 		routeStatus, exists := statuses.HTTPRoutes[key]
 		if !exists {
 			continue
 		}
-		generation := int64(0)
+		var route *gatewayv1.HTTPRoute
 		for index := range in.HTTPRoutes {
 			if in.HTTPRoutes[index].Namespace == key.Namespace && in.HTTPRoutes[index].Name == key.Name {
-				generation = in.HTTPRoutes[index].Generation
+				route = &in.HTTPRoutes[index]
 				break
 			}
 		}
-		if remaining[key] <= 0 {
-			for _, listener := range listeners {
-				delete(listener.attachedRoutes, key)
-			}
+		generation := int64(0)
+		if route != nil {
+			generation = route.Generation
 		}
 		for index := range routeStatus.Parents {
 			parent := &routeStatus.Parents[index]
 			if parent.ControllerName != ControllerName {
 				continue
 			}
-			if remaining[key] <= 0 {
+			var parentMessages []string
+			allDropped := false
+			if route != nil {
+				matched, _ := matchingListeners(in, route, parent.ParentRef, listeners)
+				if len(matched) > 0 {
+					allDropped = true
+					for _, listener := range matched {
+						lname := string(listener.spec.Name)
+						if msgs := listenerMessages[lname]; len(msgs) > 0 {
+							parentMessages = append(parentMessages, msgs...)
+						}
+						if remaining[routeListenerKey{route: key, listener: lname}] > 0 {
+							allDropped = false
+						}
+					}
+				}
+			}
+			if len(parentMessages) == 0 {
+				continue
+			}
+			if allDropped {
 				parent.Conditions = gatewaystatus.SetCondition(parent.Conditions, now, gatewaystatus.NewCondition(
 					string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonUnsupportedValue), "all Route rules were dropped", generation, now,
 				))
 			}
 			parent.Conditions = gatewaystatus.SetCondition(parent.Conditions, now, gatewaystatus.NewCondition(
-				string(gatewayv1.RouteConditionPartiallyInvalid), metav1.ConditionTrue, string(gatewayv1.RouteReasonUnsupportedValue), "Dropped Rule: "+strings.Join(uniqueStrings(messages), "; "), generation, now,
+				string(gatewayv1.RouteConditionPartiallyInvalid), metav1.ConditionTrue, string(gatewayv1.RouteReasonUnsupportedValue), "Dropped Rule: "+strings.Join(uniqueStrings(parentMessages), "; "), generation, now,
 			))
 		}
 		statuses.HTTPRoutes[key] = routeStatus

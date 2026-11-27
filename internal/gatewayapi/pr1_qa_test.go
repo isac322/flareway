@@ -437,68 +437,187 @@ func TestPartitionAccessVirtualHostUsesListenerExposureAndSanitizesUnclaimedUnpr
 				{Name: "tools/public-health/0", Match: ir.PathMatch{Type: ir.PathMatchPathPrefix, Value: "/health"}, Source: ir.RouteSource{Namespace: "default", Name: "tools", RuleName: "public-health"}},
 			},
 		}
-		dropped := map[types.NamespacedName][]string{}
-		remaining := map[types.NamespacedName]int{{Namespace: "default", Name: "tools"}: 2}
+		dropped := map[routeListenerKey][]string{}
+		rlKey := routeListenerKey{route: types.NamespacedName{Namespace: "default", Name: "tools"}, listener: "https"}
+		remaining := map[routeListenerKey]int{rlKey: 2}
 		partitionAccessVirtualHost(in, gw, statuses, base, host, nil, dropped, remaining)
 		if public := findDomain(gw.Domains, false, ir.GuardUnprotected); public != nil {
 			t.Fatalf("Private carve-out allowed using Public UnprotectedHostnames grant: %#v", public)
 		}
-		if len(dropped[types.NamespacedName{Namespace: "default", Name: "tools"}]) != 1 {
+		if len(dropped[rlKey]) != 1 {
 			t.Fatalf("expected Private carve-out without Private unprotected grant to be dropped, got dropped=%#v", dropped)
+		}
+	})
+
+	t.Run("Translate evaluates Private unprotected authorization in both grant directions", func(t *testing.T) {
+		buildInputs := func(grantExposures []v1alpha1.Exposure) Inputs {
+			in := privateWildcardInputs(t)
+			in.Gateway.Spec.Listeners[0].Hostname = new(gatewayv1.Hostname("api.example.com"))
+			in.CloudflareAccount.Spec.Grants = []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{},
+				Hostnames:            []string{"api.example.com"},
+				Zones:                []string{"example.com"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePrivate},
+				Backends:             &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
+			}, {
+				NamespaceSelector:    metav1.LabelSelector{},
+				Hostnames:            []string{"api.example.com"},
+				Zones:                []string{"example.com"},
+				Exposures:            grantExposures,
+				UnprotectedHostnames: []string{"api.example.com"},
+				Backends:             &v1alpha1.CloudflareBackendGrant{Namespaces: v1alpha1.BackendNamespaceSame, Kinds: []v1alpha1.BackendKind{v1alpha1.BackendKindService}},
+			}}
+			in.HTTPRoutes = []gatewayv1.HTTPRoute{privateWildcardRoute("api", "api", "api.example.com")}
+			return in
+		}
+
+		// Public-only UnprotectedHostnames grant must NOT make Private listener unprotected.
+		gwPublicOnly, _ := Translate(buildInputs([]v1alpha1.Exposure{v1alpha1.ExposurePublic}))
+		if len(gwPublicOnly.Domains) != 1 || gwPublicOnly.Domains[0].Guard != ir.GuardBlocked {
+			t.Fatalf("Private listener allowed Public-only UnprotectedHostnames grant: %#v", gwPublicOnly.Domains)
+		}
+
+		// Private-only UnprotectedHostnames grant allows Private listener unprotected
+		// and enables cf-access-* stripping.
+		gwPrivateOnly, _ := Translate(buildInputs([]v1alpha1.Exposure{v1alpha1.ExposurePrivate}))
+		if len(gwPrivateOnly.Domains) != 1 || gwPrivateOnly.Domains[0].Guard != ir.GuardUnprotected || !gwPrivateOnly.Domains[0].StripAccessHeaders {
+			t.Fatalf("Private listener rejected Private UnprotectedHostnames grant or skipped header strip: %#v", gwPrivateOnly.Domains)
 		}
 	})
 }
 
-// QA-1F-1: When applyAccessRouteDrops drops all rules of an HTTPRoute,
-// Gateway.Status.Listeners[*].AttachedRoutes must exclude that route. Partial
-// drops (remaining > 0) keep the route counted.
+// QA-1F-1: When applyAccessRouteDrops drops all rules of an HTTPRoute on a
+// listener, Gateway.Status.Listeners[*].AttachedRoutes excludes that route on
+// that listener while keeping unaffected listeners and partial drops counted and
+// scoping PartiallyInvalid/Accepted=False to the affected parentRefs.
 func TestApplyAccessRouteDropsUpdatesListenerAttachedRoutes(t *testing.T) {
 	in := accessInputs(false)
-	protectedRoute := gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "protected-route", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"a.example.com", "b.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"b.example.com"}
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{
+		{Name: "a", Hostname: new(gatewayv1.Hostname("a.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "b", Hostname: new(gatewayv1.Hostname("b.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+	}
+
+	sectionA := gatewayv1.SectionName("a")
+	sectionB := gatewayv1.SectionName("b")
+
+	protectedOnA := gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "protected-a", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
 		Spec: gatewayv1.HTTPRouteSpec{
-			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: &sectionA}}},
+			Hostnames:       []gatewayv1.Hostname{"a.example.com"},
 			Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("admin", "/admin", "backend")},
 		},
 	}
-	fullyDroppedRoute := gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "dropped-route", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+	fullyDroppedOnA := gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "dropped-a", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
 		Spec: gatewayv1.HTTPRouteSpec{
-			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: &sectionA}}},
+			Hostnames:       []gatewayv1.Hostname{"a.example.com"},
 			Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("public-only", "/health", "backend")},
 		},
 	}
-	partiallyDroppedRoute := gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "partial-route", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(3, 0))},
+	partialOnA := gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "partial-a", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(3, 0))},
 		Spec: gatewayv1.HTTPRouteSpec{
-			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: &sectionA}}},
+			Hostnames:       []gatewayv1.Hostname{"a.example.com"},
 			Rules: []gatewayv1.HTTPRouteRule{
 				namedRouteRule("kept", "/kept", "backend"),
 				namedRouteRule("dropped", "/v1", "backend"),
 			},
 		},
 	}
-	in.HTTPRoutes = []gatewayv1.HTTPRoute{protectedRoute, fullyDroppedRoute, partiallyDroppedRoute}
+	// Multi-listener route: dropped completely on listener "a", kept on listener "b".
+	mixedMulti := gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "mixed-multi", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(4, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
+				{Name: "gateway", SectionName: &sectionA},
+				{Name: "gateway", SectionName: &sectionB},
+			}},
+			Hostnames: []gatewayv1.Hostname{"a.example.com", "b.example.com"},
+			Rules:     []gatewayv1.HTTPRouteRule{namedRouteRule("shared-rule", "/shared", "backend")},
+		},
+	}
+	unaffectedOnB := gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "unaffected-b", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(5, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: &sectionB}}},
+			Hostnames:       []gatewayv1.Hostname{"b.example.com"},
+			Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("ok", "/ok", "backend")},
+		},
+	}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{protectedOnA, fullyDroppedOnA, partialOnA, mixedMulti, unaffectedOnB}
 	appKey := types.NamespacedName{Namespace: "default", Name: "admin-app"}
-	app := accessApplication(appKey.Name, "HTTPRoute", "protected-route", "admin")
+	app := accessApplication(appKey.Name, "HTTPRoute", "protected-a", "admin")
 	app.Spec.TargetRefs = append(app.Spec.TargetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
-		LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "partial-route"},
+		LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "partial-a"},
 		SectionName:                new(gatewayv1.SectionName("kept")),
 	})
 	in.AccessApplications = []v1alpha1.AccessApplication{app}
 	in.AUDSecrets = map[types.NamespacedName]AUDSecret{appKey: {AUD: "aud-1", ApplicationID: "app-1", Ready: true}}
 
 	_, statuses := Translate(in)
-	droppedCond := findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "dropped-route"}], gatewayv1.RouteConditionAccepted)
-	if droppedCond == nil || droppedCond.Status != metav1.ConditionFalse {
-		t.Fatalf("fully dropped route Accepted = %#v, want False", droppedCond)
+
+	// Fully dropped route on "a": Accepted=False, PartiallyInvalid=True.
+	droppedKey := types.NamespacedName{Namespace: "default", Name: "dropped-a"}
+	if cond := findRouteCondition(statuses.HTTPRoutes[droppedKey], gatewayv1.RouteConditionAccepted); cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("dropped-a Accepted = %#v, want False", cond)
 	}
-	partialCond := findRouteCondition(statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "partial-route"}], gatewayv1.RouteConditionAccepted)
-	if partialCond == nil || partialCond.Status != metav1.ConditionTrue {
-		t.Fatalf("partially dropped route Accepted = %#v, want True", partialCond)
+	if cond := findRouteCondition(statuses.HTTPRoutes[droppedKey], gatewayv1.RouteConditionPartiallyInvalid); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("dropped-a PartiallyInvalid = %#v, want True", cond)
 	}
+
+	// Partially dropped route on "a": Accepted=True, PartiallyInvalid=True.
+	partialKey := types.NamespacedName{Namespace: "default", Name: "partial-a"}
+	if cond := findRouteCondition(statuses.HTTPRoutes[partialKey], gatewayv1.RouteConditionAccepted); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("partial-a Accepted = %#v, want True", cond)
+	}
+	if cond := findRouteCondition(statuses.HTTPRoutes[partialKey], gatewayv1.RouteConditionPartiallyInvalid); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("partial-a PartiallyInvalid = %#v, want True", cond)
+	}
+
+	// Multi-listener route: parent "a" is Accepted=False & PartiallyInvalid=True,
+	// while parent "b" stays Accepted=True with NO PartiallyInvalid condition.
+	mixedStatus := statuses.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "mixed-multi"}]
+	if len(mixedStatus.Parents) != 2 {
+		t.Fatalf("mixed-multi parents = %#v, want 2", mixedStatus.Parents)
+	}
+	for _, parent := range mixedStatus.Parents {
+		var acc, partial *metav1.Condition
+		for index := range parent.Conditions {
+			switch parent.Conditions[index].Type {
+			case string(gatewayv1.RouteConditionAccepted):
+				acc = &parent.Conditions[index]
+			case string(gatewayv1.RouteConditionPartiallyInvalid):
+				partial = &parent.Conditions[index]
+			}
+		}
+		if *parent.ParentRef.SectionName == sectionA {
+			if acc == nil || acc.Status != metav1.ConditionFalse {
+				t.Fatalf("mixed-multi parent a Accepted = %#v, want False", acc)
+			}
+			if partial == nil || partial.Status != metav1.ConditionTrue {
+				t.Fatalf("mixed-multi parent a PartiallyInvalid = %#v, want True", partial)
+			}
+		} else {
+			if acc == nil || acc.Status != metav1.ConditionTrue {
+				t.Fatalf("mixed-multi parent b Accepted = %#v, want True", acc)
+			}
+			if partial != nil {
+				t.Fatalf("mixed-multi parent b unexpectedly tainted with PartiallyInvalid: %#v", partial)
+			}
+		}
+	}
+
+	// Listener "a" keeps only protected-a + partial-a (2); listener "b" keeps mixed-multi + unaffected-b (2).
 	if got := statuses.Gateway.Listeners[0].AttachedRoutes; got != 2 {
-		t.Fatalf("AttachedRoutes = %d, want 2 (protected-route + partial-route, excluding fully dropped-route)", got)
+		t.Fatalf("listener a AttachedRoutes = %d, want 2 (protected-a + partial-a)", got)
+	}
+	if got := statuses.Gateway.Listeners[1].AttachedRoutes; got != 2 {
+		t.Fatalf("listener b AttachedRoutes = %d, want 2 (mixed-multi + unaffected-b)", got)
 	}
 }
 

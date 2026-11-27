@@ -61,7 +61,7 @@ A private listener is reached over WARP, and Envoy terminates TLS:
 - The account and devices need WARP setup: `DeviceSettings` with `gatewayProxyEnabled` and `gatewayUdpProxyEnabled` set to `true`, a `HostnameRoute` or `NetworkRoute` to the tunnel, a device profile that includes the private hostname ranges when it uses Include mode, no overlap between a hostname route and a fallback DNS suffix, and a compatible WARP client and Cloudflare plan.
 - Origin JWT verification on a private hostname requires Cloudflare Gateway TLS decryption, confirmed with `AccessApplication.spec.originJWT.assumeGatewayTLSDecryption: true`.
 
-Not verified live: a CoreDNS sidecar answers private hostnames with `127.0.0.1` so that WARP traffic passes through Envoy. That behavior is measured locally, but no live Cloudflare edge and WARP run has confirmed that the edge accepts a `127.0.0.1` answer for a private hostname.
+Not verified live: the CoreDNS sidecar answers private hostnames with `127.0.0.1` by default (or the Pod IP per listener using Pod IP fallback, with exact hostnames taking precedence over overlapping wildcards and duplicate exact hostnames preferring `127.0.0.1`) so that WARP traffic passes through Envoy. That behavior is measured locally, but no live Cloudflare edge and WARP run has confirmed that the edge accepts a `127.0.0.1` answer for a private hostname.
 
 [Reach private Services over Cloudflare WARP](../get-started/private-services-over-warp.md) walks through the setup.
 

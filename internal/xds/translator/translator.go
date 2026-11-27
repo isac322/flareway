@@ -271,7 +271,7 @@ func groupDomains(gw *ir.Gateway, listeners map[string]ir.Listener) ([]routeGrou
 			return nil, fmt.Errorf("protection domain %q requires at least one Access audience", domain.Name)
 		}
 		port := domain.EnvoyPort
-		if listener.Exposure == ir.ExposurePrivate {
+		if listener.Exposure == ir.ExposurePrivate && listener.Port > 0 {
 			port = listener.Port
 		} else if port == 0 {
 			port = listener.EnvoyPort

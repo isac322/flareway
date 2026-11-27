@@ -94,6 +94,17 @@ func privateDNSAnswerAddress(podIP bool) string {
 	return "127.0.0.1"
 }
 
+func escapeCoreDNSRegex(host string) string {
+	return strings.ReplaceAll(regexp.QuoteMeta(host), `\.`, "[.]")
+}
+
+func writePrivateDNSTemplate(builder *strings.Builder, pattern, addr string) {
+	builder.WriteString("    template IN A {\n")
+	fmt.Fprintf(builder, "        match %q\n", pattern)
+	fmt.Fprintf(builder, "        answer \"{{ .Name }} 30 IN A %s\"\n", addr)
+	builder.WriteString("        fallthrough\n    }\n")
+}
+
 func renderPrivateCorefile(entries []privateDNSEntry) string {
 	exact := make([]privateDNSEntry, 0, len(entries))
 	wildcards := make([]privateDNSEntry, 0, len(entries))
@@ -107,20 +118,17 @@ func renderPrivateCorefile(entries []privateDNSEntry) string {
 
 	var builder strings.Builder
 	builder.WriteString(".:53 {\n    bind 127.0.0.1\n")
+	// CoreDNS executes template plugins before hosts in plugin.cfg order.
+	// Render exact hostnames as template blocks ahead of wildcards so an exact
+	// hostname always takes precedence over an overlapping wildcard binding.
+	for _, entry := range exact {
+		pattern := "^" + escapeCoreDNSRegex(entry.hostname) + "[.]?$"
+		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
+	}
 	for _, entry := range wildcards {
 		suffix := strings.TrimPrefix(entry.hostname, "*.")
-		pattern := "^[^.]+[.]" + strings.ReplaceAll(regexp.QuoteMeta(suffix), `\.`, "[.]") + "[.]?$"
-		builder.WriteString("    template IN A {\n")
-		fmt.Fprintf(&builder, "        match %q\n", pattern)
-		fmt.Fprintf(&builder, "        answer \"{{ .Name }} 30 IN A %s\"\n", privateDNSAnswerAddress(entry.podIP))
-		builder.WriteString("        fallthrough\n    }\n")
-	}
-	if len(exact) > 0 {
-		builder.WriteString("    hosts {\n")
-		for _, entry := range exact {
-			fmt.Fprintf(&builder, "        %s %s\n", privateDNSAnswerAddress(entry.podIP), entry.hostname)
-		}
-		builder.WriteString("        ttl 30\n        no_reverse\n        fallthrough\n    }\n")
+		pattern := "^[^.]+[.]" + escapeCoreDNSRegex(suffix) + "[.]?$"
+		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
 	}
 	builder.WriteString("    forward . /etc/resolv.conf\n    reload 5s 2s\n    errors\n}\n")
 	return builder.String()
