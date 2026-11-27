@@ -430,51 +430,71 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	// Separate undrained slow subscriber overflowing buffer=3 on ZeroTrustList.
 	_ = sweeper.EventsFor("ZeroTrustList")
 
-	// Register ALL 19 real production reconcilers matching cmd/main.go:357-595.
-	polClient, _ := wrapClient("AccessPolicy", probeKey("AccessPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessPolicy); return ok })
-	vnetClient, _ := wrapClient("VirtualNetwork", probeKey("VirtualNetwork"), func(o client.Object) bool { _, ok := o.(*v1alpha1.VirtualNetwork); return ok })
-	tunnelClient, _ := wrapClient("CloudflareTunnel", probeKey("CloudflareTunnel"), func(o client.Object) bool { _, ok := o.(*v1alpha1.CloudflareTunnel); return ok })
-	gwSubClient, _ := wrapClient("Gateway-CloudflareTunnel", types.NamespacedName{Namespace: "tenant-fanout", Name: "gw-target-for-tunnel"}, func(o client.Object) bool { _, ok := o.(*gatewayv1.Gateway); return ok })
-	nrClient, _ := wrapClient("NetworkRoute", probeKey("NetworkRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.NetworkRoute); return ok })
-	hrClient, _ := wrapClient("HostnameRoute", probeKey("HostnameRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.HostnameRoute); return ok })
-	wcClient, _ := wrapClient("WARPConnector", probeKey("WARPConnector"), func(o client.Object) bool { _, ok := o.(*v1alpha1.WARPConnector); return ok })
-	grpClient, grpReader := wrapClient("AccessGroup", probeKey("AccessGroup"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessGroup); return ok })
-	idpClient, _ := wrapClient("IdentityProvider", probeKey("IdentityProvider"), func(o client.Object) bool { _, ok := o.(*v1alpha1.IdentityProvider); return ok })
-	dprClient, _ := wrapClient("DevicePostureRule", probeKey("DevicePostureRule"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureRule); return ok })
-	dpiClient, _ := wrapClient("DevicePostureIntegration", probeKey("DevicePostureIntegration"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureIntegration); return ok })
-	stClient, _ := wrapClient("ServiceToken", probeKey("ServiceToken"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ServiceToken); return ok })
-	appClient, _ := wrapClient("AccessApplication", probeKey("AccessApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessApplication); return ok })
-	saClient, _ := wrapClient("AccessStandaloneApplication", probeKey("AccessStandaloneApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessStandaloneApplication); return ok })
-	infraClient, infraReader := wrapClient("AccessInfrastructureTarget", probeKey("AccessInfrastructureTarget"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessInfrastructureTarget); return ok })
-	cpClient, _ := wrapClient("AccessCustomPage", probeKey("AccessCustomPage"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessCustomPage); return ok })
-	dpClient, _ := wrapClient("DeviceProfile", probeKey("DeviceProfile"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DeviceProfile); return ok })
-	ztlClient, _ := wrapClient("ZeroTrustList", probeKey("ZeroTrustList"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustList); return ok })
-	gwPolClient, _ := wrapClient("ZeroTrustGatewayPolicy", probeKey("ZeroTrustGatewayPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustGatewayPolicy); return ok })
+	// Register ALL 19 real production sweep-subscribed reconcilers via the
+	// canonical production SetupProductionControllers wiring used by cmd/main.go.
+	type subClients struct {
+		client client.Client
+		reader client.Reader
+	}
+	controllerClients := map[string]subClients{}
+	registerWrap := func(controllerKind, subName string, expected types.NamespacedName, matches func(client.Object) bool) {
+		c, r := wrapClient(subName, expected, matches)
+		controllerClients[controllerKind] = subClients{client: c, reader: r}
+	}
+	registerWrap("AccessPolicy", "AccessPolicy", probeKey("AccessPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessPolicy); return ok })
+	registerWrap("VirtualNetwork", "VirtualNetwork", probeKey("VirtualNetwork"), func(o client.Object) bool { _, ok := o.(*v1alpha1.VirtualNetwork); return ok })
+	registerWrap("CloudflareTunnel", "CloudflareTunnel", probeKey("CloudflareTunnel"), func(o client.Object) bool { _, ok := o.(*v1alpha1.CloudflareTunnel); return ok })
+	registerWrap("Gateway", "Gateway-CloudflareTunnel", types.NamespacedName{Namespace: "tenant-fanout", Name: "gw-target-for-tunnel"}, func(o client.Object) bool { _, ok := o.(*gatewayv1.Gateway); return ok })
+	registerWrap("NetworkRoute", "NetworkRoute", probeKey("NetworkRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.NetworkRoute); return ok })
+	registerWrap("HostnameRoute", "HostnameRoute", probeKey("HostnameRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.HostnameRoute); return ok })
+	registerWrap("WARPConnector", "WARPConnector", probeKey("WARPConnector"), func(o client.Object) bool { _, ok := o.(*v1alpha1.WARPConnector); return ok })
+	registerWrap("AccessGroup", "AccessGroup", probeKey("AccessGroup"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessGroup); return ok })
+	registerWrap("IdentityProvider", "IdentityProvider", probeKey("IdentityProvider"), func(o client.Object) bool { _, ok := o.(*v1alpha1.IdentityProvider); return ok })
+	registerWrap("DevicePostureRule", "DevicePostureRule", probeKey("DevicePostureRule"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureRule); return ok })
+	registerWrap("DevicePostureIntegration", "DevicePostureIntegration", probeKey("DevicePostureIntegration"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureIntegration); return ok })
+	registerWrap("ServiceToken", "ServiceToken", probeKey("ServiceToken"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ServiceToken); return ok })
+	registerWrap("AccessApplication", "AccessApplication", probeKey("AccessApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessApplication); return ok })
+	registerWrap("AccessStandaloneApplication", "AccessStandaloneApplication", probeKey("AccessStandaloneApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessStandaloneApplication); return ok })
+	registerWrap("AccessInfrastructureTarget", "AccessInfrastructureTarget", probeKey("AccessInfrastructureTarget"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessInfrastructureTarget); return ok })
+	registerWrap("AccessCustomPage", "AccessCustomPage", probeKey("AccessCustomPage"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessCustomPage); return ok })
+	registerWrap("DeviceProfile", "DeviceProfile", probeKey("DeviceProfile"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DeviceProfile); return ok })
+	registerWrap("ZeroTrustList", "ZeroTrustList", probeKey("ZeroTrustList"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustList); return ok })
+	registerWrap("ZeroTrustGatewayPolicy", "ZeroTrustGatewayPolicy", probeKey("ZeroTrustGatewayPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustGatewayPolicy); return ok })
 
-	for _, err := range []error{
-		(&AccessPolicyReconciler{Client: polClient, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessPolicy")}).SetupWithManager(mgr),
-		(&VirtualNetworkReconciler{Client: vnetClient, Scheme: mgr.GetScheme(), NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("VirtualNetwork")}).SetupWithManager(mgr),
-		(&CloudflareTunnelReconciler{Client: tunnelClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: tunnelFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("CloudflareTunnel")}).SetupWithManager(mgr),
-		(&GatewayReconciler{Client: gwSubClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace, CloudflareFactory: gatewayCloudflareFactory{api: gwAPI}, Prober: &staticGatewayProber{version: 1, ready: true}, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("CloudflareTunnel")}).SetupWithManager(mgr),
-		(&NetworkRouteReconciler{Client: nrClient, Scheme: mgr.GetScheme(), NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("NetworkRoute")}).SetupWithManager(mgr),
-		(&HostnameRouteReconciler{Client: hrClient, Scheme: mgr.GetScheme(), OperatorNamespace: dataplane.DefaultOperatorNamespace, NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("HostnameRoute")}).SetupWithManager(mgr),
-		(&WARPConnectorReconciler{Client: wcClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.WARPConnectorAPI, error) { return warpFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("WARPConnector")}).SetupWithManager(mgr),
-		(&AccessGroupReconciler{Client: grpClient, APIReader: grpReader, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessGroup")}).SetupWithManager(mgr),
-		(&IdentityProviderReconciler{Client: idpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return idpFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("IdentityProvider")}).SetupWithManager(mgr),
-		(&DevicePostureRuleReconciler{Client: dprClient, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DevicePostureRule")}).SetupWithManager(mgr),
-		(&DevicePostureIntegrationReconciler{Client: dpiClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return integrationFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DevicePostureIntegration")}).SetupWithManager(mgr),
-		(&ServiceTokenReconciler{Client: stClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ServiceToken")}).SetupWithManager(mgr),
-		(&AccessApplicationReconciler{Client: appClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), OperatorNamespace: dataplane.DefaultOperatorNamespace, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessApplication")}).SetupWithManager(mgr),
-		(&AccessStandaloneApplicationReconciler{Client: saClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessStandaloneApplication")}).SetupWithManager(mgr),
-		(&AccessInfrastructureTargetReconciler{Client: infraClient, APIReader: infraReader, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return infraFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessInfrastructureTarget")}).SetupWithManager(mgr),
-		(&AccessCustomPageReconciler{Client: cpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return customPageFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessCustomPage")}).SetupWithManager(mgr),
-		(&DeviceProfileReconciler{Client: dpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: profileFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DeviceProfile")}).SetupWithManager(mgr),
-		(&ZeroTrustListReconciler{Client: ztlClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: gatewayFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ZeroTrustList")}).SetupWithManager(mgr),
-		(&ZeroTrustGatewayPolicyReconciler{Client: gwPolClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: gatewayFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ZeroTrustGatewayPolicy")}).SetupWithManager(mgr),
-	} {
-		if err != nil {
-			t.Fatalf("setup production reconciler: %v", err)
-		}
+	if err := SetupProductionControllers(mgr, ProductionControllerOptions{
+		Groups: sweep.ControllerGroups{
+			Gateway: true, Access: true, PrivateNetwork: true, Device: true, Organization: true,
+		},
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		ClientFor: func(controllerKind string) (client.Client, client.Reader) {
+			if pair, ok := controllerClients[controllerKind]; ok {
+				return pair.client, pair.reader
+			}
+			return mgr.GetClient(), mgr.GetAPIReader()
+		},
+		Snapshots:             snapshots,
+		OperatorNamespace:     dataplane.DefaultOperatorNamespace,
+		Prober:                &staticGatewayProber{version: 1, ready: true},
+		Freshness:             policy,
+		Invalidator:           latch,
+		Sweeper:               sweeper,
+		SkipAccountController: true,
+		GatewayCloudflareFactory:       gatewayCloudflareFactory{api: gwAPI},
+		TunnelClient:                   tunnelFake.Client,
+		PrivateNetworkClient:           vnetFake.Client,
+		WARPConnectorClient:            func(string, string) (flarecloudflare.WARPConnectorAPI, error) { return warpFake, nil },
+		AccessClient:                   accessFake.Client,
+		IdentityProviderClient:         func(string, string) (flarecloudflare.AccessAPI, error) { return idpFake, nil },
+		DevicePostureIntegrationClient: func(string, string) (flarecloudflare.AccessAPI, error) { return integrationFake, nil },
+		AccessApplicationClient:        func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil },
+		AccessStandaloneClient:         func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneFake, nil },
+		AccessInfrastructureClient:     func(string, string) (flarecloudflare.AccessAPI, error) { return infraFake, nil },
+		AccessCustomPageClient:         func(string, string) (flarecloudflare.AccessAPI, error) { return customPageFake, nil },
+		DeviceProfileClient:            profileFake.Client,
+		GatewayClient:                  gatewayFake.Client,
+	}); err != nil {
+		t.Fatalf("setup production controllers: %v", err)
 	}
 
 	startManagerAndWait(t, mgr)
