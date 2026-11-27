@@ -222,7 +222,7 @@ A private listener needs three things:
 
 - `protocol: HTTPS` with a `certificateRefs` Secret. Envoy terminates TLS for private listeners, the reverse of public listeners, where Cloudflare owns edge TLS.
 - a `CloudflareTunnel.spec.listeners[]` entry with the same name and `exposure: Private`.
-- the port that clients dial. Envoy binds to the listener's declared port, here `443`, because Cloudflare forwards the original destination port. Another port would break the WARP destination and the Access `portRange`.
+- the port that clients dial (excluding the reserved dataplane pod ports `53`, `2000`, `18000`, `19000`, and `19001`, which report `Accepted=False` with reason `PortUnavailable`). Envoy binds to the listener's declared port, here `443`, because Cloudflare forwards the original destination port. Another port would break the WARP destination and the Access `portRange`.
 
 One Gateway cannot expose the same hostname as both public and private; the tunnel reports `Accepted=False` with "hostname exposure must be unique per Gateway". `dns.mode: External` fits a private-only tunnel, which needs no public DNS record.
 
@@ -266,9 +266,11 @@ spec:
 
 `private-https` protects the private listener with Access at the edge only, because `originJWT.mode` is `Disabled`; the `flareway-platform` namespace label allows that. For an origin JWT check on this listener, turn on Zero Trust Gateway TLS decryption and set `originJWT.mode: Required` with `assumeGatewayTLSDecryption: true`. [Security model](../concepts/security-model.md#access-enforcement) compares the public and private checks.
 
+Because Cloudflare Private Access enforces L4 host+port destinations and a Private listener serves all of its virtual hosts on one TLS filter chain, an `AccessApplication` on a Private listener must protect a whole Private hostname: `pathScope`, per-rule `HTTPRoute` splits (`sectionName` or partial-route targeting), and multiple `AccessApplication` objects for the same Private hostname on a listener are rejected with `Accepted=False` and reason `Invalid`. On a wildcard Private listener, separate hostnames can still each use their own `AccessApplication`.
+
 ## How resolution works
 
-A Gateway with private listeners gets a CoreDNS sidecar in its data-plane Pod. The sidecar answers private hostnames with `127.0.0.1`, so WARP traffic that arrives through `cloudflared` goes to Envoy on loopback. Envoy terminates TLS with your certificate and applies the `HTTPRoute` rules.
+A Gateway with private listeners gets a CoreDNS sidecar in its data-plane Pod. The sidecar answers each private hostname according to its listener's binding (`127.0.0.1` for `Loopback`, or `{$POD_IP}` for `PodIP`; if both bindings share the exact same hostname, it answers `127.0.0.1`), so WARP traffic that arrives through `cloudflared` reaches Envoy. Envoy terminates TLS with your certificate and applies the `HTTPRoute` rules.
 
 The tunnel's `PrivateListenerDegraded` condition reports how the listener is bound:
 

@@ -209,6 +209,8 @@ spec:
 
 `pathScope` requires at least one target. It narrows the target-derived hostname to an `Exact` or `PathPrefix` path; omitted `type` defaults to `PathPrefix`. It creates a more-specific protection domain without changing the HTTPRoute's backend behavior.
 
+Private listeners enforce L4 host+port Access semantics on Cloudflare and share one TLS filter chain per listener port, so `pathScope`, per-rule `HTTPRoute` splits (`sectionName` or partial-route targeting of a shared Private hostname), and multiple `AccessApplication` objects targeting the same Private hostname on a listener are rejected with `Accepted=False` and reason `Invalid`. Distinct Private hostnames on a wildcard Private listener can each have their own `AccessApplication`.
+
 `ProxyEndpoint` requires target references and does not accept direct destinations. Other attached application types require targets, destinations, or both.
 
 #### Additional destinations

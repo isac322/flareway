@@ -127,7 +127,7 @@ kubectl apply -f demo-admin.yaml
 The fields that decide what is protected:
 
 - `targetRefs` names a `Gateway` or `HTTPRoute` in the same namespace. On a `Gateway`, `sectionName` selects a listener, and the listener's whole hostname is protected. On an `HTTPRoute`, `sectionName` selects a named rule (`rules[].name`).
-- `pathScope` narrows the target's hostname to an `Exact` or `PathPrefix` path, and `type` defaults to `PathPrefix`. It creates a more specific protected area without changing where the route sends traffic.
+- `pathScope` narrows a public target's hostname to an `Exact` or `PathPrefix` path, and `type` defaults to `PathPrefix`. It creates a more specific protected area without changing where the route sends traffic. Private listeners enforce whole-hostname L4 protection and reject `pathScope`, per-rule `HTTPRoute` splits, and duplicate same-host `AccessApplication`s with `Invalid`.
 - `policies` attach in list order, and that order is the precedence in Cloudflare.
 - `originJWT.mode` defaults to `Required`. `audienceScope: Application`, the default, accepts only this application's AUD. `Hostname` accepts the AUD of every ready application on the same hostname and works only with `Required`.
 - `originJWT.mode: Disabled` turns off the origin check and needs platform approval: the namespace must carry the label `flareway.bhyoo.com/allow-origin-jwt-disable: "true"`. Without it, the application reports `RefNotPermitted`.

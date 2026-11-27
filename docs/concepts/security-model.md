@@ -80,7 +80,7 @@ Origin verification is controlled by `AccessApplication.spec.originJWT.mode`:
 - `Required` is the default. Requests without a valid Access JWT for the application's AUD are refused at the origin.
 - `Disabled` is an explicit opt-out. Flareway still creates the Access application and forwards traffic once the application is ready, but the origin does not check the JWT.
 
-Routes with no `AccessApplication` carry no JWT check. A granted hostname can serve such routes only if it is listed in `unprotectedHostnames`.
+Routes with no `AccessApplication` carry no JWT check. A granted hostname can serve such routes only if it is listed in `unprotectedHostnames` for that listener's exposure (`Public` or `Private`). On non-conformance unprotected routes, Flareway strips incoming Access identity headers and removes `cf-access-*` `Set`/`Add` headers from route and backend `RequestHeaderModifier` filters so neither clients nor routes can spoof Access identity headers. Protected forwarding domains keep `cf-access-*` headers intact after JWT verification.
 
 [Protect a route with Cloudflare Access](../get-started/protect-with-access.md) walks through a full example.
 

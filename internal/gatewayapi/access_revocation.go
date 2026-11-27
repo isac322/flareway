@@ -29,6 +29,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -401,7 +402,7 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 	for port := range reserved {
 		ports.reserved[port] = struct{}{}
 	}
-	for _, internalPort := range []int32{18000, 19000, 19001} {
+	for _, internalPort := range dataplane.ReservedPodPorts() {
 		ports.reserved[internalPort] = struct{}{}
 	}
 	if conformance || in.Gateway == nil {
@@ -430,7 +431,6 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 		if _, live := livePublic[listenerName]; !live {
 			continue
 		}
-		suffix := "-" + disambiguateListenerHash(listenerName)
 		for _, pd := range ls.ProtectionDomains {
 			port := pd.EnvoyPort
 			if port < publicPortMin || port > publicPortMax {
@@ -444,11 +444,7 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 			}
 			ports.preClaimed[port] = struct{}{}
 			ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
-			if pd.Name == listenerName ||
-				pd.Name == listenerName+"-public" ||
-				pd.Name == listenerName+"-blocked" ||
-				pd.Name == listenerName+"-public"+suffix ||
-				pd.Name == listenerName+"-blocked"+suffix {
+			if pd.Name == listenerName {
 				if _, exists := ports.stickyBase[listenerName]; !exists {
 					ports.stickyBase[listenerName] = port
 				}

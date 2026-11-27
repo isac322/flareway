@@ -155,7 +155,7 @@ Both application resources require `spec.accountRef`, an immutable PascalCase `s
 
 If admission reports that a variant is missing or mismatched, change the discriminator and variant together. Do not replace a type with a lower-case Cloudflare wire value such as `self_hosted` or `app_launcher`.
 
-`AccessApplication.targetRefs[]` accepts same-namespace `gateway.networking.k8s.io` `Gateway` and `HTTPRoute` references. `sectionName` selects a listener or named route rule. `pathScope` can narrow the compiled public region with `Exact` or `PathPrefix`; it cannot create a public destination without a target. Direct `destinations[]` entries must use one matching typed member. A `Private` entry requires exactly one of `networkRouteRef` or `hostnameRouteRef`.
+`AccessApplication.targetRefs[]` accepts same-namespace `gateway.networking.k8s.io` `Gateway` and `HTTPRoute` references. `sectionName` selects a listener or named route rule. `pathScope` can narrow a compiled public region with `Exact` or `PathPrefix`; it cannot create a public destination without a target. On Private listeners, `pathScope`, per-rule `HTTPRoute` target splits, and multiple `AccessApplication`s targeting the same Private hostname are rejected with `Invalid`. Direct `destinations[]` entries must use one matching typed member. A `Private` entry requires exactly one of `networkRouteRef` or `hostnameRouteRef`.
 
 ### Account and zone scope
 

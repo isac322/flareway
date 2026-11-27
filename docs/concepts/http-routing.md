@@ -125,7 +125,7 @@ Flareway does not claim these 11 Extended features:
 | `GatewayAddressEmpty`, `GatewayAddressRoutability`, `GatewayAddressRoutabilityCluster`, `GatewayStaticAddresses` | A Gateway with any `spec.addresses` entry, including one without a value that asks for a dynamically assigned address, reports `Accepted=False` with reason `UnsupportedAddress`. Cloudflare's edge owns the public addresses. A Gateway with a public listener reports the tunnel's `<tunnel-id>.cfargotunnel.com` hostname as its address. |
 | `GatewayBackendClientCertificate`, `GatewayFrontendClientCertificateValidation`, `GatewayFrontendClientCertificateValidationInsecureFallback` | Flareway does not claim these features. |
 | `GatewayListenerFilters` | `Gateway.spec.listeners[].filters` is rejected on that listener with `Accepted=False` and reason `UnsupportedValue`. |
-| `GatewayPort8080` | Public listeners must be HTTP on port 80 or HTTPS on port 443. Any other port marks the listener `PortUnavailable`. Private HTTPS listeners accept any port. |
+| `GatewayPort8080` | Public listeners must be HTTP on port 80 or HTTPS on port 443. Any other port marks the listener `PortUnavailable`. Private HTTPS listeners accept any port except the reserved dataplane pod ports (`53`, `2000`, `18000`, `19000`, `19001`), which also report `Accepted=False` with reason `PortUnavailable`. |
 | `ListenerSet` | A Gateway with `spec.allowedListeners.namespaces.from: Same`, `All`, or `Selector` reports `Accepted=False` with reason `ListenersNotValid`. `None` is accepted as a no-op. |
 
 `Gateway.spec.tls` is rejected with `Accepted=False` and reason `ListenersNotValid`.
