@@ -107,11 +107,18 @@ type tunnelConditionUpdate struct {
 // Ready=True) pair is repaired atomically while promotion is never folded into
 // a claim.
 func patchTunnelConditions(ctx context.Context, c client.Client, reader client.Reader, update tunnelConditionUpdate) error {
+	_, err := patchTunnelConditionsChecked(ctx, c, reader, update)
+	return err
+}
+
+// patchTunnelConditionsChecked applies the merged tunnel condition document and
+// returns whether Ready=True at the live generation was durably present/applied.
+func patchTunnelConditionsChecked(ctx context.Context, c client.Client, reader client.Reader, update tunnelConditionUpdate) (bool, error) {
 	if c == nil {
-		return errors.New("tunnel conditions update requires a client")
+		return false, errors.New("tunnel conditions update requires a client")
 	}
 	if update.Observed == nil {
-		return errors.New("tunnel conditions update requires an observed CloudflareTunnel")
+		return false, errors.New("tunnel conditions update requires an observed CloudflareTunnel")
 	}
 	if reader == nil {
 		reader = c
@@ -129,34 +136,35 @@ func patchTunnelConditions(ctx context.Context, c client.Client, reader client.R
 			// successful commit: callers that invalidate before remote
 			// mutation must not proceed on a deleted object. Top-level
 			// Reconcile may IgnoreNotFound on its own read.
-			return fmt.Errorf("read live CloudflareTunnel %s for conditions: %w", key, err)
+			return false, fmt.Errorf("read live CloudflareTunnel %s for conditions: %w", key, err)
 		}
 		if err := tunnelConditionIdentityCheck(update.Observed, &live); err != nil {
-			return err
+			return false, err
 		}
 		if update.Validate != nil {
 			if err := update.Validate(&live); err != nil {
-				return err
+				return false, err
 			}
 		}
 		merged := mergeTunnelConditions(&live, update.Conditions, update.ReadyOverride, now)
+		readyLive := conditionTrueForGeneration(merged, v1alpha1.CloudflareTunnelConditionReady, live.Generation)
 		if tunnelConditionsDeepEqual(live.Status.Conditions, merged) && tunnelSharedConditionCoverage(&live, merged) {
-			return nil
+			return readyLive, nil
 		}
 		apply, err := tunnelConditionsApply(&live, merged)
 		if err != nil {
-			return err
+			return false, err
 		}
 		err = c.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(tunnelStatusFieldManager), client.ForceOwnership)
 		if err == nil {
-			return nil
+			return readyLive, nil
 		}
 		if !apierrors.IsConflict(err) {
-			return fmt.Errorf("apply CloudflareTunnel %s conditions: %w", key, err)
+			return false, fmt.Errorf("apply CloudflareTunnel %s conditions: %w", key, err)
 		}
 		lastErr = err
 	}
-	return fmt.Errorf("apply CloudflareTunnel %s conditions: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
+	return false, fmt.Errorf("apply CloudflareTunnel %s conditions: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
 }
 
 // tunnelConditionIdentityCheck enforces the shared Tier-1 precondition: the

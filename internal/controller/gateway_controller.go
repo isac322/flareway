@@ -738,10 +738,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
 	}
 
-	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
+	programmedCurrentGen, err := r.patchGatewayStatusChecked(ctx, req.NamespacedName, gateway.UID, gateway.Generation, statuses.Gateway)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if tunnelConfigCommitted && !pending {
+	if tunnelConfigCommitted && !pending && programmedCurrentGen {
 		r.confirmTunnelConfigGate(cloudflareResult)
 	}
 	if compiled.ConformanceMode {
@@ -1816,7 +1817,14 @@ func (r *GatewayReconciler) patchGatewayAdmissionStatus(ctx context.Context, key
 }
 
 func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
+	_, err := r.patchGatewayStatusChecked(ctx, key, "", 0, desired)
+	return err
+}
+
+func (r *GatewayReconciler) patchGatewayStatusChecked(ctx context.Context, key types.NamespacedName, expectedUID types.UID, expectedGen int64, desired gatewayv1.GatewayStatus) (bool, error) {
 	deleted := false
+	stale := false
+	var liveGen int64
 	var patched gatewayv1.GatewayStatus
 	now := metav1.Now()
 	if r.Now != nil {
@@ -1832,6 +1840,11 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 			}
 			return err
 		}
+		if !admissionOnly && ((expectedUID != "" && current.UID != expectedUID) || (expectedGen > 0 && current.Generation != expectedGen)) {
+			stale = true
+			return nil
+		}
+		liveGen = current.Generation
 
 		ownedGatewayConditions := map[string]struct{}{
 			string(gatewayv1.GatewayConditionAccepted):   {},
@@ -1958,15 +1971,21 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if deleted {
 		observability.Default.DeleteGateway(key.String())
-		return nil
+		return false, nil
+	}
+	if stale {
+		return false, nil
 	}
 	condition := meta.FindStatusCondition(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	observability.Default.SetGatewayProgrammed(key.String(), condition != nil && condition.Status == metav1.ConditionTrue)
-	return nil
+	if admissionOnly {
+		return false, nil
+	}
+	return conditionTrueForGeneration(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed), liveGen), nil
 }
 
 func monotonicProgrammedTransitionTime(desired metav1.Condition, prev *metav1.Condition, now metav1.Time) metav1.Time {

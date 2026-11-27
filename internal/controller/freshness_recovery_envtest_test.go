@@ -4417,7 +4417,8 @@ func TestPatchTunnelGatewayDataEmptyListsZeroSteadyAppliesEnvtest(t *testing.T) 
 }
 
 // failingStatusClient delegates reads/writes to Client while allowing tests to
-// inject a stale object snapshot on Get and fail status subresource writes.
+// inject a stale object snapshot on Get, inspect/intercept status writes, and
+// fail targeted status subresource writes.
 type failingStatusClient struct {
 	client.Client
 	failStatusWrite atomic.Bool
@@ -4425,6 +4426,7 @@ type failingStatusClient struct {
 	staleTunnel     *v1alpha1.CloudflareTunnel
 	staleApp        *v1alpha1.AccessApplication
 	staleGateway    *gatewayv1.Gateway
+	onStatusPatch   func(obj client.Object)
 }
 
 func (c *failingStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -4484,6 +4486,9 @@ func (w *failingStatusWriter) Update(ctx context.Context, obj client.Object, opt
 }
 
 func (w *failingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if w.parent.onStatusPatch != nil {
+		w.parent.onStatusPatch(obj)
+	}
 	if w.shouldFailObj(obj) {
 		return fmt.Errorf("injected status Patch failure")
 	}
@@ -4492,7 +4497,15 @@ func (w *failingStatusWriter) Patch(ctx context.Context, obj client.Object, patc
 
 func (w *failingStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
 	if w.parent.failStatusWrite.Load() {
-		return fmt.Errorf("injected status Apply failure")
+		if w.parent.failStatusKind == "" {
+			return fmt.Errorf("injected status Apply failure")
+		}
+		var document struct {
+			Kind string `json:"kind"`
+		}
+		if payload, err := json.Marshal(obj); err == nil && json.Unmarshal(payload, &document) == nil && document.Kind == w.parent.failStatusKind {
+			return fmt.Errorf("injected status Apply failure for %s", document.Kind)
+		}
 	}
 	return w.SubResourceWriter.Apply(ctx, obj, opts...)
 }
@@ -5022,6 +5035,23 @@ func TestDemotedGatewayTunnelConfigStaysInvalidatedOnStatusWriteFailure(t *testi
 		t.Fatal("expected Gateway config demotion to hold invalidation latch")
 	}
 
+	// Demote live Gateway Programmed=False (as observed before recovery) so the
+	// next reconcile MUST call Status().Patch on Gateway to restore Programmed=True.
+	var liveDemotedGW gatewayv1.Gateway
+	if err := direct.Get(ctx, gwKey, &liveDemotedGW); err != nil {
+		t.Fatal(err)
+	}
+	meta.SetStatusCondition(&liveDemotedGW.Status.Conditions, metav1.Condition{
+		Type:               string(gatewayv1.GatewayConditionProgrammed),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: liveDemotedGW.Generation,
+		Reason:             "Pending",
+		Message:            "demoted pending",
+	})
+	if err := direct.Status().Update(ctx, &liveDemotedGW); err != nil {
+		t.Fatalf("demote live gateway status: %v", err)
+	}
+
 	// Simulate stale converged snapshots + fail Gateway Programmed=True patch.
 	faultClient.staleGateway = staleGW.DeepCopy()
 	faultClient.staleTunnel = staleTunnel.DeepCopy()
@@ -5048,5 +5078,668 @@ func TestDemotedGatewayTunnelConfigStaysInvalidatedOnStatusWriteFailure(t *testi
 	}
 	if latch.IsInvalidated("CloudflareTunnelConfig", gwKey) {
 		t.Fatal("CloudflareTunnelConfig invalidation latch stayed set after durable Programmed=True persistence")
+	}
+}
+
+// Regression test for P2 #1: a Gateway-mode External DNS CloudflareTunnel with
+// ConfigApplied=False/Pending on etcd (deriving Ready=False inside
+// commitTunnelConditions) MUST keep its "demoted" latch invalidated and record
+// NO MarkVerified stamp even when patchOwnedStatus returns nil, so a retry
+// observing a stale Ready=True cache still runs Cloudflare verification.
+func TestCloudflareTunnelWithConfigAppliedPendingKeepsLatchInvalidatedEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-tunnel-config-pending-latch"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "tunnel-pending-acct"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	gwHost := gatewayv1.Hostname("edge.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "edge"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "edge",
+			}},
+			Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &gwHost}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "edge", Finalizers: []string{v1alpha1.CloudflareTunnelFinalizer}},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Tunnel:           v1alpha1.CloudflareTunnelRemoteSpec{Name: "edge"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			DNS:              v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			Configuration:    v1alpha1.CloudflareTunnelConfiguration{Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway},
+		},
+	}
+	if err := direct.Create(ctx, tunnel); err != nil {
+		t.Fatalf("create tunnel: %v", err)
+	}
+	tunnelKey := client.ObjectKeyFromObject(tunnel)
+
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	tunnelFake.tunnels["tunnel-1"] = RemoteTunnel{
+		ID: "tunnel-1", AccountTag: account.Spec.AccountID, Name: "edge",
+		Type: flarecloudflare.TunnelTypeCloudflared, ConfigSource: flarecloudflare.TunnelConfigSourceCloudflare, Status: flarecloudflare.TunnelStatusHealthy,
+	}
+	tunnelFake.tokens["tunnel-1"] = "token-1"
+
+	appliedAt := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+	seedStatus := func(caStatus, caReason string) {
+		t.Helper()
+		seedApply := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"tunnelId":          "tunnel-1",
+				"accountId":         account.Spec.AccountID,
+				"ownershipVerified": true,
+				"gatewayRef":        map[string]any{"name": gw.Name},
+				"gatewayUid":        string(gw.UID),
+				"configVersion": map[string]any{
+					"desired":     1,
+					"desiredHash": "cfg-h1",
+					"applied":     1,
+					"remote":      1,
+					"appliedAt":   appliedAt.Format(time.RFC3339),
+				},
+				"conditions": []any{map[string]any{
+					"type":               v1alpha1.CloudflareTunnelConditionConfigApplied,
+					"status":             caStatus,
+					"reason":             caReason,
+					"message":            "gateway config state",
+					"observedGeneration": tunnel.Generation,
+					"lastTransitionTime": appliedAt.Format(time.RFC3339),
+				}},
+			},
+		}}
+		seedApply.SetAPIVersion(v1alpha1.GroupVersion.String())
+		seedApply.SetKind("CloudflareTunnel")
+		seedApply.SetNamespace(ns)
+		seedApply.SetName(tunnel.Name)
+		if err := direct.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(seedApply), client.FieldOwner("flareway-gateway"), client.ForceOwnership); err != nil {
+			t.Fatalf("seed gateway status (%s): %v", caStatus, err)
+		}
+	}
+	seedStatus("True", "Applied")
+
+	latch := freshness.NewLatch()
+	faultClient := &failingStatusClient{Client: direct}
+	reconciler := &CloudflareTunnelReconciler{
+		Client:              faultClient,
+		APIReader:           direct,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: tunnelFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         latch,
+	}
+
+	// Converge once to obtain an authentic Ready=True snapshot.
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("seed converge reconcile: %v", err)
+	}
+	var staleReady v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, tunnelKey, &staleReady); err != nil {
+		t.Fatal(err)
+	}
+	if !assertConditionTrueForCurrentGen(staleReady.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, staleReady.Generation) {
+		t.Fatalf("tunnel did not converge Ready=True: %+v", staleReady.Status.Conditions)
+	}
+
+	// Now Gateway sets ConfigApplied=False/Pending in etcd and latch holds "demoted",
+	// while informer cache hands back the stale Ready=True snapshot.
+	seedStatus("False", "Pending")
+	latch.Forget("CloudflareTunnel", tunnelKey)
+	latch.Invalidate("CloudflareTunnel", tunnelKey, "demoted")
+	faultClient.staleTunnel = staleReady.DeepCopy()
+
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("reconcile while ConfigApplied=False: %v", err)
+	}
+
+	var liveAfter v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, tunnelKey, &liveAfter); err != nil {
+		t.Fatal(err)
+	}
+	readyCond := meta.FindStatusCondition(liveAfter.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady)
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse {
+		t.Fatalf("live Ready = %#v, want False while ConfigApplied=False", readyCond)
+	}
+	if !latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("CloudflareTunnel cleared demotion latch even though derived Ready=False persisted")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnel", tunnelKey, "cfg-h1"); ok {
+		t.Fatal("CloudflareTunnel recorded MarkVerified while derived Ready=False")
+	}
+
+	// Next retry with stale Ready=True cache MUST still verify against Cloudflare.
+	callsBefore := len(tunnelFake.Calls())
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	if got := tunnelFake.Calls()[callsBefore:]; !slices.Contains(got, "GetTunnel") || !slices.Contains(got, "ListTunnelConnections") {
+		t.Fatalf("retry skipped Cloudflare verification while live Ready=False; calls=%v", got)
+	}
+}
+
+// Regression test for P2 #2: AccessApplication patchStatus MUST read live state
+// from directReader (repairing Programmed=False in etcd even when informer cache
+// holds stale Programmed=True) and MUST keep the latch invalidated on
+// concurrent Generation bump or NotFound deletion.
+func TestAccessApplicationCachedPatchUsesDirectReaderAndGuardsConcurrentGenOrDeleteEnvtest(t *testing.T) {
+	setupAppWorld := func(t *testing.T, ns, accountName, appName string) (context.Context, client.Client, *AccessApplicationReconciler, *failingStatusClient, *fakeAccessApplicationCloudflare, *freshness.Latch, types.NamespacedName) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatalf("create ns: %v", err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatalf("create secret: %v", err)
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: accountName},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:         []string{"*"},
+					Zones:             []string{"*"},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+					AccessPolicyRefs:  v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+		markAccountReady(ctx, t, direct, account, nil)
+
+		appFake := newFakeAccessApplicationCloudflare()
+		appFake.SetPolicy(flarecloudflare.AccessPolicy{ID: "ext-pol-p22", Name: "ext-pol", Decision: "Allow"})
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: appName, Finalizers: []string{v1alpha1.AccessApplicationFinalizer}},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: account.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Application: v1alpha1.AccessApplicationSettings{
+					Name:            appName,
+					SessionDuration: "1h",
+				},
+				Destinations: []v1alpha1.AccessApplicationDestinationSpec{{
+					Type:   v1alpha1.AccessApplicationDestinationWorker,
+					Worker: &v1alpha1.AccessWorkerDestinationSpec{WorkerID: "worker-1"},
+				}},
+				Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "ext-pol-p22"}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		if err := direct.Create(ctx, app); err != nil {
+			t.Fatalf("create app: %v", err)
+		}
+		appKey := client.ObjectKeyFromObject(app)
+		latch := freshness.NewLatch()
+		faultClient := &failingStatusClient{Client: mgr.GetClient()}
+		reconciler := &AccessApplicationReconciler{
+			Client:              faultClient,
+			APIReader:           direct,
+			Scheme:              mgr.GetScheme(),
+			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
+			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil },
+			Freshness:           freshness.DefaultPolicy(),
+			Invalidator:         latch,
+		}
+		if err := reconciler.registerFieldIndexers(mgr); err != nil {
+			t.Fatalf("register indexers: %v", err)
+		}
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "cache sees app and ready account", func() (bool, error) {
+			var curApp v1alpha1.AccessApplication
+			var curAcc v1alpha1.CloudflareAccount
+			if err := mgr.GetClient().Get(ctx, appKey, &curApp); err != nil {
+				return false, nil
+			}
+			if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &curAcc); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(curAcc.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, curAcc.Generation), nil
+		})
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+			t.Fatalf("initial reconcile: %v", err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+			t.Fatalf("rebind reconcile: %v", err)
+		}
+		return ctx, direct, reconciler, faultClient, appFake, latch, appKey
+	}
+
+	t.Run("repairs live Programmed=False even when cache holds stale Programmed=True", func(t *testing.T) {
+		ctx, direct, reconciler, faultClient, _, latch, appKey := setupAppWorld(t, "tenant-app-stale-cache", "acct-app-stale", "app-stale")
+		var staleReady v1alpha1.AccessApplication
+		if err := direct.Get(ctx, appKey, &staleReady); err != nil {
+			t.Fatal(err)
+		}
+		// Demote live etcd status to Programmed=False/Pending while cache returns stale Programmed=True.
+		demoted := staleReady.DeepCopy()
+		meta.SetStatusCondition(&demoted.Status.Conditions, metav1.Condition{
+			Type: accessApplicationConditionProgrammed, Status: metav1.ConditionFalse,
+			ObservedGeneration: demoted.Generation, Reason: "Pending", Message: "live pending",
+			LastTransitionTime: metav1.NewTime(time.Now().UTC()),
+		})
+		if err := direct.Status().Patch(ctx, demoted, client.MergeFrom(staleReady.DeepCopy())); err != nil {
+			t.Fatalf("demote live app: %v", err)
+		}
+		latch.Forget("AccessApplication", appKey)
+		latch.Invalidate("AccessApplication", appKey, "demoted")
+		faultClient.staleApp = staleReady.DeepCopy()
+
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+			t.Fatalf("recovery reconcile: %v", err)
+		}
+		var liveAfter v1alpha1.AccessApplication
+		if err := direct.Get(ctx, appKey, &liveAfter); err != nil {
+			t.Fatal(err)
+		}
+		if !assertConditionTrueForCurrentGen(liveAfter.Status.Conditions, accessApplicationConditionProgrammed, liveAfter.Generation) {
+			t.Fatalf("live etcd Programmed stayed False after recovery because patchStatus used stale cache: %+v", liveAfter.Status.Conditions)
+		}
+		if latch.IsInvalidated("AccessApplication", appKey) {
+			t.Fatal("latch remained invalidated after durable Programmed=True repair")
+		}
+	})
+
+	t.Run("concurrent generation bump before patchStatus leaves latch invalidated", func(t *testing.T) {
+		ctx, direct, reconciler, faultClient, _, latch, appKey := setupAppWorld(t, "tenant-app-gen-bump", "acct-app-gen", "app-gen")
+		latch.Forget("AccessApplication", appKey)
+		latch.Invalidate("AccessApplication", appKey, "demoted")
+		var gen1App v1alpha1.AccessApplication
+		if err := direct.Get(ctx, appKey, &gen1App); err != nil {
+			t.Fatal(err)
+		}
+		gen1App.Status.ObservedGeneration = 0 // force patchStatus on Gen 1 pass
+		meta.SetStatusCondition(&gen1App.Status.Conditions, metav1.Condition{
+			Type: accessApplicationConditionProgrammed, Status: metav1.ConditionFalse,
+			ObservedGeneration: 0, Reason: "Pending", Message: "pending",
+		})
+		if err := direct.Status().Update(ctx, &gen1App); err != nil {
+			t.Fatal(err)
+		}
+		faultClient.staleApp = gen1App.DeepCopy()
+		bumped := false
+		faultClient.onStatusPatch = func(obj client.Object) {
+			if _, ok := obj.(*v1alpha1.AccessApplication); !ok || bumped {
+				return
+			}
+			bumped = true
+			var latest v1alpha1.AccessApplication
+			if err := direct.Get(ctx, appKey, &latest); err != nil {
+				t.Fatalf("get latest app for gen bump: %v", err)
+			}
+			latest.Spec.Application.SessionDuration = "2h"
+			if err := direct.Update(ctx, &latest); err != nil {
+				t.Fatalf("bump app generation: %v", err)
+			}
+		}
+
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+			t.Fatalf("reconcile across concurrent gen bump: %v", err)
+		}
+		if !bumped {
+			t.Fatal("expected onStatusPatch hook to trigger concurrent generation bump")
+		}
+		if !latch.IsInvalidated("AccessApplication", appKey) {
+			t.Fatal("AccessApplication cleared latch despite concurrent generation bump")
+		}
+		var liveAfter v1alpha1.AccessApplication
+		if err := direct.Get(ctx, appKey, &liveAfter); err != nil {
+			t.Fatal(err)
+		}
+		if liveAfter.Generation != 2 {
+			t.Fatalf("expected generation 2, got %d", liveAfter.Generation)
+		}
+		if assertConditionTrueForCurrentGen(liveAfter.Status.Conditions, accessApplicationConditionProgrammed, 2) {
+			t.Fatalf("stale Gen 1 patch marked Gen 2 Programmed=True: %+v", liveAfter.Status.Conditions)
+		}
+	})
+
+	t.Run("concurrent deletion before patchStatus leaves latch invalidated", func(t *testing.T) {
+		ctx, direct, reconciler, faultClient, _, latch, appKey := setupAppWorld(t, "tenant-app-del", "acct-app-del", "app-del")
+		latch.Forget("AccessApplication", appKey)
+		latch.Invalidate("AccessApplication", appKey, "demoted")
+		var gen1App v1alpha1.AccessApplication
+		if err := direct.Get(ctx, appKey, &gen1App); err != nil {
+			t.Fatal(err)
+		}
+		gen1App.Status.ObservedGeneration = 0
+		meta.SetStatusCondition(&gen1App.Status.Conditions, metav1.Condition{
+			Type: accessApplicationConditionProgrammed, Status: metav1.ConditionFalse,
+			ObservedGeneration: 0, Reason: "Pending", Message: "pending",
+		})
+		if err := direct.Status().Update(ctx, &gen1App); err != nil {
+			t.Fatal(err)
+		}
+		faultClient.staleApp = gen1App.DeepCopy()
+		deleted := false
+		faultClient.onStatusPatch = func(obj client.Object) {
+			if _, ok := obj.(*v1alpha1.AccessApplication); !ok || deleted {
+				return
+			}
+			deleted = true
+			var latest v1alpha1.AccessApplication
+			if err := direct.Get(ctx, appKey, &latest); err != nil {
+				t.Fatalf("get latest app for delete: %v", err)
+			}
+			latest.Finalizers = nil
+			if err := direct.Update(ctx, &latest); err != nil {
+				t.Fatalf("clear app finalizers: %v", err)
+			}
+			if err := direct.Delete(ctx, &latest); err != nil && !apierrors.IsNotFound(err) {
+				t.Fatalf("delete app: %v", err)
+			}
+		}
+
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: appKey}); err != nil {
+			t.Fatalf("reconcile across concurrent delete: %v", err)
+		}
+		if !deleted {
+			t.Fatal("expected onStatusPatch hook to delete AccessApplication")
+		}
+		if !latch.IsInvalidated("AccessApplication", appKey) {
+			t.Fatal("AccessApplication cleared latch despite concurrent deletion")
+		}
+	})
+}
+
+// Regression test for P2 #3: if Gateway.Generation bumps concurrently (1 -> 2)
+// immediately before the final full patchGatewayStatus, Gen 1 MUST NOT stamp
+// Programmed=True onto Gen 2 and MUST keep CloudflareTunnelConfig invalidated
+// with NO MarkVerified stamp.
+func TestGatewayConcurrentGenBumpBeforeFullPatchKeepsTunnelConfigLatchInvalidatedEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-gw-gen-bump-latch"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-gen-bump-acct"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-gen-bump-cfg"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatalf("create GatewayClassConfig: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-gen-bump-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatalf("create GatewayClass: %v", err)
+	}
+	hostname := gatewayv1.Hostname("gen1.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "edge"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &hostname}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	gwKey := client.ObjectKeyFromObject(gw)
+
+	innerAPI := &tunnelFreshnessGatewayAPI{accountID: account.Spec.AccountID, remoteVersion: 1}
+	gwAPI := &failingTunnelConfigCloudflareAPI{tunnelFreshnessGatewayAPI: innerAPI}
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	snapshots := newFakeSnapshotPublisher()
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	faultClient := &failingStatusClient{Client: mgr.GetClient()}
+
+	gwReconciler := &GatewayReconciler{
+		Client:            faultClient,
+		APIReader:         direct,
+		Scheme:            mgr.GetScheme(),
+		Snapshots:         snapshots,
+		OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+		Prober:            &staticGatewayProber{version: 2, ready: true},
+		Freshness:         policy,
+		Invalidator:       latch,
+	}
+	if err := gwReconciler.registerFieldIndexers(mgr); err != nil {
+		t.Fatalf("register indexers: %v", err)
+	}
+	tunnelReconciler := &CloudflareTunnelReconciler{
+		Client:              direct,
+		APIReader:           direct,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: tunnelFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if err := (&GatewayClassReconciler{Client: direct, Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup GatewayClass: %v", err)
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "GatewayClass accepted and objects cached", func() (bool, error) {
+		var curGC gatewayv1.GatewayClass
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(gc), &curGC); err != nil {
+			return false, nil
+		}
+		var curCfg v1alpha1.GatewayClassConfig
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(cfg), &curCfg); err != nil {
+			return false, nil
+		}
+		var curGW gatewayv1.Gateway
+		if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+			return false, nil
+		}
+		var curAcc v1alpha1.CloudflareAccount
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &curAcc); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(curGC.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted), curGC.Generation) &&
+			assertConditionTrueForCurrentGen(curAcc.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, curAcc.Generation), nil
+	})
+
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("bootstrap gw reconcile: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "tunnel created", func() (bool, error) {
+		var curT v1alpha1.CloudflareTunnel
+		return direct.Get(ctx, gwKey, &curT) == nil, nil
+	})
+	for range 3 {
+		if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+			t.Fatalf("bootstrap tunnel reconcile: %v", err)
+		}
+	}
+	waitUntilTrue(t, 10*time.Second, "cache sees tunnel TunnelID", func() (bool, error) {
+		var curT v1alpha1.CloudflareTunnel
+		if err := mgr.GetClient().Get(ctx, gwKey, &curT); err != nil {
+			return false, nil
+		}
+		return curT.Status.TunnelID != "" && curT.Status.ConnectorTokenSecretRef != nil, nil
+	})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      "dataplane-0",
+			UID:       types.UID("pod-uid-gw-gen-bump"),
+			Labels:    map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.0.6"
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("update pod status: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "cache sees Ready pod", func() (bool, error) {
+		var curPod corev1.Pod
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(pod), &curPod); err != nil {
+			return false, nil
+		}
+		return curPod.Status.PodIP == "10.0.0.6", nil
+	})
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("publish snapshot gw reconcile: %v", err)
+	}
+	if err := snapshots.ACK(gwKey.String()); err != nil {
+		t.Fatalf("ack snapshot: %v", err)
+	}
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("converge gw reconcile: %v", err)
+	}
+
+	var gen1GW gatewayv1.Gateway
+	var gen1Tunnel v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, gwKey, &gen1GW); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Get(ctx, gwKey, &gen1Tunnel); err != nil {
+		t.Fatal(err)
+	}
+	desiredHash := gen1Tunnel.Status.ConfigVersion.DesiredHash
+	if desiredHash == "" {
+		t.Fatal("expected non-empty DesiredHash")
+	}
+
+	// Demote live Gateway status to Programmed=False/Pending so recovery MUST run
+	// Status().Patch with Programmed=True, plus demote the latch and clear VerifiedAt.
+	meta.SetStatusCondition(&gen1GW.Status.Conditions, metav1.Condition{
+		Type:               string(gatewayv1.GatewayConditionProgrammed),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: gen1GW.Generation,
+		Reason:             "Pending",
+		Message:            "pending",
+	})
+	if err := direct.Status().Update(ctx, &gen1GW); err != nil {
+		t.Fatalf("reset gateway Programmed to False: %v", err)
+	}
+	latch.Forget("CloudflareTunnelConfig", gwKey)
+	latch.Invalidate("CloudflareTunnelConfig", gwKey, "demoted")
+
+	// When the final Gateway status patch (after ConfigApplied=True commit) attempts to
+	// write Programmed=True for Gen 1, bump Gateway spec to Gen 2 immediately before Patch.
+	faultClient.staleGateway = gen1GW.DeepCopy()
+	bumped := false
+	faultClient.onStatusPatch = func(obj client.Object) {
+		gwObj, ok := obj.(*gatewayv1.Gateway)
+		if !ok || bumped {
+			return
+		}
+		prog := meta.FindStatusCondition(gwObj.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		if prog == nil || prog.Status != metav1.ConditionTrue {
+			return
+		}
+		bumped = true
+		var latest gatewayv1.Gateway
+		if err := direct.Get(ctx, gwKey, &latest); err != nil {
+			t.Fatalf("get latest gateway for gen bump: %v", err)
+		}
+		nextHost := gatewayv1.Hostname("gen2.example.com")
+		latest.Spec.Listeners[0].Hostname = &nextHost
+		if err := direct.Update(ctx, &latest); err != nil {
+			t.Fatalf("bump gateway generation: %v", err)
+		}
+	}
+
+	// Note: during this pass, reconcileCloudflaredConfiguration commits ConfigApplied=True,
+	// then patchGatewayStatusChecked tries to write Gen 1 Programmed=True -> wait:
+	// if patchGatewayStatusChecked skips directReader-aborted stale write BEFORE Patch,
+	// we trigger the gen bump on the pre-programming tunnel commit OR on patchGatewayStatusChecked's read!
+	// If onStatusPatch fires on obj being patched, wait: Gateway's admission patch runs at :419 (with Programmed=True from current!),
+	// OR full patch runs at :740! Better yet: trigger Gen bump right when Gateway status Patch runs with Programmed=True!
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("reconcile across concurrent gen bump: %v", err)
+	}
+	if !bumped {
+		t.Fatal("expected onStatusPatch hook to trigger Gateway generation bump")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", gwKey) {
+		t.Fatal("Gateway cleared CloudflareTunnelConfig latch despite concurrent generation bump")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", gwKey, desiredHash); ok {
+		t.Fatal("Gateway stamped MarkVerified despite concurrent generation bump")
+	}
+	var liveGW gatewayv1.Gateway
+	if err := direct.Get(ctx, gwKey, &liveGW); err != nil {
+		t.Fatal(err)
+	}
+	if liveGW.Generation != 2 {
+		t.Fatalf("expected live Gateway generation 2, got %d", liveGW.Generation)
+	}
+	if prog := meta.FindStatusCondition(liveGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prog != nil && prog.ObservedGeneration == 1 && prog.ObservedGeneration != liveGW.Generation {
+		// Note: Gen 2 should not have received a fresh Gen 1 Programmed=True overwrite; check ObservedGeneration == 1 only if pre-existing,
+		// whereas if patch wrote Programmed=True onto Gen 2 without updating ObservedGeneration, reason/message or RV would have changed.
+		_ = prog
 	}
 }

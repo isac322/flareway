@@ -27,11 +27,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -339,11 +341,15 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			status.AppliedHash, status.AppliedAt, _ = nextGateStamp(application.Status.AppliedHash, application.Status.AppliedAt, newGateStamp(desiredHash, r.now()))
 		}
 	}
-	if err := r.patchStatus(ctx, application, status); err != nil {
+	convergedPersisted, err := r.patchStatusChecked(ctx, application, status)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
+	}
+	if !convergedPersisted {
+		return ctrl.Result{}, nil
 	}
 	clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	stamp := newGateStamp(desiredHash, r.now())
@@ -2382,21 +2388,58 @@ func rejectedCompilationLoss(message string, loss gatewayapi.AccessTargetLoss) g
 	return gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
 }
 
+func (r *AccessApplicationReconciler) directReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *AccessApplicationReconciler) patchStatus(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) error {
+	_, err := r.patchStatusChecked(ctx, application, status)
+	return err
+}
+
+func (r *AccessApplicationReconciler) patchStatusChecked(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) (bool, error) {
 	key := client.ObjectKeyFromObject(application)
-	if !statusConverged(application.Generation, status.ObservedGeneration, status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed) {
+	targetConverged := statusConverged(application.Generation, status.ObservedGeneration, status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed)
+	if !targetConverged {
 		forgetGate(r.Invalidator, "AccessApplication", key)
 	}
-	current := &v1alpha1.AccessApplication{}
-	if err := r.Get(ctx, key, current); err != nil {
-		return client.IgnoreNotFound(err)
+	convergedPersisted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.AccessApplication{}
+		if err := r.directReader().Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				convergedPersisted = false
+				return nil
+			}
+			return err
+		}
+		if (application.UID != "" && current.UID != application.UID) || current.Generation != application.Generation {
+			convergedPersisted = false
+			return nil
+		}
+		if apiequality.Semantic.DeepEqual(current.Status, status) {
+			convergedPersisted = targetConverged
+			return nil
+		}
+		before := current.DeepCopy()
+		current.Status = status
+		if err := r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsNotFound(err) {
+				convergedPersisted = false
+				return nil
+			}
+			return fmt.Errorf("patch AccessApplication status: %w", err)
+		}
+		convergedPersisted = targetConverged
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	before := current.DeepCopy()
-	current.Status = status
-	if err := r.Status().Patch(ctx, current, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("patch AccessApplication status: %w", err)
-	}
-	return nil
+	return convergedPersisted, nil
 }
 
 func (r *AccessApplicationReconciler) operatorNamespace() string {
