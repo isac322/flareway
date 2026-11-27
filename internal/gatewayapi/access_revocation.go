@@ -430,38 +430,47 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 		return ports
 	}
 	ports.hasPersistedListeners = true
-	for _, ls := range in.CloudflareTunnel.Status.Listeners {
-		if ls.Exposure == v1alpha1.ExposurePrivate {
-			continue
-		}
-		listenerName := string(ls.Name)
-		if _, live := livePublic[listenerName]; !live {
-			continue
-		}
-		for _, pd := range ls.ProtectionDomains {
-			port := pd.EnvoyPort
-			if port < publicPortMin || port > publicPortMax {
+	// Pass 1 claims literal base entries (pd.Name == listenerName) ahead of any
+	// derived/non-base entries so legacy status listing e.g. "web-public" before
+	// "web" on the same port never starves stickyBase["web"].
+	for _, wantBase := range []bool{true, false} {
+		for _, ls := range in.CloudflareTunnel.Status.Listeners {
+			if ls.Exposure == v1alpha1.ExposurePrivate {
 				continue
 			}
-			if _, blocked := ports.reserved[port]; blocked {
+			listenerName := string(ls.Name)
+			if _, live := livePublic[listenerName]; !live {
 				continue
 			}
-			if _, claimed := ports.preClaimed[port]; claimed {
-				continue
-			}
-			ports.preClaimed[port] = struct{}{}
-			ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
-			if pd.Name == listenerName {
-				if _, exists := ports.stickyBase[listenerName]; !exists {
-					ports.stickyBase[listenerName] = port
+			for _, pd := range ls.ProtectionDomains {
+				isBase := pd.Name == listenerName
+				if isBase != wantBase {
+					continue
 				}
-			} else if _, exact := liveExactPublic[listenerName]; exact &&
-				(pd.Name == listenerName+"-public" || pd.Name == listenerName+"-public-"+disambiguateListenerHash(listenerName)) {
-				// Record the -public carve-out port as a fallback for exact Public
-				// listeners so removing the last AccessApplication restores the base
-				// domain onto its previously served Envoy port without shifting.
-				if _, exists := ports.stickyBaseFallback[listenerName]; !exists {
-					ports.stickyBaseFallback[listenerName] = port
+				port := pd.EnvoyPort
+				if port < publicPortMin || port > publicPortMax {
+					continue
+				}
+				if _, blocked := ports.reserved[port]; blocked {
+					continue
+				}
+				if _, claimed := ports.preClaimed[port]; claimed {
+					continue
+				}
+				ports.preClaimed[port] = struct{}{}
+				ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
+				if isBase {
+					if _, exists := ports.stickyBase[listenerName]; !exists {
+						ports.stickyBase[listenerName] = port
+					}
+				} else if _, exact := liveExactPublic[listenerName]; exact &&
+					(pd.Name == listenerName+"-public" || pd.Name == listenerName+"-public-"+disambiguateListenerHash(listenerName)) {
+					// Record the -public carve-out port as a fallback for exact Public
+					// listeners so removing the last AccessApplication restores the base
+					// domain onto its previously served Envoy port without shifting.
+					if _, exists := ports.stickyBaseFallback[listenerName]; !exists {
+						ports.stickyBaseFallback[listenerName] = port
+					}
 				}
 			}
 		}

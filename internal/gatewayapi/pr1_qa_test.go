@@ -907,3 +907,82 @@ func TestExactPublicUnsplitReusesCarveOutPort(t *testing.T) {
 		t.Fatalf("unsplit base domain %q allocated port %d, want reused -public port %d", base.Name, base.EnvoyPort, splitPublicPort)
 	}
 }
+
+// #4723260033: Upgrading a wildcard Public listener from v0.5.0 where persisted
+// status lists a derived alias ("web-public") before the literal base ("web")
+// sharing the same Envoy port must prioritize literal "web" so the base domain
+// keeps its recorded port while derived domains allocate distinct unused ports.
+func TestWildcardPublicLiteralBaseTakesPriorityOverLegacyDerivedAlias(t *testing.T) {
+	in := accessInputs(true)
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"a.example.com", "b.example.com"}
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{{
+		Name: "web", Hostname: new(gatewayv1.Hostname("*.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	}}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"a.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					namedRouteRule("admin", "/admin", "backend"),
+					namedRouteRule("health", "/health", "backend"),
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-b", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"b.example.com"},
+				Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("home", "/", "backend")},
+			},
+		},
+	}
+	appA := accessApplication("app-a", "HTTPRoute", "route-a", "admin")
+	in.AccessApplications = []v1alpha1.AccessApplication{appA}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{{Namespace: "default", Name: "app-a"}: {AUD: "aud-a", ApplicationID: "id-a", Ready: true}}
+
+	const legacyBasePort int32 = 18080
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "web",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: "web-public", EnvoyPort: legacyBasePort},
+			{Name: "web", EnvoyPort: legacyBasePort},
+		},
+	}}
+
+	gw, _ := Translate(in)
+	if _, err := translator.Build(gw, nil); err != nil {
+		t.Fatalf("translator.Build failed: %v", err)
+	}
+	var baseDomain *ir.ProtectionDomain
+	var derivedPorts []int32
+	for index := range gw.Domains {
+		d := &gw.Domains[index]
+		if d.Name == "web" {
+			baseDomain = d
+			continue
+		}
+		derivedPorts = append(derivedPorts, d.EnvoyPort)
+	}
+	if baseDomain == nil {
+		t.Fatalf("expected literal base domain \"web\", got %#v", gw.Domains)
+	}
+	if baseDomain.EnvoyPort != legacyBasePort {
+		t.Fatalf("literal base domain \"web\" shifted from %d to %d", legacyBasePort, baseDomain.EnvoyPort)
+	}
+	if len(derivedPorts) != 2 {
+		t.Fatalf("expected 2 derived domains (-public and -access), got %#v", gw.Domains)
+	}
+	for _, port := range derivedPorts {
+		if port == legacyBasePort {
+			t.Fatalf("derived domain collided on literal base port %d: %#v", legacyBasePort, gw.Domains)
+		}
+	}
+	if derivedPorts[0] == derivedPorts[1] {
+		t.Fatalf("derived domains collided on port %d: %#v", derivedPorts[0], gw.Domains)
+	}
+}
