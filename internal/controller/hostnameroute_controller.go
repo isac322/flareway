@@ -128,6 +128,7 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		Kind: "HostnameRoute", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RouteID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -570,6 +571,9 @@ func (r *HostnameRouteReconciler) finishRemoteError(ctx context.Context, object 
 }
 
 func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alpha1.HostnameRoute, remote flarecloudflare.HostnameRoute, hostname string, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "HostnameRoute", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)

@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
@@ -795,5 +796,72 @@ func v1alpha1Checkpoint(hostname, recordID, zoneID, comment string) v1alpha1.Clo
 		RecordID:         recordID,
 		ZoneID:           zoneID,
 		OwnershipComment: comment,
+	}
+}
+
+func TestSweeperEventsForFanoutAndSlowConsumerIsolation(t *testing.T) {
+	t.Parallel()
+	sweeper := NewSweeper(SweeperOptions{
+		Logger:          logr.Discard(),
+		EventBufferSize: 2,
+		Targets:         []TargetDescriptor{},
+	})
+	slowPolicySub := sweeper.EventsFor("AccessPolicy")
+	tunnelSubA := sweeper.EventsFor("CloudflareTunnel")
+	tunnelSubB := sweeper.EventsFor("CloudflareTunnel")
+	otherSub := sweeper.EventsFor("VirtualNetwork")
+
+	as := NewAccountSweeper(AccountSweeperOptions{
+		EventSink: sweeper.emitEvent,
+		Logger:    logr.Discard(),
+	})
+
+	// Overflow slow AccessPolicy subscriber (buffer=2, send 5 items).
+	for i := range 5 {
+		as.handleDriftResults(context.Background(), []DriftItem{{
+			Kind:           "AccessPolicy",
+			TargetKind:     "AccessPolicy",
+			NamespacedName: types.NamespacedName{Namespace: "ns", Name: fmt.Sprintf("pol-%d", i)},
+			Case:           DriftCaseMismatch,
+		}})
+	}
+	// Emit DNSRecord (TargetKind=CloudflareTunnel) and VirtualNetwork drift.
+	as.handleDriftResults(context.Background(), []DriftItem{
+		{
+			Kind:           "DNSRecord",
+			TargetKind:     "CloudflareTunnel",
+			NamespacedName: types.NamespacedName{Namespace: "ns", Name: "tun"},
+			Case:           DriftCaseMissing,
+		},
+		{
+			Kind:           "VirtualNetwork",
+			TargetKind:     "VirtualNetwork",
+			NamespacedName: types.NamespacedName{Namespace: "ns", Name: "vnet"},
+			Case:           DriftCaseMismatch,
+		},
+	})
+
+	expectOne := func(name string, ch <-chan event.GenericEvent, wantName string) {
+		t.Helper()
+		select {
+		case ev := <-ch:
+			if ev.Object.GetName() != wantName {
+				t.Fatalf("%s received %q, want %q", name, ev.Object.GetName(), wantName)
+			}
+		default:
+			t.Fatalf("%s missed expected event %q", name, wantName)
+		}
+		select {
+		case extra := <-ch:
+			t.Fatalf("%s received unexpected extra event %q", name, extra.Object.GetName())
+		default:
+		}
+	}
+
+	expectOne("tunnelSubA", tunnelSubA, "tun")
+	expectOne("tunnelSubB", tunnelSubB, "tun")
+	expectOne("otherSub", otherSub, "vnet")
+	if got := len(slowPolicySub); got != 2 {
+		t.Fatalf("slowPolicySub buffered %d events, want 2", got)
 	}
 }

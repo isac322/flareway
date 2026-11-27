@@ -55,6 +55,12 @@ type gateInput struct {
 	// restored backup in a different cluster cannot inherit a converged gate.
 	AccountID string
 	ClusterID string
+	// Converged reports whether the object's live Kubernetes status currently
+	// reflects a converged state for the current generation (e.g., Ready=True or
+	// Programmed=True with ObservedGeneration == Generation). When false, the
+	// gate closes with DecisionClosedUnconverged so cached TTL or sweep
+	// confirmations never suppress recovery after a transient pre-gate failure.
+	Converged bool
 	// Spec is the spec-derived desired state. Callers pass the object's spec or
 	// the compiled input they are about to send to Cloudflare.
 	Spec any
@@ -114,6 +120,7 @@ func evaluateGate(
 		Spec:      input.Spec,
 	})
 	if err != nil || desired == "" {
+		latch.Forget(input.Kind, types.NamespacedName{Namespace: input.Namespace, Name: input.Name})
 		observability.ObserveGate(input.Kind, gateHashFailureDecision)
 		return gateDecision{}
 	}
@@ -121,7 +128,7 @@ func evaluateGate(
 	return evaluateGateWithHash(
 		policy, latch, grade, input.Kind,
 		types.NamespacedName{Namespace: input.Namespace, Name: input.Name},
-		appliedHash, desired, appliedAt, now,
+		appliedHash, desired, appliedAt, input.Converged, now,
 	)
 }
 
@@ -142,8 +149,23 @@ func evaluateGateWithHash(
 	key types.NamespacedName,
 	appliedHash, desiredHash string,
 	appliedAt *metav1.Time,
+	converged bool,
 	now time.Time,
 ) gateDecision {
+	if grade == freshness.GradeAlways {
+		return gateDecision{
+			Gate:        freshness.Gate{Decision: freshness.DecisionNotGated},
+			DesiredHash: desiredHash,
+		}
+	}
+	if !converged {
+		latch.Forget(kind, key)
+		observability.ObserveGate(kind, string(freshness.DecisionClosedUnconverged))
+		return gateDecision{
+			Gate:        freshness.Gate{Decision: freshness.DecisionClosedUnconverged},
+			DesiredHash: desiredHash,
+		}
+	}
 	invalidated := latch.IsInvalidated(kind, key)
 
 	// The gate's age is measured from the most recent confirmation of this
@@ -194,6 +216,27 @@ func evaluateGateWithHash(
 // converged, so the next pass is judged on hash and age alone.
 func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 	latch.Clear(kind, key)
+}
+
+// forgetGate drops cached verification, sweep confirmation, and sweep baseline
+// state when a reconcile turns status unconverged (pre-gate failure or remote
+// error). Sweep confirmation must not keep the gate open while status is False.
+func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
+	latch.Forget(kind, key)
+}
+
+// statusConverged reports whether the object's live status is converged on the
+// current generation with every required condition set to True.
+func statusConverged(generation, observedGeneration int64, conditions []metav1.Condition, required ...string) bool {
+	if observedGeneration != generation {
+		return false
+	}
+	for _, conditionType := range required {
+		if !conditionTrueForGeneration(conditions, conditionType, generation) {
+			return false
+		}
+	}
+	return true
 }
 
 // releaseGoneObject is the NotFound branch of every gated reconciler's

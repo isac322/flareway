@@ -116,7 +116,8 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 		Kind: "VirtualNetwork", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.VirtualNetworkID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
-		Spec: object.Spec,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady),
+		Spec:      object.Spec,
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
@@ -379,6 +380,9 @@ func (r *VirtualNetworkReconciler) finishRemoteError(ctx context.Context, object
 }
 
 func (r *VirtualNetworkReconciler) patchStatus(ctx context.Context, object *v1alpha1.VirtualNetwork, remote flarecloudflare.VirtualNetwork, owned bool, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "VirtualNetwork", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)

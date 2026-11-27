@@ -714,6 +714,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		tunnel.Status.ConfigVersion.DesiredHash,
 		hash,
 		tunnel.Status.ConfigVersion.AppliedAt,
+		tunnelConfigConvergedForGate(tunnel),
 		now,
 	).Gate
 	if gate.Open {
@@ -834,6 +835,30 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	return result, nil
 }
 
+// tunnelConfigConvergedForGate checks whether the tunnel's remote
+// configuration state is converged on the current generation. Healthy Pod
+// rollouts (Applying, Pending, TeardownBlocked) keep the config gate usable so
+// Pod startup churn does not re-PUT unchanged tunnel ingress configuration;
+// error demotions (RemoteError, GateError, ConfigurationError, DriftHold,
+// OutOfBandChange) or stale ObservedGeneration force the gate closed so recovery
+// runs immediately.
+func tunnelConfigConvergedForGate(tunnel *v1alpha1.CloudflareTunnel) bool {
+	if tunnel.Status.ConfigVersion.Desired == 0 {
+		return false
+	}
+	cond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+	if cond == nil {
+		return true
+	}
+	if cond.ObservedGeneration != tunnel.Generation {
+		return false
+	}
+	if cond.Status == metav1.ConditionTrue {
+		return true
+	}
+	return cond.Reason == "Applying" || cond.Reason == "Pending" || cond.Reason == "TeardownBlocked"
+}
+
 // remoteConfigFailure records ConfigApplied=False before returning a remote
 // path error so a quiet True never masks a real failure. The demotion is
 // best-effort: a commit failure is reported alongside the original error, and
@@ -849,6 +874,9 @@ func (r *GatewayReconciler) remoteConfigFailure(ctx context.Context, gateway *ir
 // demoteTunnelConfigApplied commits ConfigApplied=False through the shared
 // conditions transaction. Ready is derived False in the same document.
 func (r *GatewayReconciler) demoteTunnelConfigApplied(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, now time.Time, reason, message string) error {
+	if reason != "Applying" && reason != "Pending" && reason != "TeardownBlocked" {
+		forgetGate(r.Invalidator, "CloudflareTunnelConfig", client.ObjectKeyFromObject(tunnel))
+	}
 	return r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
 		gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, metav1.NewTime(now)))
 }
@@ -1512,19 +1540,19 @@ func scaleDesiredDeploymentToZero(objects []client.Object) {
 }
 
 func (r *GatewayReconciler) mapTunnelToGateways(ctx context.Context, object client.Object) []reconcile.Request {
-	tunnel, ok := object.(*v1alpha1.CloudflareTunnel)
-	if !ok {
+	if object == nil || object.GetNamespace() == "" || object.GetName() == "" {
 		return nil
 	}
+	tunnelKey := client.ObjectKeyFromObject(object)
 	var gateways gatewayv1.GatewayList
-	if err := r.List(ctx, &gateways, client.InNamespace(tunnel.Namespace)); err != nil {
-		ctrl.LoggerFrom(ctx).Error(err, "Unable to list Gateways for CloudflareTunnel", "tunnel", client.ObjectKeyFromObject(tunnel))
+	if err := r.List(ctx, &gateways, client.InNamespace(tunnelKey.Namespace)); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Unable to list Gateways for CloudflareTunnel", "tunnel", tunnelKey)
 		return nil
 	}
 	requests := make([]reconcile.Request, 0)
 	for index := range gateways.Items {
 		name, _, supported := referencedTunnelName(&gateways.Items[index])
-		if supported && (name == tunnel.Name || (name == "" && gateways.Items[index].Name == tunnel.Name)) {
+		if supported && (name == tunnelKey.Name || (name == "" && gateways.Items[index].Name == tunnelKey.Name)) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&gateways.Items[index])})
 		}
 	}

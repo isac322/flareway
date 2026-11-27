@@ -30,9 +30,10 @@ limitations under the License.
 //
 // Gate.Decision reports why the gate closed, using the same label values as
 // the flareway_gate_total metric (internal/observability): "open",
-// "closed_hash", "closed_ttl", "closed_invalidated". DecisionNotGated is
-// returned for GradeAlways and is intentionally not a registered metric
-// label — T0 reads are not gate evaluations and must not be observed as such.
+// "closed_hash", "closed_ttl", "closed_invalidated", "closed_unconverged".
+// DecisionNotGated is returned for GradeAlways and is intentionally not a
+// registered metric label — T0 reads are not gate evaluations and must not be
+// observed as such.
 //
 // # Hash input discipline
 //

@@ -122,6 +122,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 			Kind: "ZeroTrustOrganization", Namespace: object.Namespace, Name: object.Name,
 			UID:       object.UID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionAccepted, v1alpha1.ZeroTrustOrganizationConditionReady),
 			Spec: struct {
 				Spec  any `json:"spec"`
 				Input any `json:"input"`
@@ -658,6 +659,9 @@ func (r *ZeroTrustOrganizationReconciler) finishRemoteError(ctx context.Context,
 }
 
 func (r *ZeroTrustOrganizationReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, remote flarecloudflare.Organization, doh *flarecloudflare.OrganizationDOHSettings, wouldApply *v1alpha1.ZeroTrustOrganizationValues, observedRevocation *metav1.Time, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustOrganization", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	if status == metav1.ConditionTrue {
 		object.Status.AuthDomain = remote.AuthDomain

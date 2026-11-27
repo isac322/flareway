@@ -21,8 +21,8 @@ limitations under the License.
 // ready CloudflareAccount it lists each selected target from the enabled
 // controller groups once per freshness grade period and compares the remote listing against the cached
 // Kubernetes objects. Detected drift closes the object's desired-hash gate
-// through the Invalidator latch and emits a GenericEvent on Events() so the
-// owning controller reconciles promptly.
+// through the Invalidator latch and fans out a GenericEvent on EventsFor(kind)
+// so the owning controller reconciles promptly.
 //
 // # Rate budget
 //
@@ -38,7 +38,7 @@ limitations under the License.
 //
 // # Trigger channel semantics
 //
-// The Invalidator latch is the source of truth; Events() is only a fast
+// The Invalidator latch is the source of truth; EventsFor(kind) is only a fast
 // wakeup optimization. The channel is bounded and sends never block: when
 // the buffer is full the event is dropped and the item is re-evaluated on
 // the next pass, which re-sends it while the latch is still set. A lost

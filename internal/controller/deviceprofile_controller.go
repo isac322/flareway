@@ -139,6 +139,7 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 			Kind: "DeviceProfile", Namespace: object.Namespace, Name: object.Name,
 			UID: object.UID, RemoteID: profileID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady),
 			Spec: struct {
 				Spec     any `json:"spec"`
 				Input    any `json:"input"`
@@ -1202,8 +1203,12 @@ func deviceProfileStatus(object *v1alpha1.DeviceProfile, profileID string, owner
 }
 
 func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alpha1.DeviceProfile, status v1alpha1.DeviceProfileStatus) error {
+	key := client.ObjectKeyFromObject(object)
+	if !statusConverged(object.Generation, status.ObservedGeneration, status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady) {
+		forgetGate(r.Invalidator, "DeviceProfile", key)
+	}
 	current := new(v1alpha1.DeviceProfile)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
+	if err := r.Get(ctx, key, current); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	before := current.DeepCopy()

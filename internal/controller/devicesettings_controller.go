@@ -93,7 +93,8 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 		decision = evaluateGate(r.Freshness, r.Invalidator, freshness.GradeIndirect, gateInput{
 			Kind: "DeviceSettings", Namespace: object.Namespace, Name: object.Name,
 			UID: object.UID, AccountID: account.Spec.AccountID, ClusterID: clusterID,
-			Spec: object.Spec,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.DeviceSettingsConditionAccepted, v1alpha1.DeviceSettingsConditionReady),
+			Spec:      object.Spec,
 		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
@@ -234,6 +235,9 @@ func (r *DeviceSettingsReconciler) finishRemoteError(ctx context.Context, object
 }
 
 func (r *DeviceSettingsReconciler) patchStatus(ctx context.Context, object *v1alpha1.DeviceSettings, remote flarecloudflare.DeviceSettings, wouldApply *v1alpha1.DeviceSettingsValues, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "DeviceSettings", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	if status == metav1.ConditionTrue {
 		object.Status.Observed = deviceSettingsObserved(remote)

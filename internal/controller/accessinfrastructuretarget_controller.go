@@ -122,6 +122,7 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 		Kind: "AccessInfrastructureTarget", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TargetID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -306,6 +307,9 @@ func (r *AccessInfrastructureTargetReconciler) finishObserved(ctx context.Contex
 }
 
 func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, owned bool, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
+	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessInfrastructureTarget", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	object.Status.AppliedHash = appliedHash
 	object.Status.AppliedAt = appliedAt

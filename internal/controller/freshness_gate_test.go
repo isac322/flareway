@@ -415,7 +415,7 @@ func TestEvaluateGateInMemoryVerification(t *testing.T) {
 	now := virtualNetworkTestClock
 	stale := metav1.NewTime(now.Add(-2 * ttl))
 	evaluate := func(latch *freshness.Latch, policy freshness.Policy, desired string) freshness.Gate {
-		return evaluateGateWithHash(policy, latch, freshness.GradeTraffic, "VirtualNetwork", key, "applied", desired, &stale, now).Gate
+		return evaluateGateWithHash(policy, latch, freshness.GradeTraffic, "VirtualNetwork", key, "applied", desired, &stale, true, now).Gate
 	}
 
 	latch := freshness.NewLatch()
@@ -469,7 +469,7 @@ func TestEvaluateGateSweepConfirmation(t *testing.T) {
 	now := virtualNetworkTestClock
 	stale := metav1.NewTime(now.Add(-3 * ttl))
 	evaluate := func(latch *freshness.Latch, desired string, at time.Time) freshness.Gate {
-		return evaluateGateWithHash(policy, latch, freshness.GradeAuthz, "AccessApplication", key, "h1", desired, &stale, at).Gate
+		return evaluateGateWithHash(policy, latch, freshness.GradeAuthz, "AccessApplication", key, "h1", desired, &stale, true, at).Gate
 	}
 	confirmed := func() *freshness.Latch {
 		latch := freshness.NewLatch()
@@ -519,5 +519,125 @@ func TestGateStampFieldsCoverEveryGatedKind(t *testing.T) {
 	}
 	if _, _, _, ok := gateStampFields(&v1alpha1.CloudflareAccount{}); ok {
 		t.Fatal("gateStampFields accepted a kind that carries no gate stamp fields")
+	}
+}
+
+// QA-2-REG-5: An unconverged object (Ready=False or stale ObservedGeneration)
+// must close the gate, forget prior verification/sweep confirmation, and
+// immediately reconcile to Ready=True when dependencies return even inside TTL.
+func TestQA2REG5GateRejectsUnconvergedStatus(t *testing.T) {
+	ctx := context.Background()
+	vnet := virtualNetworkFixture("tenant", "prod", virtualNetworkTestClock)
+	vnet.Generation = 1
+	scheme := virtualNetworkTestScheme(t)
+	tokenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"},
+		Data:       map[string][]byte{"token": []byte("value")},
+	}
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.VirtualNetwork{}).
+		WithObjects(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: map[string]string{"tenant": "true"}}},
+			tokenSecret,
+			virtualNetworkTestAccount(),
+			vnet,
+		).Build()
+	api := newFakePrivateNetworkCloudflare()
+	now := virtualNetworkTestClock
+	latch := freshness.NewLatch()
+	reconciler := &VirtualNetworkReconciler{
+		Client: kube, Scheme: scheme, NewCloudflareClient: api.Client,
+		Now:         func() time.Time { return now },
+		Freshness:   freshness.DefaultPolicy(),
+		Invalidator: latch,
+	}
+	key := client.ObjectKeyFromObject(vnet)
+	for range 2 {
+		now = now.Add(time.Second)
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("converge reconcile: %v", err)
+		}
+	}
+	var converged v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &converged); err != nil {
+		t.Fatal(err)
+	}
+	if !conditionTrueForGeneration(converged.Status.Conditions, v1alpha1.PrivateNetworkConditionReady, converged.Generation) {
+		t.Fatalf("fixture never converged: %+v", converged.Status.Conditions)
+	}
+
+	// Simulate active sweep confirmation.
+	listed, err := api.ListVirtualNetworks(ctx)
+	if err != nil || len(listed) == 0 {
+		t.Fatalf("list vnets: %v", err)
+	}
+	now = now.Add(time.Second)
+	if latch.ConfirmContent("VirtualNetwork", key, listed[0], now) {
+		t.Fatal("sweep reported unexpected drift")
+	}
+
+	// Transient pre-gate failure: delete API token Secret -> Ready=False.
+	if err := kube.Delete(ctx, tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err == nil {
+		t.Fatal("expected pre-gate failure when token Secret is missing")
+	}
+	var failed v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if conditionTrueForGeneration(failed.Status.Conditions, v1alpha1.PrivateNetworkConditionReady, failed.Generation) {
+		t.Fatalf("expected Ready=False after pre-gate failure: %+v", failed.Status.Conditions)
+	}
+	if _, ok := latch.ConfirmedAt("VirtualNetwork", key, converged.Status.AppliedHash); ok {
+		t.Fatal("pre-gate failure must forget cached sweep confirmation")
+	}
+
+	// Restore Secret well inside TTL: must immediately recover Ready=True.
+	if err := kube.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant", Name: "api-token"},
+		Data:       map[string][]byte{"token": []byte("value")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	callsBefore := len(api.calls)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("recovery reconcile: %v", err)
+	}
+	if len(api.calls) == callsBefore {
+		t.Fatal("gate stayed open on unconverged Ready=False status instead of reconciling")
+	}
+	var recovered v1alpha1.VirtualNetwork
+	if err := kube.Get(ctx, key, &recovered); err != nil {
+		t.Fatal(err)
+	}
+	if !conditionTrueForGeneration(recovered.Status.Conditions, v1alpha1.PrivateNetworkConditionReady, recovered.Generation) {
+		t.Fatalf("VirtualNetwork did not recover Ready=True immediately: %+v", recovered.Status.Conditions)
+	}
+
+	// Direct evaluateGateWithHash check: unconverged status must close with
+	// DecisionClosedUnconverged, forget cached confirmation/verification, and
+	// preserve DesiredHash so the recovery pass can stamp it.
+	directLatch := freshness.NewLatch()
+	directLatch.SetBaseline("VirtualNetwork", key, "h1", func(any) bool { return true })
+	directLatch.ConfirmContent("VirtualNetwork", key, "listed", now)
+	directLatch.MarkVerified("VirtualNetwork", key, "h1", now)
+	stamp := metav1.NewTime(now)
+	unconvergedDecision := evaluateGateWithHash(freshness.DefaultPolicy(), directLatch, freshness.GradeTraffic, "VirtualNetwork", key, "h1", "h1", &stamp, false, now)
+	if unconvergedDecision.Open || unconvergedDecision.Decision != freshness.DecisionClosedUnconverged {
+		t.Fatalf("unconverged gate decision = %+v, want DecisionClosedUnconverged", unconvergedDecision.Gate)
+	}
+	if unconvergedDecision.DesiredHash != "h1" {
+		t.Fatalf("unconverged DesiredHash = %q, want h1", unconvergedDecision.DesiredHash)
+	}
+	if _, ok := directLatch.ConfirmedAt("VirtualNetwork", key, "h1"); ok {
+		t.Fatal("evaluateGateWithHash with converged=false must forget sweep confirmation")
+	}
+	if _, ok := directLatch.VerifiedAt("VirtualNetwork", key, "h1"); ok {
+		t.Fatal("evaluateGateWithHash with converged=false must forget verify timestamp")
 	}
 }

@@ -59,6 +59,7 @@ const (
 	GateDecisionClosedHash        = "closed_hash"
 	GateDecisionClosedTTL         = "closed_ttl"
 	GateDecisionClosedInvalidated = "closed_invalidated"
+	GateDecisionClosedUnconverged = "closed_unconverged"
 )
 
 // Metrics contains Flareway's collectors. A separate value can be registered
@@ -298,7 +299,7 @@ func validSweepResult(value string) bool {
 
 func validGateDecision(value string) bool {
 	switch value {
-	case GateDecisionOpen, GateDecisionClosedHash, GateDecisionClosedTTL, GateDecisionClosedInvalidated:
+	case GateDecisionOpen, GateDecisionClosedHash, GateDecisionClosedTTL, GateDecisionClosedInvalidated, GateDecisionClosedUnconverged:
 		return true
 	}
 	return false

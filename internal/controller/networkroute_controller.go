@@ -138,6 +138,7 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		Kind: "NetworkRoute", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RouteID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -537,6 +538,9 @@ func (r *NetworkRouteReconciler) patchStatusWithIPLookup(ctx context.Context, ob
 }
 
 func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object *v1alpha1.NetworkRoute, remote flarecloudflare.NetworkRoute, lookup *v1alpha1.NetworkRouteIPLookupStatus, updateLookup, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "NetworkRoute", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)

@@ -133,6 +133,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 		Kind: "IdentityProvider", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.IDPID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -929,6 +930,9 @@ func (r *IdentityProviderReconciler) reconcileDelete(ctx context.Context, object
 	return r.Patch(ctx, object, base)
 }
 func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1alpha1.IdentityProvider, remote flarecloudflare.IdentityProvider, directory *v1alpha1.IdentityProviderSCIMDirectoryStatus, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
+	}
 	beforeStatus := object.Status
 	base := client.MergeFrom(object.DeepCopy())
 	if status == metav1.ConditionTrue {
@@ -961,6 +965,7 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 // failure is transient, so the existing Accepted condition and the recorded
 // remote identifiers are preserved while Ready flips to False.
 func (r *IdentityProviderReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.IdentityProvider, err error) error {
+	forgetGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
 	conditions := []metav1.Condition{
 		accessCondition(object.Generation, "Ready", metav1.ConditionFalse, "RemoteError", err.Error()),
 	}

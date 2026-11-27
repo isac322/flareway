@@ -121,6 +121,7 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 		Kind: "AccessCustomPage", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.CustomPageID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.AccessCustomPageConditionAccepted, v1alpha1.AccessCustomPageConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -318,6 +319,9 @@ func customPageDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionP
 }
 
 func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool, appliedHash string, appliedAt *metav1.Time) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessCustomPage", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	object.Status.AppliedHash = appliedHash
 	object.Status.AppliedAt = appliedAt

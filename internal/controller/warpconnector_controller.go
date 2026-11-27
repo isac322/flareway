@@ -131,7 +131,8 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 			Kind: "WARPConnector", Namespace: object.Namespace, Name: object.Name,
 			UID: object.UID, RemoteID: object.Status.TunnelID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
-			Spec: object.Spec,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted, flarewayv1alpha1.WARPConnectorConditionReady),
+			Spec:      object.Spec,
 		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
@@ -807,6 +808,7 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked, metav1.ConditionFalse, "NotBlocked", "No cleanup is pending"),
 	}
 	if len(conflicts) > 0 {
+		forgetGate(r.Invalidator, "WARPConnector", client.ObjectKeyFromObject(object))
 		message := strings.Join(conflicts, "; ")
 		conditions = append(conditions,
 			warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionConflict, metav1.ConditionTrue, "DriftDetected", message),
@@ -823,6 +825,7 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 }
 
 func (r *WARPConnectorReconciler) finishError(ctx context.Context, object *flarewayv1alpha1.WARPConnector, err error) (ctrl.Result, error) {
+	forgetGate(r.Invalidator, "WARPConnector", client.ObjectKeyFromObject(object))
 	reason := privateErrorReason(err)
 	message := privateErrorMessage(err)
 	base := client.MergeFrom(object.DeepCopy())

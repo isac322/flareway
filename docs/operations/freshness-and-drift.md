@@ -44,7 +44,7 @@ Under the default profile, an externally deleted or replaced Flareway CNAME is a
 
 ## The drift sweep
 
-A single leader-elected worker lists each enabled sweep target once per grade period and compares the result against cluster state. It filters targets by controller group before starting the target loops.
+A single leader-elected worker lists each enabled sweep target once per grade period and compares the result against cluster state. It filters targets by controller group before starting the target loops, and delivers invalidation wake-ups over per-kind fan-out channels with non-blocking sends so each reconciler receives its own kind's events (with `Gateway` also subscribing to `CloudflareTunnel` drift) without competing on a shared channel or stalling on a slow subscriber.
 
 | Case | Meaning | Action |
 |---|---|---|
@@ -105,6 +105,8 @@ An `AccessApplication` is checked against more than its own listed entry:
 
 Local state an `AccessApplication` depends on, such as its Gateways, data planes, and the tunnel's forwarding status, is part of the gate's desired hash. A change there runs the full pass without waiting for the sweep.
 
+Gates stay open only while the object's live Kubernetes status is converged on the current generation (`Ready=True` or `Programmed=True`, and for `CloudflareTunnel` in `dns.mode: External`, `DNSReady=True` with empty `status.dnsRecords`; `CloudflareTunnelConfig` also permits healthy Pod rollout states `Applying`, `Pending`, and `TeardownBlocked`). Any pre-gate or remote failure forgets cached verifications and sweep confirmations and closes the gate with `closed_unconverged`, so recovery runs immediately once dependencies return rather than waiting for TTL expiry.
+
 Confirmations live in operator memory. After a restart or leader change, each object verifies itself once and records its content again.
 
 ## API budget and DNS zone scope
@@ -142,7 +144,7 @@ Setting every freshness flag to `0` keeps every gate closed, so reconcilers read
 
 | Metric | Labels | Reading |
 |---|---|---|
-| `flareway_gate_total` | `kind`, `decision` | `decision="open"` counts skipped remote reads. A kind stuck at `closed_hash` means its desired hash keeps changing, usually because of an unstable spec input (the Gateway tunnel-config gate reports `kind="CloudflareTunnelConfig"`, separate from `"CloudflareTunnel"` DNS/identity sweep invalidation) |
+| `flareway_gate_total` | `kind`, `decision` | `decision` is one of `open`, `closed_hash`, `closed_ttl`, `closed_invalidated`, or `closed_unconverged`. `open` counts skipped remote reads; `closed_unconverged` counts passes forced to run because live status is not yet converged on the current generation. A kind stuck at `closed_hash` means its desired hash keeps changing, usually because of an unstable spec input (the Gateway tunnel-config gate reports `kind="CloudflareTunnelConfig"`, separate from `"CloudflareTunnel"` DNS/identity sweep invalidation) |
 | `flareway_drift_detected_total` | `kind`, `case` | Out-of-band changes found, by `orphan`, `missing`, `mismatch`, or `version` |
 | `flareway_sweep_total` | `kind`, `result` | `ok`, `partial`, or `error` per sweep pass |
 | `flareway_sweep_last_success_timestamp` | `kind` | Last pass that observed a complete listing. A stale value with rising `partial` counts means drift detection is degraded |

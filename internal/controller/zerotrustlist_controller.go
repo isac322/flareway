@@ -103,7 +103,8 @@ func (r *ZeroTrustListReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		Kind: "ZeroTrustList", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.ListID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
-		Spec: object.Spec,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustListConditionAccepted, v1alpha1.ZeroTrustListConditionReady),
+		Spec:      object.Spec,
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
@@ -393,6 +394,9 @@ func (r *ZeroTrustListReconciler) finishRemoteOrValidationError(ctx context.Cont
 }
 
 func (r *ZeroTrustListReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustList, remote flarecloudflare.GatewayList, owned bool, wouldApply *v1alpha1.ZeroTrustListItemsDiff, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustList", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	if remote.ID != "" {
 		object.Status.ListID = remote.ID

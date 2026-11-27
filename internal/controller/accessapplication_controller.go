@@ -279,6 +279,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			Kind: "AccessApplication", Namespace: application.Namespace, Name: application.Name,
 			UID: application.UID, RemoteID: application.Status.ApplicationID,
 			AccountID: resolved.account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(application.Generation, application.Status.ObservedGeneration, application.Status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed),
 			Spec: struct {
 				Spec  any `json:"spec"`
 				Input any `json:"input"`
@@ -2382,8 +2383,11 @@ func rejectedCompilationLoss(message string, loss gatewayapi.AccessTargetLoss) g
 }
 
 func (r *AccessApplicationReconciler) patchStatus(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) error {
-	current := &v1alpha1.AccessApplication{}
 	key := client.ObjectKeyFromObject(application)
+	if !statusConverged(application.Generation, status.ObservedGeneration, status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed) {
+		forgetGate(r.Invalidator, "AccessApplication", key)
+	}
+	current := &v1alpha1.AccessApplication{}
 	if err := r.Get(ctx, key, current); err != nil {
 		return client.IgnoreNotFound(err)
 	}

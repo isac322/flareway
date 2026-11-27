@@ -34,7 +34,7 @@ import (
 // Access ownership tag markers, mirroring internal/controller's
 // accessapplication_tags.go. They are replicated here because the sweep
 // package must not import the controller package (the controllers will
-// import this package for Events()).
+// import this package for EventsFor()).
 const (
 	accessManagedTag      = "flareway-managed"
 	accessOwnerTagPrefix  = flarecloudflare.AccessOwnerTagPrefix

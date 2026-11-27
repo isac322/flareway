@@ -129,6 +129,7 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 		Kind: "DevicePostureRule", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RuleID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -547,6 +548,9 @@ func (r *DevicePostureRuleReconciler) reconcileDelete(ctx context.Context, objec
 }
 
 func (r *DevicePostureRuleReconciler) patchStatus(ctx context.Context, object *v1alpha1.DevicePostureRule, remote *flarecloudflare.DevicePostureRule, id string, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "DevicePostureRule", client.ObjectKeyFromObject(object))
+	}
 	baseObject := object.DeepCopy()
 	if remote != nil {
 		object.Status.RuleID = id
@@ -567,6 +571,7 @@ func (r *DevicePostureRuleReconciler) patchStatus(ctx context.Context, object *v
 // temporary Cloudflare outage. The remote argument stays nil so a failed call
 // never stamps ownership or changes the recorded ID.
 func (r *DevicePostureRuleReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.DevicePostureRule, err error) (ctrl.Result, error) {
+	forgetGate(r.Invalidator, "DevicePostureRule", client.ObjectKeyFromObject(object))
 	reason := "CloudflareError"
 	if flarecloudflare.IsNotFound(err) {
 		reason = "RemoteMissing"

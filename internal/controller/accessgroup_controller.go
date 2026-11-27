@@ -145,6 +145,7 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		Kind: "AccessGroup", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.GroupID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -363,6 +364,9 @@ func accessGroupObservedState(remote flarecloudflare.AccessGroup) (*v1alpha1.Acc
 }
 
 func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessGroup, scope flarecloudflare.AccessScope, remote flarecloudflare.AccessGroup, owned bool, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessGroup", client.ObjectKeyFromObject(object))
+	}
 	generation := object.Generation
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly)
 	if status == metav1.ConditionTrue && remote.ID == "" {

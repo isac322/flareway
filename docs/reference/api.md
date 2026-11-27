@@ -481,6 +481,7 @@ The complete Direct `originRequest` surface is `access` (`audTags`, `teamName`, 
 - `ipv4Only` and `ipv6Only` are mutually exclusive.
 - Either IP-family setting requires `proxied: true`.
 - Flareway uses the DNS comment as the ownership ledger and does not overwrite a foreign record.
+- Under `dns.mode: External`, `CloudflareTunnel` does not reconcile `status.dnsRecords` against `publicHosts`; once `DNSReady=True` on the current generation and `status.dnsRecords` is empty, the tunnel satisfies the convergence check for the T2 `CloudflareTunnel` freshness gate.
 
 ## WARP Connector and private routes
 

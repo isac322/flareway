@@ -136,6 +136,7 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		Kind: "AccessStandaloneApplication", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.ApplicationID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -945,6 +946,9 @@ func (r *AccessStandaloneApplicationReconciler) finishObserved(ctx context.Conte
 }
 
 func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
+	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	object.Status.AppliedHash = appliedHash
 	object.Status.AppliedAt = appliedAt

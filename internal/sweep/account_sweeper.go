@@ -142,9 +142,11 @@ type AccountSweeperOptions struct {
 	// Targets defaults to all sweepable kinds only when nil. A non-nil empty
 	// selection starts no target loops.
 	Targets []TargetDescriptor
-	// Events is the shared wakeup channel owned by Sweeper.
+	// Events is an optional wakeup sink used by unit tests; Sweeper sets EventSink.
 	Events chan event.GenericEvent
-	Logger logr.Logger
+	// EventSink dispatches drift wakeup events to per-kind fan-out subscribers.
+	EventSink func(targetKind string, ev event.GenericEvent)
+	Logger    logr.Logger
 }
 
 // AccountSweeper runs every target loop for one Cloudflare account.
@@ -161,6 +163,7 @@ type AccountSweeper struct {
 	limiter           *rate.Limiter
 	targets           []TargetDescriptor
 	events            chan event.GenericEvent
+	eventSink         func(targetKind string, ev event.GenericEvent)
 	logger            logr.Logger
 
 	cancel context.CancelFunc
@@ -202,6 +205,7 @@ func NewAccountSweeper(opts AccountSweeperOptions) *AccountSweeper {
 		limiter:           rate.NewLimiter(rate.Limit(opts.RateLimit), opts.RateBurst),
 		targets:           opts.Targets,
 		events:            opts.Events,
+		eventSink:         opts.EventSink,
 		logger:            opts.Logger,
 	}
 }
@@ -379,11 +383,11 @@ func contentCheckWith[R any](ctx context.Context, as *AccountSweeper, observe fu
 	}
 }
 
-// emitEvent performs a non-blocking send on the wakeup channel. A full
-// buffer drops the event: the latch keeps the gate closed and the next
-// pass re-emits while the drift persists.
+// emitEvent dispatches a drift wakeup to EventSink and performs a non-blocking
+// send on Events if configured. A full buffer drops the event: the latch keeps
+// the gate closed and the next pass re-emits while the drift persists.
 func (as *AccountSweeper) emitEvent(item DriftItem) {
-	if as.events == nil {
+	if as.eventSink == nil && as.events == nil {
 		return
 	}
 	object := &unstructured.Unstructured{}
@@ -392,11 +396,17 @@ func (as *AccountSweeper) emitEvent(item DriftItem) {
 	}
 	object.SetNamespace(item.NamespacedName.Namespace)
 	object.SetName(item.NamespacedName.Name)
-	select {
-	case as.events <- event.GenericEvent{Object: object}:
-	default:
-		as.logger.V(1).Info("sweep event buffer full; deferring wakeup to next pass",
-			"kind", item.TargetKind, "key", item.NamespacedName.String())
+	ev := event.GenericEvent{Object: object}
+	if as.eventSink != nil {
+		as.eventSink(item.TargetKind, ev)
+	}
+	if as.events != nil {
+		select {
+		case as.events <- ev:
+		default:
+			as.logger.V(1).Info("sweep event buffer full; deferring wakeup to next pass",
+				"kind", item.TargetKind, "key", item.NamespacedName.String())
+		}
 	}
 }
 

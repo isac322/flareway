@@ -209,6 +209,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TokenID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -629,6 +630,9 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 }
 
 func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
 		object.Status.TokenID = remote.ID

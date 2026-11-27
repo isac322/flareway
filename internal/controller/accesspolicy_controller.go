@@ -141,6 +141,7 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		Kind: "AccessPolicy", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.PolicyID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -523,6 +524,9 @@ func (r *AccessPolicyReconciler) reconcileDelete(ctx context.Context, object *v1
 	return r.Patch(ctx, object, base)
 }
 func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, object *v1alpha1.AccessPolicy, remote *flarecloudflare.AccessPolicy, owned bool, wouldApply *v1alpha1.AccessPolicyObservedState, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessPolicy", client.ObjectKeyFromObject(object))
+	}
 	generation := object.Generation
 	persistIdentity := remote != nil && remote.ID != "" && (status == metav1.ConditionTrue || owned || object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly)
 	if status == metav1.ConditionTrue && remote != nil && remote.ID == "" {

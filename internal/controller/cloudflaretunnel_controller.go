@@ -395,10 +395,11 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	// writes), and the read-modify-write inside WithTunnelLock. They only
 	// execute while the gate is closed; the sweep re-opens them early via
 	// the invalidation latch when it detects drift.
-	if tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && tunnelConvergedForGate(tunnel, &account, publicHosts) {
+	if tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
+		converged := tunnelConvergedForGate(tunnel, &account, publicHosts)
 		gate := evaluateGateWithHash(r.Freshness, r.Invalidator, freshness.GradeTraffic, "CloudflareTunnel",
 			client.ObjectKeyFromObject(tunnel), tunnel.Status.ConfigVersion.DesiredHash, tunnel.Status.ConfigVersion.DesiredHash,
-			tunnel.Status.ConfigVersion.AppliedAt, now.Time)
+			tunnel.Status.ConfigVersion.AppliedAt, converged, now.Time)
 		if gate.Open {
 			// QA-001 residual: ListTunnelConnections is the T4 display read
 			// that keeps status.clients fresh; the token-secret ensures
@@ -1551,6 +1552,13 @@ func tunnelConvergedForGate(tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1
 	ready := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady)
 	if ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != tunnel.Generation {
 		return false
+	}
+	if tunnel.Spec.DNS.Mode == v1alpha1.DNSModeExternal {
+		dnsReady := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady)
+		return dnsReady != nil &&
+			dnsReady.Status == metav1.ConditionTrue &&
+			dnsReady.ObservedGeneration == tunnel.Generation &&
+			len(tunnel.Status.DNSRecords) == 0
 	}
 	desired := make(map[string]string, len(hosts))
 	for _, host := range hosts {
@@ -2722,6 +2730,18 @@ type tunnelStatusClear struct {
 // conditions transaction carries non-authored Flareway entries verbatim from
 // the live object and derives Ready inside the same document.
 func (r *CloudflareTunnelReconciler) patchOwnedStatus(ctx context.Context, tunnel *v1alpha1.CloudflareTunnel, status v1alpha1.CloudflareTunnelStatus, clearIntent tunnelStatusClear) error {
+	for _, condition := range status.Conditions {
+		switch condition.Type {
+		case v1alpha1.CloudflareTunnelConditionAccepted,
+			v1alpha1.CloudflareTunnelConditionTunnelReady,
+			v1alpha1.CloudflareTunnelConditionDNSReady,
+			v1alpha1.CloudflareTunnelConditionConfigApplied,
+			v1alpha1.CloudflareTunnelConditionReady:
+			if condition.Status == metav1.ConditionFalse {
+				forgetGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
+			}
+		}
+	}
 	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeDirect {
 		for _, condition := range status.Conditions {
 			if condition.Type == v1alpha1.CloudflareTunnelConditionConfigApplied {

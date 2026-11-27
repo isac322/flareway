@@ -118,6 +118,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 		Kind: "ZeroTrustGatewayPolicy", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RuleID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustGatewayPolicyConditionAccepted, v1alpha1.ZeroTrustGatewayPolicyConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -590,6 +591,9 @@ func (r *ZeroTrustGatewayPolicyReconciler) finishRemoteOrValidationError(ctx con
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustGatewayPolicy, remote flarecloudflare.GatewayRule, owned bool, wouldApply *v1alpha1.ZeroTrustGatewayPolicyDesiredState, status metav1.ConditionStatus, reason, message string) error {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustGatewayPolicy", client.ObjectKeyFromObject(object))
+	}
 	base := client.MergeFrom(object.DeepCopy())
 	if remote.ID != "" {
 		object.Status.RuleID = remote.ID
