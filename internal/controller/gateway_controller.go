@@ -1421,11 +1421,23 @@ func tunnelGatewayStatusUnchanged(
 	}
 	for _, want := range conditions {
 		got := meta.FindStatusCondition(tunnel.Status.Conditions, want.Type)
-		if got == nil ||
-			got.Status != want.Status ||
+		if got == nil {
+			return false
+		}
+		// Match tunnel_conditions.go normalization: a zero ObservedGeneration
+		// inherits the stored condition's ObservedGeneration, and an authored
+		// update older than the stored ObservedGeneration is ignored.
+		if want.ObservedGeneration != 0 && got.ObservedGeneration > want.ObservedGeneration {
+			continue
+		}
+		wantObservedGeneration := want.ObservedGeneration
+		if wantObservedGeneration == 0 {
+			wantObservedGeneration = got.ObservedGeneration
+		}
+		if got.Status != want.Status ||
 			got.Reason != want.Reason ||
 			got.Message != want.Message ||
-			got.ObservedGeneration != want.ObservedGeneration {
+			got.ObservedGeneration != wantObservedGeneration {
 			return false
 		}
 	}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +48,55 @@ import (
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 )
+
+type tunnelStatusWriteCounterClient struct {
+	client.Client
+	tunnelName string
+	writes     atomic.Int64
+}
+
+func (c *tunnelStatusWriteCounterClient) Status() client.SubResourceWriter {
+	return &tunnelStatusWriteCounterWriter{writer: c.Client.Status(), owner: c}
+}
+
+type tunnelStatusWriteCounterWriter struct {
+	writer client.SubResourceWriter
+	owner  *tunnelStatusWriteCounterClient
+}
+
+func (w *tunnelStatusWriteCounterWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return w.writer.Create(ctx, obj, subResource, opts...)
+}
+
+func (w *tunnelStatusWriteCounterWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if tunnel, ok := obj.(*v1alpha1.CloudflareTunnel); ok && tunnel.Name == w.owner.tunnelName {
+		w.owner.writes.Add(1)
+	}
+	return w.writer.Update(ctx, obj, opts...)
+}
+
+func (w *tunnelStatusWriteCounterWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if tunnel, ok := obj.(*v1alpha1.CloudflareTunnel); ok && tunnel.Name == w.owner.tunnelName {
+		w.owner.writes.Add(1)
+	}
+	return w.writer.Patch(ctx, obj, patch, opts...)
+}
+
+func (w *tunnelStatusWriteCounterWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	name := ""
+	switch typed := obj.(type) {
+	case client.Object:
+		name = typed.GetName()
+	case interface{ GetName() *string }:
+		if value := typed.GetName(); value != nil {
+			name = *value
+		}
+	}
+	if name == w.owner.tunnelName {
+		w.owner.writes.Add(1)
+	}
+	return w.writer.Apply(ctx, obj, opts...)
+}
 
 type handoffIndexedClient struct {
 	client.Client
@@ -1500,6 +1551,9 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			return apierrors.IsNotFound(f.direct.Get(f.ctx, types.NamespacedName{Namespace: ns, Name: "dataplane-0"}, &corev1.Pod{}))
 		}, 10*time.Second, 50*time.Millisecond).Should(gomega.BeTrue())
 
+		statusCounter := &tunnelStatusWriteCounterClient{Client: f.reconciler.Client, tunnelName: f.tunnelKey.Name}
+		f.reconciler.Client = statusCounter
+
 		// Initial deny-only push -> v2 + freshness requeue horizon.
 		res, err := f.reconciler.Reconcile(f.ctx, f.request)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1509,14 +1563,16 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
 		rvAfterPush := tunnel.ResourceVersion
 		locksAfterPush := f.remote.locks
+		writesAfterPush := statusCounter.writes.Load()
 
 		// Immediate steady-state reconcile while gate is fresh: 0 remote locks/writes,
-		// 0 status writes on tunnel, non-zero freshness RequeueAfter.
+		// 0 status write requests on tunnel, non-zero freshness RequeueAfter.
 		f.clock = f.clock.Add(30 * time.Second)
 		res, err = f.reconciler.Reconcile(f.ctx, f.request)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(f.remote.locks).To(gomega.Equal(locksAfterPush), "fresh gate must skip remote reads")
 		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesAfterPush), "fresh steady-state reconcile must emit 0 CloudflareTunnel/status write requests")
 		gomega.Expect(res.RequeueAfter).To(gomega.Equal(f.reconciler.Freshness.Traffic-30*time.Second), "fresh steady-state reconcile must keep freshness requeue")
 		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
 		gomega.Expect(tunnel.ResourceVersion).To(gomega.Equal(rvAfterPush), "fresh steady-state reconcile must make 0 tunnel status writes")
@@ -1557,6 +1613,27 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(appliedCond).NotTo(gomega.BeNil())
 		gomega.Expect(appliedCond.Status).To(gomega.Equal(metav1.ConditionFalse))
 		gomega.Expect(appliedCond.Reason).To(gomega.Equal("DriftHold"))
+
+		// Repeated unchanged DriftHold reconcile must emit 0 CloudflareTunnel/status write requests.
+		writesBeforeRepeatHold := statusCounter.writes.Load()
+		res, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(programmedRequeue))
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeRepeatHold), "repeated unchanged DriftHold reconcile must emit 0 CloudflareTunnel/status write requests")
+
+		// Zero-TTL (--freshness-traffic=0) with matching remote must synchronize
+		// once and then emit 0 CloudflareTunnel/status write requests on repeats.
+		f.reconciler.Freshness = freshness.Policy{}
+		f.reconciler.DriftPolicy = ""
+		f.remote.remoteVersion = 4
+		res, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(time.Duration(0)))
+
+		writesBeforeZeroTTL := statusCounter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesBeforeZeroTTL), "repeated unchanged --freshness-traffic=0 reconcile must emit 0 CloudflareTunnel/status write requests")
 	})
 })
 
