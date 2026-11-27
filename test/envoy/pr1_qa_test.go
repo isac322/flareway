@@ -744,114 +744,178 @@ func TestEnvoyUnprotectedAndProtectedHeaderStrippingEndToEnd(t *testing.T) {
 	})
 }
 
-// QA-1D-1 & QA-1-REG-5 (CoreDNS runtime precedence & AAAA handling): Real
+// QA-1D-1 & QA-1-REG-5 (CoreDNS runtime precedence, AAAA, & HTTPS/TYPE65): Real
 // CoreDNS 1.15.0 answers exact hostnames ahead of overlapping wildcards
 // regardless of PodIP vs Loopback binding order, prefers 127.0.0.1 for
 // duplicate exact hostnames, returns authoritative NOERROR with zero answers
-// for exact Private AAAA queries (never leaking to upstream), and still forwards
-// wildcard and unrelated AAAA queries upstream.
+// for exact Private non-A queries (AAAA and HTTPS/TYPE65) in both mixed and
+// homogeneous modes, and still forwards wildcard and unrelated AAAA/HTTPS
+// queries upstream.
 func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	requireDocker(t)
-	upstreamPort := startMockAAAAUpstream(t, net.ParseIP("2001:db8::7"))
-	gw := &ir.Gateway{
-		Key: types.NamespacedName{Namespace: "demo", Name: "dns"},
-		Listeners: []ir.Listener{
+	upstreamPort := startMockDNSUpstream(t, net.ParseIP("2001:db8::7"))
+
+	startCoreDNS := func(t *testing.T, listeners []ir.Listener) (string, string) {
+		t.Helper()
+		gw := &ir.Gateway{
+			Key:       types.NamespacedName{Namespace: "demo", Name: "dns"},
+			Listeners: listeners,
+		}
+		cm := dataplane.BuildPrivateDNSConfigMap(gw)
+		if cm == nil {
+			t.Fatal("BuildPrivateDNSConfigMap returned nil")
+		}
+		corefile := strings.ReplaceAll(cm.Data["Corefile"], ".:53 {", ".:5353 {")
+		// Bind wildcard inside the container so host UDP port forwarding can reach CoreDNS.
+		corefile = strings.ReplaceAll(corefile, "    bind 127.0.0.1\n", "")
+		corefile = strings.ReplaceAll(corefile, "    forward . /etc/resolv.conf\n", fmt.Sprintf("    forward . host.docker.internal:%d\n", upstreamPort))
+		corefilePath := filepath.Join(t.TempDir(), "Corefile")
+		if err := os.WriteFile(corefilePath, []byte(corefile), 0o600); err != nil {
+			t.Fatalf("write Corefile: %v", err)
+		}
+
+		name := "flareway-coredns-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		args := []string{
+			"run", "-d", "--name", name,
+			"--add-host", "host.docker.internal:host-gateway",
+			"-e", "POD_IP=192.0.2.7",
+			"-p", "127.0.0.1::5353/udp",
+			"-v", corefilePath + ":/Corefile:ro",
+			"coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26",
+			"-conf", "/Corefile",
+		}
+		if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+			t.Fatalf("start CoreDNS container: %v\n%s", err, out)
+		}
+		t.Cleanup(func() {
+			cCtx, cCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cCancel()
+			_ = exec.CommandContext(cCtx, "docker", "rm", "-f", name).Run()
+		})
+
+		addrOut, err := exec.CommandContext(ctx, "docker", "port", name, "5353/udp").CombinedOutput()
+		if err != nil {
+			t.Fatalf("docker port 5353/udp: %v\n%s", err, addrOut)
+		}
+		dnsAddr := strings.TrimSpace(strings.Split(string(addrOut), "\n")[0])
+		if h, p, err := net.SplitHostPort(dnsAddr); err == nil && (h == "0.0.0.0" || h == "::") {
+			dnsAddr = net.JoinHostPort("127.0.0.1", p)
+		}
+		return dnsAddr, corefile
+	}
+
+	assertQueries := func(t *testing.T, dnsAddr, corefile string, cases []struct {
+		host          string
+		wantA         string
+		wantAAAA      string
+		wantHTTPSAns  int
+	}) {
+		t.Helper()
+		for _, tc := range cases {
+			if tc.wantA != "" {
+				var got string
+				deadline := time.Now().Add(15 * time.Second)
+				for time.Now().Before(deadline) {
+					ip, _, err := queryDNS(dnsAddr, tc.host, 1)
+					if err == nil && ip != "" {
+						got = ip
+						break
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+				if got != tc.wantA {
+					t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s", tc.host, got, tc.wantA, corefile)
+				}
+			}
+			var gotAAAA string
+			var gotErr error
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				ip, _, err := queryDNS(dnsAddr, tc.host, 28)
+				if err == nil {
+					gotAAAA = ip
+					gotErr = nil
+					break
+				}
+				gotErr = err
+				time.Sleep(200 * time.Millisecond)
+			}
+			if gotErr != nil || gotAAAA != tc.wantAAAA {
+				t.Fatalf("CoreDNS AAAA(%s) = (%q, err=%v), want (%q, nil)\nCorefile:\n%s", tc.host, gotAAAA, gotErr, tc.wantAAAA, corefile)
+			}
+
+			var gotHTTPSAns int
+			var httpsErr error
+			deadline = time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				_, ancount, err := queryDNS(dnsAddr, tc.host, 65)
+				if err == nil {
+					gotHTTPSAns = ancount
+					httpsErr = nil
+					break
+				}
+				httpsErr = err
+				time.Sleep(200 * time.Millisecond)
+			}
+			if httpsErr != nil || gotHTTPSAns != tc.wantHTTPSAns {
+				t.Fatalf("CoreDNS HTTPS/TYPE65(%s) = (ancount=%d, err=%v), want (ancount=%d, nil)\nCorefile:\n%s", tc.host, gotHTTPSAns, httpsErr, tc.wantHTTPSAns, corefile)
+			}
+		}
+	}
+
+	t.Run("mixed bindings", func(t *testing.T) {
+		dnsAddr, corefile := startCoreDNS(t, []ir.Listener{
 			{Name: "wild-pod", Hostname: "*.internal.example", Port: 9443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "exact-loop", Hostname: "api.internal.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 			{Name: "wild-loop", Hostname: "*.loop.example", Port: 8444, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 			{Name: "exact-pod", Hostname: "podexact.loop.example", Port: 9444, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "dup-pod", Hostname: "dup.internal.example", Port: 9445, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "dup-loop", Hostname: "dup.internal.example", Port: 8445, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
-		},
-	}
-	cm := dataplane.BuildPrivateDNSConfigMap(gw)
-	if cm == nil {
-		t.Fatal("BuildPrivateDNSConfigMap returned nil")
-	}
-	corefile := strings.ReplaceAll(cm.Data["Corefile"], ".:53 {", ".:5353 {")
-	// Bind wildcard inside the container so host UDP port forwarding can reach CoreDNS.
-	corefile = strings.ReplaceAll(corefile, "    bind 127.0.0.1\n", "")
-	corefile = strings.ReplaceAll(corefile, "    forward . /etc/resolv.conf\n", fmt.Sprintf("    forward . host.docker.internal:%d\n", upstreamPort))
-	corefilePath := filepath.Join(t.TempDir(), "Corefile")
-	if err := os.WriteFile(corefilePath, []byte(corefile), 0o600); err != nil {
-		t.Fatalf("write Corefile: %v", err)
-	}
-
-	name := "flareway-coredns-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	args := []string{
-		"run", "-d", "--name", name,
-		"--add-host", "host.docker.internal:host-gateway",
-		"-e", "POD_IP=192.0.2.7",
-		"-p", "127.0.0.1::5353/udp",
-		"-v", corefilePath + ":/Corefile:ro",
-		"coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26",
-		"-conf", "/Corefile",
-	}
-	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
-		t.Fatalf("start CoreDNS container: %v\n%s", err, out)
-	}
-	t.Cleanup(func() {
-		cCtx, cCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cCancel()
-		_ = exec.CommandContext(cCtx, "docker", "rm", "-f", name).Run()
+		})
+		assertQueries(t, dnsAddr, corefile, []struct {
+			host         string
+			wantA        string
+			wantAAAA     string
+			wantHTTPSAns int
+		}{
+			{"api.internal.example", "127.0.0.1", "", 0},
+			{"other.internal.example", "192.0.2.7", "2001:db8::7", 1},
+			{"podexact.loop.example", "192.0.2.7", "", 0},
+			{"other.loop.example", "127.0.0.1", "2001:db8::7", 1},
+			{"dup.internal.example", "127.0.0.1", "", 0},
+			{"unrelated.example", "", "2001:db8::7", 1},
+		})
 	})
 
-	addrOut, err := exec.CommandContext(ctx, "docker", "port", name, "5353/udp").CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker port 5353/udp: %v\n%s", err, addrOut)
-	}
-	dnsAddr := strings.TrimSpace(strings.Split(string(addrOut), "\n")[0])
-	if h, p, err := net.SplitHostPort(dnsAddr); err == nil && (h == "0.0.0.0" || h == "::") {
-		dnsAddr = net.JoinHostPort("127.0.0.1", p)
-	}
-
-	cases := []struct {
-		host     string
-		wantA    string
-		wantAAAA string // "" means authoritative NOERROR with zero AAAA answers
-	}{
-		{"api.internal.example", "127.0.0.1", ""},
-		{"other.internal.example", "192.0.2.7", "2001:db8::7"},
-		{"podexact.loop.example", "192.0.2.7", ""},
-		{"other.loop.example", "127.0.0.1", "2001:db8::7"},
-		{"dup.internal.example", "127.0.0.1", ""},
-		{"unrelated.example", "", "2001:db8::7"},
-	}
-	for _, tc := range cases {
-		if tc.wantA != "" {
-			var got string
-			deadline := time.Now().Add(15 * time.Second)
-			for time.Now().Before(deadline) {
-				ip, err := queryDNS(dnsAddr, tc.host, 1)
-				if err == nil && ip != "" {
-					got = ip
-					break
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			if got != tc.wantA {
-				t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s\nLogs:\n%s", tc.host, got, tc.wantA, corefile, containerLogs(name))
-			}
+	t.Run("QA-1-REG-5 homogeneous all-Loopback and all-PodIP", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			binding string
+			wantIP  string
+		}{
+			{"all-loopback", ir.ListenerBindingLoopback, "127.0.0.1"},
+			{"all-podip", ir.ListenerBindingPodIP, "192.0.2.7"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dnsAddr, corefile := startCoreDNS(t, []ir.Listener{
+					{Name: "exact", Hostname: "api.homo.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: tc.binding},
+					{Name: "wild", Hostname: "*.wild.homo.example", Port: 8444, Exposure: ir.ExposurePrivate, Binding: tc.binding},
+				})
+				assertQueries(t, dnsAddr, corefile, []struct {
+					host         string
+					wantA        string
+					wantAAAA     string
+					wantHTTPSAns int
+				}{
+					{"api.homo.example", tc.wantIP, "", 0},
+					{"app.wild.homo.example", tc.wantIP, "2001:db8::7", 1},
+					{"unrelated.example", "", "2001:db8::7", 1},
+				})
+			})
 		}
-		var gotAAAA string
-		var gotErr error
-		deadline := time.Now().Add(15 * time.Second)
-		for time.Now().Before(deadline) {
-			ip, err := queryDNS(dnsAddr, tc.host, 28)
-			if err == nil {
-				gotAAAA = ip
-				gotErr = nil
-				break
-			}
-			gotErr = err
-			time.Sleep(200 * time.Millisecond)
-		}
-		if gotErr != nil || gotAAAA != tc.wantAAAA {
-			t.Fatalf("CoreDNS AAAA(%s) = (%q, err=%v), want (%q, nil)\nCorefile:\n%s\nLogs:\n%s", tc.host, gotAAAA, gotErr, tc.wantAAAA, corefile, containerLogs(name))
-		}
-	}
+	})
 }
 
 func assertStrippedAccessHeaders(t *testing.T, body, label string) {
@@ -906,10 +970,10 @@ func firstMatchingIngressService(t *testing.T, params zero_trust.TunnelCloudflar
 	return ""
 }
 
-func queryDNS(serverAddr, host string, qtype uint16) (string, error) {
+func queryDNS(serverAddr, host string, qtype uint16) (string, int, error) {
 	conn, err := net.DialTimeout("udp", serverAddr, 2*time.Second)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -926,18 +990,18 @@ func queryDNS(serverAddr, host string, qtype uint16) (string, error) {
 	pkt = binary.BigEndian.AppendUint16(pkt, qtype)
 	pkt = binary.BigEndian.AppendUint16(pkt, 1) // QCLASS=IN
 	if _, err := conn.Write(pkt); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	resp := make([]byte, 512)
 	n, err := conn.Read(resp)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if n < 12 {
-		return "", fmt.Errorf("short DNS response %d", n)
+		return "", 0, fmt.Errorf("short DNS response %d", n)
 	}
 	if rcode := resp[3] & 0x0F; rcode != 0 {
-		return "", fmt.Errorf("DNS RCODE=%d", rcode)
+		return "", 0, fmt.Errorf("DNS RCODE=%d", rcode)
 	}
 	qd := int(binary.BigEndian.Uint16(resp[4:6]))
 	an := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -959,32 +1023,32 @@ func queryDNS(serverAddr, host string, qtype uint16) (string, error) {
 	}
 	for range qd {
 		if err := skipName(); err != nil {
-			return "", err
+			return "", an, err
 		}
 		off += 4
 	}
 	for range an {
 		if err := skipName(); err != nil {
-			return "", err
+			return "", an, err
 		}
 		if off+10 > n {
-			return "", fmt.Errorf("truncated RR header")
+			return "", an, fmt.Errorf("truncated RR header")
 		}
 		rrType := binary.BigEndian.Uint16(resp[off : off+2])
 		rdLen := int(binary.BigEndian.Uint16(resp[off+8 : off+10]))
 		off += 10
 		if off+rdLen > n {
-			return "", fmt.Errorf("truncated RR data")
+			return "", an, fmt.Errorf("truncated RR data")
 		}
 		if rrType == qtype && ((qtype == 1 && rdLen == 4) || (qtype == 28 && rdLen == 16)) {
-			return net.IP(resp[off : off+rdLen]).String(), nil
+			return net.IP(resp[off : off+rdLen]).String(), an, nil
 		}
 		off += rdLen
 	}
-	return "", nil
+	return "", an, nil
 }
 
-func startMockAAAAUpstream(t *testing.T, ipv6 net.IP) int {
+func startMockDNSUpstream(t *testing.T, ipv6 net.IP) int {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "0.0.0.0:0")
 	if err != nil {
@@ -1016,11 +1080,15 @@ func startMockAAAAUpstream(t *testing.T, ipv6 net.IP) int {
 			resp[3] = 0x80 // QR=1, RA=1, NOERROR
 			binary.BigEndian.PutUint16(resp[4:6], 1)
 			binary.BigEndian.PutUint16(resp[8:12], 0)
-			if qtype == 28 {
+			switch qtype {
+			case 28: // AAAA
 				binary.BigEndian.PutUint16(resp[6:8], 1)
 				resp = append(resp, 0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 0, 30, 0, 16)
 				resp = append(resp, ipv6.To16()...)
-			} else {
+			case 65: // HTTPS (SvcPriority=1, TargetName=".")
+				binary.BigEndian.PutUint16(resp[6:8], 1)
+				resp = append(resp, 0xC0, 0x0C, 0, 65, 0, 1, 0, 0, 0, 30, 0, 3, 0, 1, 0)
+			default:
 				binary.BigEndian.PutUint16(resp[6:8], 0)
 			}
 			_, _ = pc.WriteTo(resp, addr)

@@ -105,8 +105,8 @@ func writePrivateDNSTemplate(builder *strings.Builder, pattern, addr string) {
 	builder.WriteString("        fallthrough\n    }\n")
 }
 
-func writePrivateDNSEmptyAAAATemplate(builder *strings.Builder, pattern string) {
-	builder.WriteString("    template IN AAAA {\n")
+func writePrivateDNSEmptyNonATemplate(builder *strings.Builder, pattern string) {
+	builder.WriteString("    template IN ANY {\n")
 	fmt.Fprintf(builder, "        match %q\n", pattern)
 	builder.WriteString("        rcode NOERROR\n")
 	builder.WriteString("        fallthrough\n    }\n")
@@ -128,12 +128,13 @@ func renderPrivateCorefile(entries []privateDNSEntry) string {
 	// CoreDNS executes template plugins before hosts in plugin.cfg order.
 	// Render exact hostnames as template blocks ahead of wildcards so an exact
 	// hostname always takes precedence over an overlapping wildcard binding, and
-	// return authoritative empty NOERROR for exact-name AAAA queries so IPv4-only
-	// exact Private hostnames do not fall through to upstream AAAA resolvers.
+	// return authoritative empty NOERROR via template IN ANY for all non-A query
+	// types (AAAA, HTTPS/TYPE65, etc.) on exact IPv4-only Private hostnames so
+	// they match the CoreDNS hosts contract and do not fall through upstream.
 	for _, entry := range exact {
 		pattern := "^" + escapeCoreDNSRegex(entry.hostname) + "[.]?$"
 		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
-		writePrivateDNSEmptyAAAATemplate(&builder, pattern)
+		writePrivateDNSEmptyNonATemplate(&builder, pattern)
 	}
 	for _, entry := range wildcards {
 		suffix := strings.TrimPrefix(entry.hostname, "*.")
