@@ -252,6 +252,43 @@ func releaseGoneObject(latch *freshness.Latch, kind string, key types.Namespaced
 	return err
 }
 
+// retireTunnelLatchKeys drops both the Tunnel reconciliation and Gateway
+// config freshness latch records for a confirmed-absent CloudflareTunnel.
+func retireTunnelLatchKeys(latch *freshness.Latch, key types.NamespacedName) {
+	latch.Remove("CloudflareTunnel", key)
+	latch.Remove(configFreshnessKind, key)
+}
+
+// retireTunnelIfConfirmedAbsent corroborates a cached CloudflareTunnel
+// NotFound error against reader (uncached APIReader) before retiring both
+// CloudflareTunnel and CloudflareTunnelConfig latch keys.
+//
+// Returns (true, nil) when uncached reader confirms NotFound and both keys are
+// retired, (false, nil) when uncached reader still observes a live tunnel
+// (stale cache lag), or (false, err) when getErr is not NotFound or the
+// uncached lookup fails transiently.
+func retireTunnelIfConfirmedAbsent(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	key types.NamespacedName,
+	getErr error,
+) (bool, error) {
+	if !apierrors.IsNotFound(getErr) {
+		return false, getErr
+	}
+	var live v1alpha1.CloudflareTunnel
+	confirmErr := reader.Get(ctx, key, &live)
+	if confirmErr == nil {
+		return false, nil
+	}
+	if !apierrors.IsNotFound(confirmErr) {
+		return false, fmt.Errorf("confirm CloudflareTunnel %s absence: %w", key, confirmErr)
+	}
+	retireTunnelLatchKeys(latch, key)
+	return true, nil
+}
+
 // gateClusterID resolves the cluster identity used in the gate hash.
 //
 // Failure is deliberately not fatal. The gate is an optimization, and a

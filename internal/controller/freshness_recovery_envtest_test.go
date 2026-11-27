@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -2807,10 +2808,19 @@ func TestQA2REG3ExternalDNSWithStaleRecordsStaysClosedEnvtest(t *testing.T) {
 type failingTunnelConfigCloudflareAPI struct {
 	*tunnelFreshnessGatewayAPI
 	failGetTunnel atomic.Bool
+	onGetTunnel   func(ctx context.Context, tunnelID string) error
 	mu            sync.Mutex
 }
 
 func (api *failingTunnelConfigCloudflareAPI) GetTunnel(ctx context.Context, tunnelID string) (flarecloudflare.Tunnel, error) {
+	if api.onGetTunnel != nil {
+		if err := api.onGetTunnel(ctx, tunnelID); err != nil {
+			api.mu.Lock()
+			api.calls = append(api.calls, "GetTunnel(hookErr)")
+			api.mu.Unlock()
+			return flarecloudflare.Tunnel{}, err
+		}
+	}
 	if api.failGetTunnel.Load() {
 		api.mu.Lock()
 		api.calls = append(api.calls, "GetTunnel(err)")
@@ -4421,17 +4431,21 @@ func TestPatchTunnelGatewayDataEmptyListsZeroSteadyAppliesEnvtest(t *testing.T) 
 // fail targeted status subresource writes.
 type failingStatusClient struct {
 	client.Client
-	failStatusWrite atomic.Bool
-	failStatusKind  string // optional object kind filter; empty fails all status writes
-	staleTunnel     *v1alpha1.CloudflareTunnel
-	staleApp        *v1alpha1.AccessApplication
-	staleGateway    *gatewayv1.Gateway
-	onStatusPatch   func(obj client.Object)
+	failStatusWrite     atomic.Bool
+	failStatusKind      string // optional object kind filter; empty fails all status writes
+	staleTunnel         *v1alpha1.CloudflareTunnel
+	staleNotFoundTunnel *client.ObjectKey
+	staleApp            *v1alpha1.AccessApplication
+	staleGateway        *gatewayv1.Gateway
+	onStatusPatch       func(obj client.Object)
 }
 
 func (c *failingStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	switch target := obj.(type) {
 	case *v1alpha1.CloudflareTunnel:
+		if c.staleNotFoundTunnel != nil && *c.staleNotFoundTunnel == key {
+			return apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, key.Name)
+		}
 		if c.staleTunnel != nil && client.ObjectKeyFromObject(c.staleTunnel) == key {
 			*target = *c.staleTunnel.DeepCopy()
 			return nil
@@ -5973,9 +5987,420 @@ func TestTunnelDeletionRetiresCloudflareTunnelConfigLatchEnvtest(t *testing.T) {
 		}
 		return curGW.Spec.Infrastructure != nil && curGW.Spec.Infrastructure.ParametersRef != nil, nil
 	})
+	latch.Invalidate("CloudflareTunnel", tunnelKey, "stale-demotion")
 	latch.Invalidate("CloudflareTunnelConfig", tunnelKey, "stale-demotion")
 	_, _ = gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey})
+	if latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("GatewayReconciler did not retire CloudflareTunnel latch on Tunnel NotFound")
+	}
 	if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
 		t.Fatal("GatewayReconciler did not retire CloudflareTunnelConfig latch on Tunnel NotFound")
 	}
+}
+
+// Regression test: when cached r.Get returns NotFound while uncached direct
+// APIReader.Get still sees a live CloudflareTunnel, neither CloudflareTunnel nor
+// CloudflareTunnelConfig latch keys may be retired in CloudflareTunnelReconciler
+// or GatewayReconciler; only corroborated uncached NotFound retires both keys.
+func TestStaleCacheNotFoundDoesNotRetireLiveTunnelLatchEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-stale-nf-tunnel"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-stale-nf-tunnel"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg-stale-nf"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gc-stale-nf"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatal(err)
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "tun-stale-nf"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			DNS:              v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			Configuration:    v1alpha1.CloudflareTunnelConfiguration{Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway},
+		},
+	}
+	if err := direct.Create(ctx, tunnel); err != nil {
+		t.Fatal(err)
+	}
+	tunnelKey := client.ObjectKeyFromObject(tunnel)
+	host := gatewayv1.Hostname("stale-nf.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-stale-nf"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: tunnel.Name,
+			}},
+			Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	gwKey := client.ObjectKeyFromObject(gw)
+
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	faultClient := &failingStatusClient{Client: mgr.GetClient(), staleNotFoundTunnel: &tunnelKey}
+	gwReconciler := &GatewayReconciler{
+		Client:            faultClient,
+		APIReader:         direct,
+		Scheme:            mgr.GetScheme(),
+		Snapshots:         newFakeSnapshotPublisher(),
+		OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: &tunnelFreshnessGatewayAPI{accountID: account.Spec.AccountID, remoteVersion: 1}},
+		Prober:            &staticGatewayProber{version: 2, ready: true},
+		Freshness:         policy,
+		Invalidator:       latch,
+	}
+	if err := gwReconciler.registerFieldIndexers(mgr); err != nil {
+		t.Fatal(err)
+	}
+	tunnelReconciler := &CloudflareTunnelReconciler{
+		Client:              faultClient,
+		APIReader:           direct,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: newFakeTunnelCloudflareFactory().Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if err := (&GatewayClassReconciler{Client: direct, Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		t.Fatal(err)
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "GatewayClass and Gateway cached", func() (bool, error) {
+		var curGC gatewayv1.GatewayClass
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(gc), &curGC); err != nil {
+			return false, nil
+		}
+		var curGW gatewayv1.Gateway
+		if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(curGC.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted), curGC.Generation), nil
+	})
+
+	// Seed active demotions on BOTH tunnel latch keys while live tunnel exists in etcd.
+	latch.Invalidate("CloudflareTunnel", tunnelKey, "live-drift")
+	latch.Invalidate("CloudflareTunnelConfig", tunnelKey, "live-drift")
+
+	// 1. CloudflareTunnelReconciler seeing cached NotFound while etcd holds live tunnel
+	// MUST NOT retire either latch key.
+	res, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+	if err == nil && res.RequeueAfter == 0 {
+		t.Fatalf("expected error or requeue when cached NotFound is contradicted by live tunnel; got res=%+v err=%v", res, err)
+	}
+	if !latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("CloudflareTunnelReconciler retired live CloudflareTunnel latch from stale cache NotFound")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("CloudflareTunnelReconciler retired live CloudflareTunnelConfig latch from stale cache NotFound")
+	}
+
+	// 2. GatewayReconciler seeing cached NotFound while etcd holds live tunnel
+	// MUST NOT retire either latch key.
+	_, _ = gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey})
+	if !latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("GatewayReconciler retired live CloudflareTunnel latch from stale cache NotFound")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("GatewayReconciler retired live CloudflareTunnelConfig latch from stale cache NotFound")
+	}
+
+	// 3. Delete tunnel in etcd -> corroborated uncached NotFound MUST retire BOTH keys.
+	var liveTunnel v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, tunnelKey, &liveTunnel); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Delete(ctx, &liveTunnel); err != nil {
+		t.Fatal(err)
+	}
+	waitUntilTrue(t, 10*time.Second, "deleted tunnel absent from etcd", func() (bool, error) {
+		var cur v1alpha1.CloudflareTunnel
+		return apierrors.IsNotFound(direct.Get(ctx, tunnelKey, &cur)), nil
+	})
+	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("corroborated NotFound reconcile: %v", err)
+	}
+	if latch.IsInvalidated("CloudflareTunnel", tunnelKey) || latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("corroborated uncached NotFound did not retire both tunnel latch keys")
+	}
+}
+
+// Regression test: an in-flight remote GetTunnel failure after the CloudflareTunnel
+// is concurrently deleted OR replaced with a different UID MUST NOT strand a
+// "demoted" CloudflareTunnelConfig latch entry for the deleted/replaced Tunnel.
+func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnvtest(t *testing.T) {
+	setupScenario := func(t *testing.T, suffix string, onGetTunnel func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error) (context.Context, client.ObjectKey, *freshness.Latch) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+		ns := "tenant-remote-race-" + suffix
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatal(err)
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "acct-race-" + suffix},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:            []string{"*"},
+					Zones:                []string{"*"},
+					Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					UnprotectedHostnames: []string{"*"},
+					PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+		markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+		cfg := &v1alpha1.GatewayClassConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "cfg-race-" + suffix},
+			Spec: v1alpha1.GatewayClassConfigSpec{
+				AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+				DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			},
+		}
+		if err := direct.Create(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
+		gc := &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "gc-race-" + suffix},
+			Spec: gatewayv1.GatewayClassSpec{
+				ControllerName: gatewayapi.ControllerName,
+				ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+			},
+		}
+		if err := direct.Create(ctx, gc); err != nil {
+			t.Fatal(err)
+		}
+		host := gatewayv1.Hostname("race-" + suffix + ".example.com")
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-race"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: gatewayv1.ObjectName(gc.Name),
+				Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+			},
+		}
+		if err := direct.Create(ctx, gw); err != nil {
+			t.Fatal(err)
+		}
+		gwKey := client.ObjectKeyFromObject(gw)
+		tunnelKey := gwKey
+
+		innerAPI := &tunnelFreshnessGatewayAPI{accountID: account.Spec.AccountID, remoteVersion: 1}
+		gwAPI := &failingTunnelConfigCloudflareAPI{tunnelFreshnessGatewayAPI: innerAPI}
+		snapshots := newFakeSnapshotPublisher()
+		latch := freshness.NewLatch()
+		policy := freshness.DefaultPolicy()
+		gwReconciler := &GatewayReconciler{
+			Client:            mgr.GetClient(),
+			APIReader:         direct,
+			Scheme:            mgr.GetScheme(),
+			Snapshots:         snapshots,
+			OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+			Prober:            &staticGatewayProber{version: 2, ready: true},
+			Freshness:         policy,
+			Invalidator:       latch,
+		}
+		if err := gwReconciler.registerFieldIndexers(mgr); err != nil {
+			t.Fatal(err)
+		}
+		tunnelReconciler := &CloudflareTunnelReconciler{
+			Client:              direct,
+			APIReader:           direct,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: newFakeTunnelCloudflareFactory().Client,
+			Freshness:           policy,
+			Invalidator:         latch,
+		}
+		if err := (&GatewayClassReconciler{Client: direct, Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+			t.Fatal(err)
+		}
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "GatewayClass accepted", func() (bool, error) {
+			var curGC gatewayv1.GatewayClass
+			if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(gc), &curGC); err != nil {
+				return false, nil
+			}
+			var curCfg v1alpha1.GatewayClassConfig
+			if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(cfg), &curCfg); err != nil {
+				return false, nil
+			}
+			var curGW gatewayv1.Gateway
+			if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+				return false, nil
+			}
+			var curAcc v1alpha1.CloudflareAccount
+			if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &curAcc); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(curGC.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted), curGC.Generation) &&
+				assertConditionTrueForCurrentGen(curAcc.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, curAcc.Generation), nil
+		})
+		if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+			t.Fatalf("bootstrap gw reconcile: %v", err)
+		}
+		waitUntilTrue(t, 10*time.Second, "tunnel created", func() (bool, error) {
+			var curT v1alpha1.CloudflareTunnel
+			return direct.Get(ctx, tunnelKey, &curT) == nil, nil
+		})
+		for i := 0; i < 3; i++ {
+			if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+				t.Fatalf("tunnel reconcile %d: %v", i, err)
+			}
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns, Name: "dataplane-0", UID: types.UID("pod-uid-" + suffix),
+				Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+		}
+		if err := direct.Create(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
+		pod.Status.PodIP = "10.0.0.8"
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		if err := direct.Status().Update(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
+		waitUntilTrue(t, 10*time.Second, "cache sees Ready pod", func() (bool, error) {
+			var curPod corev1.Pod
+			if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(pod), &curPod); err != nil {
+				return false, nil
+			}
+			return curPod.Status.PodIP == "10.0.0.8", nil
+		})
+		if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+			t.Fatalf("publish snapshot gw reconcile: %v", err)
+		}
+		if err := snapshots.ACK(gwKey.String()); err != nil {
+			t.Fatalf("ack snapshot: %v", err)
+		}
+
+		hookFired := false
+		gwAPI.onGetTunnel = func(ctx context.Context, _ string) error {
+			if hookFired {
+				return nil
+			}
+			hookFired = true
+			return onGetTunnel(ctx, direct, tunnelKey)
+		}
+		if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err == nil {
+			t.Fatal("expected GetTunnel failure from hook")
+		}
+		if !hookFired {
+			t.Fatal("expected onGetTunnel hook to fire")
+		}
+		return ctx, tunnelKey, latch
+	}
+
+	t.Run("deleted tunnel during GetTunnel retires latch without stranding demoted", func(t *testing.T) {
+		_, tunnelKey, latch := setupScenario(t, "del", func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error {
+			var cur v1alpha1.CloudflareTunnel
+			if err := direct.Get(ctx, tunnelKey, &cur); err != nil {
+				return err
+			}
+			cur.Finalizers = nil
+			if err := direct.Update(ctx, &cur); err != nil {
+				return err
+			}
+			if err := direct.Delete(ctx, &cur); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+			return fmt.Errorf("injected GetTunnel failure after delete")
+		})
+		if latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+			t.Fatal("CloudflareTunnel latch stranded after in-flight delete")
+		}
+		if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+			t.Fatal("CloudflareTunnelConfig demoted latch stranded after in-flight delete")
+		}
+	})
+
+	t.Run("UID replaced tunnel during GetTunnel does not strand demoted latch", func(t *testing.T) {
+		_, tunnelKey, latch := setupScenario(t, "uid", func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error {
+			var cur v1alpha1.CloudflareTunnel
+			if err := direct.Get(ctx, tunnelKey, &cur); err != nil {
+				return err
+			}
+			spec := cur.Spec.DeepCopy()
+			cur.Finalizers = nil
+			if err := direct.Update(ctx, &cur); err != nil {
+				return err
+			}
+			if err := direct.Delete(ctx, &cur); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+			waitUntilTrue(t, 10*time.Second, "old tunnel deleted", func() (bool, error) {
+				var check v1alpha1.CloudflareTunnel
+				return apierrors.IsNotFound(direct.Get(ctx, tunnelKey, &check)), nil
+			})
+			replacement := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{Namespace: tunnelKey.Namespace, Name: tunnelKey.Name},
+				Spec:       *spec,
+			}
+			if err := direct.Create(ctx, replacement); err != nil {
+				return err
+			}
+			return fmt.Errorf("injected GetTunnel failure after UID replacement")
+		})
+		if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+			t.Fatal("CloudflareTunnelConfig demoted latch stranded for replacement Tunnel UID")
+		}
+	})
 }

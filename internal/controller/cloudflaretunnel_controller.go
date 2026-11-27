@@ -127,14 +127,24 @@ type CloudflareTunnelReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=flareway.bhyoo.com,resources=accessapplications;hostnameroutes;networkroutes,verbs=get;list;watch
 
+func (r *CloudflareTunnelReconciler) directReader() client.Reader {
+	return directStatusReader(r.Client, r.APIReader)
+}
+
 // Reconcile converges one CloudflareTunnel without ever writing gateway-owned status fields.
 func (r *CloudflareTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var tunnel v1alpha1.CloudflareTunnel
 	if err := r.Get(ctx, req.NamespacedName, &tunnel); err != nil {
-		if apierrors.IsNotFound(err) {
-			r.Invalidator.Remove(configFreshnessKind, req.NamespacedName)
+		retired, checkErr := retireTunnelIfConfirmedAbsent(ctx, r.directReader(), r.Invalidator, req.NamespacedName, err)
+		if checkErr != nil {
+			return ctrl.Result{}, checkErr
 		}
-		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "CloudflareTunnel", req.NamespacedName, err)
+		if retired {
+			return ctrl.Result{}, nil
+		}
+		// Cached r.Get returned NotFound while uncached directReader still saw
+		// the live tunnel: preserve both latch keys and requeue cleanly.
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 	}
 
 	if !tunnel.DeletionTimestamp.IsZero() {
