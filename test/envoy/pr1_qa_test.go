@@ -447,28 +447,28 @@ func TestEnvoyUnprotectedAndProtectedHeaderStrippingEndToEnd(t *testing.T) {
 
 		headerFilters := func() ([]gatewayv1.HTTPRouteFilter, []gatewayv1.HTTPRouteFilter) {
 			return []gatewayv1.HTTPRouteFilter{{
-					Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
-					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-						Set: []gatewayv1.HTTPHeader{
-							{Name: "Cf-Access-Authenticated-User-Email", Value: "spoofed@attacker.test"},
-							{Name: "X-Keep-Route", Value: "route-ok"},
-						},
-						Add: []gatewayv1.HTTPHeader{
-							{Name: "cf-access-custom-role", Value: "superadmin"},
-						},
+				Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+				RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+					Set: []gatewayv1.HTTPHeader{
+						{Name: "Cf-Access-Authenticated-User-Email", Value: "spoofed@attacker.test"},
+						{Name: "X-Keep-Route", Value: "route-ok"},
 					},
-				}}, []gatewayv1.HTTPRouteFilter{{
-					Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
-					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-						Set: []gatewayv1.HTTPHeader{
-							{Name: "Cf-Access-Jwt-Assertion", Value: "forged-backend-jwt"},
-							{Name: "X-Keep-Backend", Value: "backend-ok"},
-						},
-						Add: []gatewayv1.HTTPHeader{
-							{Name: "cf-access-custom-group", Value: "root"},
-						},
+					Add: []gatewayv1.HTTPHeader{
+						{Name: "cf-access-custom-role", Value: "superadmin"},
 					},
-				}}
+				},
+			}}, []gatewayv1.HTTPRouteFilter{{
+				Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+				RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+					Set: []gatewayv1.HTTPHeader{
+						{Name: "Cf-Access-Jwt-Assertion", Value: "forged-backend-jwt"},
+						{Name: "X-Keep-Backend", Value: "backend-ok"},
+					},
+					Add: []gatewayv1.HTTPHeader{
+						{Name: "cf-access-custom-group", Value: "root"},
+					},
+				},
+			}}
 		}
 		routeFilters, backendFilters := headerFilters()
 		privRouteFilters, privBackendFilters := headerFilters()
@@ -807,10 +807,11 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	}
 
 	assertQueries := func(t *testing.T, dnsAddr, corefile string, cases []struct {
-		host          string
-		wantA         string
-		wantAAAA      string
-		wantHTTPSAns  int
+		host         string
+		wantA        string
+		wantANY      string
+		wantAAAA     string
+		wantHTTPSAns int
 	}) {
 		t.Helper()
 		for _, tc := range cases {
@@ -827,6 +828,26 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 				}
 				if got != tc.wantA {
 					t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s", tc.host, got, tc.wantA, corefile)
+				}
+			}
+			if tc.wantANY != "" {
+				var gotANY string
+				var gotANYAns int
+				var anyErr error
+				deadline := time.Now().Add(15 * time.Second)
+				for time.Now().Before(deadline) {
+					ip, ancount, err := queryDNS(dnsAddr, tc.host, 255)
+					if err == nil && ancount == 1 {
+						gotANY = ip
+						gotANYAns = ancount
+						anyErr = nil
+						break
+					}
+					anyErr = err
+					time.Sleep(200 * time.Millisecond)
+				}
+				if anyErr != nil || gotANYAns != 1 || gotANY != tc.wantANY {
+					t.Fatalf("CoreDNS ANY(%s) = (%q, ancount=%d, err=%v), want (%q, 1, nil)\nCorefile:\n%s", tc.host, gotANY, gotANYAns, anyErr, tc.wantANY, corefile)
 				}
 			}
 			var gotAAAA string
@@ -869,6 +890,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		dnsAddr, corefile := startCoreDNS(t, []ir.Listener{
 			{Name: "wild-pod", Hostname: "*.internal.example", Port: 9443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "exact-loop", Hostname: "api.internal.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+			{Name: "exact-disjoint", Hostname: "disjoint.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 			{Name: "wild-loop", Hostname: "*.loop.example", Port: 8444, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 			{Name: "exact-pod", Hostname: "podexact.loop.example", Port: 9444, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "dup-pod", Hostname: "dup.internal.example", Port: 9445, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
@@ -877,15 +899,17 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		assertQueries(t, dnsAddr, corefile, []struct {
 			host         string
 			wantA        string
+			wantANY      string
 			wantAAAA     string
 			wantHTTPSAns int
 		}{
-			{"api.internal.example", "127.0.0.1", "", 0},
-			{"other.internal.example", "192.0.2.7", "2001:db8::7", 1},
-			{"podexact.loop.example", "192.0.2.7", "", 0},
-			{"other.loop.example", "127.0.0.1", "2001:db8::7", 1},
-			{"dup.internal.example", "127.0.0.1", "", 0},
-			{"unrelated.example", "", "2001:db8::7", 1},
+			{"api.internal.example", "127.0.0.1", "127.0.0.1", "", 0},
+			{"disjoint.example", "127.0.0.1", "127.0.0.1", "", 0},
+			{"other.internal.example", "192.0.2.7", "192.0.2.7", "2001:db8::7", 1},
+			{"podexact.loop.example", "192.0.2.7", "192.0.2.7", "", 0},
+			{"other.loop.example", "127.0.0.1", "127.0.0.1", "2001:db8::7", 1},
+			{"dup.internal.example", "127.0.0.1", "127.0.0.1", "", 0},
+			{"unrelated.example", "", "", "2001:db8::7", 1},
 		})
 	})
 
@@ -906,12 +930,13 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 				assertQueries(t, dnsAddr, corefile, []struct {
 					host         string
 					wantA        string
+					wantANY      string
 					wantAAAA     string
 					wantHTTPSAns int
 				}{
-					{"api.homo.example", tc.wantIP, "", 0},
-					{"app.wild.homo.example", tc.wantIP, "2001:db8::7", 1},
-					{"unrelated.example", "", "2001:db8::7", 1},
+					{"api.homo.example", tc.wantIP, tc.wantIP, "", 0},
+					{"app.wild.homo.example", tc.wantIP, tc.wantIP, "2001:db8::7", 1},
+					{"unrelated.example", "", "", "2001:db8::7", 1},
 				})
 			})
 		}
@@ -1040,7 +1065,7 @@ func queryDNS(serverAddr, host string, qtype uint16) (string, int, error) {
 		if off+rdLen > n {
 			return "", an, fmt.Errorf("truncated RR data")
 		}
-		if rrType == qtype && ((qtype == 1 && rdLen == 4) || (qtype == 28 && rdLen == 16)) {
+		if (rrType == qtype || (qtype == 255 && rrType == 1)) && ((rrType == 1 && rdLen == 4) || (rrType == 28 && rdLen == 16)) {
 			return net.IP(resp[off : off+rdLen]).String(), an, nil
 		}
 		off += rdLen

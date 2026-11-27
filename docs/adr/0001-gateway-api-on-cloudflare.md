@@ -257,11 +257,12 @@ hostnames (exact and single-label wildcard) using per-listener binding lookup—
 `CloudflareTunnel.status.listeners[*].binding` is `PodIP`
 (`internal/gatewayapi/translate.go`)—and forwards everything else to the Pod's
 resolver (`internal/dataplane/dns.go`). Exact hostnames are ordered before
-wildcard rules in CoreDNS (returning `127.0.0.1` or `{$POD_IP}` for `A`, and
-authoritative empty `NOERROR` for non-`A` queries such as `AAAA` and `HTTPS` so
-exact IPv4-only hostnames do not fall through upstream) so an exact hostname
-always takes precedence over an overlapping wildcard regardless of binding, and
-if both bindings share the same exact hostname, `127.0.0.1` wins. When a listener carries a recorded `PodIP`
+wildcard rules in CoreDNS (returning `127.0.0.1` or `{$POD_IP}` for `A` and
+for `ANY` meta-queries per RFC 8482 §4.1, and authoritative empty `NOERROR` for
+specific non-`A` query types such as `AAAA` and `HTTPS` so exact IPv4-only
+hostnames do not fall through upstream) so an exact hostname always takes
+precedence over an overlapping wildcard regardless of binding, and if both
+bindings share the same exact hostname, `127.0.0.1` wins. When a listener carries a recorded `PodIP`
 binding, CoreDNS answers its hostname with `{$POD_IP}`, Envoy binds that
 listener on `0.0.0.0`, a NetworkPolicy restricts access, and the tunnel reports
 `PrivateListenerDegraded=True` with reason `PodIPFallback` while any active

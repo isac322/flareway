@@ -127,10 +127,11 @@ func renderPrivateCorefile(entries []privateDNSEntry) string {
 	builder.WriteString(".:53 {\n    bind 127.0.0.1\n")
 	// CoreDNS executes template plugins before hosts in plugin.cfg order.
 	// Render exact hostnames as template blocks ahead of wildcards so an exact
-	// hostname always takes precedence over an overlapping wildcard binding, and
-	// return authoritative empty NOERROR via template IN ANY for all non-A query
-	// types (AAAA, HTTPS/TYPE65, etc.) on exact IPv4-only Private hostnames so
-	// they match the CoreDNS hosts contract and do not fall through upstream.
+	// hostname always takes precedence over an overlapping wildcard binding:
+	// template IN A handles literal A queries (and QTYPE=ANY meta-queries per
+	// RFC 8482 §4.1), while template IN ANY returns authoritative empty NOERROR
+	// for specific non-A query types (AAAA, HTTPS/TYPE65, etc.) so exact
+	// IPv4-only Private hostnames do not fall through upstream.
 	for _, entry := range exact {
 		pattern := "^" + escapeCoreDNSRegex(entry.hostname) + "[.]?$"
 		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
