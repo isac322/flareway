@@ -42,6 +42,7 @@ import (
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 )
@@ -1402,6 +1403,160 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		var deletedCheck v1alpha1.AccessApplication
 		err = f.direct.Get(f.ctx, client.ObjectKeyFromObject(app), &deletedCheck)
 		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "sole Public rejected AccessApplication should finish deleting after deny-only push; err=%v", err)
+	})
+
+	// Finding 2C: A rejected Public listener with retained Public revocation
+	// must keep the freshness gate active (0 remote reads/writes and 0 status
+	// writes + non-zero freshness RequeueAfter when fresh) and still detect and
+	// handle out-of-band remote drift under both Overwrite and Hold policies
+	// when the freshness TTL expires or is invalidated.
+	ginkgo.It("Finding 2C: rejected Public listener keeps freshness requeue and repairs or holds out-of-band drift", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{})
+		f.reconciler.Freshness = freshness.DefaultPolicy()
+		f.reconciler.Invalidator = freshness.NewLatch()
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		gw.Spec.Listeners = []gatewayv1.Listener{{
+			Name:     "http",
+			Hostname: new(gatewayv1.Hostname("ungranted.example.com")),
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		}}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		_, tunnelErr := f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+		f.remote.remoteVersion = 1
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		tunnel.Status.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{
+			Desired: 1, Applied: 1, Remote: 1,
+		}
+		tunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+			Hostname:          "edge-a.example.com",
+			ProtectionDomain:  "http-access-default-pub-drift-app",
+			AccessApplication: ns + "/pub-drift-app",
+			Guard:             v1alpha1.HostnameGuardForwarding,
+			AppliedVersion:    1,
+		}}
+		tunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "http",
+			Exposure: v1alpha1.ExposurePublic,
+			ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{
+				Name: "http-access-default-pub-drift-app", EnvoyPort: 18080, Protected: true,
+			}},
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		latchPayload, err := json.Marshal(gatewayapi.AccessRevocationLatch{
+			Claims: []gatewayapi.AccessRevocationClaim{{
+				Tunnel:           tunnel.Name,
+				ProtectionDomain: "http-access-default-pub-drift-app",
+				Hostname:         "edge-a.example.com",
+				BaselineVersion:  1,
+			}},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "pub-drift-app",
+				Namespace:   ns,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{gatewayapi.AccessRevocationAnnotation: string(latchPayload)},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "Gateway", Name: gatewayv1.ObjectName(gw.Name)},
+					SectionName:                new(gatewayv1.SectionName("http")),
+				}},
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "pub-drift-app", SessionDuration: "1h"},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, app)).To(gomega.Succeed())
+		app.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel:           tunnel.Name,
+			Listener:         "http",
+			ProtectionDomain: "http-access-default-pub-drift-app",
+			EnvoyPort:        18080,
+		}}
+		app.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+			Type:     v1alpha1.AccessApplicationDestinationPublic,
+			Hostname: "edge-a.example.com",
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, app)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, app)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dataplane-0", Namespace: ns}})).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(f.direct.Get(f.ctx, types.NamespacedName{Namespace: ns, Name: "dataplane-0"}, &corev1.Pod{}))
+		}, 10*time.Second, 50*time.Millisecond).Should(gomega.BeTrue())
+
+		// Initial deny-only push -> v2 + freshness requeue horizon.
+		res, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(f.reconciler.Freshness.Traffic), "initial rejected Public push must return freshness requeue horizon")
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		rvAfterPush := tunnel.ResourceVersion
+		locksAfterPush := f.remote.locks
+
+		// Immediate steady-state reconcile while gate is fresh: 0 remote locks/writes,
+		// 0 status writes on tunnel, non-zero freshness RequeueAfter.
+		f.clock = f.clock.Add(30 * time.Second)
+		res, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.locks).To(gomega.Equal(locksAfterPush), "fresh gate must skip remote reads")
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(f.reconciler.Freshness.Traffic-30*time.Second), "fresh steady-state reconcile must keep freshness requeue")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.ResourceVersion).To(gomega.Equal(rvAfterPush), "fresh steady-state reconcile must make 0 tunnel status writes")
+
+		// Advance clock past TTL and simulate out-of-band remote bump to v3:
+		// default Overwrite policy must detect drift and repair to deny-only v4.
+		f.clock = f.clock.Add(6 * time.Minute)
+		f.remote.remoteVersion = 3
+		res, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(2), "expired gate with remote drift must re-apply deny-only config")
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(f.reconciler.Freshness.Traffic))
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.ConfigVersion.Applied).To(gomega.Equal(int64(4)))
+		gomega.Expect(tunnel.Status.Hostnames[0].Guard).To(gomega.Equal(v1alpha1.HostnameGuardBlocked))
+		gomega.Expect(tunnel.Status.Hostnames[0].AppliedVersion).To(gomega.Equal(int64(4)))
+		driftCond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionDriftDetected)
+		gomega.Expect(driftCond).NotTo(gomega.BeNil())
+		gomega.Expect(driftCond.Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(driftCond.Reason).To(gomega.Equal("OutOfBandChangeDetected"))
+
+		// Switch to DriftPolicyHold, invalidate freshness latch, and bump remote to v5:
+		// must detect drift WITHOUT overwriting remote and surface DriftHold.
+		f.reconciler.DriftPolicy = DriftPolicyHold
+		f.reconciler.Invalidator.Invalidate("CloudflareTunnelConfig", f.tunnelKey, "sweep detected version drift")
+		f.remote.remoteVersion = 5
+		res, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(2), "DriftPolicyHold must not overwrite remote")
+		gomega.Expect(res.RequeueAfter).To(gomega.Equal(programmedRequeue))
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.ConfigVersion.Remote).To(gomega.Equal(int64(5)))
+		gomega.Expect(tunnel.Status.ConfigVersion.Applied).To(gomega.Equal(int64(4)))
+		gomega.Expect(tunnel.Status.Hostnames[0].Guard).To(gomega.Equal(v1alpha1.HostnameGuardBlocked))
+		appliedCond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+		gomega.Expect(appliedCond).NotTo(gomega.BeNil())
+		gomega.Expect(appliedCond.Status).To(gomega.Equal(metav1.ConditionFalse))
+		gomega.Expect(appliedCond.Reason).To(gomega.Equal("DriftHold"))
 	})
 })
 

@@ -62,7 +62,6 @@ import (
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
-	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/gatewayapi"
@@ -387,10 +386,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.retractGatewayDataplane(ctx, &gateway); err != nil {
 			return ctrl.Result{}, err
 		}
-		needsDrainRequeue := false
+		var revocationRequeue time.Duration
 		if !compiled.ConformanceMode && tunnel != nil && block == nil {
 			var syncErr error
-			needsDrainRequeue, syncErr = r.syncRejectedGatewayTunnelRevocation(ctx, compiled, &gateway, tunnel, account, privateState)
+			revocationRequeue, syncErr = r.syncRejectedGatewayTunnelRevocation(ctx, compiled, &gateway, tunnel, account, privateState)
 			if syncErr != nil {
 				return ctrl.Result{}, syncErr
 			}
@@ -404,7 +403,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchBackendTLSPolicyStatuses(ctx, inputs.BackendTLSPolicies, statuses.BackendTLSPolicies, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
-		if needsDrainRequeue || (block != nil && !block.terminal && !topLevelInvalid) {
+		if revocationRequeue > 0 {
+			return ctrl.Result{RequeueAfter: revocationRequeue}, nil
+		}
+		if block != nil && !block.terminal && !topLevelInvalid {
 			return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 		}
 		return ctrl.Result{}, nil
@@ -1389,19 +1391,45 @@ func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.Cloud
 	if !hasRetainedRevocationDomains(compiled.Domains) {
 		return false
 	}
+	// Rejected Gateways holding Public revocation claims must always keep the
+	// cloudflared freshness/drift gate active rather than short-circuiting once
+	// Blocked is written; reconcileCloudflaredConfiguration skips remote reads
+	// while the gate is fresh and repairs/holds drift once expired or swept.
 	if hasPublicRetainedRevocationDomains(compiled.Domains) && account != nil && compiled.Cloudflare != nil {
-		if _, denyHash, err := cloudflaredconfig.Compile(compiled); err == nil {
-			if tunnel.Status.ConfigVersion.DesiredHash != denyHash ||
-				tunnel.Status.ConfigVersion.Applied <= 0 ||
-				tunnel.Status.ConfigVersion.Desired != tunnel.Status.ConfigVersion.Applied {
-				return true
-			}
-		}
+		return true
 	}
 	desiredHostnames := desiredTunnelHostnames(compiled, tunnel.Status.ConfigVersion.Applied)
 	desiredListeners := desiredTunnelListeners(compiled, tunnel)
 	return !apiequality.Semantic.DeepEqual(tunnel.Status.Hostnames, desiredHostnames) ||
 		!apiequality.Semantic.DeepEqual(tunnel.Status.Listeners, desiredListeners)
+}
+
+func tunnelGatewayStatusUnchanged(
+	tunnel *v1alpha1.CloudflareTunnel,
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+	conditions []metav1.Condition,
+) bool {
+	if tunnel == nil {
+		return false
+	}
+	if !apiequality.Semantic.DeepEqual(tunnel.Status.ConfigVersion, config) ||
+		!apiequality.Semantic.DeepEqual(tunnel.Status.Hostnames, hostnames) ||
+		!apiequality.Semantic.DeepEqual(tunnel.Status.Listeners, listeners) {
+		return false
+	}
+	for _, want := range conditions {
+		got := meta.FindStatusCondition(tunnel.Status.Conditions, want.Type)
+		if got == nil ||
+			got.Status != want.Status ||
+			got.Reason != want.Reason ||
+			got.Message != want.Message ||
+			got.ObservedGeneration != want.ObservedGeneration {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *GatewayReconciler) gatewayDataplaneDrained(ctx context.Context, gateway *gatewayv1.Gateway) (bool, error) {
@@ -1467,23 +1495,23 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 	tunnel *v1alpha1.CloudflareTunnel,
 	account *v1alpha1.CloudflareAccount,
 	privateState privatePrerequisiteResult,
-) (bool, error) {
+) (time.Duration, error) {
 	if !needsRejectedGatewayTunnelSync(compiled, tunnel, account) {
-		return false, nil
+		return 0, nil
 	}
 	currentTunnel, err := r.validateGatewayTunnelWriter(ctx, compiled, tunnel)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	if !needsRejectedGatewayTunnelSync(compiled, currentTunnel, account) {
-		return false, nil
+		return 0, nil
 	}
 	drained, err := r.gatewayDataplaneDrained(ctx, gateway)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	if !drained {
-		return true, nil
+		return programmedRequeue, nil
 	}
 
 	config := currentTunnel.Status.ConfigVersion
@@ -1492,13 +1520,14 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 	if existingDrift := meta.FindStatusCondition(currentTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionDriftDetected); existingDrift != nil {
 		driftCondition = gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, existingDrift.Status, existingDrift.Reason, existingDrift.Message, now)
 	}
+	var requeueAfter time.Duration
 	if hasPublicRetainedRevocationDomains(compiled.Domains) {
 		if account == nil || compiled.Cloudflare == nil {
-			return true, nil
+			return programmedRequeue, nil
 		}
 		cloudflareResult, err := r.reconcileCloudflaredConfiguration(ctx, compiled, currentTunnel, account)
 		if err != nil {
-			return false, err
+			return 0, err
 		}
 		if cloudflareResult.version > 0 {
 			config.Desired = cloudflareResult.version
@@ -1511,6 +1540,8 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 		config.CreatedAt = cloudflareResult.remoteCreatedAt
 		if cloudflareResult.drift {
 			driftCondition = gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionTrue, "OutOfBandChangeDetected", cloudflareResult.message, now)
+		} else if cloudflareResult.appliedAt != nil {
+			driftCondition = gatewayTunnelCondition(currentTunnel, v1alpha1.CloudflareTunnelConditionDriftDetected, metav1.ConditionFalse, "Synchronized", "Cloudflare Tunnel configuration matches the applied state", now)
 		}
 		if cloudflareResult.pending != "" || cloudflareResult.held || cloudflareResult.version <= 0 {
 			if cloudflareResult.held {
@@ -1520,15 +1551,18 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 					privateListenerCondition(compiled, privateState, now),
 					driftCondition,
 				}
-				if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions...); err != nil {
-					return false, err
+				if !tunnelGatewayStatusUnchanged(currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions) {
+					if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, currentTunnel.Status.Hostnames, listeners, conditions...); err != nil {
+						return 0, err
+					}
 				}
 			}
-			return true, nil
+			return programmedRequeue, nil
 		}
 		// Remote edge ingress is now deny-only and the owned dataplane has zero
 		// running or terminating Pods, so advance Applied to acknowledge Blocked.
 		config.Applied = cloudflareResult.version
+		requeueAfter = cloudflareResult.requeue
 	}
 
 	hostnames := desiredTunnelHostnames(compiled, config.Applied)
@@ -1538,10 +1572,12 @@ func (r *GatewayReconciler) syncRejectedGatewayTunnelRevocation(
 		privateListenerCondition(compiled, privateState, now),
 		driftCondition,
 	}
-	if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, hostnames, listeners, conditions...); err != nil {
-		return false, err
+	if !tunnelGatewayStatusUnchanged(currentTunnel, config, hostnames, listeners, conditions) {
+		if err := r.patchTunnelGatewayStatus(ctx, compiled, currentTunnel, config, hostnames, listeners, conditions...); err != nil {
+			return 0, err
+		}
 	}
-	return false, nil
+	return requeueAfter, nil
 }
 
 // retractCloudflareListenerService deletes the conformance listener Service
