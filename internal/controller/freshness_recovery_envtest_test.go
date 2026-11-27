@@ -3824,28 +3824,40 @@ func TestDefensiveGatewayAdmissionDoesNotRepublishAStaleProgrammedCondition(t *t
 		t.Fatalf("create gw: %v", err)
 	}
 
-	// Step 1: Persist rev A with Accepted=True, Programmed=True, Addresses=[host].
+	// Step 1: Persist rev A with Translated admission fields plus Programmed=True, Addresses=[host].
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), gw); err != nil {
 		t.Fatal(err)
 	}
 	t1 := metav1.Now()
 	addrType := gatewayv1.HostnameAddressType
-	gw.Status = gatewayv1.GatewayStatus{
-		Addresses: []gatewayv1.GatewayStatusAddress{{Type: &addrType, Value: string(host)}},
-		Conditions: []metav1.Condition{
-			{Type: string(gatewayv1.GatewayConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-			{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-		},
-		Listeners: []gatewayv1.ListenerStatus{{
-			Name: "http",
-			Conditions: []metav1.Condition{
-				{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-				{Type: string(gatewayv1.ListenerConditionResolvedRefs), Status: metav1.ConditionTrue, Reason: "ResolvedRefs", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-				{Type: string(gatewayv1.ListenerConditionConflicted), Status: metav1.ConditionFalse, Reason: "NoConflicts", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-				{Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
-			},
-		}},
+	reconciler := &GatewayReconciler{
+		Client:    direct,
+		APIReader: direct,
+		Scheme:    mgr.GetScheme(),
 	}
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName},
+	}
+	gwCfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway-cfg"},
+		Spec:       v1alpha1.GatewayClassConfigSpec{ConformanceMode: true},
+	}
+	_, initialStatuses := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway:            gw,
+		GatewayClass:       gwClass,
+		GatewayClassConfig: gwCfg,
+		Namespaces:         []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&initialStatuses.Gateway, gw)
+	initialStatuses.Gateway.Addresses = []gatewayv1.GatewayStatusAddress{{Type: &addrType, Value: string(host)}}
+	meta.SetStatusCondition(&initialStatuses.Gateway.Conditions, metav1.Condition{
+		Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1,
+	})
+	meta.SetStatusCondition(&initialStatuses.Gateway.Listeners[0].Conditions, metav1.Condition{
+		Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1,
+	})
+	gw.Status = initialStatuses.Gateway
 	if err := direct.Status().Update(ctx, gw); err != nil {
 		t.Fatalf("write rev A status: %v", err)
 	}
@@ -3869,28 +3881,16 @@ func TestDefensiveGatewayAdmissionDoesNotRepublishAStaleProgrammedCondition(t *t
 	}
 	demotedRV := liveGW.ResourceVersion
 
-	// Step 3: Run the real admission prepare + patch functions using staleSnapshot (rev A).
-	reconciler := &GatewayReconciler{
-		Client:    direct,
-		APIReader: direct,
-		Scheme:    mgr.GetScheme(),
-	}
-	admissionStatus := gatewayv1.GatewayStatus{
-		Conditions: []metav1.Condition{
-			{Type: string(gatewayv1.GatewayConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
-		},
-		Listeners: []gatewayv1.ListenerStatus{{
-			Name: "http",
-			Conditions: []metav1.Condition{
-				{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
-				{Type: string(gatewayv1.ListenerConditionResolvedRefs), Status: metav1.ConditionTrue, Reason: "ResolvedRefs", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
-				{Type: string(gatewayv1.ListenerConditionConflicted), Status: metav1.ConditionFalse, Reason: "NoConflicts", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
-			},
-		}},
-	}
-	reconciler.prepareGatewayStatus(&admissionStatus, staleSnapshot)
-	if err := reconciler.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gw), admissionStatus); err != nil {
-		t.Fatalf("patchGatewayStatus with stale admission snapshot: %v", err)
+	// Step 3: Run the real Translate -> prepareGatewayStatus -> patchGatewayAdmissionStatus path using staleSnapshot (rev A).
+	_, translatedStatuses := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway:            staleSnapshot,
+		GatewayClass:       gwClass,
+		GatewayClassConfig: gwCfg,
+		Namespaces:         []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&translatedStatuses.Gateway, staleSnapshot)
+	if err := reconciler.patchGatewayAdmissionStatus(ctx, client.ObjectKeyFromObject(gw), translatedStatuses.Gateway); err != nil {
+		t.Fatalf("patchGatewayAdmissionStatus with stale translated admission snapshot: %v", err)
 	}
 
 	var after gatewayv1.Gateway
@@ -3910,5 +3910,55 @@ func TestDefensiveGatewayAdmissionDoesNotRepublishAStaleProgrammedCondition(t *t
 	}
 	if after.ResourceVersion != demotedRV {
 		t.Fatalf("admission no-op bumped ResourceVersion %s -> %s, want unchanged %s", demotedRV, after.ResourceVersion, demotedRV)
+	}
+
+	// Step 4: Reverse direction (root cause of TestCloudflareModeGatewayRemovesListenerService
+	// flake): a stale reconcile-start snapshot carrying Programmed=False/Pending from
+	// OwnershipCheckpoint/credentials wait runs Translate -> prepareGatewayStatus ->
+	// patchGatewayStatus after live Gateway already converged to Programmed=True.
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &liveGW); err != nil {
+		t.Fatal(err)
+	}
+	stalePending := liveGW.DeepCopy()
+	t3 := metav1.NewTime(t2.Add(time.Second))
+	liveGW.Status.Addresses = []gatewayv1.GatewayStatusAddress{{Type: &addrType, Value: string(host)}}
+	meta.SetStatusCondition(&liveGW.Status.Conditions, metav1.Condition{
+		Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "converged", ObservedGeneration: liveGW.Generation, LastTransitionTime: t3,
+	})
+	meta.SetStatusCondition(&liveGW.Status.Listeners[0].Conditions, metav1.Condition{
+		Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "converged", ObservedGeneration: liveGW.Generation, LastTransitionTime: t3,
+	})
+	if err := direct.Status().Update(ctx, &liveGW); err != nil {
+		t.Fatalf("write rev C programmed: %v", err)
+	}
+	convergedRV := liveGW.ResourceVersion
+
+	_, stalePendingStatuses := gatewayapi.Translate(gatewayapi.Inputs{
+		Gateway:            stalePending,
+		GatewayClass:       gwClass,
+		GatewayClassConfig: gwCfg,
+		Namespaces:         []corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: ns}}},
+	})
+	reconciler.prepareGatewayStatus(&stalePendingStatuses.Gateway, stalePending)
+	if err := reconciler.patchGatewayAdmissionStatus(ctx, client.ObjectKeyFromObject(gw), stalePendingStatuses.Gateway); err != nil {
+		t.Fatalf("patchGatewayAdmissionStatus with stale pending snapshot: %v", err)
+	}
+
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &after); err != nil {
+		t.Fatal(err)
+	}
+	prog = meta.FindStatusCondition(after.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != "Programmed" {
+		t.Fatalf("stale pending admission patch overwrote live Programmed=True: got %#v, want True/Programmed", prog)
+	}
+	lprog = meta.FindStatusCondition(after.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if lprog == nil || lprog.Status != metav1.ConditionTrue || lprog.Reason != "Programmed" {
+		t.Fatalf("stale pending admission patch overwrote live listener Programmed=True: got %#v, want True/Programmed", lprog)
+	}
+	if len(after.Status.Addresses) != 1 || after.Status.Addresses[0].Value != string(host) {
+		t.Fatalf("stale pending admission patch cleared live Addresses %#v, want [%s]", after.Status.Addresses, host)
+	}
+	if after.ResourceVersion != convergedRV {
+		t.Fatalf("stale pending admission no-op bumped ResourceVersion %s -> %s, want unchanged %s", convergedRV, after.ResourceVersion, convergedRV)
 	}
 }

@@ -412,11 +412,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
-	// Admission-only patch: patchGatewayStatus preserves live Programmed,
-	// listener Programmed, and Addresses from the freshly fetched current
-	// revision so a stale reconcile-start snapshot can never republish True
-	// over a newer demotion or churn Addresses on steady-state passes.
-	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
+	// Admission-only patch: patchGatewayAdmissionStatus strips programming fields
+	// on a copy so a stale reconcile-start snapshot can never republish
+	// Programmed or Addresses over a newer write, while keeping statuses.Gateway
+	// intact for downstream programming and rejection paths.
+	if err := r.patchGatewayAdmissionStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1795,6 +1795,20 @@ func prepareConditions(
 	return result
 }
 
+// patchGatewayAdmissionStatus strips programming fields from a copy of
+// desired before calling patchGatewayStatus so an admission-only update never
+// republishes stale Programmed, listener Programmed, or Addresses while
+// leaving the caller's status intact for downstream programming updates.
+func (r *GatewayReconciler) patchGatewayAdmissionStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
+	admission := *desired.DeepCopy()
+	admission.Addresses = nil
+	meta.RemoveStatusCondition(&admission.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	for index := range admission.Listeners {
+		meta.RemoveStatusCondition(&admission.Listeners[index].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	}
+	return r.patchGatewayStatus(ctx, key, admission)
+}
+
 func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
 	deleted := false
 	var patched gatewayv1.GatewayStatus
@@ -1805,7 +1819,7 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 	admissionOnly := meta.FindStatusCondition(desired.Conditions, string(gatewayv1.GatewayConditionProgrammed)) == nil
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current gatewayv1.Gateway
-		if err := r.Get(ctx, key, &current); err != nil {
+		if err := r.directReader().Get(ctx, key, &current); err != nil {
 			if apierrors.IsNotFound(err) {
 				deleted = true
 				return nil
