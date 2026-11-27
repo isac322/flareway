@@ -44,7 +44,7 @@ Under the default profile, an externally deleted or replaced Flareway CNAME is a
 
 ## The drift sweep
 
-A single leader-elected worker lists each enabled sweep target once per grade period and compares the result against cluster state. It filters targets by controller group before starting the target loops, and delivers invalidation wake-ups over per-kind fan-out channels with non-blocking sends so each reconciler receives its own kind's events (with `Gateway` also subscribing to `CloudflareTunnel` drift) without competing on a shared channel or stalling on a slow subscriber.
+A single leader-elected worker lists each enabled sweep target once per grade period and compares the result against cluster state. It filters targets by controller group before starting the target loops, and dispatches wakeup notifications over per-kind fan-out channels (`Gateway` also subscribes to `CloudflareTunnel` drift) using bounded non-blocking sends. Because channel sends are non-blocking, wakeup notifications are best-effort if a subscriber's buffer fills; the in-memory invalidation latch retains the drift marker so the affected object still closes its gate (`closed_invalidated`) on its next reconcile or periodic retry without waiting on a slow subscriber.
 
 | Case | Meaning | Action |
 |---|---|---|
@@ -105,7 +105,7 @@ An `AccessApplication` is checked against more than its own listed entry:
 
 Local state an `AccessApplication` depends on, such as its Gateways, data planes, and the tunnel's forwarding status, is part of the gate's desired hash. A change there runs the full pass without waiting for the sweep.
 
-Gates stay open only while the object's live Kubernetes status is converged on the current generation (`Ready=True` or `Programmed=True`, and for `CloudflareTunnel` in `dns.mode: External`, `DNSReady=True` with empty `status.dnsRecords`; `CloudflareTunnelConfig` also permits healthy Pod rollout states `Applying`, `Pending`, and `TeardownBlocked`). Any pre-gate or remote failure forgets cached verifications and sweep confirmations and closes the gate with `closed_unconverged`, so recovery runs immediately once dependencies return rather than waiting for TTL expiry.
+Gates stay open only while the object's live Kubernetes status is converged on the current generation (`Ready=True` or `Programmed=True`; for `CloudflareTunnel` in `dns.mode: External`, `Ready=True`, verified ownership/account identity, `DNSReady=True`, and empty `status.dnsRecords`; and for `Gateway`'s `CloudflareTunnelConfig` gate, both `ConfigApplied=True` on the tunnel's current generation and `Programmed=True` on the Gateway's current generation). Pre-gate and remote failures that demote status (including Gateway pre-gate admission, compile, snapshot, and dataplane failures on the owning writer's `CloudflareTunnelConfig` key, respecting writer identity and keeping the `CloudflareTunnel` key distinct) forget cached verifications and sweep confirmations and close the gate with `closed_unconverged`, so recovery runs immediately once dependencies return rather than waiting for TTL expiry.
 
 Confirmations live in operator memory. After a restart or leader change, each object verifies itself once and records its content again.
 

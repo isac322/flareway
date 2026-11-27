@@ -373,7 +373,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		})
 	}
 	recordGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), stamp)
-	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
+	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessApplicationRequeue)}, nil
 }
 
 func (r *AccessApplicationReconciler) reconcileInvalidation(ctx context.Context, application *v1alpha1.AccessApplication, invalid gatewayapi.AccessApplicationCompilation) (ctrl.Result, error) {

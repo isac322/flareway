@@ -30,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,6 +54,97 @@ func (a *accountMatchedWARPCloudflare) CreateWARPConnector(ctx context.Context, 
 	c.AccountTag = a.accountID
 	a.connector.AccountTag = a.accountID
 	return c, err
+}
+
+type scimIdentityProviderFakeAPI struct {
+	*identityProviderFakeAPI
+}
+
+func (f *scimIdentityProviderFakeAPI) UpdateIdentityProvider(ctx context.Context, id string, input flarecloudflare.IdentityProviderInput) (flarecloudflare.IdentityProvider, error) {
+	remote, err := f.identityProviderFakeAPI.UpdateIdentityProvider(ctx, id, input)
+	if err != nil {
+		return remote, err
+	}
+	if input.SCIMConfig != nil && input.SCIMConfig.Enabled != nil && *input.SCIMConfig.Enabled {
+		if remote.SCIMSecret == "" {
+			remote.SCIMSecret = "scim-secret-1"
+		}
+		if remote.SCIMBaseURL == "" {
+			remote.SCIMBaseURL = "https://scim.example.test"
+		}
+		f.providers[id] = remote
+	}
+	return remote, nil
+}
+
+func (f *scimIdentityProviderFakeAPI) ListIdentityProviderSCIMUsers(context.Context, string, int64) ([]flarecloudflare.IdentityProviderSCIMUser, bool, error) {
+	return nil, false, nil
+}
+
+func (f *scimIdentityProviderFakeAPI) ListIdentityProviderSCIMGroups(context.Context, string, int64) ([]flarecloudflare.IdentityProviderSCIMGroup, bool, error) {
+	return nil, false, nil
+}
+
+type statusWriteCountingClient struct {
+	client.Client
+	writes *atomic.Int64
+}
+
+func (c *statusWriteCountingClient) Status() client.SubResourceWriter {
+	return &statusWriteCountingSubResource{
+		SubResourceWriter: c.Client.Status(),
+		writes:            c.writes,
+	}
+}
+
+type statusWriteCountingSubResource struct {
+	client.SubResourceWriter
+	writes *atomic.Int64
+}
+
+func (w *statusWriteCountingSubResource) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	w.writes.Add(1)
+	return w.SubResourceWriter.Create(ctx, obj, subResource, opts...)
+}
+
+func (w *statusWriteCountingSubResource) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	w.writes.Add(1)
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func (w *statusWriteCountingSubResource) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	w.writes.Add(1)
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
+
+func (w *statusWriteCountingSubResource) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	w.writes.Add(1)
+	return w.SubResourceWriter.Apply(ctx, obj, opts...)
+}
+
+type fakeAccountVerifyFactory struct {
+	accountID string
+	zoneName  string
+}
+
+func (f fakeAccountVerifyFactory) AccountClient(_, _ string) flarecloudflare.AccountAPI {
+	return f
+}
+
+func (f fakeAccountVerifyFactory) VerifyToken(context.Context) (flarecloudflare.TokenVerification, error) {
+	return flarecloudflare.TokenVerification{ID: "tok-1", Status: "active"}, nil
+}
+
+func (f fakeAccountVerifyFactory) ListZones(context.Context) ([]flarecloudflare.Zone, error) {
+	zoneName := f.zoneName
+	if zoneName == "" {
+		zoneName = "example.com"
+	}
+	return []flarecloudflare.Zone{{ID: "z1", Name: zoneName, AccountID: f.accountID, AccountName: "test-account"}}, nil
+}
+
+func (f fakeAccountVerifyFactory) GetOrganization(context.Context) (flarecloudflare.Organization, error) {
+	return flarecloudflare.Organization{Name: "test-account", AuthDomain: "test.cloudflareaccess.com"}, nil
 }
 
 func setAccountCredentialsValid(ctx context.Context, t *testing.T, direct client.Client, accountName string, valid metav1.ConditionStatus) {
@@ -128,6 +220,8 @@ func checkObjectConverged(ctx context.Context, direct client.Client, obj client.
 		gen, obsGen, conds, appliedHash, appliedAt = o.Generation, o.Status.ObservedGeneration, o.Status.Conditions, o.Status.AppliedHash, o.Status.AppliedAt
 	case *v1alpha1.ZeroTrustOrganization:
 		gen, obsGen, conds, appliedHash, appliedAt = o.Generation, o.Status.ObservedGeneration, o.Status.Conditions, o.Status.AppliedHash, o.Status.AppliedAt
+	case *v1alpha1.CloudflareTunnel:
+		gen, obsGen, conds, appliedHash, appliedAt = o.Generation, o.Status.ObservedGeneration, o.Status.Conditions, o.Status.ConfigVersion.DesiredHash, o.Status.ConfigVersion.AppliedAt
 	default:
 		return false, fmt.Errorf("unexpected type %T", obj)
 	}
@@ -182,6 +276,8 @@ func checkObjectFailed(ctx context.Context, direct client.Client, obj client.Obj
 		conds = o.Status.Conditions
 	case *v1alpha1.ZeroTrustOrganization:
 		conds = o.Status.Conditions
+	case *v1alpha1.CloudflareTunnel:
+		conds = o.Status.Conditions
 	default:
 		return false, fmt.Errorf("unexpected type %T", obj)
 	}
@@ -205,7 +301,7 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 	accessFake := newFakeAccessResourceCloudflare()
 	standaloneFake := &fakeStandaloneCloudflare{applications: map[string]flarecloudflare.AccessApplication{}, tags: map[string]flarecloudflare.AccessTag{}}
 	infraFake := &fakeInfrastructureTargetCloudflare{targets: map[string]flarecloudflare.AccessInfrastructureTarget{}}
-	idpFake := &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}
+	idpFake := &scimIdentityProviderFakeAPI{identityProviderFakeAPI: &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}}
 	appFake := newFakeAccessApplicationCloudflare()
 	customPageFake := newFakeCustomPageCloudflare()
 	integrationFake := &fakeDevicePostureIntegrationCloudflare{integrations: map[string]flarecloudflare.DevicePostureIntegration{}}
@@ -218,6 +314,10 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 	deviceSettingsFake := new(fakeGlobalDeviceCloudflare)
 	orgFake := new(fakeGlobalOrganizationCloudflare)
 	gatewayFake := newFakeGlobalGatewayCloudflare()
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	gwAPI := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1}
+	snapshots := newFakeSnapshotPublisher()
+	prober := &staticGatewayProber{version: 2, ready: true}
 
 	for _, err := range []error{
 		(&AccessPolicyReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
@@ -239,6 +339,9 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 		(&WARPConnectorReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.WARPConnectorAPI, error) { return warpFake, nil }, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
 		(&ZeroTrustListReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: gatewayFake.Client, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
 		(&ZeroTrustOrganizationReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: orgFake.Client, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
+		(&CloudflareTunnelReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: tunnelFake.Client, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
+		(&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
+		(&GatewayReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace, CloudflareFactory: gatewayCloudflareFactory{api: gwAPI}, Prober: prober, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
 	} {
 		if err != nil {
 			t.Fatalf("setup controller: %v", err)
@@ -266,6 +369,7 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 				Hostnames:            []string{"*"},
 				Zones:                []string{"*"},
 				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate},
+				UnprotectedHostnames: []string{"*"},
 				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
 				AccessPolicyRefs:     v1alpha1.GrantPermissionAllowed,
 				AccessCustomPageRefs: v1alpha1.GrantPermissionAllowed,
@@ -281,26 +385,105 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 	}
 	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "zone-1", Name: "example.com"}})
 
-	// Pre-seeded Accepted CloudflareTunnel for NetworkRoute and HostnameRoute.
+	// Real Direct-mode External-DNS CloudflareTunnel managed by CloudflareTunnelReconciler
+	// (also used as the tunnel target for NetworkRoute and HostnameRoute).
 	tunnel := &v1alpha1.CloudflareTunnel{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "route-tunnel"},
 		Spec: v1alpha1.CloudflareTunnelSpec{
 			AccountRef:       corev1.LocalObjectReference{Name: accountName},
+			Tunnel:           v1alpha1.CloudflareTunnelRemoteSpec{Name: "route-tunnel"},
 			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			DNS:              v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			Configuration: v1alpha1.CloudflareTunnelConfiguration{
+				Mode: v1alpha1.CloudflareTunnelConfigurationModeDirect,
+				Direct: &v1alpha1.CloudflareTunnelDirectConfiguration{
+					Ingress: []v1alpha1.CloudflareTunnelIngressRule{{
+						Service: v1alpha1.CloudflareTunnelIngressService{HTTPStatus: &v1alpha1.CloudflareTunnelHTTPStatusService{Code: 404}},
+					}},
+				},
+			},
 		},
 	}
 	if err := direct.Create(ctx, tunnel); err != nil {
 		t.Fatalf("create tunnel: %v", err)
 	}
-	tunnel.Status.TunnelID = "tunnel-1"
-	tunnel.Status.OwnershipVerified = true
-	tunnel.Status.Conditions = []metav1.Condition{{
-		Type: v1alpha1.CloudflareTunnelConditionAccepted, Status: metav1.ConditionTrue,
-		Reason: "Accepted", Message: "ready", ObservedGeneration: tunnel.Generation, LastTransitionTime: metav1.Now(),
-	}}
-	if err := direct.Status().Update(ctx, tunnel); err != nil {
-		t.Fatalf("update tunnel status: %v", err)
+	waitUntilTrue(t, 15*time.Second, "Direct CloudflareTunnel converged", func() (bool, error) {
+		var cur v1alpha1.CloudflareTunnel
+		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(tunnel), v1alpha1.CloudflareTunnelConditionReady, v1alpha1.CloudflareTunnelConditionAccepted)
+	})
+
+	// Real Gateway + Gateway-mode CloudflareTunnel (covering Gateway CloudflareTunnelConfig gate).
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "qa2c1-cfg"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: accountName},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
 	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatalf("create GatewayClassConfig: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "qa2c1-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatalf("create GatewayClass: %v", err)
+	}
+	gwHost := gatewayv1.Hostname("qa2c1.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-2c1"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &gwHost}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create Gateway: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "Gateway dataplane Deployment created", func() (bool, error) {
+		var dep appsv1.DeploymentList
+		if err := direct.List(ctx, &dep, client.InNamespace(ns)); err != nil {
+			return false, err
+		}
+		return len(dep.Items) > 0, nil
+	})
+	gwPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "dp-2c1-0", UID: types.UID("dp-2c1-uid"),
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, gwPod); err != nil {
+		t.Fatalf("create Gateway pod: %v", err)
+	}
+	gwPod.Status.PodIP = "10.0.0.12"
+	gwPod.Status.Phase = corev1.PodRunning
+	gwPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, gwPod); err != nil {
+		t.Fatalf("update Gateway pod status: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "Gateway snapshot ACKed", func() (bool, error) {
+		return snapshots.ACK(client.ObjectKeyFromObject(gw).String()) == nil, nil
+	})
+	gwTunnelKey := types.NamespacedName{Namespace: ns, Name: gw.Name}
+	waitUntilTrue(t, 15*time.Second, "Gateway ConfigApplied=True & Programmed=True", func() (bool, error) {
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		var curTunnel v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, gwTunnelKey, &curTunnel); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), curGW.Generation) &&
+			assertConditionTrueForCurrentGen(curTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curTunnel.Generation), nil
+	})
 
 	accountRef := corev1.LocalObjectReference{Name: accountName}
 	appFake.SetPolicy(flarecloudflare.AccessPolicy{ID: "ext-pol-1", Name: "ext-pol", Decision: "Allow"})
@@ -363,6 +546,17 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-1"},
 			Spec: v1alpha1.IdentityProviderSpec{
 				AccountRef: accountRef, Name: "idp-1", Type: v1alpha1.IdentityProviderTypeOneTimePIN,
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready"},
+		{"IdentityProvider", &v1alpha1.IdentityProvider{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-scim"},
+			Spec: v1alpha1.IdentityProviderSpec{
+				AccountRef: accountRef, Name: "idp-scim", Type: v1alpha1.IdentityProviderTypeOneTimePIN,
+				SCIMConfig: &v1alpha1.IdentityProviderSCIMConfig{
+					Enabled:   new(true),
+					SecretRef: &corev1.LocalObjectReference{Name: "idp-scim-secret"},
+				},
 				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
 			},
 		}, "Ready"},
@@ -478,8 +672,8 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 			},
 		}, v1alpha1.ZeroTrustOrganizationConditionReady},
 	}
-	if len(objects) != 19 {
-		t.Fatalf("expected 19 gated CRDs, got %d", len(objects))
+	if len(objects) != 20 {
+		t.Fatalf("expected 20 gated CRD instances (19 CRDs + SCIM IdentityProvider), got %d", len(objects))
 	}
 
 	for _, item := range objects {
@@ -488,8 +682,8 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 		}
 	}
 
-	// Step 1: Converge all 19 CRDs.
-	waitUntilTrue(t, 20*time.Second, "all 19 gated CRDs converged", func() (bool, error) {
+	// Step 1: Converge all 20 gated CRD instances (19 CRDs + SCIM IdentityProvider), plus Direct CloudflareTunnel and Gateway.
+	waitUntilTrue(t, 20*time.Second, "all gated CRDs converged", func() (bool, error) {
 		var pending []string
 		for _, item := range objects {
 			copyObj := item.obj.DeepCopyObject().(client.Object)
@@ -498,7 +692,7 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 				return false, err
 			}
 			if !ok {
-				pending = append(pending, item.kind)
+				pending = append(pending, item.kind+"/"+item.obj.GetName())
 			}
 		}
 		if len(pending) > 0 {
@@ -507,73 +701,289 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 		return true, nil
 	})
 
-	// Step 2: Simulate active Sweep ConfirmContent on all 10 ConfirmContent CRDs.
-	confirmAll10 := func() {
-		now := time.Now()
-		confirmKind := func(kind string, name string, listed any) {
-			if latch.ConfirmContent(kind, types.NamespacedName{Namespace: ns, Name: name}, listed, now) {
-				t.Fatalf("unexpected drift during ConfirmContent for %s", kind)
+	// Step 2: Run active Sweep ConfirmContent on ALL 10 ConfirmContent CRDs and
+	// REQUIRE a non-zero ConfirmedAt timestamp matching each object's AppliedHash
+	// BEFORE injecting any failure.
+	type confirmSpec struct {
+		kind string
+		name string
+		read func() any
+	}
+	confirmSpecs := []confirmSpec{
+		{"AccessPolicy", "pol-1", func() any {
+			var obj v1alpha1.AccessPolicy
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "pol-1"}, &obj); err != nil {
+				return nil
 			}
-		}
-		if items, err := accessFake.ListAccessPolicies(ctx); err == nil && len(items) > 0 {
-			confirmKind("AccessPolicy", "pol-1", items[0])
-		}
-		if items, err := accessFake.ListAccessGroups(ctx, flarecloudflare.AccessGroupListOptions{}); err == nil && len(items) > 0 {
-			confirmKind("AccessGroup", "grp-1", items[0])
-		}
-		if items, err := standaloneFake.ListAccessApplications(ctx, flarecloudflare.AccessScope{}); err == nil && len(items) > 0 {
-			confirmKind("AccessStandaloneApplication", "standalone-1", items[0])
-		}
-		if items, err := infraFake.ListAccessInfrastructureTargets(ctx); err == nil && len(items) > 0 {
-			confirmKind("AccessInfrastructureTarget", "infra-1", items[0])
-		}
-		if items, err := idpFake.ListIdentityProviders(ctx); err == nil && len(items) > 0 {
-			confirmKind("IdentityProvider", "idp-1", items[0])
-		}
-		if items := unrecordedApplicationListing(appFake); len(items) > 0 {
+			items, _ := accessFake.ListAccessPolicies(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.PolicyID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"AccessGroup", "grp-1", func() any {
+			var obj v1alpha1.AccessGroup
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "grp-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := accessFake.ListAccessGroups(ctx, flarecloudflare.AccessGroupListOptions{})
+			for _, it := range items {
+				if it.ID == obj.Status.GroupID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"AccessStandaloneApplication", "standalone-1", func() any {
+			var obj v1alpha1.AccessStandaloneApplication
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "standalone-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := standaloneFake.ListAccessApplications(ctx, flarecloudflare.AccessScope{})
+			for _, it := range items {
+				if it.ID == obj.Status.ApplicationID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"AccessInfrastructureTarget", "infra-1", func() any {
+			var obj v1alpha1.AccessInfrastructureTarget
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "infra-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := infraFake.ListAccessInfrastructureTargets(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.TargetID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"IdentityProvider", "idp-1", func() any {
+			var obj v1alpha1.IdentityProvider
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "idp-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := idpFake.ListIdentityProviders(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.IDPID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"AccessApplication", "app-1", func() any {
+			var obj v1alpha1.AccessApplication
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app-1"}, &obj); err != nil {
+				return nil
+			}
+			items := unrecordedApplicationListing(appFake)
 			byID := make(map[string]flarecloudflare.AccessApplication, len(items))
 			for _, app := range items {
 				byID[app.ID] = app
 			}
-			confirmKind("AccessApplication", "app-1", flarecloudflare.AccessApplicationListing{Application: items[0], Applications: byID})
-		}
-		if items, err := privateFake.ListVirtualNetworks(ctx); err == nil && len(items) > 0 {
-			confirmKind("VirtualNetwork", "vnet-1", items[0])
-		}
-		if items, err := privateFake.ListNetworkRoutes(ctx); err == nil && len(items) > 0 {
-			confirmKind("NetworkRoute", "nr-1", items[0])
-		}
-		if items, err := privateFake.ListHostnameRoutes(ctx); err == nil && len(items) > 0 {
-			confirmKind("HostnameRoute", "hr-1", items[0])
-		}
-		if items, err := gatewayFake.ListGatewayRules(ctx); err == nil && len(items) > 0 {
-			confirmKind("ZeroTrustGatewayPolicy", "gwpol-1", items[0])
-		}
-	}
-	confirmAll10()
-
-	// Step 3: Inject transient pre-gate failure (CloudflareAccount CredentialsValid=False).
-	setAccountCredentialsValid(ctx, t, direct, accountName, metav1.ConditionFalse)
-
-	waitUntilTrue(t, 15*time.Second, "all 19 gated CRDs turn False on pre-gate failure", func() (bool, error) {
-		for _, item := range objects {
-			copyObj := item.obj.DeepCopyObject().(client.Object)
-			ok, err := checkObjectFailed(ctx, direct, copyObj, client.ObjectKeyFromObject(item.obj), item.readyCond)
-			if err != nil || !ok {
-				return false, err
+			if app, ok := byID[obj.Status.ApplicationID]; ok {
+				return flarecloudflare.AccessApplicationListing{Application: app, Applications: byID}
 			}
+			return nil
+		}},
+		{"VirtualNetwork", "vnet-1", func() any {
+			var obj v1alpha1.VirtualNetwork
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "vnet-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := privateFake.ListVirtualNetworks(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.VirtualNetworkID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"NetworkRoute", "nr-1", func() any {
+			var obj v1alpha1.NetworkRoute
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "nr-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := privateFake.ListNetworkRoutes(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.RouteID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"HostnameRoute", "hr-1", func() any {
+			var obj v1alpha1.HostnameRoute
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "hr-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := privateFake.ListHostnameRoutes(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.RouteID {
+					return it
+				}
+			}
+			return nil
+		}},
+		{"ZeroTrustGatewayPolicy", "gwpol-1", func() any {
+			var obj v1alpha1.ZeroTrustGatewayPolicy
+			if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "gwpol-1"}, &obj); err != nil {
+				return nil
+			}
+			items, _ := gatewayFake.ListGatewayRules(ctx)
+			for _, it := range items {
+				if it.ID == obj.Status.RuleID {
+					return it
+				}
+			}
+			return nil
+		}},
+	}
+	appliedHashes := make(map[string]string, len(confirmSpecs))
+	waitUntilTrue(t, 15*time.Second, "all 10 ConfirmContent CRDs establish non-zero ConfirmedAt", func() (bool, error) {
+		now := time.Now()
+		for _, spec := range confirmSpecs {
+			key := types.NamespacedName{Namespace: ns, Name: spec.name}
+			listed := spec.read()
+			if listed == nil {
+				return false, nil
+			}
+			if latch.ConfirmContent(spec.kind, key, listed, now) {
+				return false, fmt.Errorf("unexpected drift during ConfirmContent for %s", spec.kind)
+			}
+			var hash string
+			switch spec.kind {
+			case "AccessPolicy":
+				var o v1alpha1.AccessPolicy
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "AccessGroup":
+				var o v1alpha1.AccessGroup
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "AccessStandaloneApplication":
+				var o v1alpha1.AccessStandaloneApplication
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "AccessInfrastructureTarget":
+				var o v1alpha1.AccessInfrastructureTarget
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "IdentityProvider":
+				var o v1alpha1.IdentityProvider
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "AccessApplication":
+				var o v1alpha1.AccessApplication
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "VirtualNetwork":
+				var o v1alpha1.VirtualNetwork
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "NetworkRoute":
+				var o v1alpha1.NetworkRoute
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "HostnameRoute":
+				var o v1alpha1.HostnameRoute
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			case "ZeroTrustGatewayPolicy":
+				var o v1alpha1.ZeroTrustGatewayPolicy
+				_ = direct.Get(ctx, key, &o)
+				hash = o.Status.AppliedHash
+			}
+			if hash == "" {
+				return false, nil
+			}
+			ts, ok := latch.ConfirmedAt(spec.kind, key, hash)
+			if !ok || ts.IsZero() {
+				return false, nil
+			}
+			appliedHashes[spec.kind+"/"+spec.name] = hash
 		}
 		return true, nil
 	})
 
-	// Even if a sweep pass attempts ConfirmContent right here, Forget must have cleared baselines.
-	confirmAll10()
+	// Step 3: Inject transient pre-gate failure (CloudflareAccount CredentialsValid=False + retract Gateway dataplane Pod).
+	setAccountCredentialsValid(ctx, t, direct, accountName, metav1.ConditionFalse)
+	if err := direct.Delete(ctx, gwPod); err != nil {
+		t.Fatalf("delete gwPod: %v", err)
+	}
 
-	// Step 4: Restore CloudflareAccount CredentialsValid=True well inside TTL.
+	waitUntilTrue(t, 15*time.Second, "all gated CRDs + tunnel + Gateway turn False on pre-gate failure", func() (bool, error) {
+		var stillTrue []string
+		for _, item := range objects {
+			copyObj := item.obj.DeepCopyObject().(client.Object)
+			ok, err := checkObjectFailed(ctx, direct, copyObj, client.ObjectKeyFromObject(item.obj), item.readyCond)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				stillTrue = append(stillTrue, item.kind+"/"+item.obj.GetName())
+			}
+		}
+		var curDirectTunnel v1alpha1.CloudflareTunnel
+		if ok, err := checkObjectFailed(ctx, direct, &curDirectTunnel, client.ObjectKeyFromObject(tunnel), v1alpha1.CloudflareTunnelConditionReady); err != nil {
+			return false, err
+		} else if !ok {
+			stillTrue = append(stillTrue, "CloudflareTunnel/"+tunnel.Name)
+		}
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		prog := meta.FindStatusCondition(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		if prog == nil || prog.Status != metav1.ConditionFalse {
+			stillTrue = append(stillTrue, "Gateway/"+gw.Name)
+		}
+		if len(stillTrue) > 0 {
+			return false, fmt.Errorf("not False yet: %v", stillTrue)
+		}
+		return true, nil
+	})
+
+	// Forget MUST have cleared all 10 ConfirmContent baselines & ConfirmedAt timestamps.
+	for _, spec := range confirmSpecs {
+		key := types.NamespacedName{Namespace: ns, Name: spec.name}
+		prevHash := appliedHashes[spec.kind+"/"+spec.name]
+		if _, ok := latch.ConfirmedAt(spec.kind, key, prevHash); ok {
+			t.Fatalf("%s/%s retained ConfirmedAt after pre-gate failure", spec.kind, spec.name)
+		}
+		if listed := spec.read(); listed != nil {
+			_ = latch.ConfirmContent(spec.kind, key, listed, time.Now())
+		}
+		if _, ok := latch.ConfirmedAt(spec.kind, key, prevHash); ok {
+			t.Fatalf("%s/%s re-recorded ConfirmedAt after Forget while failed", spec.kind, spec.name)
+		}
+	}
+
+	// Step 4: Restore CloudflareAccount CredentialsValid=True and Gateway dataplane Pod ready well inside TTL.
 	setAccountCredentialsValid(ctx, t, direct, accountName, metav1.ConditionTrue)
+	restoredPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "dp-2c1-1", UID: types.UID("dp-2c1-uid-1"),
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, restoredPod); err != nil {
+		t.Fatalf("recreate gwPod: %v", err)
+	}
+	restoredPod.Status.PodIP = "10.0.0.13"
+	restoredPod.Status.Phase = corev1.PodRunning
+	restoredPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, restoredPod); err != nil {
+		t.Fatalf("update recreated gwPod ready: %v", err)
+	}
 
-	// Step 5: ALL 19 CRDs MUST recover immediately (within 15s, far below 60s/300s/1800s TTL).
-	waitUntilTrue(t, 15*time.Second, "all 19 gated CRDs recover immediately after dependency restoration", func() (bool, error) {
+	// Step 5: ALL gated resources MUST recover immediately (within 15s, far below 60s/300s/1800s TTL).
+	waitUntilTrue(t, 15*time.Second, "all gated CRDs + tunnel + Gateway recover immediately after dependency restoration", func() (bool, error) {
 		for _, item := range objects {
 			copyObj := item.obj.DeepCopyObject().(client.Object)
 			ok, err := checkObjectConverged(ctx, direct, copyObj, client.ObjectKeyFromObject(item.obj), item.readyCond, "Accepted")
@@ -581,7 +991,20 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 				return false, err
 			}
 		}
-		return true, nil
+		var curDirectTunnel v1alpha1.CloudflareTunnel
+		if ok, err := checkObjectConverged(ctx, direct, &curDirectTunnel, client.ObjectKeyFromObject(tunnel), v1alpha1.CloudflareTunnelConditionReady, v1alpha1.CloudflareTunnelConditionAccepted); err != nil || !ok {
+			return false, err
+		}
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		var curGWTunnel v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, gwTunnelKey, &curGWTunnel); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), curGW.Generation) &&
+			assertConditionTrueForCurrentGen(curGWTunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curGWTunnel.Generation), nil
 	})
 }
 
@@ -622,6 +1045,13 @@ func TestQA2C2GatewayAccessAppHTTPRouteAndServiceTokenRecoverImmediatelyEnvtest(
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup ServiceTokenReconciler: %v", err)
 	}
+	if err := (&CloudflareAccountReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Cloudflare: fakeAccountVerifyFactory{accountID: accountID, zoneName: "example.test"},
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup CloudflareAccountReconciler: %v", err)
+	}
 
 	startManagerAndWait(t, mgr)
 
@@ -649,7 +1079,13 @@ func TestQA2C2GatewayAccessAppHTTPRouteAndServiceTokenRecoverImmediatelyEnvtest(
 	if err := direct.Create(ctx, account); err != nil {
 		t.Fatalf("create account: %v", err)
 	}
-	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.test"}})
+	waitUntilTrue(t, 10*time.Second, "CloudflareAccount CredentialsValid=True", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid, cur.Generation), nil
+	})
 
 	cfg := &v1alpha1.GatewayClassConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "qa2c2-cfg"},
@@ -816,11 +1252,43 @@ func TestQA2C2GatewayAccessAppHTTPRouteAndServiceTokenRecoverImmediatelyEnvtest(
 		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(app), accessApplicationConditionProgrammed, accessApplicationConditionAccepted)
 	})
 
-	// Part B: ServiceToken recovers immediately after transient failure inside 60s TTL.
+	// Part B: ServiceToken recovers immediately after credential Secret deletion and restoration inside 60s TTL.
+	stSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-api-token"},
+		Data:       map[string][]byte{"token": []byte("tok")},
+	}
+	if err := direct.Create(ctx, stSecret); err != nil {
+		t.Fatalf("create st-api-token secret: %v", err)
+	}
+	stAccount := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "st-account-qa2c2"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   accountID,
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: stSecret.Name, Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, stAccount); err != nil {
+		t.Fatalf("create st-account: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "st-account CredentialsValid=True", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(stAccount), &cur); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid, cur.Generation), nil
+	})
+
 	st := &v1alpha1.ServiceToken{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-qa2c2"},
 		Spec: v1alpha1.ServiceTokenSpec{
-			AccountRef: corev1.LocalObjectReference{Name: accountName}, Name: "st-qa2c2",
+			AccountRef: corev1.LocalObjectReference{Name: stAccount.Name}, Name: "st-qa2c2",
 			Enabled: true, Duration: "8760h",
 			SecretRef:        corev1.LocalObjectReference{Name: "st-qa2c2-creds"},
 			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
@@ -834,14 +1302,21 @@ func TestQA2C2GatewayAccessAppHTTPRouteAndServiceTokenRecoverImmediatelyEnvtest(
 		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready", "Accepted")
 	})
 
-	setAccountCredentialsValid(ctx, t, direct, accountName, metav1.ConditionFalse)
-	waitUntilTrue(t, 10*time.Second, "ServiceToken turns Ready=False", func() (bool, error) {
+	if err := direct.Delete(ctx, stSecret); err != nil {
+		t.Fatalf("delete st-api-token secret: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "ServiceToken turns Ready=False after credential Secret deletion", func() (bool, error) {
 		var cur v1alpha1.ServiceToken
 		return checkObjectFailed(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready")
 	})
 
-	setAccountCredentialsValid(ctx, t, direct, accountName, metav1.ConditionTrue)
-	waitUntilTrue(t, 10*time.Second, "ServiceToken recovers immediately inside 60s TTL", func() (bool, error) {
+	if err := direct.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-api-token"},
+		Data:       map[string][]byte{"token": []byte("tok")},
+	}); err != nil {
+		t.Fatalf("restore st-api-token secret: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "ServiceToken recovers immediately after credential Secret restoration inside 60s TTL", func() (bool, error) {
 		var cur v1alpha1.ServiceToken
 		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready", "Accepted")
 	})
@@ -1057,24 +1532,59 @@ func TestQA2D1ExternalDNSTunnelsOpenT2GateEnvtest(t *testing.T) {
 	}
 }
 
-// QA-2-REG-1: Steady-state 0 remote reads and 0 status writes for healthy converged
-// resources (including active Sweep ConfirmContent).
+// QA-2-REG-1: Steady-state 0 remote reads and 0 K8s status write requests for
+// healthy converged resources across gated CRDs (under active Sweep ConfirmContent),
+// Direct External DNS CloudflareTunnel, and Gateway CloudflareTunnelConfig.
 func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
 
 	latch := freshness.NewLatch()
 	policy := freshness.DefaultPolicy()
+	const accountID = "0123456789abcdef0123456789abcdef"
 	store := newFakeAccessResourceCloudflare()
 	remote := &recordingAccessAPI{AccessAPI: store}
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	gwAPI := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1}
+	snapshots := newFakeSnapshotPublisher()
+	prober := &staticGatewayProber{version: 2, ready: true}
+	var statusWrites atomic.Int64
+	countingClient := &statusWriteCountingClient{
+		Client: mgr.GetClient(),
+		writes: &statusWrites,
+	}
+
 	reconciler := &AccessPolicyReconciler{
-		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+		Client: countingClient, Scheme: mgr.GetScheme(),
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
 		Freshness:           policy,
 		Invalidator:         latch,
 	}
+	tunnelReconciler := &CloudflareTunnelReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: tunnelFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	gwReconciler := &GatewayReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+		Prober:            prober,
+		Freshness:         policy,
+		Invalidator:       latch,
+	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup reconciler: %v", err)
+		t.Fatalf("setup policy reconciler: %v", err)
+	}
+	if err := tunnelReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup tunnel reconciler: %v", err)
+	}
+	if err := (&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup gwclass reconciler: %v", err)
+	}
+	if err := gwReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup gw reconciler: %v", err)
 	}
 	startManagerAndWait(t, mgr)
 
@@ -1088,21 +1598,22 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	account := &v1alpha1.CloudflareAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "reg1-account"},
 		Spec: v1alpha1.CloudflareAccountSpec{
-			AccountID:   "0123456789abcdef0123456789abcdef",
+			AccountID:   accountID,
 			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-token", Key: "token"}},
 			Grants: []v1alpha1.CloudflareAccountGrant{{
-				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
-				Hostnames:         []string{"*"},
-				Zones:             []string{"*"},
-				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
-				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
 			}},
 		},
 	}
 	if err := direct.Create(ctx, account); err != nil {
 		t.Fatalf("create account: %v", err)
 	}
-	markAccountReady(ctx, t, direct, account, nil)
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
 
 	pol := &v1alpha1.AccessPolicy{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-steady"},
@@ -1116,38 +1627,176 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	if err := direct.Create(ctx, pol); err != nil {
 		t.Fatalf("create policy: %v", err)
 	}
-	key := client.ObjectKeyFromObject(pol)
+	polKey := client.ObjectKeyFromObject(pol)
 	waitUntilTrue(t, 10*time.Second, "policy converged", func() (bool, error) {
 		var cur v1alpha1.AccessPolicy
-		return checkObjectConverged(ctx, direct, &cur, key, "Ready", "Accepted")
+		return checkObjectConverged(ctx, direct, &cur, polKey, "Ready", "Accepted")
 	})
 	// Run one rebind pass so AppliedHash binds the newly assigned PolicyID.
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("rebind reconcile: %v", err)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+		t.Fatalf("rebind policy reconcile: %v", err)
+	}
+	// Establish sweep ConfirmContent & verify non-zero ConfirmedAt for AccessPolicy.
+	waitUntilTrue(t, 10*time.Second, "AccessPolicy ConfirmedAt established", func() (bool, error) {
+		var cur v1alpha1.AccessPolicy
+		if err := direct.Get(ctx, polKey, &cur); err != nil || cur.Status.AppliedHash == "" {
+			return false, err
+		}
+		items, _ := store.ListAccessPolicies(ctx)
+		for _, it := range items {
+			if it.ID == cur.Status.PolicyID {
+				_ = latch.ConfirmContent("AccessPolicy", polKey, it, time.Now())
+			}
+		}
+		ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, cur.Status.AppliedHash)
+		return ok && !ts.IsZero(), nil
+	})
+
+	// Direct External-DNS CloudflareTunnel with publicHosts.
+	directTunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "direct-ext-reg1"},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Tunnel:     v1alpha1.CloudflareTunnelRemoteSpec{Name: "direct-ext-reg1"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			DNS: v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			Configuration: v1alpha1.CloudflareTunnelConfiguration{
+				Mode: v1alpha1.CloudflareTunnelConfigurationModeDirect,
+				Direct: &v1alpha1.CloudflareTunnelDirectConfiguration{
+					Ingress: []v1alpha1.CloudflareTunnelIngressRule{
+						{Hostname: "reg1-direct.example.com", Service: v1alpha1.CloudflareTunnelIngressService{HTTPStatus: &v1alpha1.CloudflareTunnelHTTPStatusService{Code: 200}}},
+						{Service: v1alpha1.CloudflareTunnelIngressService{HTTPStatus: &v1alpha1.CloudflareTunnelHTTPStatusService{Code: 404}}},
+					},
+				},
+			},
+		},
+	}
+	if err := direct.Create(ctx, directTunnel); err != nil {
+		t.Fatalf("create direct tunnel: %v", err)
+	}
+	tunnelKey := client.ObjectKeyFromObject(directTunnel)
+	waitUntilTrue(t, 15*time.Second, "Direct External DNS tunnel converged", func() (bool, error) {
+		var cur v1alpha1.CloudflareTunnel
+		return checkObjectConverged(ctx, direct, &cur, tunnelKey, v1alpha1.CloudflareTunnelConditionReady, v1alpha1.CloudflareTunnelConditionDNSReady)
+	})
+
+	// Gateway + Gateway-mode tunnel.
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg1-cfg"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatalf("create cfg: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg1-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatalf("create gc: %v", err)
+	}
+	gwHost := gatewayv1.Hostname("reg1-gw.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "reg1-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &gwHost}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "reg1 Gateway dataplane Deployment created", func() (bool, error) {
+		var dep appsv1.DeploymentList
+		if err := direct.List(ctx, &dep, client.InNamespace(ns)); err != nil {
+			return false, err
+		}
+		return len(dep.Items) > 0, nil
+	})
+	gwPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "dp-reg1-0", UID: types.UID("dp-reg1-uid"),
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, gwPod); err != nil {
+		t.Fatalf("create gw pod: %v", err)
+	}
+	gwPod.Status.PodIP = "10.0.0.20"
+	gwPod.Status.Phase = corev1.PodRunning
+	gwPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, gwPod); err != nil {
+		t.Fatalf("update gw pod status: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "reg1 Gateway snapshot ACKed", func() (bool, error) {
+		return snapshots.ACK(client.ObjectKeyFromObject(gw).String()) == nil, nil
+	})
+	gwTunnelKey := types.NamespacedName{Namespace: ns, Name: gw.Name}
+	waitUntilTrue(t, 15*time.Second, "reg1 Gateway Programmed=True & ConfigApplied=True", func() (bool, error) {
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		var curT v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, gwTunnelKey, &curT); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), curGW.Generation) &&
+			assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curT.Generation), nil
+	})
+
+	// Allow any initial in-flight status reconciles to settle.
+	time.Sleep(300 * time.Millisecond)
+
+	accessCallsBefore := remote.count()
+	tunnelCallsBefore := len(tunnelFake.Calls())
+	gwCallsBefore := len(gwAPI.calls)
+
+	writesBeforePolicy := statusWrites.Load()
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+		t.Fatalf("steady AccessPolicy reconcile: %v", err)
+	}
+	if got := statusWrites.Load() - writesBeforePolicy; got != 0 {
+		t.Fatalf("steady AccessPolicy reconcile issued %d Kubernetes status write requests, want 0", got)
 	}
 
-	var before v1alpha1.AccessPolicy
-	if err := direct.Get(ctx, key, &before); err != nil {
-		t.Fatalf("get policy: %v", err)
+	writesBeforeTunnel := statusWrites.Load()
+	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("steady CloudflareTunnel reconcile: %v", err)
 	}
-	callsBefore := remote.count()
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("steady reconcile: %v", err)
+	if got := statusWrites.Load() - writesBeforeTunnel; got != 0 {
+		t.Fatalf("steady Direct External CloudflareTunnel reconcile issued %d Kubernetes status write requests, want 0", got)
 	}
-	if remote.count() != callsBefore {
-		t.Fatalf("steady-state reconcile issued %d remote calls, want 0", remote.count()-callsBefore)
+
+	writesBeforeGW := statusWrites.Load()
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gw)}); err != nil {
+		t.Fatalf("steady Gateway reconcile: %v", err)
 	}
-	var after v1alpha1.AccessPolicy
-	if err := direct.Get(ctx, key, &after); err != nil {
-		t.Fatalf("get policy after steady reconcile: %v", err)
+	if got := statusWrites.Load() - writesBeforeGW; got != 0 {
+		t.Fatalf("steady Gateway reconcile issued %d Kubernetes status write requests, want 0", got)
 	}
-	if after.ResourceVersion != before.ResourceVersion {
-		t.Fatalf("steady-state reconcile wrote status: RV %s -> %s", before.ResourceVersion, after.ResourceVersion)
+
+	if got := remote.count() - accessCallsBefore; got != 0 {
+		t.Fatalf("steady AccessPolicy reconcile issued %d remote calls, want 0", got)
+	}
+	if got := tunnelFake.Calls()[tunnelCallsBefore:]; len(got) != 0 {
+		t.Fatalf("steady Direct External CloudflareTunnel reconcile issued remote calls %v, want 0", got)
+	}
+	if got := gwAPI.calls[gwCallsBefore:]; len(got) != 0 {
+		t.Fatalf("steady Gateway CloudflareTunnelConfig reconcile issued remote calls %v, want 0", got)
 	}
 }
 
 // QA-2-REG-2: ObserveOnly (Safety Condition 9) is never gated and always reads
-// Cloudflare even when Freshness is enabled and status is Observed/Ready=True.
+// Cloudflare even when Freshness is enabled, TTL/AppliedHash/AppliedAt are fresh,
+// and Sweep confirmation + VerifiedAt are cached in the latch.
 func TestQA2REG2ObserveOnlyNeverGatedEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
@@ -1221,6 +1870,44 @@ func TestQA2REG2ObserveOnlyNeverGatedEnvtest(t *testing.T) {
 		return assertConditionTrueForCurrentGen(cur.Status.Conditions, "Ready", cur.Generation), nil
 	})
 
+	// Seed otherwise-open TTL stamp, VerifiedAt, and Sweep ConfirmedAt matching the
+	// object's gate hash so an identical Managed object would have gate.Open == true.
+	var obsPol v1alpha1.AccessPolicy
+	if err := direct.Get(ctx, key, &obsPol); err != nil {
+		t.Fatalf("get ObserveOnly policy: %v", err)
+	}
+	clusterID := gateClusterID(ctx, direct)
+	obsInput := flarecloudflare.AccessPolicyInput{Name: obsPol.Spec.Name, Decision: string(obsPol.Spec.Decision), Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}}}
+	seedDecision := evaluateGate(policy, latch, freshness.GradeAuthz, gateInput{
+		Kind: "AccessPolicy", Namespace: obsPol.Namespace, Name: obsPol.Name,
+		UID: obsPol.UID, RemoteID: obsPol.Status.PolicyID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID, Converged: true,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: obsPol.Spec, Input: obsInput},
+	}, "", nil, time.Now())
+	now := metav1.Now()
+	obsPol.Status.AppliedHash = seedDecision.DesiredHash
+	obsPol.Status.AppliedAt = &now
+	if err := direct.Status().Update(ctx, &obsPol); err != nil {
+		t.Fatalf("seed AppliedHash/AppliedAt: %v", err)
+	}
+	latch.MarkVerified("AccessPolicy", key, seedDecision.DesiredHash, now.Time)
+	latch.SetBaseline("AccessPolicy", key, seedDecision.DesiredHash, func(any) bool { return true })
+	latch.ConfirmContent("AccessPolicy", key, extPol, now.Time)
+	if !evaluateGate(policy, latch, freshness.GradeAuthz, gateInput{
+		Kind: "AccessPolicy", Namespace: obsPol.Namespace, Name: obsPol.Name,
+		UID: obsPol.UID, RemoteID: obsPol.Status.PolicyID,
+		AccountID: account.Spec.AccountID, ClusterID: clusterID, Converged: true,
+		Spec: struct {
+			Spec  any `json:"spec"`
+			Input any `json:"input"`
+		}{Spec: obsPol.Spec, Input: obsInput},
+	}, obsPol.Status.AppliedHash, obsPol.Status.AppliedAt, time.Now()).Open {
+		t.Fatal("precondition failed: seeded managed-equivalent gate did not open")
+	}
+
 	callsBefore := remote.count()
 	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("ObserveOnly reconcile: %v", err)
@@ -1281,10 +1968,10 @@ func (api *failingTunnelConfigCloudflareAPI) GetTunnel(ctx context.Context, tunn
 	return api.tunnelFreshnessGatewayAPI.GetTunnel(ctx, tunnelID)
 }
 
-// QA-2-REG-4: Gateway CloudflareTunnelConfig gate closes when ConfigApplied=False
-// (RemoteError) and recovers on retry without trusting stale VerifiedAt/AppliedAt,
-// while preserving ADR 0004 SSA condition ownership split.
-func TestQA2REG4GatewayTunnelConfigGateRecoversAfterRemoteErrorEnvtest(t *testing.T) {
+// Gateway CloudflareTunnelConfig gate closes when ConfigApplied=False (RemoteError)
+// and recovers on retry without trusting stale VerifiedAt/AppliedAt, while
+// preserving ADR 0004 SSA condition ownership split.
+func TestGatewayTunnelConfigGateRecoversAfterRemoteErrorEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
 
@@ -1485,4 +2172,105 @@ func TestQA2REG4GatewayTunnelConfigGateRecoversAfterRemoteErrorEnvtest(t *testin
 	if managedByTunnel == 0 || managedByGateway == 0 {
 		t.Fatalf("ADR 0004 SSA condition ownership split broken: tunnel=%d gateway=%d", managedByTunnel, managedByGateway)
 	}
+}
+
+// QA-2-REG-4: With freshness disabled (zero policy, no Sweep running),
+// AccessApplication still schedules a periodic drift recheck (RequeueAfter > 0)
+// and detects/repairs out-of-band remote drift via the manager's timer with
+// no Kubernetes watch event.
+func TestQA2REG4ZeroFreshnessAccessApplicationPeriodicDriftEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	latch := freshness.NewLatch()
+	appFake := newFakeAccessApplicationCloudflare()
+	if err := (&AccessApplicationReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		OperatorNamespace:   dataplane.DefaultOperatorNamespace,
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil },
+		Freshness:           freshness.Policy{}, // zero freshness (--freshness-*=0)
+		Invalidator:         latch,
+	}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup AccessApplicationReconciler: %v", err)
+	}
+	startManagerAndWait(t, mgr)
+
+	const ns = "tenant-reg4-zero"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg4-zero-account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				AccessPolicyRefs:  v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, nil)
+	appFake.SetPolicy(flarecloudflare.AccessPolicy{ID: "ext-pol-reg4", Name: "ext-pol", Decision: "Allow"})
+
+	app := &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "app-zero-fresh"},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			Application: v1alpha1.AccessApplicationSettings{
+				Name:            "app-zero-fresh",
+				SessionDuration: "1h",
+			},
+			Destinations: []v1alpha1.AccessApplicationDestinationSpec{{
+				Type:   v1alpha1.AccessApplicationDestinationWorker,
+				Worker: &v1alpha1.AccessWorkerDestinationSpec{WorkerID: "worker-reg4"},
+			}},
+			Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "ext-pol-reg4"}}},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, app); err != nil {
+		t.Fatalf("create AccessApplication: %v", err)
+	}
+	appKey := client.ObjectKeyFromObject(app)
+	waitUntilTrue(t, 15*time.Second, "AccessApplication converged", func() (bool, error) {
+		var cur v1alpha1.AccessApplication
+		return checkObjectConverged(ctx, direct, &cur, appKey, accessApplicationConditionProgrammed, accessApplicationConditionAccepted)
+	})
+
+	var curApp v1alpha1.AccessApplication
+	if err := direct.Get(ctx, appKey, &curApp); err != nil {
+		t.Fatalf("get app: %v", err)
+	}
+	appID := curApp.Status.ApplicationID
+	if appID == "" {
+		t.Fatal("missing ApplicationID")
+	}
+
+	// Mutate remote state out-of-band WITHOUT any Kubernetes event.
+	appFake.mu.Lock()
+	remoteApp := appFake.applications[appID]
+	remoteApp.Name = "drifted-out-of-band"
+	appFake.applications[appID] = remoteApp
+	appFake.mu.Unlock()
+
+	// Manager periodic requeue timer (accessApplicationRequeue) MUST detect and repair drift.
+	waitUntilTrue(t, 12*time.Second, "zero-freshness AccessApplication periodic timer repaired remote drift", func() (bool, error) {
+		appFake.mu.Lock()
+		defer appFake.mu.Unlock()
+		return appFake.applications[appID].Name == "app-zero-fresh", nil
+	})
 }

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/netip"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -388,6 +389,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.forgetTunnelConfigGateIfWriter(ctx, &gateway, tunnel)
 		if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -410,6 +412,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
+	// Preserve previously published Addresses across the early admission status
+	// patch so a steady-state reconcile does not flash Addresses to nil and
+	// back to the same tunnel hostname (avoiding two redundant status writes).
+	// Unprogrammed/compile-failure paths clear Addresses explicitly.
+	statuses.Gateway.Addresses = slices.Clone(gateway.Status.Addresses)
 	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1449,6 +1456,7 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return err
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 	if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, key); err != nil {
 		return err
 	}
@@ -1546,6 +1554,7 @@ func (r *GatewayReconciler) handleGatewayCompileFailure(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return errors.Join(buildErr, err)
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 	if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, key); err != nil {
 		return errors.Join(buildErr, err)
 	}
@@ -1623,6 +1632,7 @@ func (r *GatewayReconciler) reportDataplaneRejection(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return errors.Join(rejection, err)
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 
 	after := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	changed := before == nil || after == nil ||
@@ -1710,6 +1720,11 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 	if r.Now != nil {
 		now = metav1.NewTime(r.Now())
 	}
+	if meta.FindStatusCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed)) == nil {
+		if prev := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prev != nil {
+			status.Conditions = append(status.Conditions, *prev.DeepCopy())
+		}
+	}
 	status.Conditions = prepareConditions(
 		status.Conditions,
 		gateway.Generation,
@@ -1724,6 +1739,16 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 	)
 	for index := range status.Listeners {
 		listener := &status.Listeners[index]
+		if meta.FindStatusCondition(listener.Conditions, string(gatewayv1.ListenerConditionProgrammed)) == nil {
+			for j := range gateway.Status.Listeners {
+				if gateway.Status.Listeners[j].Name == listener.Name {
+					if prev := meta.FindStatusCondition(gateway.Status.Listeners[j].Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
+						listener.Conditions = append(listener.Conditions, *prev.DeepCopy())
+					}
+					break
+				}
+			}
+		}
 		listener.Conditions = prepareConditions(
 			listener.Conditions,
 			gateway.Generation,

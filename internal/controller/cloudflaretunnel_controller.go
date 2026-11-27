@@ -401,11 +401,11 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			client.ObjectKeyFromObject(tunnel), tunnel.Status.ConfigVersion.DesiredHash, tunnel.Status.ConfigVersion.DesiredHash,
 			tunnel.Status.ConfigVersion.AppliedAt, converged, now.Time)
 		if gate.Open {
-			// QA-001 residual: ListTunnelConnections is the T4 display read
-			// that keeps status.clients fresh; the token-secret ensures
-			// self-heal a deleted Secret without remote calls in the steady
-			// state. The status apply is skipped when the projection is
-			// unchanged so an open pass costs zero etcd writes (QA-030).
+			// Ensure token Secrets self-heal from the manager cache without
+			// remote calls when present. An open-gate steady-state pass executes
+			// zero Cloudflare reads (status.clients is refreshed on closed-gate,
+			// TTL, and ObserveOnly passes). The status apply is skipped when the
+			// projection is unchanged so an open pass costs zero etcd writes.
 			connectorSecretRef, err := r.ensureTokenSecret(ctx, cf, tunnel, tunnel.Status.TunnelID)
 			if err != nil {
 				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "TokenUnavailable", err)
@@ -414,20 +414,17 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 			if err != nil {
 				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "TokenUnavailable", err)
 			}
-			clients, _, err := cf.ListTunnelConnections(ctx, tunnel.Status.TunnelID, tunnelObservationLimit)
-			if err != nil {
-				return r.activeFailure(ctx, tunnel, gatewayRef, gatewayUID, ownedConditions, "ConnectionsUnavailable", err)
-			}
 			status := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
 			status.ConnectorTokenSecretRef = connectorSecretRef
 			status.ManagementTokenSecretRef = managementSecretRef
-			status.Clients = tunnelClientStatuses(clients)
+			status.Clients = slices.Clone(tunnel.Status.Clients)
 			status.Addresses = tunnelAddresses(tunnel.Status.TunnelID, len(publicHosts) > 0)
 			setTunnelReadyPolicy(&status, tunnel, now)
 			if tunnelGateStatusUnchanged(tunnel.Status, status) {
 				// The data fields are unchanged, but the conditions
 				// transaction still runs: it owns migration, the Ready
-				// clamp, and any authored deltas from this pass.
+				// clamp, and any authored deltas from this pass (and is a
+				// zero-write no-op when conditions already match).
 				return ctrl.Result{RequeueAfter: gate.Requeue}, r.commitTunnelConditions(ctx, tunnel, status.Conditions, false)
 			}
 			openClear := clearIntent
@@ -1588,8 +1585,18 @@ func tunnelConvergedForGate(tunnel *v1alpha1.CloudflareTunnel, account *v1alpha1
 func tunnelGateStatusUnchanged(current, projected v1alpha1.CloudflareTunnelStatus) bool {
 	return localObjectRefEqual(current.ConnectorTokenSecretRef, projected.ConnectorTokenSecretRef) &&
 		localObjectRefEqual(current.ManagementTokenSecretRef, projected.ManagementTokenSecretRef) &&
-		slices.Equal(current.Addresses, projected.Addresses) &&
+		slices.EqualFunc(current.Addresses, projected.Addresses, tunnelAddressEqual) &&
 		slices.EqualFunc(current.Clients, projected.Clients, tunnelClientStatusEqual)
+}
+
+func tunnelAddressEqual(left, right gatewayv1.GatewayStatusAddress) bool {
+	if left.Value != right.Value {
+		return false
+	}
+	if left.Type == nil || right.Type == nil {
+		return left.Type == right.Type
+	}
+	return *left.Type == *right.Type
 }
 
 func localObjectRefEqual(left, right *corev1.LocalObjectReference) bool {

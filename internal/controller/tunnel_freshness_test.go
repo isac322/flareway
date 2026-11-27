@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -40,6 +41,7 @@ import (
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/freshness"
+	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -328,6 +330,16 @@ func TestGatewayTunnelConfigConfirmKeepsAppliedAt(t *testing.T) {
 	ttl := policy.TTL(freshness.GradeTraffic)
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	written := metav1.NewTime(now.Add(-2 * ttl))
+	gateway = &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps", UID: "gateway-uid", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+			Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+		}}},
+		Status: gatewayv1.GatewayStatus{Conditions: []metav1.Condition{{
+			Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue,
+			ObservedGeneration: 1, Reason: "Programmed", LastTransitionTime: written,
+		}}},
+	}
 	tunnel := &v1alpha1.CloudflareTunnel{
 		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid", Generation: 1},
 		Spec: v1alpha1.CloudflareTunnelSpec{
@@ -344,6 +356,10 @@ func TestGatewayTunnelConfigConfirmKeepsAppliedAt(t *testing.T) {
 			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{
 				Desired: 5, DesiredHash: hash, Applied: 5, Remote: 5, AppliedAt: &written,
 			},
+			Conditions: []metav1.Condition{{
+				Type: v1alpha1.CloudflareTunnelConditionConfigApplied, Status: metav1.ConditionTrue,
+				ObservedGeneration: 1, Reason: "Applied", LastTransitionTime: written,
+			}},
 		},
 	}
 	account := &v1alpha1.CloudflareAccount{
@@ -497,5 +513,196 @@ func TestGatewayConfigFreshnessDoesNotClearTunnelDNSInvalidation(t *testing.T) {
 	}
 	if !latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
 		t.Fatal("Gateway config confirmation cleared CloudflareTunnel DNS/identity sweep invalidation")
+	}
+}
+
+// Finding 1 (P0): Gateway CloudflareTunnelConfig gate MUST require BOTH
+// current-generation ConfigApplied=True on the tunnel AND current-generation
+// Programmed=True on the Gateway; missing ConfigApplied, ConfigApplied=False/Pending,
+// Gateway Programmed=False, or stale ObservedGeneration MUST run GetTunnelConfiguration.
+func TestGatewayConfigGateRequiresCurrentConfigAppliedAndGatewayProgrammed(t *testing.T) {
+	ctx := context.Background()
+	scheme := tunnelFreshnessScheme(t)
+	const accountID = "0123456789abcdef0123456789abcdef"
+	compiled := &ir.Gateway{
+		Key:        types.NamespacedName{Namespace: "apps", Name: "edge"},
+		UID:        "gateway-uid",
+		Cloudflare: &ir.Cloudflare{AccountID: accountID, TunnelID: "remote-id"},
+		Listeners:  []ir.Listener{{Name: "http", Hostname: "edge.example.com", Exposure: ir.ExposurePublic}},
+		Domains: []ir.ProtectionDomain{{
+			Name: "http", ListenerName: "http", EnvoyPort: 18080, Guard: ir.GuardUnprotected,
+			VirtualHosts: []ir.VirtualHost{{Hostname: "edge.example.com"}},
+		}},
+	}
+	_, hash, err := cloudflaredconfig.Compile(compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	oneSecAgo := metav1.NewTime(now.Add(-time.Second))
+
+	runCase := func(t *testing.T, gwGen int64, gwConds []metav1.Condition, tunnelGen int64, tunnelConds []metav1.Condition, wantSkip bool) {
+		t.Helper()
+		gateway := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps", UID: "gateway-uid", Generation: gwGen},
+			Spec: gatewayv1.GatewaySpec{Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			}}},
+			Status: gatewayv1.GatewayStatus{Conditions: gwConds},
+		}
+		tunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid", Generation: tunnelGen},
+			Spec:       v1alpha1.CloudflareTunnelSpec{AccountRef: corev1.LocalObjectReference{Name: "account"}, ManagementPolicy: v1alpha1.ManagementPolicyManaged},
+			Status: v1alpha1.CloudflareTunnelStatus{
+				TunnelID: "remote-id", AccountID: accountID, OwnershipVerified: true,
+				ConnectorTokenSecretRef: &corev1.LocalObjectReference{Name: "tunnel-token"},
+				GatewayRef:              &corev1.LocalObjectReference{Name: gateway.Name}, GatewayUID: gateway.UID,
+				ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{
+					Desired: 5, DesiredHash: hash, Applied: 5, Remote: 5, AppliedAt: &oneSecAgo,
+				},
+				Conditions: tunnelConds,
+			},
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "account"},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID: accountID,
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{
+					Name: "cloudflare-token", Namespace: "apps", Key: "token",
+				}},
+			},
+		}
+		kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
+			WithObjects(gateway, tunnel, account, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "cloudflare-token", Namespace: "apps"}, Data: map[string][]byte{"token": []byte("tok")},
+			}).Build()
+		remote := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 5}
+		reconciler := &GatewayReconciler{
+			Client: kube, APIReader: kube, Scheme: scheme,
+			CloudflareFactory: gatewayCloudflareFactory{api: remote},
+			Now:               func() time.Time { return now },
+			Freshness:         freshness.DefaultPolicy(),
+			Invalidator:       freshness.NewLatch(),
+		}
+		if _, err := reconciler.reconcileCloudflaredConfiguration(ctx, compiled, tunnel, account); err != nil {
+			t.Fatalf("reconcileCloudflaredConfiguration: %v", err)
+		}
+		if wantSkip && len(remote.calls) != 0 {
+			t.Fatalf("converged control unexpectedly called Cloudflare: %v", remote.calls)
+		}
+		if !wantSkip && !slices.Contains(remote.calls, "GetTunnelConfiguration") {
+			t.Fatalf("unconverged gate skipped GetTunnelConfiguration; calls=%v", remote.calls)
+		}
+	}
+
+	gwReady := []metav1.Condition{{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, ObservedGeneration: 1, Reason: "Programmed", LastTransitionTime: oneSecAgo}}
+	gwFalse := []metav1.Condition{{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionFalse, ObservedGeneration: 1, Reason: "Pending", LastTransitionTime: oneSecAgo}}
+	caTrue := []metav1.Condition{{Type: v1alpha1.CloudflareTunnelConditionConfigApplied, Status: metav1.ConditionTrue, ObservedGeneration: 1, Reason: "Applied", LastTransitionTime: oneSecAgo}}
+	caPending := []metav1.Condition{{Type: v1alpha1.CloudflareTunnelConditionConfigApplied, Status: metav1.ConditionFalse, ObservedGeneration: 1, Reason: "Pending", LastTransitionTime: oneSecAgo}}
+
+	t.Run("missing ConfigApplied", func(t *testing.T) { runCase(t, 1, gwReady, 1, nil, false) })
+	t.Run("ConfigApplied False Pending", func(t *testing.T) { runCase(t, 1, gwReady, 1, caPending, false) })
+	t.Run("Gateway Programmed False", func(t *testing.T) { runCase(t, 1, gwFalse, 1, caTrue, false) })
+	t.Run("stale ConfigApplied ObservedGeneration", func(t *testing.T) { runCase(t, 1, gwReady, 2, caTrue, false) })
+	t.Run("stale Gateway Programmed ObservedGeneration", func(t *testing.T) { runCase(t, 2, gwReady, 1, caTrue, false) })
+	t.Run("converged current generation skips remote read", func(t *testing.T) { runCase(t, 1, gwReady, 1, caTrue, true) })
+}
+
+// Finding 2 (P1): Gateway pre-gate demotions that write Programmed=False must
+// forget CloudflareTunnelConfig freshness only when this Gateway is the live
+// writer for that tunnel, while leaving CloudflareTunnel DNS/tunnel state alone
+// and protecting another owner's gate from a conflicting Gateway.
+func TestGatewayPreGateDemotionsForgetOwnConfigGateButProtectForeignOwner(t *testing.T) {
+	ctx := context.Background()
+	scheme := tunnelFreshnessScheme(t)
+	ownerGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps", UID: "gw-owner", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			}},
+		},
+	}
+	foreignGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "intruder", Namespace: "apps", UID: "gw-intruder", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "shared",
+			}},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName},
+	}
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid", Generation: 1},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			Configuration: v1alpha1.CloudflareTunnelConfiguration{
+				Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway,
+			},
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID: "remote-id", AccountID: "0123456789abcdef0123456789abcdef", OwnershipVerified: true,
+			GatewayRef: &corev1.LocalObjectReference{Name: ownerGW.Name}, GatewayUID: ownerGW.UID,
+		},
+	}
+	tunnelKey := client.ObjectKeyFromObject(tunnel)
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&gatewayv1.Gateway{}, &v1alpha1.CloudflareTunnel{}).
+		WithObjects(gc, ownerGW, foreignGW, tunnel).Build()
+
+	latch := freshness.NewLatch()
+	reconciler := &GatewayReconciler{
+		Client: kube, APIReader: kube, Scheme: scheme,
+		Now:         func() time.Time { return now },
+		Freshness:   freshness.DefaultPolicy(),
+		Invalidator: latch,
+	}
+
+	// Seed both keys so we also verify key isolation.
+	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	latch.MarkVerified("CloudflareTunnel", tunnelKey, "tun-h1", now)
+
+	// 1. A non-owner (conflicting) Gateway demoting itself must NOT forget the real owner's config gate.
+	foreignStatuses := &gatewayapi.Statuses{
+		Gateway: *foreignGW.Status.DeepCopy(),
+	}
+	_ = reconciler.reportDataplaneRejection(ctx, client.ObjectKeyFromObject(foreignGW), foreignGW, foreignStatuses, foreignGW, &dataplaneRejectionError{reason: "Invalid"})
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); !ok {
+		t.Fatal("non-owner Gateway demotion cleared the legitimate owner's CloudflareTunnelConfig gate")
+	}
+
+	// 2. Owner Gateway demoting via handleSnapshotBuildFailure MUST forget CloudflareTunnelConfig (and keep CloudflareTunnel).
+	ownerStatuses := &gatewayapi.Statuses{Gateway: *ownerGW.Status.DeepCopy()}
+	_ = reconciler.handleSnapshotBuildFailure(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, nil, nil, ownerStatuses, errors.New("snapshot boom"))
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+		t.Fatal("owner Gateway handleSnapshotBuildFailure did not forget CloudflareTunnelConfig")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnel", tunnelKey, "tun-h1"); !ok {
+		t.Fatal("Gateway demotion touched distinct CloudflareTunnel freshness key")
+	}
+
+	// 3. Owner Gateway demoting via reportDataplaneRejection MUST forget CloudflareTunnelConfig.
+	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	_ = reconciler.reportDataplaneRejection(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, ownerStatuses, ownerGW, &dataplaneRejectionError{reason: "Invalid"})
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+		t.Fatal("owner Gateway reportDataplaneRejection did not forget CloudflareTunnelConfig")
+	}
+
+	// 4. Owner Gateway demoting via reportCloudflareUnprogrammed MUST forget CloudflareTunnelConfig.
+	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	if err := reconciler.reportCloudflareUnprogrammed(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, nil, nil, ownerStatuses, "unprogrammed", false); err != nil {
+		t.Fatalf("owner reportCloudflareUnprogrammed: %v", err)
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+		t.Fatal("owner Gateway reportCloudflareUnprogrammed did not forget CloudflareTunnelConfig")
 	}
 }

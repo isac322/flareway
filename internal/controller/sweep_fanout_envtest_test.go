@@ -284,10 +284,10 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	accessFake := newFakeAccessResourceCloudflare()
 	vnetFake := newFakePrivateNetworkCloudflare()
 
-	// Subscribe a slow/un-drained ZeroTrustList channel (buffer=3, 8 items sent)
-	// alongside AccessPolicy, VirtualNetwork, and a competing dummy consumer on
-	// another kind. With per-kind fan-out, ZeroTrustList overflowing never blocks
-	// or steals AccessPolicy or VirtualNetwork events.
+	// Subscribe ALL 18 production sweep target kinds matching cmd/main.go:
+	// - ZeroTrustList: un-drained slow channel (buffer=3, 8 items sent)
+	// - AccessPolicy & VirtualNetwork: real production reconcilers repairing drift
+	// - Remaining 15 production target kinds: subscribers asserting 0 foreign/cross-kind delivery
 	_ = sweeper.EventsFor("ZeroTrustList")
 	if err := (&AccessPolicyReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
@@ -307,19 +307,39 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup VirtualNetworkReconciler: %v", err)
 	}
-	// Register a competing consumer on a different kind; it must never steal
-	// AccessPolicy or VirtualNetwork events.
-	var stolen atomic.Int64
-	if err := ctrl.NewControllerManagedBy(mgr).
-		Named("competing-consumer").
-		WatchesRawSource(source.Channel(sweeper.EventsFor("DevicePostureRule"), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
-			stolen.Add(1)
-			return nil
-		}))).
-		Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
-			return ctrl.Result{}, nil
-		})); err != nil {
-		t.Fatalf("setup competing consumer: %v", err)
+	// Register consumers for every other production sweep target kind (matching cmd/main.go);
+	// none of these may receive AccessPolicy or VirtualNetwork events or steal them.
+	var foreignHits atomic.Int64
+	otherProductionKinds := []string{
+		"AccessApplication",
+		"AccessStandaloneApplication",
+		"AccessInfrastructureTarget",
+		"AccessCustomPage",
+		"AccessGroup",
+		"IdentityProvider",
+		"DevicePostureRule",
+		"DevicePostureIntegration",
+		"ServiceToken",
+		"NetworkRoute",
+		"HostnameRoute",
+		"WARPConnector",
+		"DeviceProfile",
+		"ZeroTrustGatewayPolicy",
+		"CloudflareTunnel",
+	}
+	for _, kind := range otherProductionKinds {
+		k := kind
+		if err := ctrl.NewControllerManagedBy(mgr).
+			Named("prod-sub-" + k).
+			WatchesRawSource(source.Channel(sweeper.EventsFor(k), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
+				foreignHits.Add(1)
+				return nil
+			}))).
+			Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
+				return ctrl.Result{}, nil
+			})); err != nil {
+			t.Fatalf("setup subscriber %s: %v", k, err)
+		}
 	}
 
 	startManagerAndWait(t, mgr)
@@ -446,6 +466,11 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 		vnetFake.mu.Unlock()
 		return true, nil
 	})
+	// Allow one tick to confirm zero cross-kind delivery onto the 15 unaddressed subscriptions.
+	time.Sleep(100 * time.Millisecond)
+	if got := foreignHits.Load(); got != 0 {
+		t.Fatalf("foreign/cross-kind subscriptions received %d unexpected events, want 0", got)
+	}
 }
 
 type recordingGatewayProber struct {
@@ -673,8 +698,14 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		}
 		return assertConditionTrueForCurrentGen(cur.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), cur.Generation), nil
 	})
-	// Wait briefly for in-flight status reconciles to settle, then snapshot probes.
+	// Wait briefly for in-flight status reconciles to settle, then snapshot probes
+	// and tunnel ResourceVersion (so we prove the subsequent Gateway wakeup
+	// originates from the raw SweepEvents channel, not from a tunnel status write).
 	time.Sleep(300 * time.Millisecond)
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelObj); err != nil {
+		t.Fatalf("refresh tunnel before sweep: %v", err)
+	}
+	tunnelRVBefore := tunnelObj.ResourceVersion
 	probesBefore := prober.probes.Load()
 
 	emitTunnelDrift.Store(true)
@@ -687,4 +718,11 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 	waitUntilTrue(t, 10*time.Second, "CloudflareTunnel cleared invalidation after sweep wakeup", func() (bool, error) {
 		return !latch.IsInvalidated("CloudflareTunnel", client.ObjectKeyFromObject(&tunnelObj)), nil
 	})
+	var tunnelAfter v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelAfter); err != nil {
+		t.Fatalf("get tunnel after sweep wakeup: %v", err)
+	}
+	if tunnelAfter.ResourceVersion != tunnelRVBefore {
+		t.Fatalf("CloudflareTunnel mutated status during sweep wakeup (RV %s -> %s), conflating status watch with SweepEvents delivery", tunnelRVBefore, tunnelAfter.ResourceVersion)
+	}
 }
