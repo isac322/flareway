@@ -149,7 +149,11 @@ Access application.
 each protected region of a hostname gets its own `cloudflared` ingress rule and
 its own Envoy loopback listener (`-public` and `-blocked` carve-out or fallback
 domains also receive distinct loopback ports rather than sharing the base
-wildcard port). Public and protected paths may share a hostname only when the
+wildcard port; while newly compiled `cloudflared` ingress always targets the
+dedicated carve-out port, in-place upgrades from `v0.5.0` wildcard Public
+listeners temporarily keep authorized carve-out routes reachable on the legacy
+shared Envoy socket until active connectors acknowledge the new ingress
+version, after which the legacy route is removed and blocked). Public and protected paths may share a hostname only when the
 public carve-out `Q` is disjoint from the protected region `P`, or when `P`
 contains `Q`. In the second case Flareway creates a more specific child
 "bypass" Access application for each carve-out, and the carve-out must be listed

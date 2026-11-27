@@ -748,6 +748,9 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	if err != nil {
 		return cloudflareConfigResult{}, &cloudflaredConfigCompileError{err: err}
 	}
+	if err := validateDesiredTunnelStatusLimits(gateway, tunnel); err != nil {
+		return cloudflareConfigResult{}, &cloudflaredConfigCompileError{err: err}
+	}
 	// Desired-hash gate (D11): evaluated outside the tunnel lock and before
 	// the Cloudflare client is built. An open gate skips client creation,
 	// GetTunnel, and the lock entirely; the result is reconstructed from the
@@ -1219,6 +1222,31 @@ func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunn
 	return result
 }
 
+const (
+	maxTunnelStatusListeners           = 64
+	maxTunnelListenerProtectionDomains = 256
+	maxTunnelStatusHostnames           = 256
+)
+
+func validateDesiredTunnelStatusLimits(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) error {
+	if gateway == nil {
+		return nil
+	}
+	listeners := desiredTunnelListeners(gateway, tunnel)
+	if len(listeners) > maxTunnelStatusListeners {
+		return fmt.Errorf("desired CloudflareTunnel status.listeners count %d exceeds maximum %d", len(listeners), maxTunnelStatusListeners)
+	}
+	for _, listener := range listeners {
+		if len(listener.ProtectionDomains) > maxTunnelListenerProtectionDomains {
+			return fmt.Errorf("desired CloudflareTunnel listener %q protectionDomains count %d exceeds maximum %d", listener.Name, len(listener.ProtectionDomains), maxTunnelListenerProtectionDomains)
+		}
+	}
+	if hostnames := desiredTunnelHostnames(gateway, 1); len(hostnames) > maxTunnelStatusHostnames {
+		return fmt.Errorf("desired CloudflareTunnel status.hostnames count %d exceeds maximum %d", len(hostnames), maxTunnelStatusHostnames)
+	}
+	return nil
+}
+
 func tunnelListenerStatus(name, exposure, binding string, domains []ir.ProtectionDomain) v1alpha1.CloudflareTunnelListenerStatus {
 	status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(name), Exposure: v1alpha1.Exposure(exposure)}
 	if exposure == ir.ExposurePrivate {
@@ -1239,12 +1267,38 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 	// apply rejects it with "duplicate entries for key [name=...]" and the
 	// Gateway reconcile fails before any route status is written. Report
 	// each distinct protection domain once instead.
+	//
+	// Pass 1 emits live (!ShadowOnly) domains and records basePort when the
+	// listener's literal base domain is present. Pass 2 omits ShadowOnly
+	// entries whose EnvoyPort matches basePort (Case A: base already records
+	// that port in Status.Listeners, preserving full 256-live-domain capacity)
+	// and retains Case B ShadowOnly entries only within the 256 MaxItems cap.
 	seen := make(map[string]struct{}, len(domains))
+	var basePort int32
 	for _, domain := range domains {
-		if domain.ListenerName != name {
+		if domain.ListenerName != name || domain.ShadowOnly {
 			continue
 		}
 		if _, duplicate := seen[domain.Name]; duplicate {
+			continue
+		}
+		seen[domain.Name] = struct{}{}
+		if domain.Name == name && domain.EnvoyPort > 0 {
+			basePort = domain.EnvoyPort
+		}
+		status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+	}
+	for _, domain := range domains {
+		if domain.ListenerName != name || !domain.ShadowOnly {
+			continue
+		}
+		if basePort > 0 && domain.EnvoyPort == basePort {
+			continue
+		}
+		if _, duplicate := seen[domain.Name]; duplicate {
+			continue
+		}
+		if len(status.ProtectionDomains) >= maxTunnelListenerProtectionDomains {
 			continue
 		}
 		seen[domain.Name] = struct{}{}

@@ -13,7 +13,7 @@ An ingress rule cannot match on method, header, or query parameter, and it canno
 Flareway uses `cloudflared` for transport and Envoy for routing. Both run in the Gateway's data-plane pod:
 
 - The controller compiles each `Gateway` and its attached `HTTPRoute` objects into Envoy route tables and streams them to Envoy over xDS (Delta ADS).
-- For each public hostname, Flareway writes a `cloudflared` ingress rule whose service is an Envoy port on loopback, `http://127.0.0.1:<port>`. Each protection domain gets its own port. When a hostname needs path rules, for example because Cloudflare Access protects only part of it, Flareway anchors each path: an `Exact` path `/admin` becomes `^/admin$`, and a `PathPrefix` path `/admin` becomes `^/admin(/|$)`.
+- For each public hostname, Flareway writes a `cloudflared` ingress rule whose service is an Envoy port on loopback, `http://127.0.0.1:<port>`. Each protection domain gets its own port (during an in-place upgrade from `v0.5.0` wildcard Public listeners, authorized carve-out routes also remain reachable on the legacy shared Envoy port until connectors acknowledge the new ingress version). When a hostname needs path rules, for example because Cloudflare Access protects only part of it, Flareway anchors each path: an `Exact` path `/admin` becomes `^/admin$`, and a `PathPrefix` path `/admin` becomes `^/admin(/|$)`.
 - Envoy evaluates the `HTTPRoute` matches and filters and forwards the request to your Service.
 
 `cloudflared`, Envoy, and CoreDNS run as the upstream images, pinned by digest in the Helm chart values. Flareway does not fork them.
