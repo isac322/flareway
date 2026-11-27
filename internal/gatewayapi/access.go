@@ -556,6 +556,7 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listen
 			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, publicPorts, dropped, remaining)
 		}
 	}
+	filterCollidingShadowDomains(gateway)
 	disambiguateDerivedDomainNames(gateway, statuses)
 	// Names are settled first so holding a host never renames another domain.
 	holds.apply(gateway)
@@ -564,6 +565,35 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listen
 		sortAccessCompilation(&compiled)
 		statuses.AccessApplications[key] = compiled
 	}
+}
+
+// filterCollidingShadowDomains drops any ShadowOnly upgrade domain whose
+// EnvoyPort collides with a non-shadow domain that cannot share the same Envoy
+// route group (different listener, Protected, non-Unprotected, or
+// !StripAccessHeaders), preventing bindCollisionError in translator.Build.
+func filterCollidingShadowDomains(gateway *ir.Gateway) {
+	kept := gateway.Domains[:0]
+	for _, shadow := range gateway.Domains {
+		if !shadow.ShadowOnly {
+			kept = append(kept, shadow)
+			continue
+		}
+		collides := false
+		for _, other := range gateway.Domains {
+			if other.ShadowOnly || other.EnvoyPort != shadow.EnvoyPort {
+				continue
+			}
+			if other.ListenerName != shadow.ListenerName || other.Protected || other.Guard != ir.GuardUnprotected || !other.StripAccessHeaders {
+				collides = true
+				break
+			}
+		}
+		if !collides {
+			kept = append(kept, shadow)
+		}
+	}
+	clear(gateway.Domains[len(kept):])
+	gateway.Domains = kept
 }
 
 // disambiguateDerivedDomainNames keeps protection domain names unique across
@@ -765,6 +795,24 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		publicDomain.IngressPaths = publicIngress
 		publicDomain.VirtualHosts = []ir.VirtualHost{{Name: host.Name + "-public", Hostname: host.Hostname, Routes: keptPublic}}
 		gateway.Domains = append(gateway.Domains, publicDomain)
+
+		listener := listenerByName(gateway.Listeners, base.ListenerName)
+		if !gateway.ConformanceMode && listener != nil && listener.Exposure == ir.ExposurePublic && isWildcardHostname(listener.Hostname) {
+			if legacyPD, legacyPort, ok := publicPorts.legacyCarveOut(in, base.ListenerName, host.Hostname); ok && legacyPort != publicDomain.EnvoyPort {
+				gateway.Domains = append(gateway.Domains, ir.ProtectionDomain{
+					Name:               legacyPD,
+					ListenerName:       base.ListenerName,
+					Exposure:           ir.ExposurePublic,
+					EnvoyPort:          legacyPort,
+					Protected:          false,
+					AccessApplication:  "",
+					Guard:              ir.GuardUnprotected,
+					StripAccessHeaders: true,
+					ShadowOnly:         true,
+					VirtualHosts:       []ir.VirtualHost{{Name: host.Name + "-public-legacy", Hostname: host.Hostname, Routes: keptPublic}},
+				})
+			}
+		}
 	} else if !publicAllowed && !accessRegionsCoverWholeHost(protectedRegions) {
 		blocked := base
 		assignDerivedDomainPort(gateway, publicPorts, &blocked, base.ListenerName, "blocked", host.Hostname)

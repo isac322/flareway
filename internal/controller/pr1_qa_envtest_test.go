@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"slices"
 	"sync/atomic"
@@ -27,6 +29,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
@@ -2328,6 +2331,254 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(counter.writes.Load()).To(gomega.Equal(writesAfterClear), "subsequent unchanged reconciles after clearing Status.Listeners must emit 0 writes")
 		}
+	})
+
+	// #4723566864: During an in-place v0.5.0 upgrade on a wildcard Public listener
+	// where base ("web") and carve-out ("web-public") shared 18080, keep the
+	// shadow route on xDS port 18080 and "web-public: 18080" in Status.Listeners
+	// while connector holds v1, while cloudflared targets ONLY the new port;
+	// once connector ACKs v2 (Status.Hostnames drops "web-public"), a follow-up
+	// reconcile removes ShadowOnly (403 on 18080), drops "web-public" from
+	// Status.Listeners with 0 extra Cloudflare PUTs, and converges to 0 writes.
+	ginkgo.It("Finding 4: upgrading v0.5.0 wildcard Public listener keeps legacy carve-out shadow on xDS until connector ACK without extra Cloudflare PUTs", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{})
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		acct.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePublic}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		wildHost := gatewayv1.Hostname("*.example.com")
+		gw.Spec.Listeners = []gatewayv1.Listener{{
+			Name: "web", Hostname: &wildHost, Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+		}}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: ns},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8080}}},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, svc)).To(gomega.Succeed())
+		pathType := gatewayv1.PathMatchPathPrefix
+		adminRule := gatewayv1.SectionName("admin")
+		healthRule := gatewayv1.SectionName("health")
+		homeRule := gatewayv1.SectionName("home")
+		port := gatewayv1.PortNumber(8080)
+		routeA := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: ns, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name)}}},
+				Hostnames:       []gatewayv1.Hostname{"app.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Name:        &adminRule,
+						Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/admin")}}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+					},
+					{
+						Name:        &healthRule,
+						Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/health")}}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+					},
+				},
+			},
+		}
+		routeB := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-b", Namespace: ns, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name)}}},
+				Hostnames:       []gatewayv1.Hostname{"other.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{{
+					Name:        &homeRule,
+					Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/")}}},
+					BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+				}},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, routeA)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Create(f.ctx, routeB)).To(gomega.Succeed())
+
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-a", Namespace: ns},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "route-a"},
+					SectionName:                &adminRule,
+				}},
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "app-a", SessionDuration: "1h"},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, app)).To(gomega.Succeed())
+
+		indexedClient := handoffIndexedClient{Client: f.direct}
+		accessReconciler := &AccessApplicationReconciler{
+			Client:              indexedClient,
+			APIReader:           indexedClient,
+			Scheme:              f.direct.Scheme(),
+			NewCloudflareClient: newFakeAccessApplicationCloudflare().Client,
+			OperatorNamespace:   accessApplicationAUDNamespace,
+			Now:                 func() time.Time { return f.clock },
+		}
+		for range 2 {
+			_, err := accessReconciler.Reconcile(f.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
+
+		// Seed v0.5.0 Tunnel status (web + web-public both recorded on 18080) and connector holding v1.
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: acct.Name}, &acct)).To(gomega.Succeed())
+		var audSecret corev1.Secret
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{
+			Namespace: accessApplicationAUDNamespace,
+			Name:      accessAUDSecretName(app, f.gatewayKey),
+		}, &audSecret)).To(gomega.Succeed())
+		appDigest := accessBindingDigest(ir.ProtectionDomain{
+			AccessApplication: ns + "/app-a",
+			Protected:         true,
+			Access: &ir.AccessGuard{
+				AUDs:       []string{string(audSecret.Data["aud"])},
+				TeamName:   acct.Status.Verified.TeamName,
+				AuthDomain: acct.Status.Verified.AuthDomain,
+			},
+		})
+		appHash := sha256.Sum256([]byte(ns + "/app-a\x00app.example.com"))
+		appPD := "web-access-" + ns + "-app-a-" + hex.EncodeToString(appHash[:4])
+		f.remote.remoteVersion = 1
+		f.prober.version = 1
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		seedWriter := &GatewayReconciler{Client: f.direct, APIReader: f.direct, Scheme: f.direct.Scheme()}
+		seedIR := &ir.Gateway{Key: f.gatewayKey, UID: gw.UID}
+		gomega.Expect(seedWriter.patchTunnelGatewayData(
+			f.ctx, seedIR, &tunnel,
+			v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, DesiredHash: "v05-hash", Applied: 1, Remote: 1},
+			[]v1alpha1.CloudflareTunnelHostnameStatus{
+				{Hostname: "app.example.com", ProtectionDomain: "web-public", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+				{Hostname: "app.example.com", ProtectionDomain: appPD, AccessApplication: ns + "/app-a", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+				{Hostname: "other.example.com", ProtectionDomain: "web", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+			},
+			[]v1alpha1.CloudflareTunnelListenerStatus{{
+				Name:     "web",
+				Exposure: v1alpha1.ExposurePublic,
+				ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+					{Name: "web", EnvoyPort: 18080},
+					{Name: "web-public", EnvoyPort: 18080},
+				},
+			}},
+		)).To(gomega.Succeed())
+
+		inspectPort18080 := func() (hasHealthRoute bool, has403Block bool) {
+			f.snapshots.publisher.mu.RLock()
+			snap := f.snapshots.publisher.snapshots[f.gatewayKey.String()]
+			f.snapshots.publisher.mu.RUnlock()
+			gomega.Expect(snap).NotTo(gomega.BeNil(), "expected published xDS snapshot")
+			var targetRoute string
+			for _, res := range snap.GetResources(resourcev3.ListenerType) {
+				l := res.(*listenerv3.Listener)
+				if l.GetAddress().GetSocketAddress().GetPortValue() != 18080 {
+					continue
+				}
+				for _, fc := range l.GetFilterChains() {
+					for _, filter := range fc.GetFilters() {
+						if filter.Name != "envoy.filters.network.http_connection_manager" {
+							continue
+						}
+						var hcm hcmv3.HttpConnectionManager
+						if err := filter.GetTypedConfig().UnmarshalTo(&hcm); err == nil {
+							if rdsName := hcm.GetRds().GetRouteConfigName(); rdsName != "" {
+								targetRoute = rdsName
+							}
+						}
+					}
+				}
+			}
+			gomega.Expect(targetRoute).NotTo(gomega.BeEmpty(), "expected listener on 18080")
+			rc := snap.GetResources(resourcev3.RouteType)[targetRoute].(*routev3.RouteConfiguration)
+			for _, vh := range rc.GetVirtualHosts() {
+				if !slices.Contains(vh.GetDomains(), "app.example.com") {
+					continue
+				}
+				for _, route := range vh.GetRoutes() {
+					if route.GetDirectResponse() != nil && route.GetDirectResponse().GetStatus() == 403 {
+						has403Block = true
+					}
+					if route.GetMatch().GetPathSeparatedPrefix() == "/health" && route.GetRoute() != nil {
+						hasHealthRoute = true
+					}
+				}
+			}
+			return hasHealthRoute, has403Block
+		}
+
+		listenerPDPort := func(tObj *v1alpha1.CloudflareTunnel, pdName string) (int32, bool) {
+			for _, ls := range tObj.Status.Listeners {
+				if ls.Name != "web" {
+					continue
+				}
+				for _, pd := range ls.ProtectionDomains {
+					if pd.Name == pdName {
+						return pd.EnvoyPort, true
+					}
+				}
+			}
+			return 0, false
+		}
+
+		// Reconcile 1 & 2 while connector still holds v1:
+		// xDS port 18080 must keep /health (no 403), Status.Listeners keeps web-public:18080,
+		// and cloudflared puts only 1 config update targeting ONLY the new port.
+		for range 2 {
+			_, err := f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+			hasHealth, has403 := inspectPort18080()
+			gomega.Expect(hasHealth).To(gomega.BeTrue(), "while connector holds v1, 18080 must keep /health shadow route")
+			gomega.Expect(has403).To(gomega.BeFalse(), "while connector holds v1, 18080 must NOT 403 app.example.com")
+		}
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "expected exactly 1 Cloudflare configuration update during v1 rollout")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		shadowPort, hasLegacyPD := listenerPDPort(&tunnel, "web-public")
+		gomega.Expect(hasLegacyPD).To(gomega.BeTrue(), "Status.Listeners must retain web-public during rollout")
+		gomega.Expect(shadowPort).To(gomega.Equal(int32(18080)))
+
+		// Connector ACKs v2: Reconcile 3 promotes ConfigApplied=True and drops legacy web-public from Status.Hostnames.
+		f.prober.version = 2
+		_, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+
+		// Follow-up Reconcile 4 sees web-public absent from Status.Hostnames -> removes ShadowOnly
+		// (18080 switches to 403 for app.example.com), drops web-public from Status.Listeners, 0 extra Cloudflare PUTs.
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "removing ShadowOnly post-ACK must cause 0 extra Cloudflare PUTs")
+		hasHealth, has403 := inspectPort18080()
+		gomega.Expect(hasHealth).To(gomega.BeFalse(), "post-ACK 18080 must remove /health shadow route")
+		gomega.Expect(has403).To(gomega.BeTrue(), "post-ACK 18080 must enforce 403 for app.example.com")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		_, hasLegacyPD = listenerPDPort(&tunnel, "web-public")
+		gomega.Expect(hasLegacyPD).To(gomega.BeFalse(), "post-ACK Status.Listeners must drop legacy web-public")
+
+		// Steady-state Reconcile 5 emits 0 writes and 0 Cloudflare PUTs.
+		counter := &tunnelStatusWriteCounterClient{Client: f.direct, tunnelName: tunnel.Name}
+		f.reconciler.Client = counter
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(counter.writes.Load()).To(gomega.Equal(int64(0)))
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
 	})
 })
 

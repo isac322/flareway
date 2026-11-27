@@ -226,12 +226,16 @@ type ProtectionDomain struct {
 	Access            *AccessGuard `json:"access,omitempty"`
 	AccessApplication string       `json:"accessApplication,omitempty"`
 	// AccessBinding retains the desired binding digest while its guard is blocked.
-	AccessBinding      string        `json:"accessBinding,omitempty"`
-	Guard              string        `json:"guard,omitempty"`
-	BlockReason        string        `json:"blockReason,omitempty"`
-	StripAccessHeaders bool          `json:"stripAccessHeaders,omitempty"`
-	IngressPaths       []PathMatch   `json:"ingressPaths,omitempty"`
-	VirtualHosts       []VirtualHost `json:"virtualHosts,omitempty"`
+	AccessBinding      string `json:"accessBinding,omitempty"`
+	Guard              string `json:"guard,omitempty"`
+	BlockReason        string `json:"blockReason,omitempty"`
+	StripAccessHeaders bool   `json:"stripAccessHeaders,omitempty"`
+	// ShadowOnly marks an upgrade-transition Envoy protection domain preserved
+	// temporarily on a legacy port until cloudflared connectors acknowledge the
+	// replacement dedicated port; omitted from cloudflared ingress and status.hostnames.
+	ShadowOnly   bool          `json:"shadowOnly,omitempty"`
+	IngressPaths []PathMatch   `json:"ingressPaths,omitempty"`
+	VirtualHosts []VirtualHost `json:"virtualHosts,omitempty"`
 }
 
 // AccessGuard describes Cloudflare Access JWT enforcement for a domain.

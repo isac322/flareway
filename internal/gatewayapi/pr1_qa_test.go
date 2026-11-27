@@ -17,6 +17,9 @@ limitations under the License.
 package gatewayapi
 
 import (
+	"encoding/json"
+	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -27,6 +30,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/cloudflared"
 	"github.com/isac322/flareway/internal/ir"
 	"github.com/isac322/flareway/internal/xds/translator"
 )
@@ -985,4 +989,234 @@ func TestWildcardPublicLiteralBaseTakesPriorityOverLegacyDerivedAlias(t *testing
 	if derivedPorts[0] == derivedPorts[1] {
 		t.Fatalf("derived domains collided on port %d: %#v", derivedPorts[0], gw.Domains)
 	}
+}
+
+// #4723566864: During an in-place v0.5.0 upgrade on a wildcard Public listener
+// where base ("web") and an exact-host carve-out ("web-public") shared 18080,
+// keep a ShadowOnly domain on 18080 serving app.example.com /health until
+// Status.Hostnames records the new dedicated web-public-<hostHash> domain, while
+// compiling cloudflared ingress exclusively against the new port.
+func TestWildcardPublicLegacyCarveOutShadowDuringUpgrade(t *testing.T) {
+	firstIngressService := func(t *testing.T, gw *ir.Gateway, host, path string) (string, string) {
+		t.Helper()
+		if gw.Cloudflare == nil {
+			gw.Cloudflare = &ir.Cloudflare{AccountID: "0123456789abcdef0123456789abcdef"}
+		}
+		params, hash, err := cloudflared.Compile(gw)
+		if err != nil {
+			t.Fatalf("cloudflared.Compile failed: %v", err)
+		}
+		raw, err := json.Marshal(params.Config.Raw)
+		if err != nil {
+			t.Fatalf("marshal cloudflared config: %v", err)
+		}
+		var decoded struct {
+			Ingress []struct {
+				Hostname string `json:"hostname"`
+				Path     string `json:"path"`
+				Service  string `json:"service"`
+			} `json:"ingress"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal cloudflared config: %v", err)
+		}
+		for _, rule := range decoded.Ingress {
+			matchedHost := rule.Hostname == "" || strings.EqualFold(rule.Hostname, host) ||
+				(strings.HasPrefix(rule.Hostname, "*.") && strings.HasSuffix(strings.ToLower(host), strings.ToLower(rule.Hostname[1:])))
+			if !matchedHost {
+				continue
+			}
+			if rule.Path != "" {
+				re, err := regexp.Compile(rule.Path)
+				if err != nil {
+					t.Fatalf("compile path %q: %v", rule.Path, err)
+				}
+				if !re.MatchString(path) {
+					continue
+				}
+			}
+			return rule.Service, hash
+		}
+		return "", hash
+	}
+
+	makeInputs := func(includeBaseRoute, includeHealthRoute bool, unprotectedHosts []string) Inputs {
+		in := accessInputs(true)
+		in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+		in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = unprotectedHosts
+		in.Gateway.Spec.Listeners = []gatewayv1.Listener{{
+			Name: "web", Hostname: new(gatewayv1.Hostname("*.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+		}}
+		rulesA := []gatewayv1.HTTPRouteRule{namedRouteRule("admin", "/admin", "backend")}
+		if includeHealthRoute {
+			rulesA = append(rulesA, namedRouteRule("health", "/health", "backend"))
+		}
+		in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-a", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"app.example.com"},
+				Rules:           rulesA,
+			},
+		}}
+		if includeBaseRoute {
+			in.HTTPRoutes = append(in.HTTPRoutes, gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "route-b", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+					Hostnames:       []gatewayv1.Hostname{"other.example.com"},
+					Rules:           []gatewayv1.HTTPRouteRule{namedRouteRule("home", "/", "backend")},
+				},
+			})
+		}
+		appA := accessApplication("app-a", "HTTPRoute", "route-a", "admin")
+		in.AccessApplications = []v1alpha1.AccessApplication{appA}
+		in.AUDSecrets = map[types.NamespacedName]AUDSecret{{Namespace: "default", Name: "app-a"}: {AUD: "aud-a", ApplicationID: "id-a", Ready: true}}
+		in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "web",
+			Exposure: v1alpha1.ExposurePublic,
+			ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+				{Name: "web", EnvoyPort: 18080},
+				{Name: "web-public", EnvoyPort: 18080},
+			},
+		}}
+		in.CloudflareTunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{
+			{Hostname: "app.example.com", ProtectionDomain: "web-public", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+			{Hostname: "app.example.com", ProtectionDomain: "web-access-default-app-a", AccessApplication: "default/app-a", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1},
+			{Hostname: "other.example.com", ProtectionDomain: "web", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+		}
+		return in
+	}
+
+	// Case A: base ("web") + carve-out ("web-public") share 18080 during upgrade rollout.
+	in := makeInputs(true, true, []string{"*.example.com"})
+	gw1, _ := Translate(in)
+	if _, err := translator.Build(gw1, nil); err != nil {
+		t.Fatalf("translator.Build(gw1) failed: %v", err)
+	}
+	var newPubDomain *ir.ProtectionDomain
+	var shadowDomain *ir.ProtectionDomain
+	for i := range gw1.Domains {
+		d := &gw1.Domains[i]
+		if d.Guard == ir.GuardUnprotected && !d.Protected && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+			if d.EnvoyPort == 18080 {
+				shadowDomain = d
+			} else {
+				newPubDomain = d
+			}
+		}
+	}
+	if newPubDomain == nil {
+		t.Fatalf("expected dedicated new web-public-<hostHash> domain for app.example.com != 18080: %#v", gw1.Domains)
+	}
+	if shadowDomain == nil {
+		t.Fatalf("expected ShadowOnly domain keeping app.example.com /health on 18080 during upgrade: %#v", gw1.Domains)
+	}
+	if !shadowDomain.ShadowOnly || !shadowDomain.StripAccessHeaders || shadowDomain.Protected || shadowDomain.Name != "web-public" {
+		t.Fatalf("unexpected shadow domain attributes: %#v", shadowDomain)
+	}
+	svc1, hash1 := firstIngressService(t, gw1, "app.example.com", "/health")
+	wantSvc := fmt.Sprintf("http://127.0.0.1:%d", newPubDomain.EnvoyPort)
+	if svc1 != wantSvc {
+		t.Fatalf("cloudflared ingress = %q, want dedicated new port %q (never shadow 18080)", svc1, wantSvc)
+	}
+
+	// Post-ACK: Status.Hostnames now points to newPubDomain.Name -> shadow disappears, cloudflared hash unchanged.
+	in.CloudflareTunnel.Status.Hostnames[0].ProtectionDomain = newPubDomain.Name
+	in.CloudflareTunnel.Status.Hostnames[0].AppliedVersion = 2
+	gw2, _ := Translate(in)
+	if _, err := translator.Build(gw2, nil); err != nil {
+		t.Fatalf("translator.Build(gw2) failed: %v", err)
+	}
+	for _, d := range gw2.Domains {
+		if d.EnvoyPort == 18080 && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+			t.Fatalf("post-ACK re-translation must drop shadow domain on 18080: %#v", d)
+		}
+	}
+	_, hash2 := firstIngressService(t, gw2, "app.example.com", "/health")
+	if hash2 != hash1 {
+		t.Fatalf("cloudflared hash shifted when shadow domain was removed: before=%s after=%s", hash1, hash2)
+	}
+
+	// Edge cases: carve-out route removed, unprotected grant revoked, base GuardBlocked, revocation tombstone, and Case B (no base domain).
+	t.Run("carve-out route removed drops shadow", func(t *testing.T) {
+		edgeIn := makeInputs(true, false, []string{"*.example.com"})
+		gwEdge, _ := Translate(edgeIn)
+		if _, err := translator.Build(gwEdge, nil); err != nil {
+			t.Fatalf("translator.Build failed: %v", err)
+		}
+		for _, d := range gwEdge.Domains {
+			if d.EnvoyPort == 18080 && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+				t.Fatalf("unexpected shadow domain when /health removed: %#v", d)
+			}
+		}
+	})
+	t.Run("unprotected grant revoked drops shadow", func(t *testing.T) {
+		edgeIn := makeInputs(true, true, []string{"other.example.com"})
+		gwEdge, _ := Translate(edgeIn)
+		if _, err := translator.Build(gwEdge, nil); err != nil {
+			t.Fatalf("translator.Build failed: %v", err)
+		}
+		for _, d := range gwEdge.Domains {
+			if d.EnvoyPort == 18080 && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+				t.Fatalf("unexpected shadow domain when unprotected grant revoked: %#v", d)
+			}
+		}
+	})
+	t.Run("wildcard unprotected revoked making base GuardBlocked filters colliding shadow", func(t *testing.T) {
+		edgeIn := makeInputs(true, true, []string{"app.example.com"})
+		gwEdge, _ := Translate(edgeIn)
+		if _, err := translator.Build(gwEdge, nil); err != nil {
+			t.Fatalf("translator.Build must not bindCollide when base becomes GuardBlocked: %v", err)
+		}
+		for _, d := range gwEdge.Domains {
+			if d.EnvoyPort == 18080 && d.Guard == ir.GuardUnprotected {
+				t.Fatalf("unexpected Unprotected shadow domain on GuardBlocked port 18080: %#v", d)
+			}
+		}
+	})
+	t.Run("revocation tombstone drops shadow", func(t *testing.T) {
+		edgeIn := makeInputs(true, true, []string{"*.example.com"})
+		now := metav1.Now()
+		edgeIn.AccessApplications[0].DeletionTimestamp = &now
+		edgeIn.AccessApplications[0].Finalizers = []string{v1alpha1.AccessApplicationFinalizer}
+		edgeIn.AccessApplications[0].Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel: edgeIn.CloudflareTunnel.Name, Listener: "web", ProtectionDomain: "web-access-default-app-a", EnvoyPort: 18081,
+		}}
+		edgeIn.AccessApplications[0].Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+			Type: v1alpha1.AccessApplicationDestinationPublic, Hostname: "app.example.com",
+		}}
+		gwEdge, _ := Translate(edgeIn)
+		if _, err := translator.Build(gwEdge, nil); err != nil {
+			t.Fatalf("translator.Build failed with tombstone: %v", err)
+		}
+		for _, d := range gwEdge.Domains {
+			if d.EnvoyPort == 18080 && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+				t.Fatalf("revocation tombstone must drop shadow domain on 18080: %#v", d)
+			}
+		}
+	})
+	t.Run("Case B without base domain keeps shadow on 18080 and moves web-public to new port", func(t *testing.T) {
+		edgeIn := makeInputs(false, true, []string{"*.example.com"})
+		edgeIn.CloudflareTunnel.Status.Listeners[0].ProtectionDomains = []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: "web-public", EnvoyPort: 18080},
+		}
+		gwEdge, _ := Translate(edgeIn)
+		if _, err := translator.Build(gwEdge, nil); err != nil {
+			t.Fatalf("translator.Build failed in Case B: %v", err)
+		}
+		var sawShadow, sawNew bool
+		for _, d := range gwEdge.Domains {
+			if d.Guard == ir.GuardUnprotected && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com" {
+				if d.EnvoyPort == 18080 {
+					sawShadow = true
+				} else {
+					sawNew = true
+				}
+			}
+		}
+		if !sawShadow || !sawNew {
+			t.Fatalf("Case B expected both shadow on 18080 and new web-public port, got sawShadow=%v sawNew=%v domains=%#v", sawShadow, sawNew, gwEdge.Domains)
+		}
+	})
 }

@@ -1099,6 +1099,9 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 	result := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0)
 	teardown := gateway.Cloudflare != nil && gateway.Cloudflare.Teardown
 	for _, domain := range gateway.Domains {
+		if domain.ShadowOnly {
+			continue
+		}
 		for _, host := range domain.VirtualHosts {
 			if host.Hostname == "" || host.Hostname == "*" {
 				continue

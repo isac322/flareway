@@ -108,6 +108,9 @@ func compileConfig(gateway *ir.Gateway) configBody {
 	rules := make([]domainRule, 0, len(gateway.Domains))
 	order := 0
 	for _, domain := range gateway.Domains {
+		if domain.ShadowOnly {
+			continue
+		}
 		if listenerExposure[domain.ListenerName] == ir.ExposurePrivate || domain.Exposure == ir.ExposurePrivate {
 			continue
 		}

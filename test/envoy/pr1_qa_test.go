@@ -40,6 +40,12 @@ import (
 	"time"
 
 	"github.com/cloudflare/cloudflare-go/v7/zero_trust"
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	typesv3 "github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,6 +56,9 @@ import (
 	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
+	"github.com/isac322/flareway/internal/xds/bootstrap"
+	"github.com/isac322/flareway/internal/xds/pki"
+	xdsserver "github.com/isac322/flareway/internal/xds/server"
 	"github.com/isac322/flareway/internal/xds/translator"
 )
 
@@ -1152,4 +1161,303 @@ func startHeaderEchoOrigin(t *testing.T, jwks []byte) int {
 		_ = server.Shutdown(ctx)
 	})
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+// #4723566864: In real Envoy connected to a live ADS xDS server, keep
+// app.example.com /health returning 200 OK (and /admin returning 404, not
+// falling through to the wildcard backend) on legacy port 18080 during v0.5.0
+// upgrade rollout while the dedicated new port also serves 200 OK; once the
+// connector ACKs and ShadowOnly disappears in the follow-up xDS push, port
+// 18080 immediately shifts to 403 for app.example.com /health while the new
+// port keeps serving 200 OK.
+func TestEnvoyPublicWildcardLegacyCarveOutShadowTransition(t *testing.T) {
+	requireDocker(t)
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	echoPort := startHeaderEchoOrigin(t, mustJWKS(t, &key.PublicKey))
+
+	appKey := types.NamespacedName{Namespace: "demo", Name: "admin-app"}
+	in := wildcardAccessInputs([]string{"app.example.com", "other.example.com"}, appKey)
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{{
+		Name: "web", Hostname: new(gatewayv1.Hostname("*.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	}}
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com"}
+
+	pathType := gatewayv1.PathMatchPathPrefix
+	adminRule := gatewayv1.SectionName("admin")
+	healthRule := gatewayv1.SectionName("health")
+	homeRule := gatewayv1.SectionName("home")
+	port := gatewayv1.PortNumber(8080)
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: appKey.Namespace, Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"app.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Name:    &adminRule,
+						Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/admin")}}},
+						Filters: []gatewayv1.HTTPRouteFilter{{
+							Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+							RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Keep-Route", Value: "route-ok"}},
+							},
+						}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+					},
+					{
+						Name:    &healthRule,
+						Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/health")}}},
+						Filters: []gatewayv1.HTTPRouteFilter{{
+							Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+							RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "Cf-Access-Authenticated-User-Email", Value: "spoofed@attacker.test"},
+									{Name: "X-Keep-Route", Value: "route-ok"},
+								},
+							},
+						}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}},
+							Filters: []gatewayv1.HTTPRouteFilter{{
+								Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+								RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+									Set: []gatewayv1.HTTPHeader{
+										{Name: "Cf-Access-Jwt-Assertion", Value: "forged-backend-jwt"},
+										{Name: "X-Keep-Backend", Value: "backend-ok"},
+									},
+								},
+							}},
+						}},
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "base", Namespace: appKey.Namespace, Generation: 2, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"other.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{{
+					Name:        &homeRule,
+					Matches:     []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: new("/")}}},
+					BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}}},
+				}},
+			},
+		},
+	}
+	app := in.AccessApplications[0]
+	app.Spec.TargetRefs = []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+		LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "app"},
+		SectionName:                &adminRule,
+	}}
+	in.AccessApplications = []v1alpha1.AccessApplication{app}
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "web",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: "web", EnvoyPort: 18080},
+			{Name: "web-public", EnvoyPort: 18080},
+		},
+	}}
+	in.CloudflareTunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{
+		{Hostname: "app.example.com", ProtectionDomain: "web-public", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+		{Hostname: "app.example.com", ProtectionDomain: "web-access-demo-admin-app", AccessApplication: appKey.String(), Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1},
+		{Hostname: "other.example.com", ProtectionDomain: "web", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1},
+	}
+
+	buildDockerDynamicSnap := func(gw *ir.Gateway) (*cachev3.Snapshot, string) {
+		raw, err := translator.Build(gw, nil)
+		if err != nil {
+			t.Fatalf("translator.Build: %v", err)
+		}
+		version := raw.GetVersion(resourcev3.ListenerType)
+		jwksURI := localOriginURI(echoPort)
+		var listeners, routes, clusters []typesv3.Resource
+		for _, res := range raw.GetResources(resourcev3.ListenerType) {
+			cloned := proto.Clone(res).(*listenerv3.Listener)
+			cloned.GetAddress().GetSocketAddress().Address = "0.0.0.0"
+			if err := rewriteJWTFilter(cloned, jwksURI); err != nil && !strings.Contains(err.Error(), "not found") {
+				t.Fatalf("rewriteJWTFilter: %v", err)
+			}
+			listeners = append(listeners, cloned)
+		}
+		for _, res := range raw.GetResources(resourcev3.RouteType) {
+			routes = append(routes, res)
+		}
+		for _, res := range raw.GetResources(resourcev3.ClusterType) {
+			cloned := proto.Clone(res).(*clusterv3.Cluster)
+			setClusterEndpoint(cloned, "host.docker.internal", echoPort)
+			if strings.HasPrefix(cloned.Name, "flareway-jwks-") {
+				cloned.TransportSocket = nil
+			}
+			clusters = append(clusters, cloned)
+		}
+		snap, err := cachev3.NewSnapshot(version, map[resourcev3.Type][]typesv3.Resource{
+			resourcev3.ListenerType: listeners,
+			resourcev3.RouteType:    routes,
+			resourcev3.ClusterType:  clusters,
+		})
+		if err != nil {
+			t.Fatalf("cachev3.NewSnapshot: %v", err)
+		}
+		if err := snap.ConstructVersionMap(); err != nil {
+			t.Fatalf("ConstructVersionMap: %v", err)
+		}
+		return snap, version
+	}
+
+	gw1, statuses1 := gatewayapi.Translate(in)
+	if !statuses1.AccessApplications[appKey].Accepted {
+		t.Fatalf("AccessApplication rejected: %#v", statuses1.AccessApplications[appKey])
+	}
+	var basePort, newPubPort, protPort int
+	var newPubDomainName string
+	for _, d := range gw1.Domains {
+		switch {
+		case d.Name == "web":
+			basePort = int(d.EnvoyPort)
+		case d.AccessApplication == appKey.String():
+			protPort = int(d.EnvoyPort)
+		case d.Guard == ir.GuardUnprotected && !d.Protected && d.EnvoyPort != 18080 && len(d.VirtualHosts) > 0 && d.VirtualHosts[0].Hostname == "app.example.com":
+			newPubPort = int(d.EnvoyPort)
+			newPubDomainName = d.Name
+		}
+	}
+	if basePort != 18080 || newPubPort == 0 || protPort == 0 {
+		t.Fatalf("unexpected ports base=%d newPub=%d prot=%d domains=%#v", basePort, newPubPort, protPort, gw1.Domains)
+	}
+
+	gwKey := types.NamespacedName{Namespace: "demo", Name: "gateway"}
+	caSecret, xdsDir := buildRenderedXDSDir(t, gwKey, bootstrap.Options{NodeCluster: gwKey.String()})
+	serverTLS, err := pki.ServerTLSConfig(caSecret)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	xdsAddr := reserveLoopbackAddr(t)
+	_, xdsPort, err := net.SplitHostPort(xdsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := xdsserver.New(xdsserver.Options{Address: xdsAddr, TLSConfig: serverTLS})
+	if err != nil {
+		t.Fatalf("xdsserver.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+
+	xdsDir = writeRenderedXDSMaterial(t, gwKey, caSecret, bootstrap.Options{
+		NodeCluster: gwKey.String(),
+		XDSAddress:  "flareway-xds.flareway-system.svc.cluster.local:" + xdsPort,
+	})
+	snap1, ver1 := buildDockerDynamicSnap(gw1)
+	if err := srv.SetSnapshot(ctx, gwKey.String(), snap1); err != nil {
+		t.Fatalf("SetSnapshot v1: %v", err)
+	}
+
+	podID := dataplane.EnvoyNodeID(gwKey.Namespace, gwKey.Name, "upgrade-pod-1")
+	containerName := "flareway-envoy-upgrade-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if out, err := exec.CommandContext(ctx,
+		"docker", "run", "-d", "--name", containerName,
+		"--dns", "127.0.0.1",
+		"--add-host", "host.docker.internal:host-gateway",
+		"--add-host", "flareway-xds.flareway-system.svc.cluster.local:host-gateway",
+		"-p", "127.0.0.1::"+strconv.Itoa(basePort),
+		"-p", "127.0.0.1::"+strconv.Itoa(newPubPort),
+		"-p", "127.0.0.1::"+strconv.Itoa(protPort),
+		"-v", xdsDir+":/etc/flareway/xds:ro",
+		envoyImage,
+		"envoy",
+		"-c", "/etc/flareway/xds/bootstrap.yaml",
+		"--service-node", podID,
+		"--service-cluster", gwKey.String(),
+		"--concurrency", "1",
+		"--disable-hot-restart",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("start Envoy container: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cleanupCancel()
+		_ = exec.CommandContext(cleanupCtx, "docker", "rm", "-f", containerName).Run()
+	})
+
+	addr18080 := "http://" + dockerPort(t, containerName, basePort)
+	addrNewPub := "http://" + dockerPort(t, containerName, newPubPort)
+
+	// Wait for v1 ACK and verify transition-phase Envoy behavior.
+	wait1Ctx, wait1Cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer wait1Cancel()
+	if err := waitForHTTP(wait1Ctx, 200*time.Millisecond, func() (int, string, error) {
+		if !srv.IsACKedForNodes(gwKey.String(), ver1, []string{podID}) {
+			return 0, "", fmt.Errorf("waiting for v1 ACK")
+		}
+		req, _ := http.NewRequest(http.MethodGet, addr18080+"/health", nil)
+		req.Host = "app.example.com"
+		req.Header.Set("Cf-Access-Jwt-Assertion", "spoofed-jwt")
+		return doEnvoyRequest(req)
+	}, http.StatusOK); err != nil {
+		t.Fatalf("during upgrade transition, 18080 app.example.com /health must return 200 OK: %v\n%s", err, containerLogs(containerName))
+	}
+	reqHealth18080, _ := http.NewRequest(http.MethodGet, addr18080+"/health", nil)
+	reqHealth18080.Host = "app.example.com"
+	reqHealth18080.Header.Set("Cf-Access-Jwt-Assertion", "spoofed-jwt")
+	status, body, err := doEnvoyRequest(reqHealth18080)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("18080 app.example.com /health = (%d, %v), want 200", status, err)
+	}
+	assertStrippedAccessHeaders(t, body, "legacy-shadow-18080")
+
+	reqAdmin18080, _ := http.NewRequest(http.MethodGet, addr18080+"/admin", nil)
+	reqAdmin18080.Host = "app.example.com"
+	if status, _, err := doEnvoyRequest(reqAdmin18080); err != nil || status != http.StatusNotFound {
+		t.Fatalf("18080 app.example.com /admin = (%d, %v), want 404 (must not fall through to wildcard backend)", status, err)
+	}
+
+	reqOther18080, _ := http.NewRequest(http.MethodGet, addr18080+"/", nil)
+	reqOther18080.Host = "other.example.com"
+	if status, _, err := doEnvoyRequest(reqOther18080); err != nil || status != http.StatusOK {
+		t.Fatalf("18080 other.example.com / = (%d, %v), want 200", status, err)
+	}
+
+	reqHealthNew, _ := http.NewRequest(http.MethodGet, addrNewPub+"/health", nil)
+	reqHealthNew.Host = "app.example.com"
+	if status, _, err := doEnvoyRequest(reqHealthNew); err != nil || status != http.StatusOK {
+		t.Fatalf("newPubPort (%d) app.example.com /health = (%d, %v), want 200", newPubPort, status, err)
+	}
+
+	// Simulate post-ACK re-translation (Status.Hostnames dropped legacy web-public) and push v2 to same Envoy.
+	in.CloudflareTunnel.Status.Hostnames[0].ProtectionDomain = newPubDomainName
+	in.CloudflareTunnel.Status.Hostnames[0].AppliedVersion = 2
+	gw2, _ := gatewayapi.Translate(in)
+	snap2, ver2 := buildDockerDynamicSnap(gw2)
+	if err := srv.SetSnapshot(ctx, gwKey.String(), snap2); err != nil {
+		t.Fatalf("SetSnapshot v2: %v", err)
+	}
+
+	wait2Ctx, wait2Cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer wait2Cancel()
+	if err := waitForHTTP(wait2Ctx, 200*time.Millisecond, func() (int, string, error) {
+		if !srv.IsACKedForNodes(gwKey.String(), ver2, []string{podID}) {
+			return 0, "", fmt.Errorf("waiting for v2 ACK")
+		}
+		req, _ := http.NewRequest(http.MethodGet, addr18080+"/health", nil)
+		req.Host = "app.example.com"
+		return doEnvoyRequest(req)
+	}, http.StatusForbidden); err != nil {
+		t.Fatalf("post-ACK 18080 app.example.com /health must return 403 Forbidden: %v\n%s", err, containerLogs(containerName))
+	}
+
+	if status, _, err := doEnvoyRequest(reqHealthNew); err != nil || status != http.StatusOK {
+		t.Fatalf("post-ACK newPubPort (%d) app.example.com /health = (%d, %v), want 200", newPubPort, status, err)
+	}
+	if status, _, err := doEnvoyRequest(reqOther18080); err != nil || status != http.StatusOK {
+		t.Fatalf("post-ACK 18080 other.example.com / = (%d, %v), want 200", status, err)
+	}
 }
