@@ -2218,6 +2218,117 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(privStatus).NotTo(gomega.BeNil())
 		gomega.Expect(privStatus.Binding).To(gomega.Equal(v1alpha1.ListenerBindingPodIP), "recovered Private listener must stay PodIP instead of reverting to Loopback")
 	})
+
+	// Removing a rejected unprotected PodIP Private listener (no AccessApplication)
+	// from CloudflareTunnel.Spec.Listeners while the Gateway stays Accepted=False
+	// must clear the stale PodIP entry in Status.Listeners, then settle to 0 writes.
+	ginkgo.It("Finding 3B: removing rejected unprotected PodIP Private listener from Spec.Listeners clears Status.Listeners when Gateway stays Accepted=False", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{
+			privateListener: true,
+		})
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"edge-a.example.com", "unprot.internal.example"}
+		acct.Spec.Grants[0].UnprotectedHostnames = []string{"unprot.internal.example"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		tunnel.Spec.Listeners = []v1alpha1.CloudflareTunnelListener{
+			{Name: "private", Exposure: v1alpha1.ExposurePrivate},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+		_, tunnelErr := f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		privHost := gatewayv1.Hostname("unprot.internal.example")
+		privListener := gw.Spec.Listeners[1]
+		privListener.Hostname = &privHost
+		privListener.Port = 8443
+		gw.Spec.Listeners = []gatewayv1.Listener{privListener}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		// Seed previously published, unprotected PodIP Private listener (no AccessApplication).
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		seedWriter := &GatewayReconciler{Client: f.direct, APIReader: f.direct, Scheme: f.direct.Scheme()}
+		seedIR := &ir.Gateway{Key: f.gatewayKey, UID: gw.UID}
+		gomega.Expect(seedWriter.patchTunnelGatewayData(
+			f.ctx, seedIR, &tunnel,
+			v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, Applied: 1, Remote: 1},
+			[]v1alpha1.CloudflareTunnelHostnameStatus{{
+				Hostname:         "unprot.internal.example",
+				ProtectionDomain: "private",
+				Guard:            v1alpha1.HostnameGuardUnprotected,
+				AppliedVersion:   1,
+			}},
+			[]v1alpha1.CloudflareTunnelListenerStatus{{
+				Name:     "private",
+				Exposure: v1alpha1.ExposurePrivate,
+				Binding:  v1alpha1.ListenerBindingPodIP,
+			}},
+		)).To(gomega.Succeed())
+
+		// Move sole Private listener to reserved port 18000 (Accepted=False) and drain dataplane.
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		gw.Spec.Listeners[0].Port = 18000
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dataplane-0", Namespace: f.gatewayKey.Namespace}})).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(f.direct.Get(f.ctx, types.NamespacedName{Namespace: f.gatewayKey.Namespace, Name: "dataplane-0"}, &corev1.Pod{}))
+		}, 10*time.Second, 50*time.Millisecond).Should(gomega.BeTrue())
+
+		// Pass 1: clears unprotected hostname while preserving PodIP in Status.Listeners.
+		_, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		acceptedCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		gomega.Expect(acceptedCond).NotTo(gomega.BeNil())
+		gomega.Expect(acceptedCond.Status).To(gomega.Equal(metav1.ConditionFalse))
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Hostnames).To(gomega.BeEmpty())
+		gomega.Expect(tunnel.Status.Listeners).To(gomega.Equal([]v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "private",
+			Exposure: v1alpha1.ExposurePrivate,
+			Binding:  v1alpha1.ListenerBindingPodIP,
+		}}))
+
+		// Pass 2 (unchanged): emits 0 status writes.
+		counter := &tunnelStatusWriteCounterClient{Client: f.direct, tunnelName: tunnel.Name}
+		f.reconciler.Client = counter
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(counter.writes.Load()).To(gomega.Equal(int64(0)))
+
+		// Remove "private" from CloudflareTunnel.Spec.Listeners while Gateway stays Accepted=False.
+		tunnel.Spec.Listeners = nil
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+		_, tunnelErr = f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+
+		writesBeforeRemove := counter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Listeners).To(gomega.BeEmpty(), "removing Private listener from Spec.Listeners must clear Status.Listeners even when Gateway stays Accepted=False")
+		writesAfterClear := counter.writes.Load()
+		gomega.Expect(writesAfterClear).To(gomega.Equal(writesBeforeRemove+2), "expected 1 condition write (Gen bump) + 1 data write clearing Status.Listeners")
+
+		// Two subsequent unchanged reconciles emit 0 Tunnel status writes.
+		for range 2 {
+			_, err = f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(counter.writes.Load()).To(gomega.Equal(writesAfterClear), "subsequent unchanged reconciles after clearing Status.Listeners must emit 0 writes")
+		}
+	})
 })
 
 // QA-1-REG-5 (controller): Mixed PodIP + Loopback and All-PodIP active Private

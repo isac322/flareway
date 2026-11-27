@@ -1388,9 +1388,7 @@ func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.Cloud
 	if hasForwardingHostname(tunnel.Status.Hostnames) {
 		return true
 	}
-	if !hasRetainedRevocationDomains(compiled.Domains) {
-		return false
-	}
+	retained := hasRetainedRevocationDomains(compiled.Domains)
 	// Rejected Gateways holding Public revocation claims must always keep the
 	// cloudflared freshness/drift gate active rather than short-circuiting once
 	// Blocked is written; reconcileCloudflaredConfiguration skips remote reads
@@ -1401,7 +1399,7 @@ func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.Cloud
 	// Refresh ConfigApplied=False/GatewayInvalid ObservedGeneration when a
 	// Tunnel spec change bumps Tunnel.Generation without changing hostnames or
 	// listeners so Private revocation acknowledgment does not stall.
-	if !hasPublicRetainedRevocationDomains(compiled.Domains) && !revocationDrainedGatewayInvalid(tunnel) {
+	if retained && !hasPublicRetainedRevocationDomains(compiled.Domains) && !revocationDrainedGatewayInvalid(tunnel) {
 		return true
 	}
 	desiredHostnames := desiredTunnelHostnames(compiled, tunnel.Status.ConfigVersion.Applied)
