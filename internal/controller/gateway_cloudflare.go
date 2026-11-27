@@ -893,6 +893,7 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 	if r.Invalidator == nil || gateway == nil || gateway.UID == "" || !gateway.DeletionTimestamp.IsZero() {
 		return
 	}
+	retireSeq := r.Invalidator.RetireSequence()
 	reader := r.directReader()
 	var tunnelKey types.NamespacedName
 	if tunnel != nil {
@@ -927,7 +928,7 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 	if !sameGatewayIdentity(gateway, selected) || !tunnelGatewayStatusIdentityMatches(&liveTunnel, gateway) {
 		return
 	}
-	forgetGate(r.Invalidator, configFreshnessKind, tunnelKey)
+	forgetGateForLiveTunnelUID(ctx, reader, r.Invalidator, configFreshnessKind, tunnelKey, liveTunnel.UID, retireSeq)
 }
 
 // remoteConfigFailure records ConfigApplied=False before returning a remote
@@ -943,35 +944,33 @@ func (r *GatewayReconciler) remoteConfigFailure(ctx context.Context, gateway *ir
 }
 
 // demoteTunnelConfigApplied commits ConfigApplied=False through the shared
-// conditions transaction after verifying live Tunnel UID and Gateway writer
-// ownership via uncached directReader. If the Tunnel is gone or replaced by a
-// new UID, stale latch entries are retired instead of stranding a "demoted"
-// entry on a deleted or replacement object.
+// conditions transaction (which validates live Tunnel UID/generation/mode and
+// Gateway writer ownership on every attempt) before updating the config
+// freshness latch. Missing Tunnels retire both latch keys; precondition
+// rejections (such as a replacement UID or lost writer ownership) leave the
+// replacement object's epoch/invalidation intact; transient write errors only
+// latch "demoted" if the same Tunnel UID is still live and unretired.
 func (r *GatewayReconciler) demoteTunnelConfigApplied(ctx context.Context, gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, now time.Time, reason, message string) error {
 	if tunnel == nil {
 		return errors.New("demoteTunnelConfigApplied requires an observed CloudflareTunnel")
 	}
 	key := client.ObjectKeyFromObject(tunnel)
-	var live v1alpha1.CloudflareTunnel
-	if err := r.directReader().Get(ctx, key, &live); err != nil {
-		if apierrors.IsNotFound(err) {
-			retireTunnelLatchKeys(r.Invalidator, key)
-		}
-		return fmt.Errorf("read live CloudflareTunnel %s before demotion: %w", key, err)
-	}
-	if live.UID != tunnel.UID {
-		r.Invalidator.Remove(configFreshnessKind, key)
-		return fmt.Errorf("CloudflareTunnel %s UID changed (%s -> %s)", key, tunnel.UID, live.UID)
-	}
-	if err := tunnelConditionIdentityCheck(tunnel, &live); err != nil {
-		return err
-	}
-	if err := r.gatewayTunnelConditionGuard(ctx, gateway, tunnel)(&live); err != nil {
-		return err
-	}
-	forgetGate(r.Invalidator, configFreshnessKind, key)
-	return r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
+	retireSeq := r.Invalidator.RetireSequence()
+	err := r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
 		gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, metav1.NewTime(now)))
+	switch {
+	case err == nil:
+		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, configFreshnessKind, key, tunnel.UID, retireSeq)
+		return nil
+	case apierrors.IsNotFound(err):
+		retireTunnelLatchKeys(r.Invalidator, key)
+		return err
+	case errors.Is(err, errTunnelConditionPrecondition):
+		return err
+	default:
+		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, configFreshnessKind, key, tunnel.UID, retireSeq)
+		return err
+	}
 }
 
 func (r *GatewayReconciler) cloudflareClient(ctx context.Context, account *v1alpha1.CloudflareAccount) (flarecloudflare.API, error) {
@@ -1299,7 +1298,7 @@ func (r *GatewayReconciler) patchTunnelGatewayConditionsValidated(
 	conditions ...metav1.Condition,
 ) error {
 	if tunnelConfigurationMode(tunnel) != v1alpha1.CloudflareTunnelConfigurationModeGateway {
-		return errors.New("the Gateway reconciler cannot own Direct-mode CloudflareTunnel status")
+		return fmt.Errorf("%w: the Gateway reconciler cannot own Direct-mode CloudflareTunnel status", errTunnelConditionPrecondition)
 	}
 	guard := r.gatewayTunnelConditionGuard(ctx, gateway, tunnel)
 	validate := func(live *v1alpha1.CloudflareTunnel) error {
@@ -1329,36 +1328,39 @@ func (r *GatewayReconciler) patchTunnelGatewayConditionsValidated(
 func (r *GatewayReconciler) gatewayTunnelConditionGuard(ctx context.Context, gateway *ir.Gateway, observed *v1alpha1.CloudflareTunnel) func(*v1alpha1.CloudflareTunnel) error {
 	return func(live *v1alpha1.CloudflareTunnel) error {
 		if gateway == nil || gateway.UID == "" || live == nil {
-			return errors.New("gateway Tunnel writer requires non-empty Gateway UID and Tunnel")
+			return fmt.Errorf("%w: gateway Tunnel writer requires non-empty Gateway UID and Tunnel", errTunnelConditionPrecondition)
 		}
 		reader := r.directReader()
 		var currentGateway gatewayv1.Gateway
 		if err := reader.Get(ctx, gateway.Key, &currentGateway); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("%w: revalidate Gateway %s before Tunnel conditions write: %w", errTunnelConditionPrecondition, gateway.Key, err)
+			}
 			return fmt.Errorf("revalidate Gateway %s before Tunnel conditions write: %w", gateway.Key, err)
 		}
 		if currentGateway.UID != gateway.UID || !currentGateway.DeletionTimestamp.IsZero() {
-			return fmt.Errorf("gateway %s UID %s is no longer the live writer", gateway.Key, gateway.UID)
+			return fmt.Errorf("%w: gateway %s UID %s is no longer the live writer", errTunnelConditionPrecondition, gateway.Key, gateway.UID)
 		}
 		if observed != nil &&
 			(live.Status.TunnelID != observed.Status.TunnelID ||
 				live.Status.AccountID != observed.Status.AccountID ||
 				live.Status.GatewayUID != observed.Status.GatewayUID ||
 				localRefName(live.Status.GatewayRef) != localRefName(observed.Status.GatewayRef)) {
-			return fmt.Errorf("CloudflareTunnel %s/%s remote or owner identity changed since this pass observed it", live.Namespace, live.Name)
+			return fmt.Errorf("%w: CloudflareTunnel %s/%s remote or owner identity changed since this pass observed it", errTunnelConditionPrecondition, live.Namespace, live.Name)
 		}
 		selected, _, waitingForDrain, err := selectLiveTunnelGateway(ctx, reader, live)
 		if err != nil {
 			return err
 		}
 		if waitingForDrain || !sameGatewayIdentity(&currentGateway, selected) || !tunnelGatewayStatusIdentityMatches(live, &currentGateway) {
-			return fmt.Errorf("gateway %s UID %s does not hold the current UID-bound Tunnel ownership", gateway.Key, gateway.UID)
+			return fmt.Errorf("%w: gateway %s UID %s does not hold the current UID-bound Tunnel ownership", errTunnelConditionPrecondition, gateway.Key, gateway.UID)
 		}
 		if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
 			live.Status.DeletedAt != nil ||
 			!live.Status.OwnershipVerified ||
 			live.Status.TunnelID == "" ||
 			live.Status.ConnectorTokenSecretRef == nil {
-			return fmt.Errorf("CloudflareTunnel %s/%s is not verified for managed Gateway writes", live.Namespace, live.Name)
+			return fmt.Errorf("%w: CloudflareTunnel %s/%s is not verified for managed Gateway writes", errTunnelConditionPrecondition, live.Namespace, live.Name)
 		}
 		return nil
 	}

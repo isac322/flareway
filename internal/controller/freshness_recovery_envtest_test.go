@@ -1464,30 +1464,56 @@ func TestQA2D1ExternalDNSTunnelsOpenT2GateEnvtest(t *testing.T) {
 	if err := direct.Create(ctx, directTunnel); err != nil {
 		t.Fatalf("create direct tunnel: %v", err)
 	}
-	waitUntilTrue(t, 10*time.Second, "Direct External DNS tunnel Ready=True", func() (bool, error) {
+	directKey := client.ObjectKeyFromObject(directTunnel)
+	tunnelReadyAndCached := func(c client.Reader, key types.NamespacedName) (bool, error) {
 		var cur v1alpha1.CloudflareTunnel
-		if err := direct.Get(ctx, client.ObjectKeyFromObject(directTunnel), &cur); err != nil {
+		if err := c.Get(ctx, key, &cur); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
 			return false, err
 		}
-		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, cur.Generation) &&
-			assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady, cur.Generation) &&
-			len(cur.Status.DNSRecords) == 0 &&
-			cur.Status.ConfigVersion.DesiredHash != "", nil
+		if !assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, cur.Generation) ||
+			!assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady, cur.Generation) ||
+			len(cur.Status.DNSRecords) != 0 ||
+			cur.Status.ConfigVersion.DesiredHash == "" ||
+			cur.Status.ConfigVersion.AppliedAt == nil {
+			return false, nil
+		}
+		if latch.IsInvalidated("CloudflareTunnel", key) {
+			return false, nil
+		}
+		_, verified := latch.VerifiedAt("CloudflareTunnel", key, cur.Status.ConfigVersion.DesiredHash)
+		return verified, nil
+	}
+	waitUntilTrue(t, 10*time.Second, "Direct External DNS tunnel Ready=True and cached", func() (bool, error) {
+		okDirect, err := tunnelReadyAndCached(direct, directKey)
+		if err != nil || !okDirect {
+			return false, err
+		}
+		return tunnelReadyAndCached(mgr.GetClient(), directKey)
 	})
 	var directStored v1alpha1.CloudflareTunnel
-	if err := direct.Get(ctx, client.ObjectKeyFromObject(directTunnel), &directStored); err != nil {
+	if err := direct.Get(ctx, directKey, &directStored); err != nil {
 		t.Fatalf("get direct tunnel: %v", err)
 	}
 	if !tunnelConvergedForGate(&directStored, account, []publicHostname{{Hostname: "direct.example.com", ZoneID: "zone-1"}}) {
 		t.Fatalf("tunnelConvergedForGate returned false for converged Direct External DNS tunnel with publicHosts")
 	}
-	callsBefore := len(tunnelFake.Calls())
-	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(directTunnel)}); err != nil {
+	directProbeFake := newFakeTunnelCloudflareFactory()
+	directProbeReconciler := &CloudflareTunnelReconciler{
+		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: directProbeFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if _, err := directProbeReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: directKey}); err != nil {
 		t.Fatalf("steady-state direct reconcile: %v", err)
 	}
-	newCalls := tunnelFake.Calls()[callsBefore:]
-	if slices.Contains(newCalls, "GetTunnel") || slices.Contains(newCalls, "GetTunnelConfiguration") {
-		t.Fatalf("Direct External DNS tunnel did not open T2 gate; remote calls: %v", newCalls)
+	if got := directProbeFake.Calls(); len(got) != 0 {
+		t.Fatalf("Direct External DNS tunnel did not open T2 gate; remote calls: %v", got)
 	}
 
 	// 2. Gateway-mode tunnel with dns.mode: External and publicHosts.
@@ -1549,19 +1575,12 @@ func TestQA2D1ExternalDNSTunnelsOpenT2GateEnvtest(t *testing.T) {
 		return snapshots.ACK(client.ObjectKeyFromObject(gw).String()) == nil, nil
 	})
 	gwTunnelKey := types.NamespacedName{Namespace: ns, Name: "gw-ext"}
-	waitUntilTrue(t, 15*time.Second, "Gateway External DNS tunnel Ready=True", func() (bool, error) {
-		var cur v1alpha1.CloudflareTunnel
-		if err := direct.Get(ctx, gwTunnelKey, &cur); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
+	waitUntilTrue(t, 15*time.Second, "Gateway External DNS tunnel Ready=True and cached", func() (bool, error) {
+		okDirect, err := tunnelReadyAndCached(direct, gwTunnelKey)
+		if err != nil || !okDirect {
 			return false, err
 		}
-		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, cur.Generation) &&
-			assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady, cur.Generation) &&
-			len(cur.Status.DNSRecords) == 0 &&
-			cur.Status.ConfigVersion.DesiredHash != "" &&
-			cur.Status.ConfigVersion.AppliedAt != nil, nil
+		return tunnelReadyAndCached(mgr.GetClient(), gwTunnelKey)
 	})
 	var gwTunnelStored v1alpha1.CloudflareTunnel
 	if err := direct.Get(ctx, gwTunnelKey, &gwTunnelStored); err != nil {
@@ -1570,13 +1589,20 @@ func TestQA2D1ExternalDNSTunnelsOpenT2GateEnvtest(t *testing.T) {
 	if !tunnelConvergedForGate(&gwTunnelStored, account, []publicHostname{{Hostname: "gw.example.com", ZoneID: "zone-1"}}) {
 		t.Fatalf("tunnelConvergedForGate returned false for converged Gateway External DNS tunnel with publicHosts")
 	}
-	gwCallsBefore := len(tunnelFake.Calls())
-	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwTunnelKey}); err != nil {
+	gwProbeFake := newFakeTunnelCloudflareFactory()
+	gwProbeReconciler := &CloudflareTunnelReconciler{
+		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: gwProbeFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if _, err := gwProbeReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwTunnelKey}); err != nil {
 		t.Fatalf("steady-state gateway tunnel reconcile: %v", err)
 	}
-	gwNewCalls := tunnelFake.Calls()[gwCallsBefore:]
-	if slices.Contains(gwNewCalls, "GetTunnel") || slices.Contains(gwNewCalls, "GetTunnelConfiguration") {
-		t.Fatalf("Gateway External DNS tunnel did not open T2 gate; remote calls: %v", gwNewCalls)
+	if got := gwProbeFake.Calls(); len(got) != 0 {
+		t.Fatalf("Gateway External DNS tunnel did not open T2 gate; remote calls: %v", got)
 	}
 }
 
@@ -4438,6 +4464,17 @@ type failingStatusClient struct {
 	staleApp            *v1alpha1.AccessApplication
 	staleGateway        *gatewayv1.Gateway
 	onStatusPatch       func(obj client.Object)
+	onList              func(list client.ObjectList)
+}
+
+func (c *failingStatusClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := c.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if c.onList != nil {
+		c.onList(list)
+	}
+	return nil
 }
 
 func (c *failingStatusClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -6175,7 +6212,7 @@ func TestStaleCacheNotFoundDoesNotRetireLiveTunnelLatchEnvtest(t *testing.T) {
 // is concurrently deleted OR replaced with a different UID MUST NOT strand a
 // "demoted" CloudflareTunnelConfig latch entry for the deleted/replaced Tunnel.
 func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnvtest(t *testing.T) {
-	setupScenario := func(t *testing.T, suffix string, onGetTunnel func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error) (context.Context, client.ObjectKey, *freshness.Latch) {
+	setupScenario := func(t *testing.T, suffix string, onGetTunnel func(ctx context.Context, direct client.Client, latch *freshness.Latch, tunnelKey client.ObjectKey) error) (context.Context, client.ObjectKey, *freshness.Latch) {
 		t.Helper()
 		_, mgr, direct, _ := startPR2EnvtestManager(t)
 		ctx := context.Background()
@@ -6338,7 +6375,7 @@ func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnv
 				return nil
 			}
 			hookFired = true
-			return onGetTunnel(ctx, direct, tunnelKey)
+			return onGetTunnel(ctx, direct, latch, tunnelKey)
 		}
 		if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err == nil {
 			t.Fatal("expected GetTunnel failure from hook")
@@ -6350,7 +6387,7 @@ func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnv
 	}
 
 	t.Run("deleted tunnel during GetTunnel retires latch without stranding demoted", func(t *testing.T) {
-		_, tunnelKey, latch := setupScenario(t, "del", func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error {
+		_, tunnelKey, latch := setupScenario(t, "del", func(ctx context.Context, direct client.Client, _ *freshness.Latch, tunnelKey client.ObjectKey) error {
 			var cur v1alpha1.CloudflareTunnel
 			if err := direct.Get(ctx, tunnelKey, &cur); err != nil {
 				return err
@@ -6372,8 +6409,9 @@ func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnv
 		}
 	})
 
-	t.Run("UID replaced tunnel during GetTunnel does not strand demoted latch", func(t *testing.T) {
-		_, tunnelKey, latch := setupScenario(t, "uid", func(ctx context.Context, direct client.Client, tunnelKey client.ObjectKey) error {
+	t.Run("UID replaced tunnel during GetTunnel preserves replacement UID2 epoch and invalidation", func(t *testing.T) {
+		var replacementEpoch uint64
+		_, tunnelKey, latch := setupScenario(t, "uid", func(ctx context.Context, direct client.Client, latch *freshness.Latch, tunnelKey client.ObjectKey) error {
 			var cur v1alpha1.CloudflareTunnel
 			if err := direct.Get(ctx, tunnelKey, &cur); err != nil {
 				return err
@@ -6397,10 +6435,210 @@ func TestRemoteConfigFailureAfterTunnelDeleteOrUIDReplaceLeavesNoDemotedLatchEnv
 			if err := direct.Create(ctx, replacement); err != nil {
 				return err
 			}
+			// Seed a fresh invalidation on replacement UID2 before UID1's GetTunnel error
+			// resolves; UID1's demoteTunnelConfigApplied precondition rejection MUST NOT
+			// wipe or overwrite UID2's epoch/invalidation.
+			latch.Invalidate("CloudflareTunnelConfig", tunnelKey, "replacement-drift")
+			replacementEpoch = latch.InvalidationEpoch("CloudflareTunnelConfig", tunnelKey)
 			return fmt.Errorf("injected GetTunnel failure after UID replacement")
 		})
-		if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
-			t.Fatal("CloudflareTunnelConfig demoted latch stranded for replacement Tunnel UID")
+		if !latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+			t.Fatal("UID1 demotion wiped replacement UID2 CloudflareTunnelConfig invalidation")
+		}
+		if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", tunnelKey); gotEpoch != replacementEpoch {
+			t.Fatalf("UID1 demotion modified replacement UID2 epoch: got %d, want %d", gotEpoch, replacementEpoch)
 		}
 	})
+}
+
+// Regression test: deleting UID1 and running CloudflareTunnelReconciler 2-key
+// retirement in the narrow window AFTER gatewayTunnelConditionGuard's
+// List(GatewayList) returns and BEFORE Status().Apply executes MUST return a
+// NotFound error and leave epoch == 0 and IsInvalidated == false (zero stale
+// latch recreation).
+func TestDemoteAfterGuardAndBeforeApplyDeleteDoesNotRecreateLatchEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-narrow-window"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-narrow-window"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg-narrow-window"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gc-narrow-window"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatal(err)
+	}
+	host := gatewayv1.Hostname("narrow.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-narrow"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	gwKey := client.ObjectKeyFromObject(gw)
+	tunnelKey := gwKey
+
+	innerAPI := &tunnelFreshnessGatewayAPI{accountID: account.Spec.AccountID, remoteVersion: 1}
+	gwAPI := &failingTunnelConfigCloudflareAPI{tunnelFreshnessGatewayAPI: innerAPI}
+	snapshots := newFakeSnapshotPublisher()
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	faultReader := &failingStatusClient{Client: direct}
+
+	gwReconciler := &GatewayReconciler{
+		Client:            mgr.GetClient(),
+		APIReader:         faultReader,
+		Scheme:            mgr.GetScheme(),
+		Snapshots:         snapshots,
+		OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+		Prober:            &staticGatewayProber{version: 2, ready: true},
+		Freshness:         policy,
+		Invalidator:       latch,
+	}
+	if err := gwReconciler.registerFieldIndexers(mgr); err != nil {
+		t.Fatal(err)
+	}
+	tunnelReconciler := &CloudflareTunnelReconciler{
+		Client:              direct,
+		APIReader:           direct,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: newFakeTunnelCloudflareFactory().Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if err := (&GatewayClassReconciler{Client: direct, Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		t.Fatal(err)
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "GatewayClass accepted", func() (bool, error) {
+		var curGC gatewayv1.GatewayClass
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(gc), &curGC); err != nil {
+			return false, nil
+		}
+		var curCfg v1alpha1.GatewayClassConfig
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(cfg), &curCfg); err != nil {
+			return false, nil
+		}
+		var curGW gatewayv1.Gateway
+		if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+			return false, nil
+		}
+		var curAcc v1alpha1.CloudflareAccount
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &curAcc); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(curGC.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted), curGC.Generation) &&
+			assertConditionTrueForCurrentGen(curAcc.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, curAcc.Generation), nil
+	})
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("bootstrap gw reconcile: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "tunnel created", func() (bool, error) {
+		var curT v1alpha1.CloudflareTunnel
+		return direct.Get(ctx, tunnelKey, &curT) == nil, nil
+	})
+	for i := 0; i < 3; i++ {
+		if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+			t.Fatalf("tunnel reconcile %d: %v", i, err)
+		}
+	}
+	var tunnelObj v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, tunnelKey, &tunnelObj); err != nil {
+		t.Fatal(err)
+	}
+	irGW := &ir.Gateway{
+		Key: gwKey,
+		UID: gw.UID,
+	}
+
+	// Arm onList hook on faultReader: when gatewayTunnelConditionGuard lists
+	// GatewayList (just before Status().Apply), concurrently delete UID1 and
+	// run CloudflareTunnelReconciler's confirmed-NotFound 2-key retirement.
+	var hooked atomic.Bool
+	var retireErr error
+	faultReader.onList = func(list client.ObjectList) {
+		if _, ok := list.(*gatewayv1.GatewayList); !ok || hooked.Swap(true) {
+			return
+		}
+		var cur v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, tunnelKey, &cur); err != nil {
+			retireErr = err
+			return
+		}
+		cur.Finalizers = nil
+		if err := direct.Update(ctx, &cur); err != nil {
+			retireErr = err
+			return
+		}
+		if err := direct.Delete(ctx, &cur); err != nil && !apierrors.IsNotFound(err) {
+			retireErr = err
+			return
+		}
+		waitUntilTrue(t, 10*time.Second, "UID1 gone from etcd inside guard window", func() (bool, error) {
+			var check v1alpha1.CloudflareTunnel
+			return apierrors.IsNotFound(direct.Get(ctx, tunnelKey, &check)), nil
+		})
+		_, retireErr = tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+	}
+
+	err := gwReconciler.demoteTunnelConfigApplied(ctx, irGW, &tunnelObj, time.Now(), "Applying", "applying")
+	if !hooked.Load() {
+		t.Fatal("expected gatewayTunnelConditionGuard GatewayList hook to fire")
+	}
+	if retireErr != nil {
+		t.Fatalf("tunnel Reconcile retirement error: %v", retireErr)
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected NotFound error from demoteTunnelConfigApplied after concurrent delete, got %v", err)
+	}
+	if latch.IsInvalidated("CloudflareTunnel", tunnelKey) || latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("narrow-window delete left stale invalidation latch after NotFound")
+	}
+	if epoch := latch.InvalidationEpoch("CloudflareTunnelConfig", tunnelKey); epoch != 0 {
+		t.Fatalf("narrow-window delete left non-zero epoch %d, want 0", epoch)
+	}
 }

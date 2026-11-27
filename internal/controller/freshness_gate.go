@@ -226,6 +226,41 @@ func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 	latch.Invalidate(kind, key, "demoted")
 }
 
+// forgetGateForLiveTunnelUID forgets cached verification/baseline state and
+// latches a "demoted" invalidation only when the live API server still holds
+// expectedUID for the CloudflareTunnel and no Remove happened since retireSeq.
+// If the Tunnel is already absent (NotFound), both tunnel latch keys are
+// retired; if the live UID changed, nothing is wiped or recreated so a
+// replacement Tunnel's epoch/invalidation stays intact.
+func forgetGateForLiveTunnelUID(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	kind string,
+	key types.NamespacedName,
+	expectedUID types.UID,
+	retireSeq uint64,
+) {
+	if latch == nil || reader == nil || expectedUID == "" {
+		return
+	}
+	var live v1alpha1.CloudflareTunnel
+	if err := reader.Get(ctx, key, &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			retireTunnelLatchKeys(latch, key)
+			return
+		}
+		// Transient uncached read failure while live status may be unconverged:
+		// fail closed only if no concurrent Remove retired the key.
+		latch.ForgetAndInvalidateIfUnretired(kind, key, retireSeq, "demoted")
+		return
+	}
+	if live.UID != expectedUID {
+		return
+	}
+	latch.ForgetAndInvalidateIfUnretired(kind, key, retireSeq, "demoted")
+}
+
 // statusConverged reports whether the object's live status is converged on the
 // current generation with every required condition set to True.
 func statusConverged(generation, observedGeneration int64, conditions []metav1.Condition, required ...string) bool {

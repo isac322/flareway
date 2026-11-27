@@ -53,6 +53,7 @@ type latchKey struct {
 type Latch struct {
 	mu        sync.RWMutex
 	nextEpoch uint64
+	retireSeq uint64
 	epochs    map[latchKey]uint64
 	reasons   map[latchKey]string
 	verified  map[latchKey]verification
@@ -210,6 +211,46 @@ func (l *Latch) Forget(kind string, key types.NamespacedName) {
 	delete(l.confirmed, k)
 }
 
+// RetireSequence returns the monotonic counter incremented every time Remove
+// retires an object from the latch. Callers capture it before checking live
+// Kubernetes existence so a concurrent Remove prevents recreating stale state.
+func (l *Latch) RetireSequence() uint64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.retireSeq
+}
+
+// ForgetAndInvalidateIfUnretired atomically forgets verified/baseline state and
+// marks the object invalidated only if no Remove occurred since expectedRetireSeq
+// was captured. Reports whether the update applied.
+func (l *Latch) ForgetAndInvalidateIfUnretired(kind string, key types.NamespacedName, expectedRetireSeq uint64, reason string) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.retireSeq != expectedRetireSeq {
+		return false
+	}
+	if l.epochs == nil {
+		l.epochs = make(map[latchKey]uint64)
+	}
+	if l.reasons == nil {
+		l.reasons = make(map[latchKey]string)
+	}
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	l.nextEpoch++
+	l.epochs[k] = l.nextEpoch
+	l.reasons[k] = reason
+	delete(l.verified, k)
+	delete(l.baselines, k)
+	delete(l.confirmed, k)
+	return true
+}
+
 // Remove drops every record for an object that no longer exists, so a
 // cluster that keeps creating and deleting objects does not grow the latch.
 // A recreated object starts with nothing recorded, which only closes its gate.
@@ -219,6 +260,7 @@ func (l *Latch) Remove(kind string, key types.NamespacedName) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.retireSeq++
 	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
 	delete(l.epochs, k)
 	delete(l.reasons, k)

@@ -167,19 +167,21 @@ func patchTunnelConditionsChecked(ctx context.Context, c client.Client, reader c
 	return false, fmt.Errorf("apply CloudflareTunnel %s conditions: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
 }
 
+var errTunnelConditionPrecondition = errors.New("tunnel condition precondition failed")
+
 // tunnelConditionIdentityCheck enforces the shared Tier-1 precondition: the
 // live object must still be the same tunnel (UID), the same spec revision
 // (generation), and the same configuration mode the caller observed. Writer
 // ownership gates are caller-specific and belong in tunnelConditionUpdate.Validate.
 func tunnelConditionIdentityCheck(observed, live *v1alpha1.CloudflareTunnel) error {
 	if live.UID != observed.UID {
-		return fmt.Errorf("CloudflareTunnel %s/%s UID changed from %s to %s; aborting conditions write", observed.Namespace, observed.Name, observed.UID, live.UID)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s UID changed from %s to %s; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, observed.UID, live.UID)
 	}
 	if live.Generation != observed.Generation {
-		return fmt.Errorf("CloudflareTunnel %s/%s generation changed from %d to %d; aborting conditions write", observed.Namespace, observed.Name, observed.Generation, live.Generation)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s generation changed from %d to %d; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, observed.Generation, live.Generation)
 	}
 	if mode := tunnelConfigurationMode(live); mode != tunnelConfigurationMode(observed) {
-		return fmt.Errorf("CloudflareTunnel %s/%s configuration mode changed to %s; aborting conditions write", observed.Namespace, observed.Name, mode)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s configuration mode changed to %s; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, mode)
 	}
 	return nil
 }

@@ -101,3 +101,60 @@ func TestLatchCompleteVerificationRespectsInvalidationEpoch(t *testing.T) {
 		t.Fatal("pre-Remove epoch2 cleared post-Remove invalidation")
 	}
 }
+
+func TestLatchRetireSequenceAndForgetAndInvalidateIfUnretired(t *testing.T) {
+	latch := NewLatch()
+	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+	var nilLatch *Latch
+	if got := nilLatch.RetireSequence(); got != 0 {
+		t.Fatalf("nil Latch RetireSequence = %d, want 0", got)
+	}
+	if nilLatch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, 0, "demoted") {
+		t.Fatal("nil Latch ForgetAndInvalidateIfUnretired returned true")
+	}
+
+	seq0 := latch.RetireSequence()
+	latch.MarkVerified("CloudflareTunnelConfig", key, "h1", now)
+	latch.SetBaseline("CloudflareTunnelConfig", key, "h1", func(any) bool { return true })
+	if !latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seq0, "demoted") {
+		t.Fatal("ForgetAndInvalidateIfUnretired returned false for matching retireSeq")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", key) {
+		t.Fatal("expected invalidation latch after ForgetAndInvalidateIfUnretired")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", key, "h1"); ok {
+		t.Fatal("expected ForgetAndInvalidateIfUnretired to clear VerifiedAt")
+	}
+	if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", key); gotEpoch == 0 {
+		t.Fatal("expected non-zero InvalidationEpoch after ForgetAndInvalidateIfUnretired")
+	}
+
+	// Simulate retirement via Remove on another key or same key -> advances retireSeq.
+	latch.Remove("CloudflareTunnel", key)
+	latch.Remove("CloudflareTunnelConfig", key)
+	seqAfterRemove := latch.RetireSequence()
+	if seqAfterRemove <= seq0 {
+		t.Fatalf("RetireSequence did not advance on Remove: before=%d after=%d", seq0, seqAfterRemove)
+	}
+
+	// Stale pre-Remove retireSeq MUST NOT recreate invalidation or touch epochs.
+	if latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seq0, "demoted") {
+		t.Fatal("ForgetAndInvalidateIfUnretired succeeded with stale retireSeq")
+	}
+	if latch.IsInvalidated("CloudflareTunnelConfig", key) {
+		t.Fatal("stale ForgetAndInvalidateIfUnretired recreated invalidation after Remove")
+	}
+	if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", key); gotEpoch != 0 {
+		t.Fatalf("stale ForgetAndInvalidateIfUnretired set epoch=%d, want 0", gotEpoch)
+	}
+
+	// Current retireSeq succeeds.
+	if !latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seqAfterRemove, "demoted") {
+		t.Fatal("ForgetAndInvalidateIfUnretired failed with current retireSeq")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", key) {
+		t.Fatal("expected invalidation latch with current retireSeq")
+	}
+}
