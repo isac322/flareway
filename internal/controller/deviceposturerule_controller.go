@@ -118,7 +118,7 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	}
 	description += name
 
-	connectionID, err := r.resolveIntegrationID(ctx, object, account, api)
+	connectionID, err := r.resolveIntegrationID(ctx, object, account, nil)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, nil, object.Status.RuleID, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -137,6 +137,9 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	if err := verifyExternalDevicePostureIntegration(ctx, object, api); err != nil {
+		return ctrl.Result{}, r.patchStatus(ctx, object, nil, object.Status.RuleID, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	id := object.Status.RuleID
@@ -195,16 +198,10 @@ func (r *DevicePostureRuleReconciler) resolveIntegrationID(ctx context.Context, 
 		return "", nil
 	}
 	if ref.ExternalID != "" {
-		integrationAPI, ok := api.(flarecloudflare.DevicePostureIntegrationAPI)
-		if !ok {
-			return "", errors.New("the Cloudflare client does not support device posture integrations")
-		}
-		remote, err := integrationAPI.GetDevicePostureIntegration(ctx, ref.ExternalID)
-		if err != nil {
-			return "", fmt.Errorf("validate external DevicePostureIntegration: %w", err)
-		}
-		if expected, ok := devicePostureIntegrationTypeForRule(object.Spec.Type); ok && remote.Type != expected {
-			return "", fmt.Errorf("the DevicePostureIntegration type %q is not valid for %s; want %q", remote.Type, object.Spec.Type, expected)
+		if api != nil {
+			if err := verifyExternalDevicePostureIntegration(ctx, object, api); err != nil {
+				return "", err
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -229,6 +226,25 @@ func (r *DevicePostureRuleReconciler) resolveIntegrationID(ctx context.Context, 
 		return "", errors.New("referenced DevicePostureIntegration is not ready")
 	}
 	return integration.Status.IntegrationID, nil
+}
+
+func verifyExternalDevicePostureIntegration(ctx context.Context, object *v1alpha1.DevicePostureRule, api flarecloudflare.AccessAPI) error {
+	ref := object.Spec.Input.IntegrationRef
+	if ref == nil || ref.ExternalID == "" {
+		return nil
+	}
+	integrationAPI, ok := api.(flarecloudflare.DevicePostureIntegrationAPI)
+	if !ok {
+		return errors.New("the Cloudflare client does not support device posture integrations")
+	}
+	remote, err := integrationAPI.GetDevicePostureIntegration(ctx, ref.ExternalID)
+	if err != nil {
+		return fmt.Errorf("validate external DevicePostureIntegration: %w", err)
+	}
+	if expected, ok := devicePostureIntegrationTypeForRule(object.Spec.Type); ok && remote.Type != expected {
+		return fmt.Errorf("the DevicePostureIntegration type %q is not valid for %s; want %q", remote.Type, object.Spec.Type, expected)
+	}
+	return nil
 }
 
 func devicePostureIntegrationTypeForRule(ruleType v1alpha1.DevicePostureRuleType) (v1alpha1.DevicePostureIntegrationType, bool) {

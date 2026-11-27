@@ -52,7 +52,13 @@ import (
 	"github.com/isac322/flareway/internal/observability"
 )
 
-const cloudflareConvergenceTimeout = 30 * time.Second
+const (
+	cloudflareConvergenceTimeout = 30 * time.Second
+	// gatewayZeroFreshnessRequeue bounds periodic tunnel configuration drift
+	// checks when traffic freshness is disabled (0), while leaving short
+	// post-convergence quiescence windows free of immediate timer churn.
+	gatewayZeroFreshnessRequeue = 10 * time.Second
+)
 
 // errTunnelConvergenceLost marks promotion-guard failures caused by lost
 // convergence evidence that is ordinary pending, not a fault: the compiled
@@ -831,9 +837,9 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	}
 	if result.appliedAt != nil {
 		// The remote state was freshly confirmed or written: release any
-		// sweep invalidation, record the verify time, and requeue at the
-		// freshness horizon so the next pass re-evaluates the gate exactly
-		// when it expires (D10).
+		// sweep invalidation, record the verify time, and record the
+		// freshness horizon (0 when disabled so timed-out pending waits do
+		// not fall back to periodic polling).
 		clearGate(r.Invalidator, configFreshnessKind, gateKey)
 		r.Invalidator.MarkVerified(configFreshnessKind, gateKey, hash, now)
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)

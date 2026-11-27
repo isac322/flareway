@@ -248,12 +248,16 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := r.patchAccessPolicyStatus(ctx, object, &remote, owned, nil, metav1.ConditionTrue, "Ready", "Access policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sweep's policy listing carries every field AccessPolicyMatchesInput
-	// compares; rule references are resolved before the gate on every pass.
-	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
-		policy, ok := listed.(flarecloudflare.AccessPolicy)
-		return ok && policy.ID == remote.ID && flarecloudflare.AccessPolicyMatchesInput(policy, input)
-	}, remote))
+	// The sweep's policy listing checks only the policy payload itself; when
+	// rules reference un-listed external IDs, skip parent-only content
+	// confirmation so bounded TTL re-verification detects deleted dependencies.
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if !hasExternalAccessRules(object.Spec.Include, object.Spec.Require, object.Spec.Exclude) {
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			policy, ok := listed.(flarecloudflare.AccessPolicy)
+			return ok && policy.ID == remote.ID && flarecloudflare.AccessPolicyMatchesInput(policy, input)
+		}, remote))
+	}
 	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}

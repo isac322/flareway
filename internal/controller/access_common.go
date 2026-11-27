@@ -157,6 +157,30 @@ func resolveAccessRules(ctx context.Context, kube client.Client, namespace strin
 	return result, nil
 }
 
+func hasExternalAccessRules(ruleSets ...[]v1alpha1.AccessRule) bool {
+	for _, rules := range ruleSets {
+		for i := range rules {
+			if hasExternalAccessRule(rules[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasExternalAccessRule(rule v1alpha1.AccessRule) bool {
+	if rule.Group != nil && rule.Group.GroupRef.ExternalID != "" {
+		return true
+	}
+	if idpRef := accessRuleIDPRef(rule); idpRef != nil && idpRef.ExternalID != "" {
+		return true
+	}
+	if rule.ServiceToken != nil && rule.ServiceToken.TokenRef.ExternalID != "" {
+		return true
+	}
+	return rule.DevicePosture != nil && rule.DevicePosture.RuleRef.ExternalID != ""
+}
+
 func verifyExternalAccessRules(ctx context.Context, api flarecloudflare.AccessAPI, ruleSets ...[]v1alpha1.AccessRule) error {
 	for _, rules := range ruleSets {
 		for i := range rules {

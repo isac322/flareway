@@ -178,12 +178,16 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sweep's group listing carries every field accessGroupMatchesInput
-	// compares; rule references are resolved before the gate on every pass.
-	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
-		group, ok := listed.(flarecloudflare.AccessGroup)
-		return ok && group.ID == remote.ID && accessGroupMatchesInput(group, input)
-	}, remote))
+	// The sweep's group listing checks only the group payload itself; when
+	// rules reference un-listed external IDs, skip parent-only content
+	// confirmation so bounded TTL re-verification detects deleted dependencies.
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if !hasExternalAccessRules(object.Spec.Include, object.Spec.Require, object.Spec.Exclude) {
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			group, ok := listed.(flarecloudflare.AccessGroup)
+			return ok && group.ID == remote.ID && accessGroupMatchesInput(group, input)
+		}, remote))
+	}
 	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
 		return ctrl.Result{}, err
 	}

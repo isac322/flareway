@@ -99,7 +99,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
-	input, err := r.resolveOrganizationInput(ctx, object, account, api)
+	input, err := r.resolveOrganizationInput(ctx, object, account, nil)
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
@@ -108,7 +108,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		if scope.ZoneID != "" {
 			return r.finishError(ctx, object, privateInvalid("Invalid", "spec.doh is account-scoped and cannot be used with spec.zone"))
 		}
-		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, api, object.Spec.DOH.ServiceTokenRef)
+		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, nil, object.Spec.DOH.ServiceTokenRef)
 		if resolveErr != nil {
 			return r.finishError(ctx, object, resolveErr)
 		}
@@ -133,6 +133,9 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
+	}
+	if err := verifyOrganizationExternalRefs(ctx, object, api); err != nil {
+		return r.finishError(ctx, object, err)
 	}
 
 	observed, err := api.GetAccessOrganization(ctx, scope)
@@ -258,10 +261,33 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationInput(ctx context.C
 	return input, nil
 }
 
+func verifyOrganizationExternalRefs(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, api flarecloudflare.OrganizationAPI) error {
+	if object.Spec.CustomPages != nil {
+		if ref := object.Spec.CustomPages.Forbidden; ref != nil && ref.ExternalID != "" {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return fmt.Errorf("resolve forbidden custom page: validate external AccessCustomPage: %w", err)
+			}
+		}
+		if ref := object.Spec.CustomPages.IdentityDenied; ref != nil && ref.ExternalID != "" {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return fmt.Errorf("resolve identity-denied custom page: validate external AccessCustomPage: %w", err)
+			}
+		}
+	}
+	if object.Spec.DOH != nil && object.Spec.DOH.ServiceTokenRef.ExternalID != "" {
+		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, object.Spec.DOH.ServiceTokenRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external ServiceToken: %w", err)
+		}
+	}
+	return nil
+}
+
 func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, account *v1alpha1.CloudflareAccount, api flarecloudflare.OrganizationAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external AccessCustomPage: %w", err)
+		if api != nil {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external AccessCustomPage: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -284,8 +310,10 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx co
 
 func (r *ZeroTrustOrganizationReconciler) resolveOrganizationServiceTokenID(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, account *v1alpha1.CloudflareAccount, api flarecloudflare.OrganizationAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external ServiceToken: %w", err)
+		if api != nil {
+			if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external ServiceToken: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}

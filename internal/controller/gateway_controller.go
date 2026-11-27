@@ -752,7 +752,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if pending {
 		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
-	return ctrl.Result{RequeueAfter: cloudflareResult.requeue}, nil
+	requeue := cloudflareResult.requeue
+	if !compiled.ConformanceMode && cloudflareResult.appliedAt != nil {
+		requeue = convergedRequeue(r.Freshness, freshness.GradeTraffic, gatewayZeroFreshnessRequeue)
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 func (r *GatewayReconciler) rejectDirectTunnelAttachment(

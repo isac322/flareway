@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	zero_trust "github.com/cloudflare/cloudflare-go/v7/zero_trust"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -315,9 +316,12 @@ func TestQA2C1All19GatedCRDsRecoverUnderActiveSweepEnvtest(t *testing.T) {
 	orgFake := new(fakeGlobalOrganizationCloudflare)
 	gatewayFake := newFakeGlobalGatewayCloudflare()
 	tunnelFake := newFakeTunnelCloudflareFactory()
-	gwAPI := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1}
+	prober := &liveRemoteVersionProber{version: 2}
+	gwAPI := &reg1GatewayAPI{
+		tunnelFreshnessGatewayAPI: &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1},
+		prober:                    prober,
+	}
 	snapshots := newFakeSnapshotPublisher()
-	prober := &staticGatewayProber{version: 2, ready: true}
 
 	for _, err := range []error{
 		(&AccessPolicyReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch}).SetupWithManager(mgr),
@@ -1571,9 +1575,156 @@ func TestQA2D1ExternalDNSTunnelsOpenT2GateEnvtest(t *testing.T) {
 	}
 }
 
+type liveRemoteVersionProber struct {
+	mu      sync.Mutex
+	version int64
+}
+
+func (p *liveRemoteVersionProber) set(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.version = v
+}
+
+func (p *liveRemoteVersionProber) ConfigVersion(context.Context, string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.version, nil
+}
+
+func (p *liveRemoteVersionProber) Ready(context.Context, string) error {
+	return nil
+}
+
+type reg1GatewayAPI struct {
+	*tunnelFreshnessGatewayAPI
+	mu     sync.Mutex
+	prober *liveRemoteVersionProber
+}
+
+func (a *reg1GatewayAPI) GetTunnel(ctx context.Context, tunnelID string) (flarecloudflare.Tunnel, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tunnelFreshnessGatewayAPI.GetTunnel(ctx, tunnelID)
+}
+
+func (a *reg1GatewayAPI) GetTunnelConfiguration(ctx context.Context, tunnelID string) (flarecloudflare.TunnelConfiguration, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tunnelFreshnessGatewayAPI.GetTunnelConfiguration(ctx, tunnelID)
+}
+
+func (a *reg1GatewayAPI) UpdateTunnelConfiguration(ctx context.Context, tunnelID string, params zero_trust.TunnelCloudflaredConfigurationUpdateParams) (flarecloudflare.TunnelConfiguration, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, err := a.tunnelFreshnessGatewayAPI.UpdateTunnelConfiguration(ctx, tunnelID, params)
+	if err == nil && a.prober != nil {
+		a.prober.set(cfg.Version)
+	}
+	return cfg, err
+}
+
+type reg1OrganizationAPI struct {
+	mu           sync.Mutex
+	organization flarecloudflare.Organization
+	doh          *flarecloudflare.OrganizationDOHSettings
+	calls        []string
+}
+
+func (f *reg1OrganizationAPI) Client(_, _ string) (flarecloudflare.OrganizationAPI, error) {
+	return f, nil
+}
+
+func (f *reg1OrganizationAPI) GetOrganization(context.Context) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetOrganization")
+	return f.organization, nil
+}
+
+func (f *reg1OrganizationAPI) UpdateOrganization(_ context.Context, _ flarecloudflare.OrganizationInput) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "UpdateOrganization")
+	return f.organization, nil
+}
+
+func (f *reg1OrganizationAPI) GetAccessOrganization(context.Context, flarecloudflare.AccessScope) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessOrganization")
+	if f.organization.AuthDomain == "" {
+		return flarecloudflare.Organization{}, globalOrganizationNotFound()
+	}
+	return f.organization, nil
+}
+
+func (f *reg1OrganizationAPI) CreateAccessOrganization(_ context.Context, _ flarecloudflare.AccessScope, input flarecloudflare.OrganizationCreateInput) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "CreateAccessOrganization")
+	org := flarecloudflare.Organization{AuthDomain: input.AuthDomain}
+	applyFakeOrganizationInput(&org, input.OrganizationInput)
+	f.organization = org
+	return org, nil
+}
+
+func (f *reg1OrganizationAPI) UpdateAccessOrganization(_ context.Context, _ flarecloudflare.AccessScope, input flarecloudflare.OrganizationInput) (flarecloudflare.Organization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "UpdateAccessOrganization")
+	applyFakeOrganizationInput(&f.organization, input)
+	return f.organization, nil
+}
+
+func (f *reg1OrganizationAPI) RevokeAccessOrganizationUser(context.Context, flarecloudflare.AccessScope, flarecloudflare.OrganizationUserRevocationInput) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "RevokeAccessOrganizationUser")
+	return true, nil
+}
+
+func (f *reg1OrganizationAPI) GetAccessOrganizationDOH(context.Context) (flarecloudflare.OrganizationDOHSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessOrganizationDOH")
+	if f.doh == nil {
+		return flarecloudflare.OrganizationDOHSettings{}, globalOrganizationNotFound()
+	}
+	return *f.doh, nil
+}
+
+func (f *reg1OrganizationAPI) UpdateAccessOrganizationDOH(_ context.Context, input flarecloudflare.OrganizationDOHInput) (flarecloudflare.OrganizationDOHSettings, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "UpdateAccessOrganizationDOH")
+	doh := flarecloudflare.OrganizationDOHSettings{ServiceTokenID: input.ServiceTokenID}
+	if input.JWTDuration != nil {
+		doh.JWTDuration = *input.JWTDuration
+	}
+	f.doh = &doh
+	return doh, nil
+}
+
+func (f *reg1OrganizationAPI) GetAccessCustomPage(context.Context, string) (flarecloudflare.AccessCustomPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetAccessCustomPage")
+	return flarecloudflare.AccessCustomPage{ID: "ext-cp-reg1", Name: "ext-cp-reg1", Type: v1alpha1.AccessCustomPageTypeForbidden}, nil
+}
+
+func (f *reg1OrganizationAPI) GetServiceToken(context.Context, flarecloudflare.AccessScope, string) (flarecloudflare.ServiceToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "GetServiceToken")
+	return flarecloudflare.ServiceToken{ID: "ext-st-reg1", Name: "ext-st-reg1"}, nil
+}
+
 // QA-2-REG-1: Steady-state 0 remote reads and 0 K8s status write requests for
-// healthy converged resources across gated CRDs (under active Sweep ConfirmContent),
-// Direct External DNS CloudflareTunnel, and Gateway CloudflareTunnelConfig.
+// healthy converged resources across ALL 19 ordinary gated CRDs (including SCIM
+// IdentityProvider, Gateway-backed AccessApplication, external-ref AccessPolicy,
+// external-ref DevicePostureRule, external-ref ZeroTrustOrganization, and
+// sweep-confirmed variants), Direct External DNS CloudflareTunnel, and Gateway.
 func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
@@ -1581,6 +1732,7 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	latch := freshness.NewLatch()
 	policy := freshness.DefaultPolicy()
 	const accountID = "0123456789abcdef0123456789abcdef"
+
 	store := newFakeAccessResourceCloudflare()
 	extGroup, err := store.CreateAccessGroup(ctx, flarecloudflare.AccessScope{}, flarecloudflare.AccessGroupInput{
 		Name: "ext-grp-reg1", Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}},
@@ -1588,78 +1740,196 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed external AccessGroup: %v", err)
 	}
-	remote := &recordingAccessAPI{AccessAPI: store}
+	integrationBase := &fakeDevicePostureIntegrationCloudflare{
+		integrations: map[string]flarecloudflare.DevicePostureIntegration{
+			"ext-tanium-1": {ID: "ext-tanium-1", Name: "ext-tanium", Type: v1alpha1.DevicePostureIntegrationTypeTaniumS2S},
+		},
+	}
+	remote := &countingAccessExtendedAPI{
+		recordingAccessAPI: &recordingAccessAPI{AccessAPI: store},
+		integrations:       integrationBase,
+	}
+	standaloneBase := &fakeStandaloneCloudflare{applications: map[string]flarecloudflare.AccessApplication{}, tags: map[string]flarecloudflare.AccessTag{}}
+	standaloneRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: standaloneBase}}
+	infraBase := &fakeInfrastructureTargetCloudflare{targets: map[string]flarecloudflare.AccessInfrastructureTarget{}}
+	infraRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: infraBase}}
+	customPageBase := newFakeCustomPageCloudflare()
+	customPageRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: customPageBase}}
+	integrationRemote := &countingAccessExtendedAPI{
+		recordingAccessAPI: &recordingAccessAPI{AccessAPI: store},
+		integrations:       integrationBase,
+	}
 	idpFake := &scimIdentityProviderFakeAPI{identityProviderFakeAPI: &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}}
 	idpRemote := &recordingAccessAPI{AccessAPI: idpFake}
+	appFake := newFakeAccessApplicationCloudflare()
 	privateFake := newFakePrivateNetworkCloudflare()
+	gatewayFake := newFakeGlobalGatewayCloudflare()
+	profileBase := newFakeDeviceProfileCloudflare()
+	profileRemote := &countingDeviceProfileAPI{DeviceProfileAPI: profileBase}
+	deviceSettingsFake := new(fakeGlobalDeviceCloudflare)
+	warpBase := &accountMatchedWARPCloudflare{
+		fakeWARPConnectorCloudflare: newFakeWARPConnectorCloudflare(),
+		accountID:                   accountID,
+	}
+	warpRemote := &countingWARPConnectorAPI{WARPConnectorAPI: warpBase}
+	orgFake := new(reg1OrganizationAPI)
 	tunnelFake := newFakeTunnelCloudflareFactory()
-	gwAPI := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1}
+	prober := &liveRemoteVersionProber{version: 2}
+	gwAPI := &reg1GatewayAPI{
+		tunnelFreshnessGatewayAPI: &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1},
+		prober:                    prober,
+	}
 	snapshots := newFakeSnapshotPublisher()
-	prober := &staticGatewayProber{version: 2, ready: true}
+
 	var statusWrites atomic.Int64
 	countingClient := &statusWriteCountingClient{
 		Client: mgr.GetClient(),
 		writes: &statusWrites,
 	}
 
-	reconciler := &AccessPolicyReconciler{
+	type gatedCheck struct {
+		name      string
+		reconcile func(context.Context, ctrl.Request) (ctrl.Result, error)
+		key       types.NamespacedName
+	}
+
+	polReconciler := &AccessPolicyReconciler{
 		Client: countingClient, Scheme: mgr.GetScheme(),
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
-		Freshness:           policy,
-		Invalidator:         latch,
+		Freshness:           policy, Invalidator: latch,
 	}
-	vnetReconciler := &VirtualNetworkReconciler{
+	grpReconciler := &AccessGroupReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	standaloneReconciler := &AccessStandaloneApplicationReconciler{
 		Client: countingClient, Scheme: mgr.GetScheme(),
-		NewCloudflareClient: privateFake.Client,
-		Freshness:           policy,
-		Invalidator:         latch,
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneRemote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	infraReconciler := &AccessInfrastructureTargetReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return infraRemote, nil },
+		Freshness:           policy, Invalidator: latch,
 	}
 	idpReconciler := &IdentityProviderReconciler{
 		Client: countingClient, Scheme: mgr.GetScheme(),
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return idpRemote, nil },
-		Freshness:           policy,
-		Invalidator:         latch,
+		Freshness:           policy, Invalidator: latch,
+	}
+	appReconciler := &AccessApplicationReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		OperatorNamespace:   dataplane.DefaultOperatorNamespace,
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	vnetReconciler := &VirtualNetworkReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: privateFake.Client,
+		Freshness:           policy, Invalidator: latch,
+	}
+	nrReconciler := &NetworkRouteReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: privateFake.Client,
+		Freshness:           policy, Invalidator: latch,
+	}
+	hrReconciler := &HostnameRouteReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		OperatorNamespace:   dataplane.DefaultOperatorNamespace,
+		NewCloudflareClient: privateFake.Client,
+		Freshness:           policy, Invalidator: latch,
+	}
+	gwPolReconciler := &ZeroTrustGatewayPolicyReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: gatewayFake.Client,
+		Freshness:           policy, Invalidator: latch,
 	}
 	stReconciler := &ServiceTokenReconciler{
 		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
-		Freshness:           policy,
-		Invalidator:         latch,
+		Freshness:           policy, Invalidator: latch,
+	}
+	cpReconciler := &AccessCustomPageReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return customPageRemote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	dprReconciler := &DevicePostureRuleReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	dpiReconciler := &DevicePostureIntegrationReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return integrationRemote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	dpReconciler := &DeviceProfileReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.DeviceProfileAPI, error) { return profileRemote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	dsReconciler := &DeviceSettingsReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: deviceSettingsFake.Client,
+		Freshness:           policy, Invalidator: latch,
+	}
+	wcReconciler := &WARPConnectorReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.WARPConnectorAPI, error) { return warpRemote, nil },
+		Freshness:           policy, Invalidator: latch,
+	}
+	ztListReconciler := &ZeroTrustListReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: gatewayFake.Client,
+		Freshness:           policy, Invalidator: latch,
+	}
+	orgReconciler := &ZeroTrustOrganizationReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: orgFake.Client,
+		Freshness:           policy, Invalidator: latch,
 	}
 	tunnelReconciler := &CloudflareTunnelReconciler{
 		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		NewCloudflareClient: tunnelFake.Client,
-		Freshness:           policy,
-		Invalidator:         latch,
+		Freshness:           policy, Invalidator: latch,
 	}
 	gwReconciler := &GatewayReconciler{
 		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace,
 		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
 		Prober:            prober,
-		Freshness:         policy,
-		Invalidator:       latch,
+		Freshness:         policy, Invalidator: latch,
 	}
-	if err := reconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup policy reconciler: %v", err)
-	}
-	if err := vnetReconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup vnet reconciler: %v", err)
-	}
-	if err := idpReconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup idp reconciler: %v", err)
-	}
-	if err := stReconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup servicetoken reconciler: %v", err)
-	}
-	if err := tunnelReconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup tunnel reconciler: %v", err)
-	}
-	if err := (&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup gwclass reconciler: %v", err)
-	}
-	if err := gwReconciler.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup gw reconciler: %v", err)
+
+	for _, err := range []error{
+		polReconciler.SetupWithManager(mgr),
+		grpReconciler.SetupWithManager(mgr),
+		standaloneReconciler.SetupWithManager(mgr),
+		infraReconciler.SetupWithManager(mgr),
+		idpReconciler.SetupWithManager(mgr),
+		appReconciler.SetupWithManager(mgr),
+		vnetReconciler.SetupWithManager(mgr),
+		nrReconciler.SetupWithManager(mgr),
+		hrReconciler.SetupWithManager(mgr),
+		gwPolReconciler.SetupWithManager(mgr),
+		stReconciler.SetupWithManager(mgr),
+		cpReconciler.SetupWithManager(mgr),
+		dprReconciler.SetupWithManager(mgr),
+		dpiReconciler.SetupWithManager(mgr),
+		dpReconciler.SetupWithManager(mgr),
+		dsReconciler.SetupWithManager(mgr),
+		wcReconciler.SetupWithManager(mgr),
+		ztListReconciler.SetupWithManager(mgr),
+		orgReconciler.SetupWithManager(mgr),
+		tunnelReconciler.SetupWithManager(mgr),
+		(&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
+		gwReconciler.SetupWithManager(mgr),
+	} {
+		if err != nil {
+			t.Fatalf("setup controller: %v", err)
+		}
 	}
 	startManagerAndWait(t, mgr)
 
@@ -1670,6 +1940,9 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
 		t.Fatalf("create secret: %v", err)
 	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "kolide-secret"}, Data: map[string][]byte{"client-secret": []byte("kolide-client-secret")}}); err != nil {
+		t.Fatalf("create integration secret: %v", err)
+	}
 	account := &v1alpha1.CloudflareAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "reg1-account"},
 		Spec: v1alpha1.CloudflareAccountSpec{
@@ -1679,9 +1952,15 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
 				Hostnames:            []string{"*"},
 				Zones:                []string{"*"},
-				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate},
 				UnprotectedHostnames: []string{"*"},
 				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+				AccessPolicyRefs:     v1alpha1.GrantPermissionAllowed,
+				AccessCustomPageRefs: v1alpha1.GrantPermissionAllowed,
+				PrivateRoutes: &v1alpha1.CloudflarePrivateRouteGrant{
+					NetworkRouteSelector:  &metav1.LabelSelector{MatchLabels: map[string]string{"private-route": "allowed"}},
+					HostnameRouteSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"private-route": "allowed"}},
+				},
 			}},
 		},
 	}
@@ -1690,108 +1969,7 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	}
 	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
 
-	pol := &v1alpha1.AccessPolicy{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-steady"},
-		Spec: v1alpha1.AccessPolicySpec{
-			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "pol-steady",
-			Decision: v1alpha1.AccessPolicyDecisionAllow,
-			Include: []v1alpha1.AccessRule{
-				{Everyone: &v1alpha1.AccessEveryoneRule{}},
-				{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}},
-			},
-			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
-		},
-	}
-	if err := direct.Create(ctx, pol); err != nil {
-		t.Fatalf("create policy: %v", err)
-	}
-	polKey := client.ObjectKeyFromObject(pol)
-	waitUntilTrue(t, 10*time.Second, "policy converged", func() (bool, error) {
-		var cur v1alpha1.AccessPolicy
-		return checkObjectConverged(ctx, direct, &cur, polKey, "Ready", "Accepted")
-	})
-	// Run one rebind pass so AppliedHash binds the newly assigned PolicyID.
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
-		t.Fatalf("rebind policy reconcile: %v", err)
-	}
-	// Establish sweep ConfirmContent & verify non-zero ConfirmedAt for AccessPolicy.
-	waitUntilTrue(t, 10*time.Second, "AccessPolicy ConfirmedAt established", func() (bool, error) {
-		var cur v1alpha1.AccessPolicy
-		if err := direct.Get(ctx, polKey, &cur); err != nil || cur.Status.AppliedHash == "" {
-			return false, err
-		}
-		items, _ := store.ListAccessPolicies(ctx)
-		for _, it := range items {
-			if it.ID == cur.Status.PolicyID {
-				_ = latch.ConfirmContent("AccessPolicy", polKey, it, time.Now())
-			}
-		}
-		ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, cur.Status.AppliedHash)
-		return ok && !ts.IsZero(), nil
-	})
-
-	// Additional representative gated CRDs: VirtualNetwork (T2), IdentityProvider (T1), ServiceToken (T1).
-	vnet := &v1alpha1.VirtualNetwork{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "vnet-steady"},
-		Spec: v1alpha1.VirtualNetworkSpec{
-			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "vnet-steady",
-			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
-		},
-	}
-	if err := direct.Create(ctx, vnet); err != nil {
-		t.Fatalf("create vnet: %v", err)
-	}
-	vnetKey := client.ObjectKeyFromObject(vnet)
-	waitUntilTrue(t, 10*time.Second, "vnet converged", func() (bool, error) {
-		var cur v1alpha1.VirtualNetwork
-		return checkObjectConverged(ctx, direct, &cur, vnetKey, v1alpha1.PrivateNetworkConditionReady, v1alpha1.PrivateNetworkConditionAccepted)
-	})
-	if _, err := vnetReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: vnetKey}); err != nil {
-		t.Fatalf("rebind vnet reconcile: %v", err)
-	}
-
-	idp := &v1alpha1.IdentityProvider{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-steady"},
-		Spec: v1alpha1.IdentityProviderSpec{
-			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "idp-steady",
-			Type:             v1alpha1.IdentityProviderTypeOneTimePIN,
-			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
-		},
-	}
-	if err := direct.Create(ctx, idp); err != nil {
-		t.Fatalf("create idp: %v", err)
-	}
-	idpKey := client.ObjectKeyFromObject(idp)
-	waitUntilTrue(t, 10*time.Second, "idp converged", func() (bool, error) {
-		var cur v1alpha1.IdentityProvider
-		return checkObjectConverged(ctx, direct, &cur, idpKey, "Ready", "Accepted")
-	})
-	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
-		t.Fatalf("rebind idp reconcile: %v", err)
-	}
-
-	st := &v1alpha1.ServiceToken{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-steady"},
-		Spec: v1alpha1.ServiceTokenSpec{
-			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "st-steady",
-			Enabled: true, Duration: "8760h",
-			SecretRef:        corev1.LocalObjectReference{Name: "st-steady-creds"},
-			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
-		},
-	}
-	if err := direct.Create(ctx, st); err != nil {
-		t.Fatalf("create st: %v", err)
-	}
-	stKey := client.ObjectKeyFromObject(st)
-	waitUntilTrue(t, 10*time.Second, "st converged", func() (bool, error) {
-		var cur v1alpha1.ServiceToken
-		return checkObjectConverged(ctx, direct, &cur, stKey, "Ready", "Accepted")
-	})
-	if _, err := stReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
-		t.Fatalf("rebind st reconcile: %v", err)
-	}
-
-	// Direct External-DNS CloudflareTunnel with publicHosts.
+	// 1. Direct External-DNS CloudflareTunnel with publicHosts (also tunnel target for routes).
 	directTunnel := &v1alpha1.CloudflareTunnel{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "direct-ext-reg1"},
 		Spec: v1alpha1.CloudflareTunnelSpec{
@@ -1819,7 +1997,7 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 		return checkObjectConverged(ctx, direct, &cur, tunnelKey, v1alpha1.CloudflareTunnelConditionReady, v1alpha1.CloudflareTunnelConditionDNSReady)
 	})
 
-	// Gateway + Gateway-mode tunnel.
+	// 2. Gateway + Gateway-mode tunnel.
 	cfg := &v1alpha1.GatewayClassConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "reg1-cfg"},
 		Spec: v1alpha1.GatewayClassConfigSpec{
@@ -1891,82 +2069,518 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 			assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curT.Generation), nil
 	})
 
-	// Allow any initial in-flight status reconciles to settle.
-	time.Sleep(300 * time.Millisecond)
+	// 3. Service + HTTPRoute on reg1-gw for Gateway-backed AccessApplication.
+	svcPort := int32(80)
+	appSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "reg1-app-svc"},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: svcPort}}},
+	}
+	if err := direct.Create(ctx, appSvc); err != nil {
+		t.Fatalf("create app Service: %v", err)
+	}
+	gwSection := gatewayv1.SectionName("http")
+	routePort := gatewayv1.PortNumber(svcPort)
+	appRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "reg1-app-route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(gw.Name), SectionName: &gwSection}}},
+			Hostnames:       []gatewayv1.Hostname{gwHost},
+			Rules: []gatewayv1.HTTPRouteRule{{
+				BackendRefs: []gatewayv1.HTTPBackendRef{{
+					BackendRef: gatewayv1.BackendRef{
+						BackendObjectReference: gatewayv1.BackendObjectReference{Name: gatewayv1.ObjectName(appSvc.Name), Port: &routePort},
+					},
+				}},
+			}},
+		},
+	}
+	if err := direct.Create(ctx, appRoute); err != nil {
+		t.Fatalf("create app HTTPRoute: %v", err)
+	}
 
-	accessCallsBefore := remote.count()
-	idpCallsBefore := idpRemote.count()
+	// 4. All 19 ordinary gated CRDs + variants.
+	accountRef := corev1.LocalObjectReference{Name: account.Name}
+	appFake.SetPolicy(flarecloudflare.AccessPolicy{ID: "ext-pol-reg1", Name: "ext-pol", Decision: "Allow"})
+	addr10 := "10.21.0.0/16"
+
+	gwApp := &v1alpha1.AccessApplication{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-app-steady"},
+		Spec: v1alpha1.AccessApplicationSpec{
+			AccountRef: accountRef, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+			SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+				LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: gatewayv1.ObjectName(appRoute.Name)},
+			}},
+			Application:      v1alpha1.AccessApplicationSettings{Name: "gw-app-steady", SessionDuration: "1h"},
+			Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "ext-pol-reg1"}}},
+			OriginJWT:        v1alpha1.AccessOriginJWTSpec{Mode: v1alpha1.AccessOriginJWTModeRequired},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyOrphan,
+		},
+	}
+
+	items := []struct {
+		kind      string
+		obj       client.Object
+		readyCond string
+		reconcile func(context.Context, ctrl.Request) (ctrl.Result, error)
+	}{
+		{"AccessPolicy-ext", &v1alpha1.AccessPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-steady"},
+			Spec: v1alpha1.AccessPolicySpec{
+				AccountRef: accountRef, Name: "pol-steady", Decision: v1alpha1.AccessPolicyDecisionAllow,
+				Include: []v1alpha1.AccessRule{
+					{Everyone: &v1alpha1.AccessEveryoneRule{}},
+					{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", polReconciler.Reconcile},
+		{"AccessPolicy-sweep", &v1alpha1.AccessPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-plain"},
+			Spec: v1alpha1.AccessPolicySpec{
+				AccountRef: accountRef, Name: "pol-plain", Decision: v1alpha1.AccessPolicyDecisionAllow,
+				Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", polReconciler.Reconcile},
+		{"AccessGroup", &v1alpha1.AccessGroup{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "grp-steady"},
+			Spec: v1alpha1.AccessGroupSpec{
+				AccountRef: accountRef, Name: "grp-steady",
+				Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", grpReconciler.Reconcile},
+		{"AccessStandaloneApplication", &v1alpha1.AccessStandaloneApplication{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "standalone-steady"},
+			Spec: v1alpha1.AccessStandaloneApplicationSpec{
+				AccountRef: accountRef, Type: v1alpha1.AccessStandaloneApplicationTypeWARP,
+				Application:      v1alpha1.AccessApplicationSettings{SessionDuration: "24h"},
+				WARP:             &v1alpha1.AccessWARPApplicationSpec{},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", standaloneReconciler.Reconcile},
+		{"AccessInfrastructureTarget", &v1alpha1.AccessInfrastructureTarget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "infra-steady"},
+			Spec: v1alpha1.AccessInfrastructureTargetSpec{
+				AccountRef: accountRef, Hostname: "db-reg1.example.test",
+				IP:               v1alpha1.AccessInfrastructureTargetIP{IPV4: &v1alpha1.AccessInfrastructureTargetIPv4Address{IPAddr: "192.0.2.11", VirtualNetworkID: "vnet-ext"}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", infraReconciler.Reconcile},
+		{"IdentityProvider", &v1alpha1.IdentityProvider{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-steady"},
+			Spec: v1alpha1.IdentityProviderSpec{
+				AccountRef: accountRef, Name: "idp-steady", Type: v1alpha1.IdentityProviderTypeOneTimePIN,
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", idpReconciler.Reconcile},
+		{"IdentityProvider-SCIM", &v1alpha1.IdentityProvider{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-scim-steady"},
+			Spec: v1alpha1.IdentityProviderSpec{
+				AccountRef: accountRef, Name: "idp-scim-steady", Type: v1alpha1.IdentityProviderTypeOneTimePIN,
+				SCIMConfig: &v1alpha1.IdentityProviderSCIMConfig{
+					Enabled:   new(true),
+					SecretRef: &corev1.LocalObjectReference{Name: "idp-scim-reg1-secret"},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", idpReconciler.Reconcile},
+		{"AccessApplication-declared", &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "app-steady"},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: accountRef, Type: v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted:  &v1alpha1.AccessSelfHostedApplicationSpec{},
+				Application: v1alpha1.AccessApplicationSettings{Name: "app-steady", SessionDuration: "1h"},
+				Destinations: []v1alpha1.AccessApplicationDestinationSpec{{
+					Type: v1alpha1.AccessApplicationDestinationWorker, Worker: &v1alpha1.AccessWorkerDestinationSpec{WorkerID: "worker-reg1"},
+				}},
+				Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "ext-pol-reg1"}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, accessApplicationConditionProgrammed, appReconciler.Reconcile},
+		{"VirtualNetwork", &v1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "vnet-steady"},
+			Spec: v1alpha1.VirtualNetworkSpec{
+				AccountRef: accountRef, Name: "vnet-steady",
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.PrivateNetworkConditionReady, vnetReconciler.Reconcile},
+		{"NetworkRoute", &v1alpha1.NetworkRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "nr-steady", Labels: map[string]string{"private-route": "allowed"}},
+			Spec: v1alpha1.NetworkRouteSpec{
+				AccountRef: accountRef, Network: "10.31.0.0/16",
+				TunnelRef:        v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: directTunnel.Name, Namespace: ns},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.PrivateNetworkConditionReady, nrReconciler.Reconcile},
+		{"HostnameRoute", &v1alpha1.HostnameRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "hr-steady", Labels: map[string]string{"private-route": "allowed"}},
+			Spec: v1alpha1.HostnameRouteSpec{
+				AccountRef: accountRef, Hostname: "internal-reg1.example.test",
+				TunnelRef:        v1alpha1.TunnelReference{Kind: v1alpha1.TunnelReferenceKindCloudflareTunnel, Name: directTunnel.Name, Namespace: ns},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.PrivateNetworkConditionReady, hrReconciler.Reconcile},
+		{"ZeroTrustGatewayPolicy", &v1alpha1.ZeroTrustGatewayPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gwpol-steady"},
+			Spec: v1alpha1.ZeroTrustGatewayPolicySpec{
+				AccountRef: accountRef, Name: "gwpol-steady",
+				Filters:          []v1alpha1.ZeroTrustGatewayFilter{v1alpha1.ZeroTrustGatewayFilterL4},
+				Action:           v1alpha1.ZeroTrustGatewayAction("allow"),
+				Traffic:          "net.dst.ip == 10.0.0.2",
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.ZeroTrustGatewayPolicyConditionReady, gwPolReconciler.Reconcile},
+		{"ServiceToken", &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-steady"},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef: accountRef, Name: "st-steady", Enabled: true, Duration: "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "st-steady-creds"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", stReconciler.Reconcile},
+		{"AccessCustomPage", &v1alpha1.AccessCustomPage{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cp-steady"},
+			Spec: v1alpha1.AccessCustomPageSpec{
+				AccountRef: accountRef, Name: "cp-steady", Type: v1alpha1.AccessCustomPageTypeForbidden,
+				HTML: "<main>denied</main>", ContractVersion: 1,
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.AccessCustomPageConditionReady, cpReconciler.Reconcile},
+		{"DevicePostureRule-ext", &v1alpha1.DevicePostureRule{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dpr-steady"},
+			Spec: v1alpha1.DevicePostureRuleSpec{
+				AccountRef: accountRef, Name: "dpr-steady", Type: v1alpha1.DevicePostureRuleTypeTaniumS2S,
+				Input: v1alpha1.DevicePostureInput{
+					IntegrationRef: &v1alpha1.DevicePostureIntegrationReference{ExternalID: "ext-tanium-1"},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", dprReconciler.Reconcile},
+		{"DevicePostureIntegration", &v1alpha1.DevicePostureIntegration{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dpi-steady"},
+			Spec: v1alpha1.DevicePostureIntegrationSpec{
+				AccountRef: accountRef, Type: v1alpha1.DevicePostureIntegrationTypeKolide,
+				Name: "dpi-steady", Interval: "1h",
+				Config: v1alpha1.DevicePostureIntegrationConfig{
+					ClientID:        "kolide-id",
+					ClientSecretRef: &v1alpha1.DevicePostureIntegrationSecretReference{Name: "kolide-secret", Key: "client-secret"},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", dpiReconciler.Reconcile},
+		{"DeviceProfile", &v1alpha1.DeviceProfile{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dp-steady"},
+			Spec: v1alpha1.DeviceProfileSpec{
+				AccountRef: accountRef,
+				Profile:    v1alpha1.DeviceProfileTarget{Kind: v1alpha1.DeviceProfileKindDefault},
+				SplitTunnel: v1alpha1.DeviceProfileSplitTunnel{
+					Mode:   v1alpha1.DeviceProfileSplitTunnelModeInclude,
+					Static: []v1alpha1.DeviceProfileSplitTunnelEntry{{Address: &addr10, Description: "static"}},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyOrphan,
+			},
+		}, v1alpha1.DeviceProfileConditionReady, dpReconciler.Reconcile},
+		{"DeviceSettings", &v1alpha1.DeviceSettings{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"},
+			Spec: v1alpha1.DeviceSettingsSpec{
+				AccountRef: accountRef, GatewayProxyEnabled: new(true),
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.OrphanOnlyDeletionPolicyOrphan,
+			},
+		}, v1alpha1.DeviceSettingsConditionReady, dsReconciler.Reconcile},
+		{"WARPConnector", &v1alpha1.WARPConnector{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "wc-steady"},
+			Spec: v1alpha1.WARPConnectorSpec{
+				AccountRef: accountRef, Name: "wc-steady",
+				HighAvailability: v1alpha1.WARPConnectorHighAvailability{Enabled: new(false), Mode: v1alpha1.WARPConnectorHAModeDisabled},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyOrphan,
+			},
+		}, v1alpha1.WARPConnectorConditionReady, wcReconciler.Reconcile},
+		{"ZeroTrustList", &v1alpha1.ZeroTrustList{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "zt-list-steady"},
+			Spec: v1alpha1.ZeroTrustListSpec{
+				AccountRef: accountRef, Name: "zt-list-steady", Type: v1alpha1.ZeroTrustListTypeIP,
+				Items:            []string{"10.0.0.0/8"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, v1alpha1.ZeroTrustListConditionReady, ztListReconciler.Reconcile},
+		{"ZeroTrustOrganization-ext", &v1alpha1.ZeroTrustOrganization{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "default"},
+			Spec: v1alpha1.ZeroTrustOrganizationSpec{
+				AccountRef: accountRef, Name: new("org-reg1"), AuthDomain: new("reg1-team.cloudflareaccess.com"),
+				CustomPages: &v1alpha1.ZeroTrustOrganizationCustomPageReferences{
+					Forbidden: &v1alpha1.AccessObjectReference{ExternalID: "ext-cp-reg1"},
+				},
+				DOH: &v1alpha1.ZeroTrustOrganizationDOH{
+					ServiceTokenRef: v1alpha1.AccessObjectReference{ExternalID: "ext-st-reg1"},
+				},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.OrphanOnlyDeletionPolicyOrphan,
+			},
+		}, v1alpha1.ZeroTrustOrganizationConditionReady, orgReconciler.Reconcile},
+	}
+
+	for _, item := range items {
+		if err := direct.Create(ctx, item.obj); err != nil {
+			t.Fatalf("create %s: %v", item.kind, err)
+		}
+	}
+	if err := direct.Create(ctx, gwApp); err != nil {
+		t.Fatalf("create gw-app-steady: %v", err)
+	}
+
+	checks := make([]gatedCheck, 0, len(items)+3)
+	for _, item := range items {
+		checks = append(checks, gatedCheck{name: item.kind, reconcile: item.reconcile, key: client.ObjectKeyFromObject(item.obj)})
+	}
+	checks = append(checks,
+		gatedCheck{name: "AccessApplication-Gateway", reconcile: appReconciler.Reconcile, key: client.ObjectKeyFromObject(gwApp)},
+		gatedCheck{name: "CloudflareTunnel-DirectExternal", reconcile: tunnelReconciler.Reconcile, key: tunnelKey},
+		gatedCheck{name: "Gateway-CloudflareTunnelConfig", reconcile: gwReconciler.Reconcile, key: client.ObjectKeyFromObject(gw)},
+	)
+
+	var lastPending []string
+	defer func() {
+		if t.Failed() && len(lastPending) > 0 {
+			t.Logf("still pending convergence: %v", lastPending)
+		}
+	}()
+	waitUntilTrue(t, 20*time.Second, "all 19 CRDs + variants + Gateway converged", func() (bool, error) {
+		_ = snapshots.ACK(client.ObjectKeyFromObject(gw).String())
+		var pending []string
+		for _, item := range items {
+			copyObj := item.obj.DeepCopyObject().(client.Object)
+			ok, err := checkObjectConverged(ctx, direct, copyObj, client.ObjectKeyFromObject(item.obj), item.readyCond, "Accepted")
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				pending = append(pending, item.kind)
+			}
+		}
+		var curGWApp v1alpha1.AccessApplication
+		okApp, err := checkObjectConverged(ctx, direct, &curGWApp, client.ObjectKeyFromObject(gwApp), accessApplicationConditionProgrammed, accessApplicationConditionAccepted)
+		if err != nil {
+			return false, err
+		}
+		if !okApp {
+			pending = append(pending, "AccessApplication-Gateway")
+		}
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		var curT v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, gwTunnelKey, &curT); err != nil {
+			return false, err
+		}
+		if !assertConditionTrueForCurrentGen(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), curGW.Generation) {
+			pending = append(pending, "Gateway-Programmed")
+		}
+		if !assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curT.Generation) {
+			pending = append(pending, "Gateway-ConfigApplied")
+		}
+		if !assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionReady, curT.Generation) ||
+			!assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionDNSReady, curT.Generation) ||
+			curT.Status.ConfigVersion.AppliedAt == nil {
+			pending = append(pending, "GatewayTunnel-Ready")
+		}
+		lastPending = pending
+		return len(pending) == 0, nil
+	})
+	_ = lastPending
+
+	// Run one rebind reconcile so remote-assigned IDs settle in AppliedHash before steady-state measurement.
+	for _, chk := range checks {
+		if _, err := chk.reconcile(ctx, ctrl.Request{NamespacedName: chk.key}); err != nil {
+			t.Fatalf("rebind %s reconcile: %v", chk.name, err)
+		}
+	}
+
+	// Establish active sweep ConfirmContent & verify non-zero ConfirmedAt for the 10 sweep-confirmable kinds.
+	confirm := func(kind string, key types.NamespacedName, hash string, listed any) {
+		if latch.ConfirmContent(kind, key, listed, time.Now()) {
+			t.Fatalf("ConfirmContent(%s, %v) reported unexpected drift", kind, key)
+		}
+		ts, ok := latch.ConfirmedAt(kind, key, hash)
+		if !ok || ts.IsZero() {
+			t.Fatalf("ConfirmedAt(%s, %v) missing", kind, key)
+		}
+	}
+	var curPolPlain v1alpha1.AccessPolicy
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "pol-plain"}, &curPolPlain)
+	for _, it := range func() []flarecloudflare.AccessPolicy { v, _ := store.ListAccessPolicies(ctx); return v }() {
+		if it.ID == curPolPlain.Status.PolicyID {
+			confirm("AccessPolicy", client.ObjectKeyFromObject(&curPolPlain), curPolPlain.Status.AppliedHash, it)
+		}
+	}
+	var curGrp v1alpha1.AccessGroup
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "grp-steady"}, &curGrp)
+	for _, it := range func() []flarecloudflare.AccessGroup {
+		v, _ := store.ListAccessGroups(ctx, flarecloudflare.AccessGroupListOptions{})
+		return v
+	}() {
+		if it.ID == curGrp.Status.GroupID {
+			confirm("AccessGroup", client.ObjectKeyFromObject(&curGrp), curGrp.Status.AppliedHash, it)
+		}
+	}
+	var curStandalone v1alpha1.AccessStandaloneApplication
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "standalone-steady"}, &curStandalone)
+	if listed, ok := standaloneBase.applications[curStandalone.Status.ApplicationID]; ok {
+		confirm("AccessStandaloneApplication", client.ObjectKeyFromObject(&curStandalone), curStandalone.Status.AppliedHash, listed)
+	}
+	var curInfra v1alpha1.AccessInfrastructureTarget
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "infra-steady"}, &curInfra)
+	if listed, ok := infraBase.targets[curInfra.Status.TargetID]; ok {
+		confirm("AccessInfrastructureTarget", client.ObjectKeyFromObject(&curInfra), curInfra.Status.AppliedHash, listed)
+	}
+	var curIDP v1alpha1.IdentityProvider
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "idp-steady"}, &curIDP)
+	if listed, ok := idpFake.providers[curIDP.Status.IDPID]; ok {
+		confirm("IdentityProvider", client.ObjectKeyFromObject(&curIDP), curIDP.Status.AppliedHash, listed)
+	}
+	var curApp v1alpha1.AccessApplication
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "app-steady"}, &curApp)
+	appItems := unrecordedApplicationListing(appFake)
+	appByID := make(map[string]flarecloudflare.AccessApplication, len(appItems))
+	for _, a := range appItems {
+		appByID[a.ID] = a
+	}
+	if listed, ok := appByID[curApp.Status.ApplicationID]; ok {
+		confirm("AccessApplication", client.ObjectKeyFromObject(&curApp), curApp.Status.AppliedHash, flarecloudflare.AccessApplicationListing{
+			Application:  listed,
+			Applications: appByID,
+		})
+	}
+	var curVNet v1alpha1.VirtualNetwork
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "vnet-steady"}, &curVNet)
+	if listed, err := privateFake.GetVirtualNetwork(ctx, curVNet.Status.VirtualNetworkID); err == nil {
+		confirm("VirtualNetwork", client.ObjectKeyFromObject(&curVNet), curVNet.Status.AppliedHash, listed)
+	}
+	var curNR v1alpha1.NetworkRoute
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "nr-steady"}, &curNR)
+	if listed, err := privateFake.GetNetworkRoute(ctx, curNR.Status.RouteID); err == nil {
+		confirm("NetworkRoute", client.ObjectKeyFromObject(&curNR), curNR.Status.AppliedHash, listed)
+	}
+	var curHR v1alpha1.HostnameRoute
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "hr-steady"}, &curHR)
+	if listed, err := privateFake.GetHostnameRoute(ctx, curHR.Status.RouteID); err == nil {
+		confirm("HostnameRoute", client.ObjectKeyFromObject(&curHR), curHR.Status.AppliedHash, listed)
+	}
+	var curGWPol v1alpha1.ZeroTrustGatewayPolicy
+	_ = direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: "gwpol-steady"}, &curGWPol)
+	if listed, err := gatewayFake.GetGatewayRule(ctx, curGWPol.Status.RuleID); err == nil {
+		confirm("ZeroTrustGatewayPolicy", client.ObjectKeyFromObject(&curGWPol), curGWPol.Status.AppliedHash, listed)
+	}
+
+	// Allow any initial in-flight manager reconciles/requeues to settle cleanly.
+	waitUntilTrue(t, 10*time.Second, "manager status writes quiescent", func() (bool, error) {
+		before := statusWrites.Load()
+		time.Sleep(500 * time.Millisecond)
+		return statusWrites.Load() == before, nil
+	})
+
+	// Snapshot every Cloudflare call counter across ALL reconcilers.
+	remoteBefore := remote.count()
+	standaloneBefore := standaloneRemote.count()
+	infraBefore := infraRemote.count()
+	customPageBefore := customPageRemote.count()
+	integrationBefore := integrationRemote.count()
+	idpBefore := idpRemote.count()
+	appFake.mu.Lock()
+	appBefore := len(appFake.calls)
+	appFake.mu.Unlock()
 	privateFake.mu.Lock()
-	vnetCallsBefore := len(privateFake.calls)
+	privateBefore := len(privateFake.calls)
 	privateFake.mu.Unlock()
-	tunnelCallsBefore := len(tunnelFake.Calls())
-	gwCallsBefore := len(gwAPI.calls)
+	gatewayFake.mu.Lock()
+	gatewayBefore := len(gatewayFake.calls)
+	gatewayFake.mu.Unlock()
+	profileBefore := profileRemote.calls.Load()
+	deviceSettingsFake.mu.Lock()
+	dsBefore := len(deviceSettingsFake.calls)
+	deviceSettingsFake.mu.Unlock()
+	warpBefore := warpRemote.calls.Load()
+	orgFake.mu.Lock()
+	orgBefore := len(orgFake.calls)
+	orgFake.mu.Unlock()
+	tunnelBefore := len(tunnelFake.Calls())
+	gwAPI.mu.Lock()
+	gwBefore := len(gwAPI.calls)
+	gwAPI.mu.Unlock()
 
-	writesBeforePolicy := statusWrites.Load()
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
-		t.Fatalf("steady AccessPolicy reconcile: %v", err)
-	}
-	if got := statusWrites.Load() - writesBeforePolicy; got != 0 {
-		t.Fatalf("steady AccessPolicy reconcile issued %d Kubernetes status write requests, want 0", got)
-	}
-
-	writesBeforeVNet := statusWrites.Load()
-	if _, err := vnetReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: vnetKey}); err != nil {
-		t.Fatalf("steady VirtualNetwork reconcile: %v", err)
-	}
-	if got := statusWrites.Load() - writesBeforeVNet; got != 0 {
-		t.Fatalf("steady VirtualNetwork reconcile issued %d Kubernetes status write requests, want 0", got)
-	}
-
-	writesBeforeIDP := statusWrites.Load()
-	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
-		t.Fatalf("steady IdentityProvider reconcile: %v", err)
-	}
-	if got := statusWrites.Load() - writesBeforeIDP; got != 0 {
-		t.Fatalf("steady IdentityProvider reconcile issued %d Kubernetes status write requests, want 0", got)
-	}
-
-	writesBeforeST := statusWrites.Load()
-	if _, err := stReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
-		t.Fatalf("steady ServiceToken reconcile: %v", err)
-	}
-	if got := statusWrites.Load() - writesBeforeST; got != 0 {
-		t.Fatalf("steady ServiceToken reconcile issued %d Kubernetes status write requests, want 0", got)
+	for _, chk := range checks {
+		writesBefore := statusWrites.Load()
+		if _, err := chk.reconcile(ctx, ctrl.Request{NamespacedName: chk.key}); err != nil {
+			t.Fatalf("steady %s reconcile: %v", chk.name, err)
+		}
+		if got := statusWrites.Load() - writesBefore; got != 0 {
+			t.Fatalf("steady %s reconcile issued %d Kubernetes status write requests, want 0", chk.name, got)
+		}
 	}
 
-	writesBeforeTunnel := statusWrites.Load()
-	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
-		t.Fatalf("steady CloudflareTunnel reconcile: %v", err)
+	if got := remote.calls[remoteBefore:]; len(got) != 0 {
+		t.Fatalf("steady AccessPolicy/AccessGroup/ServiceToken/DevicePostureRule reconciles issued remote calls %v, want 0", got)
 	}
-	if got := statusWrites.Load() - writesBeforeTunnel; got != 0 {
-		t.Fatalf("steady Direct External CloudflareTunnel reconcile issued %d Kubernetes status write requests, want 0", got)
+	if got := standaloneRemote.calls[standaloneBefore:]; len(got) != 0 {
+		t.Fatalf("steady AccessStandaloneApplication reconcile issued remote calls %v, want 0", got)
 	}
-
-	writesBeforeGW := statusWrites.Load()
-	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gw)}); err != nil {
-		t.Fatalf("steady Gateway reconcile: %v", err)
+	if got := infraRemote.calls[infraBefore:]; len(got) != 0 {
+		t.Fatalf("steady AccessInfrastructureTarget reconcile issued remote calls %v, want 0", got)
 	}
-	if got := statusWrites.Load() - writesBeforeGW; got != 0 {
-		t.Fatalf("steady Gateway reconcile issued %d Kubernetes status write requests, want 0", got)
+	if got := customPageRemote.calls[customPageBefore:]; len(got) != 0 {
+		t.Fatalf("steady AccessCustomPage reconcile issued remote calls %v, want 0", got)
 	}
-
-	if got := remote.count() - accessCallsBefore; got != 0 {
-		t.Fatalf("steady AccessPolicy (with ExternalID ref) + ServiceToken reconciles issued %d remote calls, want 0", got)
+	if got := integrationRemote.calls[integrationBefore:]; len(got) != 0 {
+		t.Fatalf("steady DevicePostureIntegration reconcile issued remote calls %v, want 0", got)
 	}
-	if got := idpRemote.count() - idpCallsBefore; got != 0 {
-		t.Fatalf("steady IdentityProvider reconcile issued %d remote calls, want 0", got)
+	if got := idpRemote.calls[idpBefore:]; len(got) != 0 {
+		t.Fatalf("steady IdentityProvider (plain + SCIM) reconciles issued remote calls %v, want 0", got)
+	}
+	appFake.mu.Lock()
+	appCalls := slices.Clone(appFake.calls[appBefore:])
+	appFake.mu.Unlock()
+	if len(appCalls) != 0 {
+		t.Fatalf("steady AccessApplication (declared + Gateway) reconciles issued remote calls %v, want 0", appCalls)
 	}
 	privateFake.mu.Lock()
-	vnetCalls := slices.Clone(privateFake.calls[vnetCallsBefore:])
+	privateCalls := slices.Clone(privateFake.calls[privateBefore:])
 	privateFake.mu.Unlock()
-	if len(vnetCalls) != 0 {
-		t.Fatalf("steady VirtualNetwork reconcile issued remote calls %v, want 0", vnetCalls)
+	if len(privateCalls) != 0 {
+		t.Fatalf("steady VirtualNetwork/NetworkRoute/HostnameRoute reconciles issued remote calls %v, want 0", privateCalls)
 	}
-	if got := tunnelFake.Calls()[tunnelCallsBefore:]; len(got) != 0 {
+	gatewayFake.mu.Lock()
+	gwPolCalls := slices.Clone(gatewayFake.calls[gatewayBefore:])
+	gatewayFake.mu.Unlock()
+	if len(gwPolCalls) != 0 {
+		t.Fatalf("steady ZeroTrustGatewayPolicy/ZeroTrustList reconciles issued remote calls %v, want 0", gwPolCalls)
+	}
+	if got := profileRemote.calls.Load() - profileBefore; got != 0 {
+		t.Fatalf("steady DeviceProfile reconcile issued %d remote calls, want 0", got)
+	}
+	deviceSettingsFake.mu.Lock()
+	dsCalls := slices.Clone(deviceSettingsFake.calls[dsBefore:])
+	deviceSettingsFake.mu.Unlock()
+	if len(dsCalls) != 0 {
+		t.Fatalf("steady DeviceSettings reconcile issued remote calls %v, want 0", dsCalls)
+	}
+	if got := warpRemote.calls.Load() - warpBefore; got != 0 {
+		t.Fatalf("steady WARPConnector reconcile issued %d remote calls, want 0", got)
+	}
+	orgFake.mu.Lock()
+	orgCalls := slices.Clone(orgFake.calls[orgBefore:])
+	orgFake.mu.Unlock()
+	if len(orgCalls) != 0 {
+		t.Fatalf("steady ZeroTrustOrganization reconcile issued remote calls %v, want 0", orgCalls)
+	}
+	if got := tunnelFake.Calls()[tunnelBefore:]; len(got) != 0 {
 		t.Fatalf("steady Direct External CloudflareTunnel reconcile issued remote calls %v, want 0", got)
 	}
-	if got := gwAPI.calls[gwCallsBefore:]; len(got) != 0 {
-		t.Fatalf("steady Gateway CloudflareTunnelConfig reconcile issued remote calls %v, want 0", got)
+	gwAPI.mu.Lock()
+	gwCalls := slices.Clone(gwAPI.calls[gwBefore:])
+	gwAPI.mu.Unlock()
+	if len(gwCalls) != 0 {
+		t.Fatalf("steady Gateway CloudflareTunnelConfig reconcile issued remote calls %v, want 0", gwCalls)
 	}
 }
 
@@ -2452,5 +3066,632 @@ func TestQA2REG4ZeroFreshnessAccessApplicationPeriodicDriftEnvtest(t *testing.T)
 		appFake.mu.Lock()
 		defer appFake.mu.Unlock()
 		return appFake.applications[appID].Name == "app-zero-fresh", nil
+	})
+}
+
+type countingAccessExtendedAPI struct {
+	*recordingAccessAPI
+	integrations flarecloudflare.DevicePostureIntegrationAPI
+}
+
+func (c *countingAccessExtendedAPI) GetDevicePostureRule(ctx context.Context, id string) (flarecloudflare.DevicePostureRule, error) {
+	c.record("GetDevicePostureRule")
+	return c.AccessAPI.GetDevicePostureRule(ctx, id)
+}
+
+func (c *countingAccessExtendedAPI) ListDevicePostureRules(ctx context.Context) ([]flarecloudflare.DevicePostureRule, error) {
+	c.record("ListDevicePostureRules")
+	return c.AccessAPI.ListDevicePostureRules(ctx)
+}
+
+func (c *countingAccessExtendedAPI) CreateDevicePostureRule(ctx context.Context, input flarecloudflare.DevicePostureRuleInput) (flarecloudflare.DevicePostureRule, error) {
+	c.record("CreateDevicePostureRule")
+	return c.AccessAPI.CreateDevicePostureRule(ctx, input)
+}
+
+func (c *countingAccessExtendedAPI) UpdateDevicePostureRule(ctx context.Context, id string, input flarecloudflare.DevicePostureRuleInput) (flarecloudflare.DevicePostureRule, error) {
+	c.record("UpdateDevicePostureRule")
+	return c.AccessAPI.UpdateDevicePostureRule(ctx, id, input)
+}
+
+func (c *countingAccessExtendedAPI) CreateDevicePostureIntegration(ctx context.Context, input flarecloudflare.DevicePostureIntegrationInput) (flarecloudflare.DevicePostureIntegration, error) {
+	c.record("CreateDevicePostureIntegration")
+	return c.integrations.CreateDevicePostureIntegration(ctx, input)
+}
+
+func (c *countingAccessExtendedAPI) UpdateDevicePostureIntegration(ctx context.Context, id string, input flarecloudflare.DevicePostureIntegrationInput) (flarecloudflare.DevicePostureIntegration, error) {
+	c.record("UpdateDevicePostureIntegration")
+	return c.integrations.UpdateDevicePostureIntegration(ctx, id, input)
+}
+
+func (c *countingAccessExtendedAPI) GetDevicePostureIntegration(ctx context.Context, id string) (flarecloudflare.DevicePostureIntegration, error) {
+	c.record("GetDevicePostureIntegration")
+	return c.integrations.GetDevicePostureIntegration(ctx, id)
+}
+
+func (c *countingAccessExtendedAPI) ListDevicePostureIntegrations(ctx context.Context) ([]flarecloudflare.DevicePostureIntegration, error) {
+	c.record("ListDevicePostureIntegrations")
+	return c.integrations.ListDevicePostureIntegrations(ctx)
+}
+
+func (c *countingAccessExtendedAPI) DeleteDevicePostureIntegration(ctx context.Context, id string) error {
+	c.record("DeleteDevicePostureIntegration")
+	return c.integrations.DeleteDevicePostureIntegration(ctx, id)
+}
+
+func (c *countingAccessExtendedAPI) GetAccessCustomPage(ctx context.Context, id string) (flarecloudflare.AccessCustomPage, error) {
+	c.record("GetAccessCustomPage")
+	return c.AccessAPI.GetAccessCustomPage(ctx, id)
+}
+
+func (c *countingAccessExtendedAPI) ListAccessCustomPages(ctx context.Context) ([]flarecloudflare.AccessCustomPageSummary, error) {
+	c.record("ListAccessCustomPages")
+	return c.AccessAPI.ListAccessCustomPages(ctx)
+}
+
+func (c *countingAccessExtendedAPI) CreateAccessCustomPage(ctx context.Context, input flarecloudflare.AccessCustomPageInput) (flarecloudflare.AccessCustomPage, error) {
+	c.record("CreateAccessCustomPage")
+	return c.AccessAPI.CreateAccessCustomPage(ctx, input)
+}
+
+func (c *countingAccessExtendedAPI) UpdateAccessCustomPage(ctx context.Context, id string, input flarecloudflare.AccessCustomPageInput) (flarecloudflare.AccessCustomPage, error) {
+	c.record("UpdateAccessCustomPage")
+	return c.AccessAPI.UpdateAccessCustomPage(ctx, id, input)
+}
+
+func (c *countingAccessExtendedAPI) GetAccessApplication(ctx context.Context, scope flarecloudflare.AccessScope, id string) (flarecloudflare.AccessApplication, error) {
+	c.record("GetAccessApplication")
+	return c.AccessAPI.GetAccessApplication(ctx, scope, id)
+}
+
+func (c *countingAccessExtendedAPI) ListAccessApplications(ctx context.Context, scope flarecloudflare.AccessScope) ([]flarecloudflare.AccessApplication, error) {
+	c.record("ListAccessApplications")
+	return c.AccessAPI.ListAccessApplications(ctx, scope)
+}
+
+func (c *countingAccessExtendedAPI) CreateAccessApplication(ctx context.Context, scope flarecloudflare.AccessScope, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplicationCreateResult, error) {
+	c.record("CreateAccessApplication")
+	return c.AccessAPI.CreateAccessApplication(ctx, scope, input)
+}
+
+func (c *countingAccessExtendedAPI) UpdateAccessApplication(ctx context.Context, scope flarecloudflare.AccessScope, id string, input flarecloudflare.AccessApplicationInput) (flarecloudflare.AccessApplication, error) {
+	c.record("UpdateAccessApplication")
+	return c.AccessAPI.UpdateAccessApplication(ctx, scope, id, input)
+}
+
+func (c *countingAccessExtendedAPI) GetAccessTag(ctx context.Context, name string) (flarecloudflare.AccessTag, error) {
+	c.record("GetAccessTag")
+	return c.AccessAPI.GetAccessTag(ctx, name)
+}
+
+func (c *countingAccessExtendedAPI) CreateAccessTag(ctx context.Context, name string) (flarecloudflare.AccessTag, error) {
+	c.record("CreateAccessTag")
+	return c.AccessAPI.CreateAccessTag(ctx, name)
+}
+
+func (c *countingAccessExtendedAPI) ListAccessTags(ctx context.Context) ([]flarecloudflare.AccessTag, error) {
+	c.record("ListAccessTags")
+	return c.AccessAPI.ListAccessTags(ctx)
+}
+
+type countingDeviceProfileAPI struct {
+	flarecloudflare.DeviceProfileAPI
+	calls atomic.Int64
+}
+
+func (c *countingDeviceProfileAPI) GetDefaultDeviceProfile(ctx context.Context) (flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.GetDefaultDeviceProfile(ctx)
+}
+
+func (c *countingDeviceProfileAPI) UpdateDefaultDeviceProfile(ctx context.Context, input flarecloudflare.DeviceProfileInput) (flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.UpdateDefaultDeviceProfile(ctx, input)
+}
+
+func (c *countingDeviceProfileAPI) CreateCustomDeviceProfile(ctx context.Context, input flarecloudflare.DeviceProfileInput) (flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.CreateCustomDeviceProfile(ctx, input)
+}
+
+func (c *countingDeviceProfileAPI) ListCustomDeviceProfiles(ctx context.Context) ([]flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.ListCustomDeviceProfiles(ctx)
+}
+
+func (c *countingDeviceProfileAPI) GetCustomDeviceProfile(ctx context.Context, id string) (flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.GetCustomDeviceProfile(ctx, id)
+}
+
+func (c *countingDeviceProfileAPI) UpdateCustomDeviceProfile(ctx context.Context, id string, input flarecloudflare.DeviceProfileInput) (flarecloudflare.DeviceProfile, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.UpdateCustomDeviceProfile(ctx, id, input)
+}
+
+func (c *countingDeviceProfileAPI) GetDeviceProfileInclude(ctx context.Context, ref flarecloudflare.DeviceProfileRef) ([]flarecloudflare.SplitTunnelEntry, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.GetDeviceProfileInclude(ctx, ref)
+}
+
+func (c *countingDeviceProfileAPI) GetDeviceProfileExclude(ctx context.Context, ref flarecloudflare.DeviceProfileRef) ([]flarecloudflare.SplitTunnelEntry, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.GetDeviceProfileExclude(ctx, ref)
+}
+
+func (c *countingDeviceProfileAPI) GetDeviceProfileFallbackDomains(ctx context.Context, ref flarecloudflare.DeviceProfileRef) ([]flarecloudflare.FallbackDomain, error) {
+	c.calls.Add(1)
+	return c.DeviceProfileAPI.GetDeviceProfileFallbackDomains(ctx, ref)
+}
+
+type countingWARPConnectorAPI struct {
+	flarecloudflare.WARPConnectorAPI
+	calls atomic.Int64
+}
+
+func (c *countingWARPConnectorAPI) CreateWARPConnector(ctx context.Context, input flarecloudflare.WARPConnectorCreateInput) (flarecloudflare.WARPConnector, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.CreateWARPConnector(ctx, input)
+}
+
+func (c *countingWARPConnectorAPI) ListWARPConnectors(ctx context.Context, filter flarecloudflare.WARPConnectorListFilter) ([]flarecloudflare.WARPConnector, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.ListWARPConnectors(ctx, filter)
+}
+
+func (c *countingWARPConnectorAPI) UpdateWARPConnector(ctx context.Context, id string, input flarecloudflare.WARPConnectorUpdateInput) (flarecloudflare.WARPConnector, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.UpdateWARPConnector(ctx, id, input)
+}
+
+func (c *countingWARPConnectorAPI) GetWARPConnector(ctx context.Context, id string) (flarecloudflare.WARPConnector, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.GetWARPConnector(ctx, id)
+}
+
+func (c *countingWARPConnectorAPI) UpdateWARPConnectorConfiguration(ctx context.Context, id string, input flarecloudflare.WARPConnectorConfigurationInput) (flarecloudflare.WARPConnectorConfiguration, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.UpdateWARPConnectorConfiguration(ctx, id, input)
+}
+
+func (c *countingWARPConnectorAPI) GetWARPConnectorConfiguration(ctx context.Context, id string) (flarecloudflare.WARPConnectorConfiguration, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.GetWARPConnectorConfiguration(ctx, id)
+}
+
+func (c *countingWARPConnectorAPI) ListWARPConnectorClients(ctx context.Context, id string) ([]flarecloudflare.WARPConnectorClient, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.ListWARPConnectorClients(ctx, id)
+}
+
+func (c *countingWARPConnectorAPI) GetWARPConnectorClient(ctx context.Context, tunnelID, clientID string) (flarecloudflare.WARPConnectorClient, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.GetWARPConnectorClient(ctx, tunnelID, clientID)
+}
+
+func (c *countingWARPConnectorAPI) GetWARPConnectorToken(ctx context.Context, id string) (string, error) {
+	c.calls.Add(1)
+	return c.WARPConnectorAPI.GetWARPConnectorToken(ctx, id)
+}
+
+// Verifies that resources referencing un-listed ExternalID/ExternalRef dependencies
+// never receive parent-only sweep content confirmation (ConfirmedAt stays unset),
+// so TTL expiry detects a deleted external Group even while the parent listing is unchanged.
+func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		now = now.Add(d)
+	}
+
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	store := newFakeAccessResourceCloudflare()
+	extGroup, err := store.CreateAccessGroup(ctx, flarecloudflare.AccessScope{}, flarecloudflare.AccessGroupInput{
+		Name: "ext-grp-gone", Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}},
+	})
+	if err != nil {
+		t.Fatalf("seed external AccessGroup: %v", err)
+	}
+	extIDP, err := store.CreateIdentityProvider(ctx, flarecloudflare.IdentityProviderInput{
+		Name: "ext-idp-gone", Type: "onetimepin",
+	})
+	if err != nil {
+		t.Fatalf("seed external IdentityProvider: %v", err)
+	}
+	remote := &recordingAccessAPI{AccessAPI: store}
+	standaloneFake := &fakeStandaloneCloudflare{
+		AccessAPI:    remote,
+		applications: map[string]flarecloudflare.AccessApplication{},
+		tags:         map[string]flarecloudflare.AccessTag{},
+	}
+
+	polReconciler := &AccessPolicyReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		Freshness:           policy, Invalidator: latch, Now: nowFn,
+	}
+	grpReconciler := &AccessGroupReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		Freshness:           policy, Invalidator: latch, Now: nowFn,
+	}
+	standaloneReconciler := &AccessStandaloneApplicationReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneFake, nil },
+		Freshness:           policy, Invalidator: latch, Now: nowFn,
+	}
+	if err := polReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup policy reconciler: %v", err)
+	}
+	if err := grpReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup group reconciler: %v", err)
+	}
+	if err := standaloneReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup standalone reconciler: %v", err)
+	}
+	startManagerAndWait(t, mgr)
+
+	const ns = "tenant-extref-sweep"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "extref-sweep-account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"}, Zones: []string{"*"},
+				Exposures:       []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects: v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, nil)
+
+	pol := &v1alpha1.AccessPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-extref"},
+		Spec: v1alpha1.AccessPolicySpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "pol-extref",
+			Decision:         v1alpha1.AccessPolicyDecisionAllow,
+			Include:          []v1alpha1.AccessRule{{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}}},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	grp := &v1alpha1.AccessGroup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "grp-extref"},
+		Spec: v1alpha1.AccessGroupSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "grp-extref",
+			Include:          []v1alpha1.AccessRule{{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}}},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	standalone := &v1alpha1.AccessStandaloneApplication{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "standalone-extref"},
+		Spec: v1alpha1.AccessStandaloneApplicationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Type:       v1alpha1.AccessStandaloneApplicationTypeBookmark,
+			Bookmark:   &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://bookmark.example.com"},
+			Application: v1alpha1.AccessApplicationSettings{
+				Name:            "standalone-extref",
+				SessionDuration: "1h",
+				AllowedIDPRefs:  []v1alpha1.AccessIdentityProviderReference{{ExternalID: extIDP.ID}},
+			},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	for _, obj := range []client.Object{pol, grp, standalone} {
+		if err := direct.Create(ctx, obj); err != nil {
+			t.Fatalf("create %T: %v", obj, err)
+		}
+	}
+	polKey := client.ObjectKeyFromObject(pol)
+	grpKey := client.ObjectKeyFromObject(grp)
+	standaloneKey := client.ObjectKeyFromObject(standalone)
+
+	waitUntilTrue(t, 10*time.Second, "external-ref objects converged", func() (bool, error) {
+		var p v1alpha1.AccessPolicy
+		if ok, err := checkObjectConverged(ctx, direct, &p, polKey, "Ready", "Accepted"); err != nil || !ok {
+			return false, err
+		}
+		var g v1alpha1.AccessGroup
+		if ok, err := checkObjectConverged(ctx, direct, &g, grpKey, "Ready", "Accepted"); err != nil || !ok {
+			return false, err
+		}
+		var s v1alpha1.AccessStandaloneApplication
+		return checkObjectConverged(ctx, direct, &s, standaloneKey, "Ready", "Accepted")
+	})
+
+	// Run one rebind reconcile so AppliedHash captures assigned remote IDs.
+	for _, pair := range []struct {
+		r   interface{ Reconcile(context.Context, ctrl.Request) (ctrl.Result, error) }
+		key types.NamespacedName
+	}{
+		{polReconciler, polKey},
+		{grpReconciler, grpKey},
+		{standaloneReconciler, standaloneKey},
+	} {
+		if _, err := pair.r.Reconcile(ctx, ctrl.Request{NamespacedName: pair.key}); err != nil {
+			t.Fatalf("rebind %v: %v", pair.key, err)
+		}
+	}
+
+	var curPol v1alpha1.AccessPolicy
+	var curGrp v1alpha1.AccessGroup
+	var curStandalone v1alpha1.AccessStandaloneApplication
+	if err := direct.Get(ctx, polKey, &curPol); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Get(ctx, grpKey, &curGrp); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Get(ctx, standaloneKey, &curStandalone); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate active parent-only sweep listings matching parent state.
+	// Because all 3 carry un-listed ExternalID refs, ConfirmContent MUST NOT confirm or extend them.
+	listedPol, _ := store.GetAccessPolicy(ctx, curPol.Status.PolicyID)
+	listedGrp, _ := store.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, curGrp.Status.GroupID)
+	listedApp, _ := standaloneFake.GetAccessApplication(ctx, flarecloudflare.AccessScope{}, curStandalone.Status.ApplicationID)
+
+	_ = latch.ConfirmContent("AccessPolicy", polKey, listedPol, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, curPol.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("AccessPolicy ConfirmedAt = %v, want zero", ts)
+	}
+	_ = latch.ConfirmContent("AccessGroup", grpKey, listedGrp, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessGroup", grpKey, curGrp.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("AccessGroup ConfirmedAt = %v, want zero", ts)
+	}
+	_ = latch.ConfirmContent("AccessStandaloneApplication", standaloneKey, listedApp, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessStandaloneApplication", standaloneKey, curStandalone.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("AccessStandaloneApplication ConfirmedAt = %v, want zero", ts)
+	}
+
+	// Delete the external Group out of band while parent Policy & Group listings remain unchanged.
+	if err := store.DeleteAccessGroup(ctx, flarecloudflare.AccessScope{}, extGroup.ID); err != nil {
+		t.Fatalf("delete external group: %v", err)
+	}
+
+	// Advance inside TTL (+30s) and confirm parent listings again: gate stays open within TTL (0 reads).
+	advanceClock(30 * time.Second)
+	_ = latch.ConfirmContent("AccessPolicy", polKey, listedPol, nowFn())
+	_ = latch.ConfirmContent("AccessGroup", grpKey, listedGrp, nowFn())
+	callsBefore := remote.count()
+	if _, err := polReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+		t.Fatalf("within-TTL policy reconcile: %v", err)
+	}
+	if _, err := grpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
+		t.Fatalf("within-TTL group reconcile: %v", err)
+	}
+	if got := remote.count() - callsBefore; got != 0 {
+		t.Fatalf("within-TTL reconciles issued %d remote calls, want 0", got)
+	}
+
+	// Advance past 60s TTL (+35s) even while parent-only sweep keeps calling ConfirmContent:
+	// the gate MUST expire and detect the deleted external group as RefNotPermitted!
+	advanceClock(35 * time.Second)
+	_ = latch.ConfirmContent("AccessPolicy", polKey, listedPol, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, curPol.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("parent-only sweep confirmed AccessPolicy past TTL: %v", ts)
+	}
+	_ = latch.ConfirmContent("AccessGroup", grpKey, listedGrp, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessGroup", grpKey, curGrp.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("parent-only sweep confirmed AccessGroup past TTL: %v", ts)
+	}
+
+	if _, err := polReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+		t.Fatalf("post-TTL policy reconcile: %v", err)
+	}
+	if _, err := grpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
+		t.Fatalf("post-TTL group reconcile: %v", err)
+	}
+
+	if err := direct.Get(ctx, polKey, &curPol); err != nil {
+		t.Fatal(err)
+	}
+	polReady := meta.FindStatusCondition(curPol.Status.Conditions, "Ready")
+	if polReady == nil || polReady.Status != metav1.ConditionFalse || polReady.Reason != "RefNotPermitted" {
+		t.Fatalf("AccessPolicy after external group deletion + TTL expiry = %#v, want Ready=False (RefNotPermitted)", polReady)
+	}
+	if err := direct.Get(ctx, grpKey, &curGrp); err != nil {
+		t.Fatal(err)
+	}
+	grpReady := meta.FindStatusCondition(curGrp.Status.Conditions, "Ready")
+	if grpReady == nil || grpReady.Status != metav1.ConditionFalse || grpReady.Reason != "RefNotPermitted" {
+		t.Fatalf("AccessGroup after external group deletion + TTL expiry = %#v, want Ready=False (RefNotPermitted)", grpReady)
+	}
+}
+
+type lockingGatewayDriftAPI struct {
+	*tunnelFreshnessGatewayAPI
+	mu          sync.Mutex
+	updateCount int
+}
+
+func (a *lockingGatewayDriftAPI) GetTunnel(ctx context.Context, tunnelID string) (flarecloudflare.Tunnel, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tunnelFreshnessGatewayAPI.GetTunnel(ctx, tunnelID)
+}
+
+func (a *lockingGatewayDriftAPI) GetTunnelConfiguration(ctx context.Context, tunnelID string) (flarecloudflare.TunnelConfiguration, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tunnelFreshnessGatewayAPI.GetTunnelConfiguration(ctx, tunnelID)
+}
+
+func (a *lockingGatewayDriftAPI) UpdateTunnelConfiguration(ctx context.Context, tunnelID string, params zero_trust.TunnelCloudflaredConfigurationUpdateParams) (flarecloudflare.TunnelConfiguration, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.updateCount++
+	return a.tunnelFreshnessGatewayAPI.UpdateTunnelConfiguration(ctx, tunnelID, params)
+}
+
+// QA-2-REG-4 (Gateway): When --freshness-traffic=0, a converged/programmed Gateway
+// continues periodic drift checks and repairs out-of-band remote tunnel config drift
+// with zero Kubernetes events.
+func TestQA2REG4ZeroFreshnessGatewayPeriodicDriftEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	latch := freshness.NewLatch()
+	const accountID = "0123456789abcdef0123456789abcdef"
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	gwAPI := &lockingGatewayDriftAPI{
+		tunnelFreshnessGatewayAPI: &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1},
+	}
+	snapshots := newFakeSnapshotPublisher()
+	prober := &staticGatewayProber{version: 2, ready: true}
+
+	for _, err := range []error{
+		(&CloudflareTunnelReconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+			NewCloudflareClient: tunnelFake.Client,
+			Freshness:           freshness.Policy{}, // zero freshness
+			Invalidator:         latch,
+		}).SetupWithManager(mgr),
+		(&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
+		(&GatewayReconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+			Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+			CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+			Prober:            prober,
+			Freshness:         freshness.Policy{}, // zero freshness (--freshness-traffic=0)
+			Invalidator:       latch,
+		}).SetupWithManager(mgr),
+	} {
+		if err != nil {
+			t.Fatalf("setup controller: %v", err)
+		}
+	}
+	startManagerAndWait(t, mgr)
+
+	const ns = "tenant-reg4-gw-zero"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg4-gw-zero-account"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   accountID,
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "zone-1", Name: "example.com"}})
+
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg4-gw-zero-cfg"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatalf("create cfg: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reg4-gw-zero-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatalf("create gc: %v", err)
+	}
+	gwHost := gatewayv1.Hostname("reg4-gw-zero.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "reg4-gw-zero"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &gwHost}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "reg4 Gateway dataplane Deployment created", func() (bool, error) {
+		var dep appsv1.DeploymentList
+		if err := direct.List(ctx, &dep, client.InNamespace(ns)); err != nil {
+			return false, err
+		}
+		return len(dep.Items) > 0, nil
+	})
+	gwPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "dp-reg4-gw-0", UID: types.UID("dp-reg4-gw-uid"),
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, gwPod); err != nil {
+		t.Fatalf("create gw pod: %v", err)
+	}
+	gwPod.Status.PodIP = "10.0.0.25"
+	gwPod.Status.Phase = corev1.PodRunning
+	gwPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, gwPod); err != nil {
+		t.Fatalf("update gw pod status: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "reg4 Gateway snapshot ACKed", func() (bool, error) {
+		return snapshots.ACK(client.ObjectKeyFromObject(gw).String()) == nil, nil
+	})
+	gwTunnelKey := types.NamespacedName{Namespace: ns, Name: gw.Name}
+	waitUntilTrue(t, 15*time.Second, "reg4 Gateway Programmed=True & ConfigApplied=True", func() (bool, error) {
+		var curGW gatewayv1.Gateway
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &curGW); err != nil {
+			return false, err
+		}
+		var curT v1alpha1.CloudflareTunnel
+		if err := direct.Get(ctx, gwTunnelKey, &curT); err != nil {
+			return false, err
+		}
+		return assertConditionTrueForCurrentGen(curGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), curGW.Generation) &&
+			assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curT.Generation), nil
+	})
+
+	// Mutate remote tunnel config version out of band WITHOUT any Kubernetes event.
+	gwAPI.mu.Lock()
+	updatesBefore := gwAPI.updateCount
+	gwAPI.remoteVersion = 99
+	gwAPI.mu.Unlock()
+
+	// Gateway periodic fallback requeue (gatewayZeroFreshnessRequeue = 10s) MUST detect and overwrite drift.
+	waitUntilTrue(t, 20*time.Second, "zero-freshness Gateway periodic timer repaired remote config drift", func() (bool, error) {
+		gwAPI.mu.Lock()
+		defer gwAPI.mu.Unlock()
+		return gwAPI.updateCount > updatesBefore && gwAPI.remoteVersion != 99, nil
 	})
 }

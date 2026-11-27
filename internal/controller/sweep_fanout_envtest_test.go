@@ -329,10 +329,11 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	accessFake := newFakeAccessResourceCloudflare()
 	vnetFake := newFakePrivateNetworkCloudflare()
 
-	// Subscribe ALL 18 production sweep target kinds matching cmd/main.go:
-	// - ZeroTrustList: un-drained slow channel (buffer=3, 8 items sent)
-	// - AccessPolicy & VirtualNetwork: real production reconcilers repairing drift
-	// - Remaining 15 production target kinds: subscribers asserting 0 foreign/cross-kind delivery
+	// Subscribe ALL 19 production sweep subscriptions across 18 target kinds matching cmd/main.go,
+	// plus an independent undrained slow consumer on ZeroTrustList (buffer=3, 8 items sent):
+	// - AccessPolicy & VirtualNetwork: full production reconcilers repairing out-of-band drift
+	// - Remaining 16 production target kinds + 2nd CloudflareTunnel (Gateway): controllers enqueuing
+	//   reconcile.Request and executing Reconcile on addressed deliveries while rejecting foreign keys.
 	_ = sweeper.EventsFor("ZeroTrustList")
 	if err := (&AccessPolicyReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
@@ -352,42 +353,47 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup VirtualNetworkReconciler: %v", err)
 	}
-	// Register consumers for every other production sweep target kind (matching cmd/main.go),
-	// including a second CloudflareTunnel subscription representing Gateway alongside CloudflareTunnel.
-	// Phase 1 asserts zero foreign/cross-kind delivery while AccessPolicy/VirtualNetwork/ZeroTrustList
-	// emit; Phase 2 asserts every single one of the 19 production subscriptions receives its exact
-	// addressed event without cross-kind leakage.
 	var foreignHits atomic.Int64
 	for _, kind := range otherProductionKinds {
 		k := kind
 		counter := otherSubHits[k]
+		expectedReq := types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-" + k}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			Named("prod-sub-" + k).
 			WatchesRawSource(source.Channel(sweeper.EventsFor(k), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-				if obj != nil && obj.GetName() == "probe-"+k {
+				if obj == nil {
+					foreignHits.Add(1)
+					return nil
+				}
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
+			}))).
+			Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (ctrl.Result, error) {
+				if req.NamespacedName == expectedReq {
 					counter.Add(1)
 				} else {
 					foreignHits.Add(1)
 				}
-				return nil
-			}))).
-			Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
 				return ctrl.Result{}, nil
 			})); err != nil {
 			t.Fatalf("setup subscriber %s: %v", k, err)
 		}
 	}
+	expectedTunnelReq := types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-CloudflareTunnel"}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("prod-sub-gateway-tunnel").
 		WatchesRawSource(source.Channel(sweeper.EventsFor("CloudflareTunnel"), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-			if obj != nil && obj.GetName() == "probe-CloudflareTunnel" {
+			if obj == nil {
+				foreignHits.Add(1)
+				return nil
+			}
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
+		}))).
+		Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (ctrl.Result, error) {
+			if req.NamespacedName == expectedTunnelReq {
 				gwTunnelSubHits.Add(1)
 			} else {
 				foreignHits.Add(1)
 			}
-			return nil
-		}))).
-		Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
 			return ctrl.Result{}, nil
 		})); err != nil {
 		t.Fatalf("setup subscriber Gateway-CloudflareTunnel: %v", err)

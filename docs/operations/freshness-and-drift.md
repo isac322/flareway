@@ -89,8 +89,9 @@ Content confirmation applies only where the listing shows everything the reconci
 | Kind | Confirmed by the sweep unless |
 |---|---|
 | `AccessApplication` | it is a `ProxyEndpoint` |
-| `AccessStandaloneApplication` | it holds a one-time SaaS client secret |
-| `AccessPolicy`, `AccessGroup`, `AccessInfrastructureTarget` | always confirmed |
+| `AccessStandaloneApplication` | it holds a one-time SaaS client secret or references un-listed `externalId` / `externalRef` dependencies |
+| `AccessPolicy`, `AccessGroup` | rules reference un-listed `externalId` dependencies |
+| `AccessInfrastructureTarget` | always confirmed |
 | `IdentityProvider` | SCIM is enabled |
 | `VirtualNetwork`, `HostnameRoute`, `ZeroTrustGatewayPolicy` | always confirmed |
 | `NetworkRoute` | it uses `ipLookup` |
@@ -111,7 +112,7 @@ Confirmations live in operator memory. After a restart or leader change, each ob
 
 ## API budget and DNS zone scope
 
-The sweep lists each enabled resource kind once per period, regardless of how many objects exist. For kinds whose listing shows everything a reconciler checks, that listing also stands in for each object's own re-verify (see [Content confirmation](#content-confirmation)), so a converged object reads nothing until the sweep reports drift on it or the sweep stops. Converged Access policies, groups, and standalone applications also defer remote `externalId` / `externalRef` existence checks until the gate closes (or `ObserveOnly`), so open-gate passes make zero Cloudflare reads even when rules reference external IDs. For those objects, steady-state Cloudflare API traffic does not grow with their number. Every other object reads its remote once per freshness TTL.
+The sweep lists each enabled resource kind once per period, regardless of how many objects exist. For kinds whose listing shows everything a reconciler checks, that listing also stands in for each object's own re-verify (see [Content confirmation](#content-confirmation)), so a converged object reads nothing until the sweep reports drift on it or the sweep stops. Converged `AccessPolicy`, `AccessGroup`, `AccessStandaloneApplication`, `DevicePostureRule`, and `ZeroTrustOrganization` objects also defer remote existence checks for `externalId` / `externalRef` references until the gate closes (or `ObserveOnly`), so open-gate passes make zero Cloudflare reads even when referencing external IDs; objects with un-listed external references omit parent-only sweep confirmation and re-verify on their bounded freshness TTL instead. For sweep-confirmed objects without un-listed external dependencies, steady-state Cloudflare API traffic does not grow with their number. Every other object reads its remote once per freshness TTL.
 
 The sweep runs on a dedicated `0.5 req/s` budget for enabled targets, separate from the `3.5 req/s` reconciler budget, so the two together stay inside Cloudflare's `4.0 req/s` account limit. It starts each enabled kind on a staggered delay so a restart does not produce a burst.
 
@@ -134,7 +135,7 @@ A DNS or zone-scoped Access pass with isolated zone failures reports `result="pa
 
 `--disable-sweep` stops the sweep worker. Freshness gates keep working, and every object reads its remote once per TTL, so out-of-band drift is detected only when that TTL expires.
 
-Setting every freshness flag to `0` keeps every gate closed, so reconcilers read Cloudflare on every reconcile pass. Controllers with periodic drift loops (`AccessApplication`, `AccessStandaloneApplication`, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `ZeroTrustOrganization`, `WARPConnector`, `DeviceSettings`, `CloudflareTunnel`, and `Gateway`) fall back to their periodic requeue intervals even when freshness is `0`, while event-driven controllers (`AccessPolicy`, `AccessGroup`, `AccessInfrastructureTarget`, `IdentityProvider`, `ServiceToken`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, and `DeviceProfile`) return `RequeueAfter=0s` and recheck on Kubernetes watch events (or sweep notifications unless `--disable-sweep` is also set):
+Setting a freshness flag to `0` stops that grade's target sweep loops (even if `--disable-sweep` is unset) and keeps its gates closed, so reconcilers read Cloudflare on every reconcile pass. Controllers with periodic drift loops (`AccessApplication`, `AccessStandaloneApplication`, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `ZeroTrustOrganization`, `WARPConnector`, `DeviceSettings`, `CloudflareTunnel`, and `Gateway`) fall back to their periodic requeue intervals even when freshness is `0`; `ServiceToken` keeps its credential-expiry scheduler independently of freshness TTL; and event-driven controllers (`AccessPolicy`, `AccessGroup`, `AccessInfrastructureTarget`, `AccessCustomPage`, `IdentityProvider`, `DevicePostureRule`, `DevicePostureIntegration`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, and `DeviceProfile`) return `RequeueAfter=0s` and recheck on Kubernetes watch events:
 
 ```
 --freshness-authz=0 --freshness-traffic=0 --freshness-indirect=0 --freshness-display=0

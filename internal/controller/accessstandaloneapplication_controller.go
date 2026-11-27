@@ -162,14 +162,11 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		return ctrl.Result{}, err
 	}
 	stamp := newGateStamp(decision.DesiredHash, r.now())
-	if secretRef == nil {
-		// The sweep's application listing carries every field compared above,
-		// with each attached policy embedded; an attachment to a policy deleted
-		// out of band comes back without its decision and counts as changed.
-		// Referenced policies, identity providers, and custom pages are
-		// resolved before the gate on every pass. An application holding a
-		// one-time SaaS client Secret keeps its own verify, which is what
-		// notices that Secret going missing.
+	if secretRef == nil && !hasStandaloneExternalRefs(object) {
+		// The sweep's application listing checks the application and its
+		// embedded policies, not un-listed external IDP/custom-page/rule refs.
+		// Objects with external dependencies or a one-time SaaS client Secret
+		// keep bounded per-TTL self-verification instead.
 		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
 			application, ok := listed.(flarecloudflare.AccessApplication)
 			return ok && application.ID == remote.ID && accessApplicationPoliciesEmbedded(application) &&
@@ -910,30 +907,71 @@ func (r *AccessStandaloneApplicationReconciler) reconcileDelete(ctx context.Cont
 	return r.Patch(ctx, object, base)
 }
 
+var errFoundExternalRef = errors.New("found external ref")
+
+func hasStandaloneExternalRefs(object *v1alpha1.AccessStandaloneApplication) bool {
+	return walkStandaloneExternalRefs(object,
+		func(string) error { return errFoundExternalRef },
+		func(string) error { return errFoundExternalRef },
+		func(string) error { return errFoundExternalRef },
+		func(include, require, exclude []v1alpha1.AccessRule) error {
+			if hasExternalAccessRules(include, require, exclude) {
+				return errFoundExternalRef
+			}
+			return nil
+		},
+	) != nil
+}
+
 func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, api flarecloudflare.AccessAPI) error {
+	return walkStandaloneExternalRefs(object,
+		func(id string) error {
+			_, err := verifyExternalAccessPolicy(ctx, api, id)
+			return err
+		},
+		func(id string) error {
+			_, err := verifyExternalStandaloneIDP(ctx, api, id)
+			return err
+		},
+		func(id string) error {
+			return verifyExternalCustomPage(ctx, api, id)
+		},
+		func(include, require, exclude []v1alpha1.AccessRule) error {
+			return verifyExternalAccessRules(ctx, api, include, require, exclude)
+		},
+	)
+}
+
+func walkStandaloneExternalRefs(
+	object *v1alpha1.AccessStandaloneApplication,
+	onPolicy func(string) error,
+	onIDP func(string) error,
+	onPage func(string) error,
+	onInfraRules func(include, require, exclude []v1alpha1.AccessRule) error,
+) error {
 	for _, ref := range object.Spec.Policies {
 		if ref.ExternalRef != nil {
-			if _, err := verifyExternalAccessPolicy(ctx, api, ref.ExternalRef.PolicyID); err != nil {
+			if err := onPolicy(ref.ExternalRef.PolicyID); err != nil {
 				return err
 			}
 		}
 	}
 	for _, ref := range object.Spec.Application.AllowedIDPRefs {
 		if ref.ExternalID != "" {
-			if _, err := verifyExternalStandaloneIDP(ctx, api, ref.ExternalID); err != nil {
+			if err := onIDP(ref.ExternalID); err != nil {
 				return err
 			}
 		}
 	}
 	for _, ref := range object.Spec.Application.CustomPageRefs {
 		if ref.ExternalID != "" {
-			if err := verifyExternalCustomPage(ctx, api, ref.ExternalID); err != nil {
+			if err := onPage(ref.ExternalID); err != nil {
 				return err
 			}
 		}
 	}
 	if scim := object.Spec.Application.SCIMConfig; scim != nil && scim.IDPRef.ExternalID != "" {
-		if _, err := verifyExternalStandaloneIDP(ctx, api, scim.IDPRef.ExternalID); err != nil {
+		if err := onIDP(scim.IDPRef.ExternalID); err != nil {
 			return err
 		}
 	}
@@ -942,7 +980,7 @@ func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessSt
 			for _, claim := range saas.OIDC.CustomClaims {
 				for _, mapping := range claim.Source.NameByIDP {
 					if mapping.IDPRef.ExternalID != "" {
-						if _, err := verifyExternalStandaloneIDP(ctx, api, mapping.IDPRef.ExternalID); err != nil {
+						if err := onIDP(mapping.IDPRef.ExternalID); err != nil {
 							return err
 						}
 					}
@@ -953,7 +991,7 @@ func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessSt
 			for _, attr := range saas.SAML.CustomAttributes {
 				for _, mapping := range attr.Source.NameByIDP {
 					if mapping.IDPRef.ExternalID != "" {
-						if _, err := verifyExternalStandaloneIDP(ctx, api, mapping.IDPRef.ExternalID); err != nil {
+						if err := onIDP(mapping.IDPRef.ExternalID); err != nil {
 							return err
 						}
 					}
@@ -963,7 +1001,7 @@ func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessSt
 	}
 	if infra := object.Spec.Infrastructure; infra != nil {
 		for _, policy := range infra.Policies {
-			if err := verifyExternalAccessRules(ctx, api, policy.Include, policy.Require, policy.Exclude); err != nil {
+			if err := onInfraRules(policy.Include, policy.Require, policy.Exclude); err != nil {
 				return err
 			}
 		}
