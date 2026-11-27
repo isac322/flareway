@@ -100,6 +100,18 @@ type AccessApplicationCompilation struct {
 	// application.
 	TargetLoss AccessTargetLoss
 
+	// NoTargetsResolved reports that no route or concrete host resolved to
+	// the application's targetRefs or declared destinations (for example, a
+	// wildcard Gateway listener with zero attached HTTPRoutes). Because no
+	// live route remains to forward traffic, completed revocation tombstones
+	// may be released once Blocked is acknowledged and tokens are revoked.
+	NoTargetsResolved bool
+
+	// HasResolvedTargets reports that at least one route or declared
+	// destination resolved, even when another target or destination failed
+	// compilation.
+	HasResolvedTargets bool
+
 	claims []accessClaim
 }
 
@@ -152,14 +164,18 @@ func CompileAccessApplication(in Inputs, application *v1alpha1.AccessApplication
 	base := in
 	base.AccessApplications = nil
 	base.AUDSecrets = nil
-	gateway, _ := Translate(base)
+	gateway, baseStatuses := Translate(base)
 	if gateway == nil {
 		if len(application.Spec.TargetRefs) > 0 {
 			return accessLossFailure("Gateway target was not found", AccessTargetLossGateway)
 		}
-		return compileDeclaredAccessDestinations(in, application)
+		return CompileDeclaredAccessDestinations(in, application)
 	}
-	return compileAccessApplicationAgainstIR(in, gateway, application)
+	compiled := compileAccessApplicationAgainstIR(in, gateway, application)
+	if compiled.NoTargetsResolved && targetAttachmentRejected(in, gateway, &baseStatuses, application) {
+		compiled.NoTargetsResolved = false
+	}
+	return compiled
 }
 
 // isWildcardHostname reports whether a virtual host stands for a pattern
@@ -300,8 +316,14 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		}
 	}
 
-	declared := compileDeclaredAccessDestinations(in, application)
+	declared := CompileDeclaredAccessDestinations(in, application)
 	if !declared.Accepted {
+		hasResolved := declared.HasResolvedTargets || len(result.Destinations) > 0 || len(result.DataPlanes) > 0
+		declared.HasResolvedTargets = hasResolved
+		declared.NoTargetsResolved = false
+		if hasResolved {
+			declared.TargetLoss = AccessTargetLossNone
+		}
 		return declared
 	}
 	for _, destination := range declared.Destinations {
@@ -309,8 +331,11 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 	}
 	result.Ancestors = append(result.Ancestors, declared.Ancestors...)
 	if len(result.claims) == 0 && len(result.Destinations) == 0 {
-		return accessFailure("TargetNotFound", "no targetRef or destination resolves to this Gateway")
+		failure := accessFailure("TargetNotFound", "no targetRef or destination resolves to this Gateway")
+		failure.NoTargetsResolved = true
+		return failure
 	}
+	result.HasResolvedTargets = true
 	result.OriginJWTEnforced = len(result.claims) > 0 && effectiveOriginJWTMode(application) == v1alpha1.AccessOriginJWTModeRequired
 	sortAccessCompilation(&result)
 	return result
@@ -338,10 +363,35 @@ func accessApplicationPathScope(application *v1alpha1.AccessApplication) (access
 	}
 }
 
-func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
-	result := CompilePrivateDestinations(in, application)
-	if !result.Accepted {
+// CompileDeclaredAccessDestinations compiles explicit spec.destinations entries
+// independent of Gateway route targets.
+func CompileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessApplication) AccessApplicationCompilation {
+	result := AccessApplicationCompilation{Accepted: true, Reason: "Accepted", Message: "Declared destinations are valid"}
+	if application == nil {
 		return result
+	}
+	priv := CompilePrivateDestinations(in, application)
+	var (
+		nonLossFailure    *AccessApplicationCompilation
+		targetLossFailure *AccessApplicationCompilation
+		hasResolved       = priv.HasResolvedTargets || (priv.Accepted && len(priv.Destinations) > 0)
+	)
+	recordFailure := func(candidate AccessApplicationCompilation) {
+		copied := candidate
+		if copied.TargetLoss != AccessTargetLossNone {
+			if targetLossFailure == nil {
+				targetLossFailure = &copied
+			}
+			return
+		}
+		if nonLossFailure == nil {
+			nonLossFailure = &copied
+		}
+	}
+	if priv.Accepted {
+		result = priv
+	} else {
+		recordFailure(priv)
 	}
 	seen := make(map[string]struct{}, len(result.Destinations))
 	for _, destination := range result.Destinations {
@@ -352,36 +402,61 @@ func compileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 		case v1alpha1.AccessApplicationDestinationPrivate:
 			continue
 		case v1alpha1.AccessApplicationDestinationPublic:
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] cannot declare a public destination", index))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d] cannot declare a public destination", index)))
 		case v1alpha1.AccessApplicationDestinationViaMCPServerPortal:
 			if destination.ViaMCPServerPortal == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].viaMcpServerPortal is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].viaMcpServerPortal is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationViaMCPServerPortal, MCPServerID: destination.ViaMCPServerPortal.MCPServerID,
 			})
 		case v1alpha1.AccessApplicationDestinationWorker:
 			if destination.Worker == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].worker is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].worker is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationWorker, WorkerID: destination.Worker.WorkerID,
 			})
 		case v1alpha1.AccessApplicationDestinationPreviewWorker:
 			if destination.PreviewWorker == nil {
-				return accessFailure("Invalid", fmt.Sprintf("destinations[%d].previewWorker is required", index))
+				recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d].previewWorker is required", index)))
+				continue
 			}
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{
 				Type: v1alpha1.AccessApplicationDestinationPreviewWorker, WorkerID: destination.PreviewWorker.WorkerID,
 			})
 		case v1alpha1.AccessApplicationDestinationAllWorkers:
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllWorkers})
 		case v1alpha1.AccessApplicationDestinationAllPreviewWorkers:
+			hasResolved = true
 			appendCompiledDestination(&result, seen, AccessDestination{Type: v1alpha1.AccessApplicationDestinationAllPreviewWorkers})
 		default:
-			return accessFailure("Invalid", fmt.Sprintf("destinations[%d] uses unsupported type %q", index, destination.Type))
+			recordFailure(accessFailure("Invalid", fmt.Sprintf("destinations[%d] uses unsupported type %q", index, destination.Type)))
 		}
 	}
+	if nonLossFailure != nil {
+		failure := *nonLossFailure
+		failure.NoTargetsResolved = false
+		failure.TargetLoss = AccessTargetLossNone
+		failure.HasResolvedTargets = hasResolved
+		return failure
+	}
+	if targetLossFailure != nil {
+		failure := *targetLossFailure
+		failure.NoTargetsResolved = false
+		failure.HasResolvedTargets = hasResolved
+		if hasResolved {
+			failure.TargetLoss = AccessTargetLossNone
+		}
+		return failure
+	}
+	result.HasResolvedTargets = hasResolved || len(result.Destinations) > 0
 	sortAccessCompilation(&result)
 	return result
 }
@@ -405,6 +480,9 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 		application := &applications[index]
 		key := types.NamespacedName{Namespace: application.Namespace, Name: application.Name}
 		compiled := compileAccessApplicationAgainstIR(in, gateway, application)
+		if compiled.NoTargetsResolved && targetAttachmentRejected(in, gateway, statuses, application) {
+			compiled.NoTargetsResolved = false
+		}
 		if compiled.Accepted {
 			for _, claim := range compiled.claims {
 				for _, existing := range acceptedClaims[claim.hostname] {
@@ -1036,6 +1114,124 @@ func accessFailure(reason, message string) AccessApplicationCompilation {
 // permanently unusable; TargetLoss carries the structured discriminator.
 func accessLossFailure(message string, loss AccessTargetLoss) AccessApplicationCompilation {
 	return AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
+}
+
+func targetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses, application *v1alpha1.AccessApplication) bool {
+	if gateway == nil || statuses == nil || application == nil {
+		return false
+	}
+	for _, target := range application.Spec.TargetRefs {
+		group := string(target.Group)
+		if group == "" {
+			group = gatewayGroup
+		}
+		kind := string(target.Kind)
+		if kind == "" {
+			kind = "Gateway"
+		}
+		switch {
+		case group == gatewayGroup && kind == "Gateway":
+			if string(target.Name) != gateway.Key.Name {
+				continue
+			}
+			if gatewayTargetAttachmentRejected(in, gateway, statuses, target.SectionName) {
+				return true
+			}
+		case group == gatewayGroup && kind == "HTTPRoute":
+			key := types.NamespacedName{Namespace: application.Namespace, Name: string(target.Name)}
+			routeStatus, ok := statuses.HTTPRoutes[key]
+			if !ok {
+				continue
+			}
+			for _, parentStatus := range routeStatus.Parents {
+				if parentStatus.ControllerName != ControllerName ||
+					!parentTargetsGateway(parentStatus.ParentRef, application.Namespace, in.Gateway) {
+					continue
+				}
+				for _, cond := range parentStatus.Conditions {
+					if cond.Type == string(gatewayv1.RouteConditionAccepted) &&
+						cond.Status == metav1.ConditionFalse {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func gatewayTargetAttachmentRejected(in Inputs, gateway *ir.Gateway, statuses *Statuses, sectionName *gatewayv1.SectionName) bool {
+	var (
+		targetPort      *gatewayv1.PortNumber
+		targetListeners []gatewayv1.Listener
+	)
+	if in.Gateway != nil {
+		var activeListeners map[string]struct{}
+		if gateway != nil {
+			activeListeners = make(map[string]struct{}, len(gateway.Listeners))
+			for _, listener := range gateway.Listeners {
+				activeListeners[listener.Name] = struct{}{}
+			}
+		}
+		for _, listener := range in.Gateway.Spec.Listeners {
+			if sectionName != nil && listener.Name != *sectionName {
+				continue
+			}
+			if gateway != nil {
+				if _, active := activeListeners[string(listener.Name)]; !active {
+					return true
+				}
+			}
+			if sectionName != nil && targetPort == nil {
+				port := listener.Port
+				targetPort = &port
+			}
+			targetListeners = append(targetListeners, listener)
+		}
+	}
+	for index := range in.HTTPRoutes {
+		route := &in.HTTPRoutes[index]
+		routeStatus, ok := statuses.HTTPRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}]
+		if !ok {
+			continue
+		}
+		for _, parentStatus := range routeStatus.Parents {
+			if parentStatus.ControllerName != ControllerName ||
+				!parentTargetsGateway(parentStatus.ParentRef, route.Namespace, in.Gateway) {
+				continue
+			}
+			if sectionName != nil && parentStatus.ParentRef.SectionName != nil &&
+				*parentStatus.ParentRef.SectionName != *sectionName {
+				continue
+			}
+			if targetPort != nil && parentStatus.ParentRef.Port != nil &&
+				*parentStatus.ParentRef.Port != *targetPort {
+				continue
+			}
+			if parentStatus.ParentRef.SectionName == nil {
+				applicable := false
+				for _, listener := range targetListeners {
+					if parentStatus.ParentRef.Port != nil && *parentStatus.ParentRef.Port != listener.Port {
+						continue
+					}
+					if len(ComputeHosts(route.Spec.Hostnames, listener.Hostname, nil)) > 0 {
+						applicable = true
+						break
+					}
+				}
+				if !applicable {
+					continue
+				}
+			}
+			for _, cond := range parentStatus.Conditions {
+				if cond.Type == string(gatewayv1.RouteConditionAccepted) &&
+					cond.Status == metav1.ConditionFalse {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func accessRegionsToMatches(regions []accessRegion) []ir.PathMatch {

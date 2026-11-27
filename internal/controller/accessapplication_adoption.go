@@ -209,6 +209,9 @@ func (r *AccessApplicationReconciler) persistParentID(ctx context.Context, appli
 			return err
 		}
 		before := current.DeepCopy()
+		if current.Status.ApplicationID != id {
+			current.Status.Revocation = nil
+		}
 		current.Status.ApplicationID = id
 		return r.Status().Patch(ctx, &current, client.MergeFrom(before))
 	})

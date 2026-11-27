@@ -94,18 +94,10 @@ Procedure:
 2. Compile fail-closed: a protected domain with no verified, ready AUD — or with
    a blocked guard — produces a deny rule, never an open pass-through. Keep the
    "requires teamName and at least one non-empty audTag" validation intact.
-3. Treat revocation as a latch, not an event. A deleted or distrusted handoff
-   latches the (gateway, application) identity; the latch releases only after the
-   tunnel reports a fresh `Blocked` status above the recorded baseline with
-   desired == applied config version. Until then the handoff stays `Ready=false`
-   even if a new Secret appears.
+3. Treat Gateway AUD handoff revocation (`audRevocationApplied` on `CloudflareTunnel.status`) as a latch, not an event. A deleted or distrusted handoff latches the `(gateway, application)` identity; `audRevocationApplied` releases that latch only when `tunnel.Status.ConfigVersion.Applied > 0`, at least one matching hostname entry exists on the tunnel, and every matching entry reports `Blocked` with `AppliedVersion == tunnel.Status.ConfigVersion.Applied`. Until then the handoff stays `Ready=false` even if a new Secret appears.
 4. Only a Secret that passes the full live-binding check may latch or unlatch —
    a tenant-forged Secret in a tenant namespace must be ignored entirely.
-5. Token revocation runs only after every protection domain has acknowledged
-   `Blocked`, is skipped under `ObserveOnly`, and is recorded in the latch so
-   retries are idempotent. Revocation still goes through the normal
-   grant-gated client construction; it is a narrower operation, not an
-   authorization exemption.
+5. For `AccessApplication` lifecycle revocation (`revocationAcknowledged` and deletion/invalidation), initial acknowledgment requires `tunnel.Status.ConfigVersion.Desired == tunnel.Status.ConfigVersion.Applied > 0` with each claim on `CloudflareTunnel.status.hostnames` reporting `Blocked` at `AppliedVersion == tunnel.Status.ConfigVersion.Applied` above `baselineVersion` (or equal to `baselineVersion` for a `Private` protection domain) and no `Forwarding` entry for that claim, or converged absence on a `Desired == Applied > 0` tunnel with `Applied > baselineVersion` when the domain is absent from `status.dataPlanes`. Once controller-owned `status.revocation` records `Acknowledged: true` for the UID and latch digest, a transient `Desired != Applied` rollout while `Applied > 0` keeps acknowledgment valid as long as no ready AUD handoff or `Forwarding` entry returns and each absent claim satisfies `Applied >= baselineVersion`. While active recovery waits for acknowledgment or first latches a missing handoff, preserve existing `status.dataPlanes` and `status.destinations`. Token revocation runs only after every protection domain acknowledges revocation, is skipped under `ObserveOnly`, and skips re-invocation only when controller-owned `status.revocation` proves `TokensRevoked` for the UID and claim digest (annotation `tokensRevoked` alone is never trusted). Controller-owned release eligibility lives in `status.revocation` (bound to application UID, canonical claim digest, `observedGeneration`, acknowledgment, and token revocation — or `ObserveOnly`): `NoTargetsResolved` (zero route claims and zero declared destinations across the whole application) and target-loss applications set `Released=true` on the evaluated generation, whereas configuration, policy, grant, or listener/route-attachment rejections reset `Released=false`. `AccessRevocationTombstones` drops a tombstone only when `status.revocation` proves current-generation release and the tunnel has no remaining `Forwarding` entry for that protection domain and application (an unrelated domain on the same tunnel may continue forwarding). Revocation still goes through the normal grant-gated client construction; it is a narrower operation, not an authorization exemption.
 6. Deletion ordering: remove the AUD handoff, wait for `Blocked` acknowledgment,
    then delete bypass children, then the parent. Never delete the remote
    application while a data plane may still serve its AUD.

@@ -1680,6 +1680,36 @@ spec:
                 type: integer
               ownershipVerified:
                 type: boolean
+              revocation:
+                description: |-
+                  Revocation records controller-owned revocation acknowledgment and
+                  hold-release eligibility for an active revocation latch.
+                properties:
+                  acknowledged:
+                    description: Acknowledged reports that every latched claim stopped
+                      forwarding on the tunnel.
+                    type: boolean
+                  latchDigest:
+                    description: |-
+                      LatchDigest is the SHA-256 hex digest binding application UID and canonical
+                      revocation latch claims.
+                    type: string
+                  observedGeneration:
+                    description: ObservedGeneration is the AccessApplication generation
+                      evaluated for Released.
+                    format: int64
+                    type: integer
+                  released:
+                    description: |-
+                      Released reports whether completed revocation tombstones may be released
+                      for the evaluated generation when no Forwarding entry remains for that
+                      protection domain and application on the tunnel.
+                    type: boolean
+                  tokensRevoked:
+                    description: TokensRevoked reports that remote Access tokens were
+                      revoked for this latch.
+                    type: boolean
+                type: object
               tags:
                 items:
                   type: string
