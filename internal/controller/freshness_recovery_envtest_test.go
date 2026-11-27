@@ -1302,24 +1302,63 @@ func TestQA2C2GatewayAccessAppHTTPRouteAndServiceTokenRecoverImmediatelyEnvtest(
 		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready", "Accepted")
 	})
 
-	if err := direct.Delete(ctx, stSecret); err != nil {
-		t.Fatalf("delete st-api-token secret: %v", err)
+	// Capture established tokenID and saved spec.secretRef Secret before deleting it.
+	var convergedST v1alpha1.ServiceToken
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(st), &convergedST); err != nil {
+		t.Fatalf("get converged ServiceToken: %v", err)
 	}
-	waitUntilTrue(t, 10*time.Second, "ServiceToken turns Ready=False after credential Secret deletion", func() (bool, error) {
-		var cur v1alpha1.ServiceToken
-		return checkObjectFailed(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready")
-	})
+	tokenIDBefore := convergedST.Status.TokenID
+	if tokenIDBefore == "" {
+		t.Fatal("expected non-empty ServiceToken status.tokenId")
+	}
+	var savedCreds corev1.Secret
+	credsKey := types.NamespacedName{Namespace: ns, Name: st.Spec.SecretRef.Name}
+	if err := direct.Get(ctx, credsKey, &savedCreds); err != nil {
+		t.Fatalf("get ServiceToken credential Secret %s: %v", credsKey, err)
+	}
+	restoredCreds := savedCreds.DeepCopy()
+	restoredCreds.ResourceVersion = ""
+	restoredCreds.UID = ""
+	restoredCreds.CreationTimestamp = metav1.Time{}
 
-	if err := direct.Create(ctx, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-api-token"},
-		Data:       map[string][]byte{"token": []byte("tok")},
-	}); err != nil {
-		t.Fatalf("restore st-api-token secret: %v", err)
+	// Delete ServiceToken's own spec.secretRef Secret inside the 60s TTL.
+	// Open freshness gate MUST NOT mask its loss; ServiceToken must turn
+	// Ready=False (SecretMissing), forget cached stamps, preserve tokenId,
+	// and never silently rotate/recreate the token.
+	if err := direct.Delete(ctx, &savedCreds); err != nil {
+		t.Fatalf("delete ServiceToken spec.secretRef Secret: %v", err)
 	}
-	waitUntilTrue(t, 10*time.Second, "ServiceToken recovers immediately after credential Secret restoration inside 60s TTL", func() (bool, error) {
+	waitUntilTrue(t, 10*time.Second, "ServiceToken turns Ready=False (SecretMissing) after spec.secretRef deletion", func() (bool, error) {
+		var cur v1alpha1.ServiceToken
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(st), &cur); err != nil {
+			return false, err
+		}
+		cond := meta.FindStatusCondition(cur.Status.Conditions, "Ready")
+		return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == "SecretMissing", nil
+	})
+	var failedST v1alpha1.ServiceToken
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(st), &failedST); err != nil {
+		t.Fatalf("get failed ServiceToken: %v", err)
+	}
+	if failedST.Status.TokenID != tokenIDBefore {
+		t.Fatalf("ServiceToken tokenId mutated on SecretMissing: %q -> %q", tokenIDBefore, failedST.Status.TokenID)
+	}
+
+	// Administratively restore spec.secretRef Secret inside the original 60s TTL.
+	if err := direct.Create(ctx, restoredCreds); err != nil {
+		t.Fatalf("restore ServiceToken spec.secretRef Secret: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "ServiceToken recovers immediately after spec.secretRef restoration inside 60s TTL", func() (bool, error) {
 		var cur v1alpha1.ServiceToken
 		return checkObjectConverged(ctx, direct, &cur, client.ObjectKeyFromObject(st), "Ready", "Accepted")
 	})
+	var recoveredST v1alpha1.ServiceToken
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(st), &recoveredST); err != nil {
+		t.Fatalf("get recovered ServiceToken: %v", err)
+	}
+	if recoveredST.Status.TokenID != tokenIDBefore {
+		t.Fatalf("ServiceToken rotated tokenId on Secret restoration: got %q, want %q", recoveredST.Status.TokenID, tokenIDBefore)
+	}
 }
 
 // QA-2D-1: dns.mode: External Direct & Gateway tunnels with publicHosts converge
@@ -1543,7 +1582,16 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	policy := freshness.DefaultPolicy()
 	const accountID = "0123456789abcdef0123456789abcdef"
 	store := newFakeAccessResourceCloudflare()
+	extGroup, err := store.CreateAccessGroup(ctx, flarecloudflare.AccessScope{}, flarecloudflare.AccessGroupInput{
+		Name: "ext-grp-reg1", Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}},
+	})
+	if err != nil {
+		t.Fatalf("seed external AccessGroup: %v", err)
+	}
 	remote := &recordingAccessAPI{AccessAPI: store}
+	idpFake := &scimIdentityProviderFakeAPI{identityProviderFakeAPI: &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}}
+	idpRemote := &recordingAccessAPI{AccessAPI: idpFake}
+	privateFake := newFakePrivateNetworkCloudflare()
 	tunnelFake := newFakeTunnelCloudflareFactory()
 	gwAPI := &tunnelFreshnessGatewayAPI{accountID: accountID, remoteVersion: 1}
 	snapshots := newFakeSnapshotPublisher()
@@ -1556,6 +1604,24 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 
 	reconciler := &AccessPolicyReconciler{
 		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	vnetReconciler := &VirtualNetworkReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: privateFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	idpReconciler := &IdentityProviderReconciler{
+		Client: countingClient, Scheme: mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return idpRemote, nil },
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	stReconciler := &ServiceTokenReconciler{
+		Client: countingClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return remote, nil },
 		Freshness:           policy,
 		Invalidator:         latch,
@@ -1576,6 +1642,15 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup policy reconciler: %v", err)
+	}
+	if err := vnetReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup vnet reconciler: %v", err)
+	}
+	if err := idpReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup idp reconciler: %v", err)
+	}
+	if err := stReconciler.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup servicetoken reconciler: %v", err)
 	}
 	if err := tunnelReconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup tunnel reconciler: %v", err)
@@ -1619,8 +1694,11 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-steady"},
 		Spec: v1alpha1.AccessPolicySpec{
 			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "pol-steady",
-			Decision:         v1alpha1.AccessPolicyDecisionAllow,
-			Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+			Decision: v1alpha1.AccessPolicyDecisionAllow,
+			Include: []v1alpha1.AccessRule{
+				{Everyone: &v1alpha1.AccessEveryoneRule{}},
+				{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}},
+			},
 			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
 		},
 	}
@@ -1651,6 +1729,67 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 		ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, cur.Status.AppliedHash)
 		return ok && !ts.IsZero(), nil
 	})
+
+	// Additional representative gated CRDs: VirtualNetwork (T2), IdentityProvider (T1), ServiceToken (T1).
+	vnet := &v1alpha1.VirtualNetwork{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "vnet-steady"},
+		Spec: v1alpha1.VirtualNetworkSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "vnet-steady",
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, vnet); err != nil {
+		t.Fatalf("create vnet: %v", err)
+	}
+	vnetKey := client.ObjectKeyFromObject(vnet)
+	waitUntilTrue(t, 10*time.Second, "vnet converged", func() (bool, error) {
+		var cur v1alpha1.VirtualNetwork
+		return checkObjectConverged(ctx, direct, &cur, vnetKey, v1alpha1.PrivateNetworkConditionReady, v1alpha1.PrivateNetworkConditionAccepted)
+	})
+	if _, err := vnetReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: vnetKey}); err != nil {
+		t.Fatalf("rebind vnet reconcile: %v", err)
+	}
+
+	idp := &v1alpha1.IdentityProvider{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-steady"},
+		Spec: v1alpha1.IdentityProviderSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "idp-steady",
+			Type:             v1alpha1.IdentityProviderTypeOneTimePIN,
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, idp); err != nil {
+		t.Fatalf("create idp: %v", err)
+	}
+	idpKey := client.ObjectKeyFromObject(idp)
+	waitUntilTrue(t, 10*time.Second, "idp converged", func() (bool, error) {
+		var cur v1alpha1.IdentityProvider
+		return checkObjectConverged(ctx, direct, &cur, idpKey, "Ready", "Accepted")
+	})
+	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
+		t.Fatalf("rebind idp reconcile: %v", err)
+	}
+
+	st := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-steady"},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name}, Name: "st-steady",
+			Enabled: true, Duration: "8760h",
+			SecretRef:        corev1.LocalObjectReference{Name: "st-steady-creds"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, st); err != nil {
+		t.Fatalf("create st: %v", err)
+	}
+	stKey := client.ObjectKeyFromObject(st)
+	waitUntilTrue(t, 10*time.Second, "st converged", func() (bool, error) {
+		var cur v1alpha1.ServiceToken
+		return checkObjectConverged(ctx, direct, &cur, stKey, "Ready", "Accepted")
+	})
+	if _, err := stReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+		t.Fatalf("rebind st reconcile: %v", err)
+	}
 
 	// Direct External-DNS CloudflareTunnel with publicHosts.
 	directTunnel := &v1alpha1.CloudflareTunnel{
@@ -1756,6 +1895,10 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	accessCallsBefore := remote.count()
+	idpCallsBefore := idpRemote.count()
+	privateFake.mu.Lock()
+	vnetCallsBefore := len(privateFake.calls)
+	privateFake.mu.Unlock()
 	tunnelCallsBefore := len(tunnelFake.Calls())
 	gwCallsBefore := len(gwAPI.calls)
 
@@ -1765,6 +1908,30 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	}
 	if got := statusWrites.Load() - writesBeforePolicy; got != 0 {
 		t.Fatalf("steady AccessPolicy reconcile issued %d Kubernetes status write requests, want 0", got)
+	}
+
+	writesBeforeVNet := statusWrites.Load()
+	if _, err := vnetReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: vnetKey}); err != nil {
+		t.Fatalf("steady VirtualNetwork reconcile: %v", err)
+	}
+	if got := statusWrites.Load() - writesBeforeVNet; got != 0 {
+		t.Fatalf("steady VirtualNetwork reconcile issued %d Kubernetes status write requests, want 0", got)
+	}
+
+	writesBeforeIDP := statusWrites.Load()
+	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
+		t.Fatalf("steady IdentityProvider reconcile: %v", err)
+	}
+	if got := statusWrites.Load() - writesBeforeIDP; got != 0 {
+		t.Fatalf("steady IdentityProvider reconcile issued %d Kubernetes status write requests, want 0", got)
+	}
+
+	writesBeforeST := statusWrites.Load()
+	if _, err := stReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+		t.Fatalf("steady ServiceToken reconcile: %v", err)
+	}
+	if got := statusWrites.Load() - writesBeforeST; got != 0 {
+		t.Fatalf("steady ServiceToken reconcile issued %d Kubernetes status write requests, want 0", got)
 	}
 
 	writesBeforeTunnel := statusWrites.Load()
@@ -1784,7 +1951,16 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	}
 
 	if got := remote.count() - accessCallsBefore; got != 0 {
-		t.Fatalf("steady AccessPolicy reconcile issued %d remote calls, want 0", got)
+		t.Fatalf("steady AccessPolicy (with ExternalID ref) + ServiceToken reconciles issued %d remote calls, want 0", got)
+	}
+	if got := idpRemote.count() - idpCallsBefore; got != 0 {
+		t.Fatalf("steady IdentityProvider reconcile issued %d remote calls, want 0", got)
+	}
+	privateFake.mu.Lock()
+	vnetCalls := slices.Clone(privateFake.calls[vnetCallsBefore:])
+	privateFake.mu.Unlock()
+	if len(vnetCalls) != 0 {
+		t.Fatalf("steady VirtualNetwork reconcile issued remote calls %v, want 0", vnetCalls)
 	}
 	if got := tunnelFake.Calls()[tunnelCallsBefore:]; len(got) != 0 {
 		t.Fatalf("steady Direct External CloudflareTunnel reconcile issued remote calls %v, want 0", got)
@@ -1877,7 +2053,11 @@ func TestQA2REG2ObserveOnlyNeverGatedEnvtest(t *testing.T) {
 		t.Fatalf("get ObserveOnly policy: %v", err)
 	}
 	clusterID := gateClusterID(ctx, direct)
-	obsInput := flarecloudflare.AccessPolicyInput{Name: obsPol.Spec.Name, Decision: string(obsPol.Spec.Decision), Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}}}
+	remoteName, err := accessRemoteName(ctx, direct, obsPol.Namespace, obsPol.Spec.Name)
+	if err != nil {
+		t.Fatalf("accessRemoteName: %v", err)
+	}
+	obsInput := accessPolicyInput(obsPol.Spec, remoteName, []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}}, nil, nil)
 	seedDecision := evaluateGate(policy, latch, freshness.GradeAuthz, gateInput{
 		Kind: "AccessPolicy", Namespace: obsPol.Namespace, Name: obsPol.Name,
 		UID: obsPol.UID, RemoteID: obsPol.Status.PolicyID,

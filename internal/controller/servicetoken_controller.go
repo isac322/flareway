@@ -205,6 +205,16 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return r.recoverServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal)
 		}
 	}
+	if object.Status.TokenID != "" && !rotationRequested(object) {
+		var destSecret corev1.Secret
+		secretErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, &destSecret)
+		if apierrors.IsNotFound(secretErr) {
+			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.ServiceToken{}, metav1.ConditionFalse, "SecretMissing", "service token Secret is missing; update rotation.requestedAt to rotate explicitly", serviceTokenStatusUpdate{OwnershipVerified: object.Status.OwnershipVerified})
+		}
+		if secretErr != nil {
+			return ctrl.Result{}, secretErr
+		}
+	}
 	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
 		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TokenID,

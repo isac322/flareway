@@ -141,6 +141,10 @@ func referenceNamespace(namespace string, ref v1alpha1.AccessObjectReference) st
 	return namespace
 }
 
+func resolveAccessRulesLocal(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, rules []v1alpha1.AccessRule) ([]flarecloudflare.ResolvedAccessRule, error) {
+	return resolveAccessRules(ctx, kube, namespace, account, nil, rules)
+}
+
 func resolveAccessRules(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, rules []v1alpha1.AccessRule) ([]flarecloudflare.ResolvedAccessRule, error) {
 	result := make([]flarecloudflare.ResolvedAccessRule, 0, len(rules))
 	for i := range rules {
@@ -151,6 +155,64 @@ func resolveAccessRules(ctx context.Context, kube client.Client, namespace strin
 		result = append(result, resolved)
 	}
 	return result, nil
+}
+
+func verifyExternalAccessRules(ctx context.Context, api flarecloudflare.AccessAPI, ruleSets ...[]v1alpha1.AccessRule) error {
+	for _, rules := range ruleSets {
+		for i := range rules {
+			if err := verifyExternalAccessRule(ctx, api, rules[i]); err != nil {
+				return fmt.Errorf("resolve Access rule %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+func verifyExternalAccessRule(ctx context.Context, api flarecloudflare.AccessAPI, rule v1alpha1.AccessRule) error {
+	if rule.Group != nil && rule.Group.GroupRef.ExternalID != "" {
+		if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, rule.Group.GroupRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external AccessGroup: %w", err)
+		}
+	}
+	if idpRef := accessRuleIDPRef(rule); idpRef != nil && idpRef.ExternalID != "" {
+		if _, err := api.GetIdentityProvider(ctx, idpRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external IdentityProvider: %w", err)
+		}
+	}
+	if rule.ServiceToken != nil && rule.ServiceToken.TokenRef.ExternalID != "" {
+		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, rule.ServiceToken.TokenRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external ServiceToken: %w", err)
+		}
+	}
+	if rule.DevicePosture != nil && rule.DevicePosture.RuleRef.ExternalID != "" {
+		if _, err := api.GetDevicePostureRule(ctx, rule.DevicePosture.RuleRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external DevicePostureRule: %w", err)
+		}
+	}
+	return nil
+}
+
+func accessRuleIDPRef(rule v1alpha1.AccessRule) *v1alpha1.AccessObjectReference {
+	switch {
+	case rule.AzureAD != nil:
+		return &rule.AzureAD.IdentityProviderRef
+	case rule.GitHubOrganization != nil:
+		return &rule.GitHubOrganization.IdentityProviderRef
+	case rule.GSuite != nil:
+		return &rule.GSuite.IdentityProviderRef
+	case rule.Okta != nil:
+		return &rule.Okta.IdentityProviderRef
+	case rule.SAML != nil:
+		return &rule.SAML.IdentityProviderRef
+	case rule.OIDC != nil:
+		return &rule.OIDC.IdentityProviderRef
+	case rule.LoginMethod != nil:
+		return &rule.LoginMethod.IdentityProviderRef
+	case rule.AuthContext != nil:
+		return &rule.AuthContext.IdentityProviderRef
+	default:
+		return nil
+	}
 }
 
 func resolveAccessRule(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, rule v1alpha1.AccessRule) (flarecloudflare.ResolvedAccessRule, error) {
@@ -277,8 +339,10 @@ func validateAccessReference(_, _, kind, accountName string, deletionTimestamp *
 
 func resolveGroupID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external AccessGroup: %w", err)
+		if api != nil {
+			if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external AccessGroup: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -301,8 +365,10 @@ func resolveGroupID(ctx context.Context, kube client.Client, namespace string, a
 
 func resolveIDPID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetIdentityProvider(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external IdentityProvider: %w", err)
+		if api != nil {
+			if _, err := api.GetIdentityProvider(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external IdentityProvider: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -325,8 +391,10 @@ func resolveIDPID(ctx context.Context, kube client.Client, namespace string, acc
 
 func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external ServiceToken: %w", err)
+		if api != nil {
+			if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external ServiceToken: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -349,8 +417,10 @@ func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace st
 
 func resolvePostureID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetDevicePostureRule(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external DevicePostureRule: %w", err)
+		if api != nil {
+			if _, err := api.GetDevicePostureRule(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external DevicePostureRule: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}

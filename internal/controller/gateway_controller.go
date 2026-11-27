@@ -833,7 +833,11 @@ func (r *GatewayReconciler) rejectGatewayAdmission(
 		Message:            programmedMessage,
 		LastTransitionTime: now,
 	})
-	return r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gateway), desired)
+	if err := r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gateway), desired); err != nil {
+		return err
+	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
+	return nil
 }
 
 // invalidGatewayClassConfigError marks a GatewayClass parametersRef that can

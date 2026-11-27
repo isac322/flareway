@@ -91,15 +91,15 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "Invalid", err.Error())
 	}
-	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
+	include, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Include)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	require, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Require)
+	require, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Require)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	exclude, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Exclude)
+	exclude, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Exclude)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -115,6 +115,9 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		Name: name, Include: include, Require: require, Exclude: exclude, IsDefault: object.Spec.IsDefault,
 	}
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		}
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.GroupID == "" {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{}, false, metav1.ConditionFalse, "Invalid", "ObserveOnly requires externalRef.groupId")
 		}
@@ -153,6 +156,9 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	remote, owned, conflict, ensureErr := r.ensureManaged(ctx, api, scope, object, input)

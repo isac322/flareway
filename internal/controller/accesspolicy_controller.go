@@ -87,18 +87,18 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err != nil {
 		return r.finishAccessPolicyError(ctx, object, privateErrorReason(err), err)
 	}
-	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
+	include, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Include)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	require, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Require)
+	require, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Require)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 	if object.Spec.Require == nil {
 		require = nil
 	}
-	exclude, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Exclude)
+	exclude, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Exclude)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -112,6 +112,9 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	input := accessPolicyInput(object.Spec, name, include, require, exclude)
 
 	if effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+			return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		}
 		if object.Spec.ExternalRef == nil {
 			return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "Invalid", "ObserveOnly AccessPolicy requires externalRef")
 		}
@@ -149,6 +152,9 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	policyID := object.Status.PolicyID

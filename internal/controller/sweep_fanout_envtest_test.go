@@ -265,6 +265,51 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 		},
 	}
 
+	var emitAllKinds atomic.Bool
+	otherProductionKinds := []string{
+		"AccessApplication",
+		"AccessStandaloneApplication",
+		"AccessInfrastructureTarget",
+		"AccessCustomPage",
+		"AccessGroup",
+		"IdentityProvider",
+		"DevicePostureRule",
+		"DevicePostureIntegration",
+		"ServiceToken",
+		"NetworkRoute",
+		"HostnameRoute",
+		"WARPConnector",
+		"DeviceProfile",
+		"ZeroTrustGatewayPolicy",
+		"CloudflareTunnel",
+	}
+	otherSubHits := make(map[string]*atomic.Int64, len(otherProductionKinds)+1)
+	for _, kind := range otherProductionKinds {
+		k := kind
+		otherSubHits[k] = new(atomic.Int64)
+		var kindOnce atomic.Int64
+		targets = append(targets, sweep.TargetDescriptor{
+			Kind:         k,
+			Grade:        freshness.GradeAuthz,
+			InitialDelay: 10 * time.Millisecond,
+			SweepFunc: func(_ context.Context, _ *sweep.AccountSweeper) ([]sweep.DriftItem, error) {
+				if !emitAllKinds.Load() || kindOnce.Add(1) > 1 {
+					return []sweep.DriftItem{}, nil
+				}
+				return []sweep.DriftItem{{
+					Kind:           k,
+					TargetKind:     k,
+					NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-" + k},
+					RemoteID:       "remote-" + k,
+					Case:           sweep.DriftCaseMismatch,
+					Reason:         "per-kind positive fanout probe",
+				}}, nil
+			},
+		})
+	}
+	gwTunnelSubHits := new(atomic.Int64)
+	otherSubHits["Gateway-CloudflareTunnel"] = gwTunnelSubHits
+
 	sweeper := sweep.NewSweeper(sweep.SweeperOptions{
 		Client:              mgr.GetClient(),
 		APIReader:           mgr.GetAPIReader(),
@@ -307,32 +352,23 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup VirtualNetworkReconciler: %v", err)
 	}
-	// Register consumers for every other production sweep target kind (matching cmd/main.go);
-	// none of these may receive AccessPolicy or VirtualNetwork events or steal them.
+	// Register consumers for every other production sweep target kind (matching cmd/main.go),
+	// including a second CloudflareTunnel subscription representing Gateway alongside CloudflareTunnel.
+	// Phase 1 asserts zero foreign/cross-kind delivery while AccessPolicy/VirtualNetwork/ZeroTrustList
+	// emit; Phase 2 asserts every single one of the 19 production subscriptions receives its exact
+	// addressed event without cross-kind leakage.
 	var foreignHits atomic.Int64
-	otherProductionKinds := []string{
-		"AccessApplication",
-		"AccessStandaloneApplication",
-		"AccessInfrastructureTarget",
-		"AccessCustomPage",
-		"AccessGroup",
-		"IdentityProvider",
-		"DevicePostureRule",
-		"DevicePostureIntegration",
-		"ServiceToken",
-		"NetworkRoute",
-		"HostnameRoute",
-		"WARPConnector",
-		"DeviceProfile",
-		"ZeroTrustGatewayPolicy",
-		"CloudflareTunnel",
-	}
 	for _, kind := range otherProductionKinds {
 		k := kind
+		counter := otherSubHits[k]
 		if err := ctrl.NewControllerManagedBy(mgr).
 			Named("prod-sub-" + k).
-			WatchesRawSource(source.Channel(sweeper.EventsFor(k), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
-				foreignHits.Add(1)
+			WatchesRawSource(source.Channel(sweeper.EventsFor(k), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+				if obj != nil && obj.GetName() == "probe-"+k {
+					counter.Add(1)
+				} else {
+					foreignHits.Add(1)
+				}
 				return nil
 			}))).
 			Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -340,6 +376,21 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 			})); err != nil {
 			t.Fatalf("setup subscriber %s: %v", k, err)
 		}
+	}
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named("prod-sub-gateway-tunnel").
+		WatchesRawSource(source.Channel(sweeper.EventsFor("CloudflareTunnel"), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+			if obj != nil && obj.GetName() == "probe-CloudflareTunnel" {
+				gwTunnelSubHits.Add(1)
+			} else {
+				foreignHits.Add(1)
+			}
+			return nil
+		}))).
+		Complete(reconcile.Func(func(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
+			return ctrl.Result{}, nil
+		})); err != nil {
+		t.Fatalf("setup subscriber Gateway-CloudflareTunnel: %v", err)
 	}
 
 	startManagerAndWait(t, mgr)
@@ -466,10 +517,26 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 		vnetFake.mu.Unlock()
 		return true, nil
 	})
-	// Allow one tick to confirm zero cross-kind delivery onto the 15 unaddressed subscriptions.
+	// Phase 1 check: allow one tick to confirm zero cross-kind delivery onto the 16 other subscriptions.
 	time.Sleep(100 * time.Millisecond)
 	if got := foreignHits.Load(); got != 0 {
 		t.Fatalf("foreign/cross-kind subscriptions received %d unexpected events, want 0", got)
+	}
+
+	// Phase 2: trigger 1 targeted drift event per remaining production target kind and verify
+	// positive delivery to every single subscription (including both CloudflareTunnel subscribers)
+	// with zero cross-kind hits.
+	emitAllKinds.Store(true)
+	waitUntilTrue(t, 10*time.Second, "all remaining production sweep subscriptions receive their addressed event", func() (bool, error) {
+		for _, c := range otherSubHits {
+			if c.Load() != 1 {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if got := foreignHits.Load(); got != 0 {
+		t.Fatalf("Phase 2 cross-kind subscriptions received %d unexpected events, want 0", got)
 	}
 }
 

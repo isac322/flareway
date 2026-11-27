@@ -100,16 +100,15 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if err != nil {
 		return r.finishError(ctx, object, "Invalid", err)
 	}
-	input, err := r.applicationInput(ctx, object, account, api)
+	input, err := r.applicationInput(ctx, object, account, nil)
 	if err != nil {
-		var validation accessValidationError
-		if errors.As(err, &validation) || standaloneApplicationIsValidationError(err) {
-			return r.finishError(ctx, object, accessValidationReason(err), err)
-		}
-		return r.finishRemoteError(ctx, object, err)
+		return r.finishInputError(ctx, object, err)
 	}
 
 	if effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyStandaloneExternalRefs(ctx, object, api); err != nil {
+			return r.finishInputError(ctx, object, err)
+		}
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.ApplicationID == "" {
 			return r.finishError(ctx, object, "Invalid", errors.New("management policy ObserveOnly requires externalRef.applicationId"))
 		}
@@ -144,6 +143,9 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	if err := verifyStandaloneExternalRefs(ctx, object, api); err != nil {
+		return r.finishInputError(ctx, object, err)
 	}
 
 	remote, secretRef, err := r.ensureManaged(ctx, api, scope, object, input)
@@ -517,14 +519,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicies(ctx co
 
 func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicy(ctx context.Context, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, reference v1alpha1.AccessApplicationPolicyReference) (string, error) {
 	if reference.ExternalRef != nil {
-		policy, err := api.GetAccessPolicy(ctx, reference.ExternalRef.PolicyID)
-		if err != nil {
-			if flarecloudflare.IsNotFound(err) {
-				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", reference.ExternalRef.PolicyID, err)}
-			}
-			return "", err
+		if api == nil {
+			return reference.ExternalRef.PolicyID, nil
 		}
-		return policy.ID, nil
+		return verifyExternalAccessPolicy(ctx, api, reference.ExternalRef.PolicyID)
 	}
 	if reference.PolicyRef == nil {
 		return "", accessValidationError{reason: "Invalid", message: "policy reference is empty"}
@@ -566,14 +564,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneIDPs(ctx contex
 
 func (r *AccessStandaloneApplicationReconciler) resolveStandaloneIDP(ctx context.Context, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, reference v1alpha1.AccessIdentityProviderReference) (string, error) {
 	if reference.ExternalID != "" {
-		provider, err := api.GetIdentityProvider(ctx, reference.ExternalID)
-		if err != nil {
-			if flarecloudflare.IsNotFound(err) {
-				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", reference.ExternalID, err)}
-			}
-			return "", err
+		if api == nil {
+			return reference.ExternalID, nil
 		}
-		return provider.ID, nil
+		return verifyExternalStandaloneIDP(ctx, api, reference.ExternalID)
 	}
 	var provider v1alpha1.IdentityProvider
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: reference.Name}, &provider); err != nil {
@@ -595,11 +589,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneCustomPages(ctx
 	result := make([]string, 0, len(references))
 	for _, reference := range references {
 		if reference.ExternalID != "" {
-			if _, err := api.GetAccessCustomPage(ctx, reference.ExternalID); err != nil {
-				if flarecloudflare.IsNotFound(err) {
-					return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", reference.ExternalID, err)}
+			if api != nil {
+				if err := verifyExternalCustomPage(ctx, api, reference.ExternalID); err != nil {
+					return nil, err
 				}
-				return nil, err
 			}
 			result = append(result, reference.ExternalID)
 			continue
@@ -915,6 +908,107 @@ func (r *AccessStandaloneApplicationReconciler) reconcileDelete(ctx context.Cont
 	base := client.MergeFrom(object.DeepCopy())
 	controllerutil.RemoveFinalizer(object, v1alpha1.AccessStandaloneApplicationFinalizer)
 	return r.Patch(ctx, object, base)
+}
+
+func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, api flarecloudflare.AccessAPI) error {
+	for _, ref := range object.Spec.Policies {
+		if ref.ExternalRef != nil {
+			if _, err := verifyExternalAccessPolicy(ctx, api, ref.ExternalRef.PolicyID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ref := range object.Spec.Application.AllowedIDPRefs {
+		if ref.ExternalID != "" {
+			if _, err := verifyExternalStandaloneIDP(ctx, api, ref.ExternalID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ref := range object.Spec.Application.CustomPageRefs {
+		if ref.ExternalID != "" {
+			if err := verifyExternalCustomPage(ctx, api, ref.ExternalID); err != nil {
+				return err
+			}
+		}
+	}
+	if scim := object.Spec.Application.SCIMConfig; scim != nil && scim.IDPRef.ExternalID != "" {
+		if _, err := verifyExternalStandaloneIDP(ctx, api, scim.IDPRef.ExternalID); err != nil {
+			return err
+		}
+	}
+	if saas := object.Spec.SaaS; saas != nil {
+		if saas.OIDC != nil {
+			for _, claim := range saas.OIDC.CustomClaims {
+				for _, mapping := range claim.Source.NameByIDP {
+					if mapping.IDPRef.ExternalID != "" {
+						if _, err := verifyExternalStandaloneIDP(ctx, api, mapping.IDPRef.ExternalID); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		if saas.SAML != nil {
+			for _, attr := range saas.SAML.CustomAttributes {
+				for _, mapping := range attr.Source.NameByIDP {
+					if mapping.IDPRef.ExternalID != "" {
+						if _, err := verifyExternalStandaloneIDP(ctx, api, mapping.IDPRef.ExternalID); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+	}
+	if infra := object.Spec.Infrastructure; infra != nil {
+		for _, policy := range infra.Policies {
+			if err := verifyExternalAccessRules(ctx, api, policy.Include, policy.Require, policy.Exclude); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func verifyExternalAccessPolicy(ctx context.Context, api flarecloudflare.AccessAPI, policyID string) (string, error) {
+	policy, err := api.GetAccessPolicy(ctx, policyID)
+	if err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", policyID, err)}
+		}
+		return "", err
+	}
+	return policy.ID, nil
+}
+
+func verifyExternalStandaloneIDP(ctx context.Context, api flarecloudflare.AccessAPI, idpID string) (string, error) {
+	provider, err := api.GetIdentityProvider(ctx, idpID)
+	if err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", idpID, err)}
+		}
+		return "", err
+	}
+	return provider.ID, nil
+}
+
+func verifyExternalCustomPage(ctx context.Context, api flarecloudflare.AccessAPI, pageID string) error {
+	if _, err := api.GetAccessCustomPage(ctx, pageID); err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", pageID, err)}
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *AccessStandaloneApplicationReconciler) finishInputError(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, err error) (ctrl.Result, error) {
+	var validation accessValidationError
+	if errors.As(err, &validation) || standaloneApplicationIsValidationError(err) {
+		return r.finishError(ctx, object, accessValidationReason(err), err)
+	}
+	return r.finishRemoteError(ctx, object, err)
 }
 
 func (r *AccessStandaloneApplicationReconciler) finishError(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, reason string, err error) (ctrl.Result, error) {
