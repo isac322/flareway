@@ -855,3 +855,55 @@ func TestExactPublicCarveOutPreservesBasePort(t *testing.T) {
 		t.Fatalf("reconciled protected domain shifted from %d to %d", prot.EnvoyPort, got)
 	}
 }
+
+// #4722620648: Transitioning an exact Public listener from split
+// (<listener>-public + <listener>-access-...) back to unsplit must reuse the
+// recorded <listener>-public Envoy port for the unsplit base domain instead of
+// allocating a fresh port.
+func TestExactPublicUnsplitReusesCarveOutPort(t *testing.T) {
+	in := accessInputs(true)
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{{
+		Name: "web", Hostname: new(gatewayv1.Hostname("app.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType,
+	}}
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"app.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"app.example.com"}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "tools", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+			Rules: []gatewayv1.HTTPRouteRule{
+				namedRouteRule("admin", "/admin", "backend"),
+				namedRouteRule("health", "/health", "backend"),
+			},
+		},
+	}}
+
+	// Split state recorded in CloudflareTunnel.Status.Listeners (no base "web" entry,
+	// only "web-public" on 18120 and "web-access-..." on 18121).
+	const splitPublicPort int32 = 18120
+	const splitProtectedPort int32 = 18121
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "web",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: "web-public", EnvoyPort: splitPublicPort},
+			{Name: "web-access-default-admin-app", EnvoyPort: splitProtectedPort, Protected: true},
+		},
+	}}
+
+	// Remove AccessApplication targeting /admin so "web" becomes unsplit (/admin + /health).
+	in.AccessApplications = nil
+	in.AUDSecrets = nil
+
+	gw, _ := Translate(in)
+	if _, err := translator.Build(gw, nil); err != nil {
+		t.Fatalf("translator.Build failed: %v", err)
+	}
+	base := findDomain(gw.Domains, false, ir.GuardUnprotected)
+	if base == nil || base.Name != "web" {
+		t.Fatalf("expected unsplit base domain \"web\", got %#v", gw.Domains)
+	}
+	if base.EnvoyPort != splitPublicPort {
+		t.Fatalf("unsplit base domain %q allocated port %d, want reused -public port %d", base.Name, base.EnvoyPort, splitPublicPort)
+	}
+}

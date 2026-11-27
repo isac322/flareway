@@ -1174,6 +1174,45 @@ func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunn
 		}
 		result = append(result, tunnelListenerStatus(name, exposure, binding, gateway.Domains))
 	}
+	// Preserve recorded Private exposure and binding for listeners temporarily
+	// omitted from gateway.Listeners without an Access tombstone (for example,
+	// rejected on a reserved port) as long as CloudflareTunnel.Spec.Listeners
+	// still configures them as Private, so recovery keeps PodIP intact while
+	// listeners removed from Spec.Listeners clear cleanly.
+	if tunnel != nil {
+		specPrivate := make(map[string]struct{}, len(tunnel.Spec.Listeners))
+		for _, listener := range tunnel.Spec.Listeners {
+			if listener.Exposure == v1alpha1.ExposurePrivate {
+				specPrivate[string(listener.Name)] = struct{}{}
+			}
+		}
+		var preservedNames []string
+		seenPreserved := make(map[string]struct{})
+		for _, ls := range tunnel.Status.Listeners {
+			if ls.Exposure != v1alpha1.ExposurePrivate {
+				continue
+			}
+			name := string(ls.Name)
+			if _, recorded := recordedListeners[name]; recorded {
+				continue
+			}
+			if _, retained := retainedExposure[name]; retained {
+				continue
+			}
+			if _, configured := specPrivate[name]; !configured {
+				continue
+			}
+			if _, dup := seenPreserved[name]; dup {
+				continue
+			}
+			seenPreserved[name] = struct{}{}
+			preservedNames = append(preservedNames, name)
+		}
+		sort.Strings(preservedNames)
+		for _, name := range preservedNames {
+			result = append(result, tunnelListenerStatus(name, ir.ExposurePrivate, recordedBindings[name], gateway.Domains))
+		}
+	}
 	return result
 }
 

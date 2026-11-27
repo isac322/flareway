@@ -1899,6 +1899,325 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
 		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(3)), "follow-up unchanged pass after clearing to empty must emit 0 writes")
 	})
+
+	// #4722620743: After a drained Private interrupted rollout writes Blocked and
+	// ConfigApplied=False/GatewayInvalid at Gen 1, a Tunnel spec edit bumping
+	// Tunnel.Generation -> Gen 2 (without changing hostnames or listeners) must
+	// refresh ConfigApplied.ObservedGeneration -> 2 in 1 write -> 0 on repeat so
+	// AccessApplication finishes revocation.
+	ginkgo.It("Finding 2D: interrupted Private rollout refreshes ConfigApplied=False/GatewayInvalid on Tunnel generation bump", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{
+			privateListener: true,
+		})
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"genbump.internal.example"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePrivate}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		tunnel.Spec.Listeners = []v1alpha1.CloudflareTunnelListener{
+			{Name: "private", Exposure: v1alpha1.ExposurePrivate},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		soleHost := gatewayv1.Hostname("genbump.internal.example")
+		privListener := gw.Spec.Listeners[1]
+		privListener.Hostname = &soleHost
+		privListener.Port = 18000
+		gw.Spec.Listeners = []gatewayv1.Listener{privListener}
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		_, tunnelErr := f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		tunnel.Status.ConfigVersion = v1alpha1.CloudflareTunnelConfigVersion{
+			Desired: 2, Applied: 1, Remote: 2,
+		}
+		tunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+			Hostname:          "genbump.internal.example",
+			ProtectionDomain:  "private-access-default-genbump-app",
+			AccessApplication: ns + "/genbump-app",
+			Guard:             v1alpha1.HostnameGuardForwarding,
+			AppliedVersion:    1,
+		}}
+		tunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name:     "private",
+			Exposure: v1alpha1.ExposurePrivate,
+			Binding:  v1alpha1.ListenerBindingLoopback,
+			ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{
+				Name: "private-access-default-genbump-app", EnvoyPort: 18000, Protected: true,
+			}},
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		latchPayload, err := json.Marshal(gatewayapi.AccessRevocationLatch{
+			Claims: []gatewayapi.AccessRevocationClaim{{
+				Tunnel:           tunnel.Name,
+				ProtectionDomain: "private-access-default-genbump-app",
+				Hostname:         "genbump.internal.example",
+				BaselineVersion:  1,
+			}},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		app := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "genbump-app",
+				Namespace:   ns,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{gatewayapi.AccessRevocationAnnotation: string(latchPayload)},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "Gateway", Name: gatewayv1.ObjectName(gw.Name)},
+					SectionName:                new(gatewayv1.SectionName("private")),
+				}},
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "genbump-app", SessionDuration: "1h"},
+				OriginJWT:   v1alpha1.AccessOriginJWTSpec{Mode: v1alpha1.AccessOriginJWTModeRequired, AssumeGatewayTLSDecryption: true},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, app)).To(gomega.Succeed())
+		app.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel:           tunnel.Name,
+			Listener:         "private",
+			ProtectionDomain: "private-access-default-genbump-app",
+			EnvoyPort:        18000,
+		}}
+		app.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+			Type:     v1alpha1.AccessApplicationDestinationPrivate,
+			Hostname: "genbump.internal.example",
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, app)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, app)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dataplane-0", Namespace: ns}})).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(f.direct.Get(f.ctx, types.NamespacedName{Namespace: ns, Name: "dataplane-0"}, &corev1.Pod{}))
+		}, 10*time.Second, 50*time.Millisecond).Should(gomega.BeTrue())
+
+		counter := &tunnelStatusWriteCounterClient{Client: f.direct, tunnelName: tunnel.Name}
+		f.reconciler.Client = counter
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		genBefore := tunnel.Generation
+		cfgCond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+		gomega.Expect(cfgCond).NotTo(gomega.BeNil())
+		gomega.Expect(cfgCond.Reason).To(gomega.Equal("GatewayInvalid"))
+		gomega.Expect(cfgCond.ObservedGeneration).To(gomega.Equal(genBefore))
+
+		// DNS-only Tunnel spec edit bumps Generation while hostnames/listeners stay equal.
+		tunnel.Spec.DNS.Mode = v1alpha1.DNSModeManaged
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Generation).To(gomega.BeNumerically(">", genBefore))
+
+		writesBeforeGenBump := counter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(counter.writes.Load()).To(gomega.Equal(writesBeforeGenBump+1), "Tunnel generation bump must emit 1 condition write refreshing GatewayInvalid ObservedGeneration")
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		cfgCond = meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+		gomega.Expect(cfgCond).NotTo(gomega.BeNil())
+		gomega.Expect(cfgCond.ObservedGeneration).To(gomega.Equal(tunnel.Generation))
+
+		writesAfterGenBump := counter.writes.Load()
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(counter.writes.Load()).To(gomega.Equal(writesAfterGenBump), "steady-state after refreshing GatewayInvalid ObservedGeneration must emit 0 writes")
+
+		indexedClient := handoffIndexedClient{Client: f.direct}
+		accessReconciler := &AccessApplicationReconciler{
+			Client:              indexedClient,
+			APIReader:           indexedClient,
+			Scheme:              f.direct.Scheme(),
+			NewCloudflareClient: newFakeAccessApplicationCloudflare().Client,
+			OperatorNamespace:   accessApplicationAUDNamespace,
+			Now:                 func() time.Time { return f.clock },
+		}
+		_, err = accessReconciler.Reconcile(f.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		var deletedCheck v1alpha1.AccessApplication
+		err = f.direct.Get(f.ctx, client.ObjectKeyFromObject(app), &deletedCheck)
+		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "AccessApplication should finish deleting once ConfigApplied.ObservedGeneration catches up to Tunnel generation; err=%v", err)
+	})
+
+	// #4722620830: When an Unprotected PodIP Private listener without an Access
+	// tombstone is rejected (e.g. reserved port 18000) while the Gateway syncs
+	// a retained Public revocation claim, desiredTunnelListeners must preserve the
+	// recorded PodIP binding as long as the listener stays configured as Private
+	// on CloudflareTunnel.Spec.Listeners, while still clearing removed listeners.
+	ginkgo.It("Finding 3: rejected Unprotected PodIP Private listener without Access tombstone preserves PodIP binding", func() {
+		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{
+			privateListener: true,
+		})
+		ns := f.gatewayKey.Namespace
+
+		var tunnel v1alpha1.CloudflareTunnel
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var acct v1alpha1.CloudflareAccount
+		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: tunnel.Spec.AccountRef.Name}, &acct)).To(gomega.Succeed())
+		acct.Spec.Grants[0].Hostnames = []string{"edge-a.example.com", "pub.example.com", "priv.internal.example"}
+		acct.Spec.Grants[0].UnprotectedHostnames = []string{"priv.internal.example"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate}
+		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
+			Namespaces: v1alpha1.BackendNamespaceSame,
+			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &acct)).To(gomega.Succeed())
+
+		tunnel.Spec.Listeners = []v1alpha1.CloudflareTunnelListener{
+			{Name: "private", Exposure: v1alpha1.ExposurePrivate},
+		}
+		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+		_, tunnelErr := f.tunnelReconciler.Reconcile(f.ctx, f.tunnelRequest)
+		gomega.Expect(tunnelErr).NotTo(gomega.HaveOccurred())
+
+		// Pre-existing converged Gateway-owned Tunnel status: Public revocation claim on "http"
+		// plus Unprotected PodIP Private listener "private" (and a removed Private
+		// listener "stale-private" no longer in Spec.Listeners that must clear).
+		var gw gatewayv1.Gateway
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		f.remote.remoteVersion = 1
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		seedWriter := &GatewayReconciler{Client: f.direct, APIReader: f.direct, Scheme: f.direct.Scheme()}
+		seedIR := &ir.Gateway{Key: f.gatewayKey, UID: gw.UID}
+		gomega.Expect(seedWriter.patchTunnelGatewayData(
+			f.ctx, seedIR, &tunnel,
+			v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, DesiredHash: "old-hash", Applied: 1, Remote: 1},
+			[]v1alpha1.CloudflareTunnelHostnameStatus{{
+				Hostname:          "pub.example.com",
+				ProtectionDomain:  "http-access-default-pub-app",
+				AccessApplication: ns + "/pub-app",
+				Guard:             v1alpha1.HostnameGuardForwarding,
+				AppliedVersion:    1,
+			}},
+			[]v1alpha1.CloudflareTunnelListenerStatus{
+				{
+					Name: "http", Exposure: v1alpha1.ExposurePublic,
+					ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{{
+						Name: "http-access-default-pub-app", EnvoyPort: 18080, Protected: true,
+					}},
+				},
+				{
+					Name:     "private",
+					Exposure: v1alpha1.ExposurePrivate,
+					Binding:  v1alpha1.ListenerBindingPodIP,
+				},
+				{
+					Name:     "stale-private",
+					Exposure: v1alpha1.ExposurePrivate,
+					Binding:  v1alpha1.ListenerBindingPodIP,
+				},
+			},
+		)).To(gomega.Succeed())
+
+		rejectedPubHost := gatewayv1.Hostname("ungranted.example.com")
+		privHost := gatewayv1.Hostname("priv.internal.example")
+		gw.Spec.Listeners[0].Hostname = &rejectedPubHost // Reject "http" while retaining pub-app claim -> Gateway Accepted=False.
+		gw.Spec.Listeners[1].Hostname = &privHost
+		gw.Spec.Listeners[1].Port = 18000 // Temporarily reject Unprotected Private listener without Access tombstone.
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		// Retaining Public revocation claim on "http" while "private" is rejected.
+		latchPayload, err := json.Marshal(gatewayapi.AccessRevocationLatch{
+			Claims: []gatewayapi.AccessRevocationClaim{{
+				Tunnel:           tunnel.Name,
+				ProtectionDomain: "http-access-default-pub-app",
+				Hostname:         "pub.example.com",
+				BaselineVersion:  1,
+			}},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		pubApp := &v1alpha1.AccessApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "pub-app",
+				Namespace:   ns,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{gatewayapi.AccessRevocationAnnotation: string(latchPayload)},
+			},
+			Spec: v1alpha1.AccessApplicationSpec{
+				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
+				Type:       v1alpha1.AccessApplicationTypeSelfHosted,
+				SelfHosted: &v1alpha1.AccessSelfHostedApplicationSpec{},
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "Gateway", Name: gatewayv1.ObjectName(gw.Name)},
+					SectionName:                new(gatewayv1.SectionName("http")),
+				}},
+				Policies:    []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: "policy-allow"}}},
+				Application: v1alpha1.AccessApplicationSettings{Name: "pub-app", SessionDuration: "1h"},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, pubApp)).To(gomega.Succeed())
+		pubApp.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+			Tunnel: tunnel.Name, Listener: "http", ProtectionDomain: "http-access-default-pub-app", EnvoyPort: 18080,
+		}}
+		pubApp.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+			Type: v1alpha1.AccessApplicationDestinationPublic, Hostname: "pub.example.com",
+		}}
+		gomega.Expect(f.direct.Status().Update(f.ctx, pubApp)).To(gomega.Succeed())
+		gomega.Expect(f.direct.Delete(f.ctx, pubApp)).To(gomega.Succeed())
+
+		gomega.Expect(f.direct.Delete(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dataplane-0", Namespace: ns}})).To(gomega.Succeed())
+		gomega.Eventually(func() bool {
+			return apierrors.IsNotFound(f.direct.Get(f.ctx, types.NamespacedName{Namespace: ns, Name: "dataplane-0"}, &corev1.Pod{}))
+		}, 10*time.Second, 50*time.Millisecond).Should(gomega.BeTrue())
+
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		acceptedCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		gomega.Expect(acceptedCond).NotTo(gomega.BeNil())
+		gomega.Expect(acceptedCond.Status).To(gomega.Equal(metav1.ConditionFalse), "Gateway must enter rejected syncRejectedGatewayTunnelRevocation path")
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		var privStatus, staleStatus *v1alpha1.CloudflareTunnelListenerStatus
+		for i := range tunnel.Status.Listeners {
+			switch tunnel.Status.Listeners[i].Name {
+			case "private":
+				privStatus = &tunnel.Status.Listeners[i]
+			case "stale-private":
+				staleStatus = &tunnel.Status.Listeners[i]
+			}
+		}
+		gomega.Expect(staleStatus).To(gomega.BeNil(), "removed Private listener absent from Spec.Listeners must clear cleanly; gwConds=%#v, tunnelStatus=%#v", gw.Status.Conditions, tunnel.Status)
+		gomega.Expect(privStatus).NotTo(gomega.BeNil(), "rejected Private listener configured in Spec.Listeners must remain in Status.Listeners")
+		gomega.Expect(privStatus.Exposure).To(gomega.Equal(v1alpha1.ExposurePrivate))
+		gomega.Expect(privStatus.Binding).To(gomega.Equal(v1alpha1.ListenerBindingPodIP), "rejected Unprotected Private listener must preserve recorded PodIP binding")
+
+		// Recover "http" to granted hostname and "private" back to supported port 8443:
+		// must keep PodIP rather than reverting to Loopback.
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		grantedPubHost := gatewayv1.Hostname("pub.example.com")
+		gw.Spec.Listeners[0].Hostname = &grantedPubHost
+		gw.Spec.Listeners[1].Port = 8443
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		privStatus = nil
+		for i := range tunnel.Status.Listeners {
+			if tunnel.Status.Listeners[i].Name == "private" {
+				privStatus = &tunnel.Status.Listeners[i]
+				break
+			}
+		}
+		gomega.Expect(privStatus).NotTo(gomega.BeNil())
+		gomega.Expect(privStatus.Binding).To(gomega.Equal(v1alpha1.ListenerBindingPodIP), "recovered Private listener must stay PodIP instead of reverting to Loopback")
+	})
 })
 
 // QA-1-REG-5 (controller): Mixed PodIP + Loopback and All-PodIP active Private

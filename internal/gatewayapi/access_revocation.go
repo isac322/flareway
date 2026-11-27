@@ -387,17 +387,19 @@ type publicEnvoyPorts struct {
 	preClaimed            map[int32]struct{}
 	stickyDomain          map[string]int32
 	stickyBase            map[string]int32
+	stickyBaseFallback    map[string]int32
 	hasPersistedListeners bool
 }
 
 func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance bool) *publicEnvoyPorts {
 	ports := &publicEnvoyPorts{
-		next:         publicPortMin,
-		reserved:     make(map[int32]struct{}, len(reserved)+4),
-		used:         make(map[int32]struct{}),
-		preClaimed:   make(map[int32]struct{}),
-		stickyDomain: make(map[string]int32),
-		stickyBase:   make(map[string]int32),
+		next:               publicPortMin,
+		reserved:           make(map[int32]struct{}, len(reserved)+4),
+		used:               make(map[int32]struct{}),
+		preClaimed:         make(map[int32]struct{}),
+		stickyDomain:       make(map[string]int32),
+		stickyBase:         make(map[string]int32),
+		stickyBaseFallback: make(map[string]int32),
 	}
 	for port := range reserved {
 		ports.reserved[port] = struct{}{}
@@ -409,6 +411,7 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 		return ports
 	}
 	livePublic := make(map[string]struct{}, len(in.Gateway.Spec.Listeners))
+	liveExactPublic := make(map[string]struct{}, len(in.Gateway.Spec.Listeners))
 	for _, listener := range in.Gateway.Spec.Listeners {
 		exposure := listenerExposure(in.CloudflareTunnel, listener.Name)
 		if exposure == v1alpha1.ExposurePrivate {
@@ -417,7 +420,11 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 			}
 			continue
 		}
-		livePublic[string(listener.Name)] = struct{}{}
+		listenerName := string(listener.Name)
+		livePublic[listenerName] = struct{}{}
+		if listener.Hostname != nil && *listener.Hostname != "" && !isWildcardHostname(string(*listener.Hostname)) {
+			liveExactPublic[listenerName] = struct{}{}
+		}
 	}
 	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.DeletedAt != nil || len(in.CloudflareTunnel.Status.Listeners) == 0 {
 		return ports
@@ -447,6 +454,14 @@ func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance boo
 			if pd.Name == listenerName {
 				if _, exists := ports.stickyBase[listenerName]; !exists {
 					ports.stickyBase[listenerName] = port
+				}
+			} else if _, exact := liveExactPublic[listenerName]; exact &&
+				(pd.Name == listenerName+"-public" || pd.Name == listenerName+"-public-"+disambiguateListenerHash(listenerName)) {
+				// Record the -public carve-out port as a fallback for exact Public
+				// listeners so removing the last AccessApplication restores the base
+				// domain onto its previously served Envoy port without shifting.
+				if _, exists := ports.stickyBaseFallback[listenerName]; !exists {
+					ports.stickyBaseFallback[listenerName] = port
 				}
 			}
 		}
@@ -483,6 +498,9 @@ func (ports *publicEnvoyPorts) claimUnused(port int32) bool {
 
 func (ports *publicEnvoyPorts) takeBase(listenerName string) int32 {
 	if port, ok := ports.stickyBase[listenerName]; ok && ports.claimUnused(port) {
+		return port
+	}
+	if port, ok := ports.stickyBaseFallback[listenerName]; ok && ports.claimUnused(port) {
 		return port
 	}
 	return ports.takeFresh(listenerName, listenerName)

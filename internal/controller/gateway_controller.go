@@ -1398,6 +1398,12 @@ func needsRejectedGatewayTunnelSync(compiled *ir.Gateway, tunnel *v1alpha1.Cloud
 	if hasPublicRetainedRevocationDomains(compiled.Domains) && account != nil && compiled.Cloudflare != nil {
 		return true
 	}
+	// Refresh ConfigApplied=False/GatewayInvalid ObservedGeneration when a
+	// Tunnel spec change bumps Tunnel.Generation without changing hostnames or
+	// listeners so Private revocation acknowledgment does not stall.
+	if !hasPublicRetainedRevocationDomains(compiled.Domains) && !revocationDrainedGatewayInvalid(tunnel) {
+		return true
+	}
 	desiredHostnames := desiredTunnelHostnames(compiled, tunnel.Status.ConfigVersion.Applied)
 	desiredListeners := desiredTunnelListeners(compiled, tunnel)
 	return !apiequality.Semantic.DeepEqual(tunnel.Status.Hostnames, desiredHostnames) ||
