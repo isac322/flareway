@@ -754,8 +754,9 @@ func TestEnvoyUnprotectedAndProtectedHeaderStrippingEndToEnd(t *testing.T) {
 func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	requireDocker(t)
 	upstreamPort := startMockDNSUpstream(t, net.ParseIP("2001:db8::7"))
+	upstreamAddr := net.JoinHostPort(resolveDockerHostGatewayIP(t), strconv.Itoa(upstreamPort))
 
-	startCoreDNS := func(t *testing.T, listeners []ir.Listener) (string, string) {
+	startCoreDNS := func(t *testing.T, listeners []ir.Listener) (string, string, string) {
 		t.Helper()
 		gw := &ir.Gateway{
 			Key:       types.NamespacedName{Namespace: "demo", Name: "dns"},
@@ -768,9 +769,13 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		corefile := strings.ReplaceAll(cm.Data["Corefile"], ".:53 {", ".:5353 {")
 		// Bind wildcard inside the container so host UDP port forwarding can reach CoreDNS.
 		corefile = strings.ReplaceAll(corefile, "    bind 127.0.0.1\n", "")
-		corefile = strings.ReplaceAll(corefile, "    forward . /etc/resolv.conf\n", fmt.Sprintf("    forward . host.docker.internal:%d\n", upstreamPort))
-		corefilePath := filepath.Join(t.TempDir(), "Corefile")
-		if err := os.WriteFile(corefilePath, []byte(corefile), 0o600); err != nil {
+		corefile = strings.ReplaceAll(corefile, "    forward . /etc/resolv.conf\n", fmt.Sprintf("    forward . %s\n", upstreamAddr))
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("make Corefile directory container-readable: %v", err)
+		}
+		corefilePath := filepath.Join(dir, "Corefile")
+		if err := os.WriteFile(corefilePath, []byte(corefile), 0o644); err != nil {
 			t.Fatalf("write Corefile: %v", err)
 		}
 
@@ -779,7 +784,6 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		defer cancel()
 		args := []string{
 			"run", "-d", "--name", name,
-			"--add-host", "host.docker.internal:host-gateway",
 			"-e", "POD_IP=192.0.2.7",
 			"-p", "127.0.0.1::5353/udp",
 			"-v", corefilePath + ":/Corefile:ro",
@@ -803,10 +807,10 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 		if h, p, err := net.SplitHostPort(dnsAddr); err == nil && (h == "0.0.0.0" || h == "::") {
 			dnsAddr = net.JoinHostPort("127.0.0.1", p)
 		}
-		return dnsAddr, corefile
+		return dnsAddr, corefile, name
 	}
 
-	assertQueries := func(t *testing.T, dnsAddr, corefile string, cases []struct {
+	assertQueries := func(t *testing.T, dnsAddr, corefile, containerName string, cases []struct {
 		host         string
 		wantA        string
 		wantANY      string
@@ -827,7 +831,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 					time.Sleep(200 * time.Millisecond)
 				}
 				if got != tc.wantA {
-					t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s", tc.host, got, tc.wantA, corefile)
+					t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s\nLogs:\n%s", tc.host, got, tc.wantA, corefile, containerLogs(containerName))
 				}
 			}
 			if tc.wantANY != "" {
@@ -847,7 +851,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 					time.Sleep(200 * time.Millisecond)
 				}
 				if anyErr != nil || gotANYAns != 1 || gotANY != tc.wantANY {
-					t.Fatalf("CoreDNS ANY(%s) = (%q, ancount=%d, err=%v), want (%q, 1, nil)\nCorefile:\n%s", tc.host, gotANY, gotANYAns, anyErr, tc.wantANY, corefile)
+					t.Fatalf("CoreDNS ANY(%s) = (%q, ancount=%d, err=%v), want (%q, 1, nil)\nCorefile:\n%s\nLogs:\n%s", tc.host, gotANY, gotANYAns, anyErr, tc.wantANY, corefile, containerLogs(containerName))
 				}
 			}
 			var gotAAAA string
@@ -864,7 +868,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 				time.Sleep(200 * time.Millisecond)
 			}
 			if gotErr != nil || gotAAAA != tc.wantAAAA {
-				t.Fatalf("CoreDNS AAAA(%s) = (%q, err=%v), want (%q, nil)\nCorefile:\n%s", tc.host, gotAAAA, gotErr, tc.wantAAAA, corefile)
+				t.Fatalf("CoreDNS AAAA(%s) = (%q, err=%v), want (%q, nil)\nCorefile:\n%s\nLogs:\n%s", tc.host, gotAAAA, gotErr, tc.wantAAAA, corefile, containerLogs(containerName))
 			}
 
 			var gotHTTPSAns int
@@ -881,13 +885,13 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 				time.Sleep(200 * time.Millisecond)
 			}
 			if httpsErr != nil || gotHTTPSAns != tc.wantHTTPSAns {
-				t.Fatalf("CoreDNS HTTPS/TYPE65(%s) = (ancount=%d, err=%v), want (ancount=%d, nil)\nCorefile:\n%s", tc.host, gotHTTPSAns, httpsErr, tc.wantHTTPSAns, corefile)
+				t.Fatalf("CoreDNS HTTPS/TYPE65(%s) = (ancount=%d, err=%v), want (ancount=%d, nil)\nCorefile:\n%s\nLogs:\n%s", tc.host, gotHTTPSAns, httpsErr, tc.wantHTTPSAns, corefile, containerLogs(containerName))
 			}
 		}
 	}
 
 	t.Run("mixed bindings", func(t *testing.T) {
-		dnsAddr, corefile := startCoreDNS(t, []ir.Listener{
+		dnsAddr, corefile, containerName := startCoreDNS(t, []ir.Listener{
 			{Name: "wild-pod", Hostname: "*.internal.example", Port: 9443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "exact-loop", Hostname: "api.internal.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 			{Name: "exact-disjoint", Hostname: "disjoint.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
@@ -896,7 +900,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 			{Name: "dup-pod", Hostname: "dup.internal.example", Port: 9445, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
 			{Name: "dup-loop", Hostname: "dup.internal.example", Port: 8445, Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
 		})
-		assertQueries(t, dnsAddr, corefile, []struct {
+		assertQueries(t, dnsAddr, corefile, containerName, []struct {
 			host         string
 			wantA        string
 			wantANY      string
@@ -923,11 +927,11 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 			{"all-podip", ir.ListenerBindingPodIP, "192.0.2.7"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				dnsAddr, corefile := startCoreDNS(t, []ir.Listener{
+				dnsAddr, corefile, containerName := startCoreDNS(t, []ir.Listener{
 					{Name: "exact", Hostname: "api.homo.example", Port: 8443, Exposure: ir.ExposurePrivate, Binding: tc.binding},
 					{Name: "wild", Hostname: "*.wild.homo.example", Port: 8444, Exposure: ir.ExposurePrivate, Binding: tc.binding},
 				})
-				assertQueries(t, dnsAddr, corefile, []struct {
+				assertQueries(t, dnsAddr, corefile, containerName, []struct {
 					host         string
 					wantA        string
 					wantANY      string
