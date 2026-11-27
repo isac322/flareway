@@ -51,14 +51,34 @@ type latchKey struct {
 // checks at the call site. See the package documentation for why in-memory
 // storage is sufficient.
 type Latch struct {
-	mu        sync.RWMutex
-	nextEpoch uint64
-	retireSeq uint64
-	epochs    map[latchKey]uint64
-	reasons   map[latchKey]string
-	verified  map[latchKey]verification
-	baselines map[latchKey]baseline
-	confirmed map[latchKey]verification
+	mu           sync.RWMutex
+	nextEpoch    uint64
+	nextGuardID  uint64
+	epochs       map[latchKey]uint64
+	reasons      map[latchKey]string
+	verified     map[latchKey]verification
+	baselines    map[latchKey]baseline
+	confirmed    map[latchKey]verification
+	activeGuards map[latchKey]map[uint64]*guardState
+}
+
+// LifetimeToken guards a single in-flight read-and-update cycle on one latch
+// key against concurrent retirement or replacement-UID updates without retaining
+// any per-key state after EndLifetime.
+type LifetimeToken struct {
+	kind string
+	key  types.NamespacedName
+	id   uint64
+}
+
+// Key returns the NamespacedName guarded by this LifetimeToken.
+func (t LifetimeToken) Key() types.NamespacedName {
+	return t.key
+}
+
+type guardState struct {
+	retired bool
+	touched bool
 }
 
 // verification is the most recent confirmation of one desired hash.
@@ -82,11 +102,59 @@ type baseline struct {
 // NewLatch returns an empty latch.
 func NewLatch() *Latch {
 	return &Latch{
-		epochs:    make(map[latchKey]uint64),
-		reasons:   make(map[latchKey]string),
-		verified:  make(map[latchKey]verification),
-		baselines: make(map[latchKey]baseline),
-		confirmed: make(map[latchKey]verification),
+		epochs:       make(map[latchKey]uint64),
+		reasons:      make(map[latchKey]string),
+		verified:     make(map[latchKey]verification),
+		baselines:    make(map[latchKey]baseline),
+		confirmed:    make(map[latchKey]verification),
+		activeGuards: make(map[latchKey]map[uint64]*guardState),
+	}
+}
+
+func (l *Latch) markGuardsTouchedLocked(k latchKey) {
+	for _, st := range l.activeGuards[k] {
+		st.touched = true
+	}
+}
+
+// BeginLifetime registers an in-flight guard token for (kind, key). Callers
+// must pair it with defer EndLifetime(tok) so idle keys retain zero bytes.
+func (l *Latch) BeginLifetime(kind string, key types.NamespacedName) LifetimeToken {
+	if l == nil {
+		return LifetimeToken{kind: kind, key: key}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.nextGuardID++
+	id := l.nextGuardID
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	if l.activeGuards == nil {
+		l.activeGuards = make(map[latchKey]map[uint64]*guardState)
+	}
+	guards := l.activeGuards[k]
+	if guards == nil {
+		guards = make(map[uint64]*guardState)
+		l.activeGuards[k] = guards
+	}
+	guards[id] = &guardState{}
+	return LifetimeToken{kind: kind, key: key, id: id}
+}
+
+// EndLifetime unregisters tok and deletes the per-key guard map when empty.
+func (l *Latch) EndLifetime(tok LifetimeToken) {
+	if l == nil || tok.id == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name}
+	guards := l.activeGuards[k]
+	if guards == nil {
+		return
+	}
+	delete(guards, tok.id)
+	if len(guards) == 0 {
+		delete(l.activeGuards, k)
 	}
 }
 
@@ -114,6 +182,7 @@ func (l *Latch) Invalidate(kind string, key types.NamespacedName, reason string)
 	l.reasons[k] = reason
 	delete(l.verified, k)
 	delete(l.confirmed, k)
+	l.markGuardsTouchedLocked(k)
 }
 
 // InvalidationEpoch returns the object's current invalidation epoch. Callers
@@ -166,6 +235,7 @@ func (l *Latch) CompleteVerification(
 		}
 		l.baselines[k] = baseline{hash: hash, matches: matches}
 	}
+	l.markGuardsTouchedLocked(k)
 	return true
 }
 
@@ -211,28 +281,21 @@ func (l *Latch) Forget(kind string, key types.NamespacedName) {
 	delete(l.confirmed, k)
 }
 
-// RetireSequence returns the monotonic counter incremented every time Remove
-// retires an object from the latch. Callers capture it before checking live
-// Kubernetes existence so a concurrent Remove prevents recreating stale state.
-func (l *Latch) RetireSequence() uint64 {
-	if l == nil {
-		return 0
-	}
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.retireSeq
-}
-
 // ForgetAndInvalidateIfUnretired atomically forgets verified/baseline state and
-// marks the object invalidated only if no Remove occurred since expectedRetireSeq
-// was captured. Reports whether the update applied.
-func (l *Latch) ForgetAndInvalidateIfUnretired(kind string, key types.NamespacedName, expectedRetireSeq uint64, reason string) bool {
-	if l == nil {
+// marks the key invalidated only if tok is still active and has not been
+// retired by a concurrent Remove or RemoveIfUntouched. Other active tokens on
+// the same key are marked touched so a concurrent confirmation of absence does
+// not delete this invalidation. Reports whether the update applied.
+func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string) bool {
+	if l == nil || tok.id == 0 {
 		return false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.retireSeq != expectedRetireSeq {
+	k := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name}
+	guards := l.activeGuards[k]
+	st, ok := guards[tok.id]
+	if !ok || st.retired {
 		return false
 	}
 	if l.epochs == nil {
@@ -241,13 +304,45 @@ func (l *Latch) ForgetAndInvalidateIfUnretired(kind string, key types.Namespaced
 	if l.reasons == nil {
 		l.reasons = make(map[latchKey]string)
 	}
-	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
 	l.nextEpoch++
 	l.epochs[k] = l.nextEpoch
 	l.reasons[k] = reason
 	delete(l.verified, k)
 	delete(l.baselines, k)
 	delete(l.confirmed, k)
+	for id, other := range guards {
+		if id != tok.id {
+			other.touched = true
+		}
+	}
+	return true
+}
+
+// RemoveIfUntouched drops every record for tok's key only if tok is still
+// active and no state update touched the key since BeginLifetime. Other active
+// tokens on the same key are marked retired. Reports whether removal applied.
+func (l *Latch) RemoveIfUntouched(tok LifetimeToken) bool {
+	if l == nil || tok.id == 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name}
+	guards := l.activeGuards[k]
+	st, ok := guards[tok.id]
+	if !ok || st.touched {
+		return false
+	}
+	delete(l.epochs, k)
+	delete(l.reasons, k)
+	delete(l.verified, k)
+	delete(l.baselines, k)
+	delete(l.confirmed, k)
+	for id, other := range guards {
+		if id != tok.id {
+			other.retired = true
+		}
+	}
 	return true
 }
 
@@ -260,13 +355,15 @@ func (l *Latch) Remove(kind string, key types.NamespacedName) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.retireSeq++
 	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
 	delete(l.epochs, k)
 	delete(l.reasons, k)
 	delete(l.verified, k)
 	delete(l.baselines, k)
 	delete(l.confirmed, k)
+	for _, st := range l.activeGuards[k] {
+		st.retired = true
+	}
 }
 
 // MarkVerified records that the object's remote state was confirmed to match
@@ -278,7 +375,12 @@ func (l *Latch) MarkVerified(kind string, key types.NamespacedName, hash string,
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.verified[latchKey{kind: kind, namespace: key.Namespace, name: key.Name}] = verification{hash: hash, at: at}
+	if l.verified == nil {
+		l.verified = make(map[latchKey]verification)
+	}
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	l.verified[k] = verification{hash: hash, at: at}
+	l.markGuardsTouchedLocked(k)
 }
 
 // VerifiedAt returns when the object was last confirmed against hash. It

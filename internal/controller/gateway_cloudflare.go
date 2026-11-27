@@ -893,7 +893,6 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 	if r.Invalidator == nil || gateway == nil || gateway.UID == "" || !gateway.DeletionTimestamp.IsZero() {
 		return
 	}
-	retireSeq := r.Invalidator.RetireSequence()
 	reader := r.directReader()
 	var tunnelKey types.NamespacedName
 	if tunnel != nil {
@@ -908,10 +907,15 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 		}
 		tunnelKey = types.NamespacedName{Namespace: gateway.Namespace, Name: tunnelName}
 	}
+	tokConfig := r.Invalidator.BeginLifetime(configFreshnessKind, tunnelKey)
+	defer r.Invalidator.EndLifetime(tokConfig)
+	tokTunnel := r.Invalidator.BeginLifetime("CloudflareTunnel", tunnelKey)
+	defer r.Invalidator.EndLifetime(tokTunnel)
 	var liveTunnel v1alpha1.CloudflareTunnel
 	if err := reader.Get(ctx, tunnelKey, &liveTunnel); err != nil {
 		if apierrors.IsNotFound(err) {
-			retireTunnelLatchKeys(r.Invalidator, tunnelKey)
+			r.Invalidator.RemoveIfUntouched(tokTunnel)
+			r.Invalidator.RemoveIfUntouched(tokConfig)
 		}
 		return
 	}
@@ -928,7 +932,7 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 	if !sameGatewayIdentity(gateway, selected) || !tunnelGatewayStatusIdentityMatches(&liveTunnel, gateway) {
 		return
 	}
-	forgetGateForLiveTunnelUID(ctx, reader, r.Invalidator, configFreshnessKind, tunnelKey, liveTunnel.UID, retireSeq)
+	forgetGateForLiveTunnelUID(ctx, reader, r.Invalidator, tokConfig, liveTunnel.UID)
 }
 
 // remoteConfigFailure records ConfigApplied=False before returning a remote
@@ -955,20 +959,23 @@ func (r *GatewayReconciler) demoteTunnelConfigApplied(ctx context.Context, gatew
 		return errors.New("demoteTunnelConfigApplied requires an observed CloudflareTunnel")
 	}
 	key := client.ObjectKeyFromObject(tunnel)
-	retireSeq := r.Invalidator.RetireSequence()
+	tok := r.Invalidator.BeginLifetime(configFreshnessKind, key)
+	defer r.Invalidator.EndLifetime(tok)
 	err := r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
 		gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, metav1.NewTime(now)))
 	switch {
 	case err == nil:
-		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, configFreshnessKind, key, tunnel.UID, retireSeq)
+		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, tok, tunnel.UID)
 		return nil
-	case apierrors.IsNotFound(err):
-		retireTunnelLatchKeys(r.Invalidator, key)
-		return err
 	case errors.Is(err, errTunnelConditionPrecondition):
+		// Must precede apierrors.IsNotFound: Gateway NotFound wraps both, and
+		// losing the Gateway must never retire live CloudflareTunnel keys.
+		return err
+	case apierrors.IsNotFound(err):
+		_, _ = retireTunnelIfConfirmedAbsent(ctx, r.directReader(), r.Invalidator, key, err)
 		return err
 	default:
-		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, configFreshnessKind, key, tunnel.UID, retireSeq)
+		forgetGateForLiveTunnelUID(ctx, r.directReader(), r.Invalidator, tok, tunnel.UID)
 		return err
 	}
 }

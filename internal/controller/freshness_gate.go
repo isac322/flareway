@@ -228,37 +228,35 @@ func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 
 // forgetGateForLiveTunnelUID forgets cached verification/baseline state and
 // latches a "demoted" invalidation only when the live API server still holds
-// expectedUID for the CloudflareTunnel and no Remove happened since retireSeq.
-// If the Tunnel is already absent (NotFound), both tunnel latch keys are
-// retired; if the live UID changed, nothing is wiped or recreated so a
-// replacement Tunnel's epoch/invalidation stays intact.
+// expectedUID for the CloudflareTunnel and tok was not retired concurrently.
+// If the Tunnel is already absent (NotFound), absence is corroborated safely via
+// retireTunnelIfConfirmedAbsent; if the live UID changed, nothing is wiped or
+// recreated so a replacement Tunnel's epoch/invalidation stays intact.
 func forgetGateForLiveTunnelUID(
 	ctx context.Context,
 	reader kubeclient.Reader,
 	latch *freshness.Latch,
-	kind string,
-	key types.NamespacedName,
+	tok freshness.LifetimeToken,
 	expectedUID types.UID,
-	retireSeq uint64,
 ) {
 	if latch == nil || reader == nil || expectedUID == "" {
 		return
 	}
 	var live v1alpha1.CloudflareTunnel
-	if err := reader.Get(ctx, key, &live); err != nil {
+	if err := reader.Get(ctx, tok.Key(), &live); err != nil {
 		if apierrors.IsNotFound(err) {
-			retireTunnelLatchKeys(latch, key)
+			_, _ = retireTunnelIfConfirmedAbsent(ctx, reader, latch, tok.Key(), err)
 			return
 		}
 		// Transient uncached read failure while live status may be unconverged:
-		// fail closed only if no concurrent Remove retired the key.
-		latch.ForgetAndInvalidateIfUnretired(kind, key, retireSeq, "demoted")
+		// fail closed only if tok was not concurrently retired.
+		latch.ForgetAndInvalidateIfUnretired(tok, "demoted")
 		return
 	}
 	if live.UID != expectedUID {
 		return
 	}
-	latch.ForgetAndInvalidateIfUnretired(kind, key, retireSeq, "demoted")
+	latch.ForgetAndInvalidateIfUnretired(tok, "demoted")
 }
 
 // statusConverged reports whether the object's live status is converged on the
@@ -287,21 +285,16 @@ func releaseGoneObject(latch *freshness.Latch, kind string, key types.Namespaced
 	return err
 }
 
-// retireTunnelLatchKeys drops both the Tunnel reconciliation and Gateway
-// config freshness latch records for a confirmed-absent CloudflareTunnel.
-func retireTunnelLatchKeys(latch *freshness.Latch, key types.NamespacedName) {
-	latch.Remove("CloudflareTunnel", key)
-	latch.Remove(configFreshnessKind, key)
-}
-
 // retireTunnelIfConfirmedAbsent corroborates a cached CloudflareTunnel
 // NotFound error against reader (uncached APIReader) before retiring both
-// CloudflareTunnel and CloudflareTunnelConfig latch keys.
+// CloudflareTunnel and CloudflareTunnelConfig latch keys via per-key
+// LifetimeTokens so fresh replacement-UID state added concurrently is never
+// wiped.
 //
-// Returns (true, nil) when uncached reader confirms NotFound and both keys are
-// retired, (false, nil) when uncached reader still observes a live tunnel
-// (stale cache lag), or (false, err) when getErr is not NotFound or the
-// uncached lookup fails transiently.
+// Returns (true, nil) when uncached reader confirms NotFound, (false, nil)
+// when uncached reader still observes a live tunnel (stale cache lag), or
+// (false, err) when getErr is not NotFound or the uncached lookup fails
+// transiently.
 func retireTunnelIfConfirmedAbsent(
 	ctx context.Context,
 	reader kubeclient.Reader,
@@ -312,6 +305,10 @@ func retireTunnelIfConfirmedAbsent(
 	if !apierrors.IsNotFound(getErr) {
 		return false, getErr
 	}
+	tokTunnel := latch.BeginLifetime("CloudflareTunnel", key)
+	defer latch.EndLifetime(tokTunnel)
+	tokConfig := latch.BeginLifetime(configFreshnessKind, key)
+	defer latch.EndLifetime(tokConfig)
 	var live v1alpha1.CloudflareTunnel
 	confirmErr := reader.Get(ctx, key, &live)
 	if confirmErr == nil {
@@ -320,7 +317,8 @@ func retireTunnelIfConfirmedAbsent(
 	if !apierrors.IsNotFound(confirmErr) {
 		return false, fmt.Errorf("confirm CloudflareTunnel %s absence: %w", key, confirmErr)
 	}
-	retireTunnelLatchKeys(latch, key)
+	latch.RemoveIfUntouched(tokTunnel)
+	latch.RemoveIfUntouched(tokConfig)
 	return true, nil
 }
 

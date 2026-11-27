@@ -102,59 +102,93 @@ func TestLatchCompleteVerificationRespectsInvalidationEpoch(t *testing.T) {
 	}
 }
 
-func TestLatchRetireSequenceAndForgetAndInvalidateIfUnretired(t *testing.T) {
+func TestLatchLifetimeTokenIsolationAndCleanup(t *testing.T) {
 	latch := NewLatch()
-	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	keyA := types.NamespacedName{Namespace: "tenant", Name: "edge-a"}
+	keyB := types.NamespacedName{Namespace: "tenant", Name: "edge-b"}
 	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
 
 	var nilLatch *Latch
-	if got := nilLatch.RetireSequence(); got != 0 {
-		t.Fatalf("nil Latch RetireSequence = %d, want 0", got)
-	}
-	if nilLatch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, 0, "demoted") {
+	nilTok := nilLatch.BeginLifetime("CloudflareTunnelConfig", keyA)
+	nilLatch.EndLifetime(nilTok)
+	if nilLatch.ForgetAndInvalidateIfUnretired(nilTok, "demoted") {
 		t.Fatal("nil Latch ForgetAndInvalidateIfUnretired returned true")
 	}
+	if nilLatch.RemoveIfUntouched(nilTok) {
+		t.Fatal("nil Latch RemoveIfUntouched returned true")
+	}
 
-	seq0 := latch.RetireSequence()
-	latch.MarkVerified("CloudflareTunnelConfig", key, "h1", now)
-	latch.SetBaseline("CloudflareTunnelConfig", key, "h1", func(any) bool { return true })
-	if !latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seq0, "demoted") {
-		t.Fatal("ForgetAndInvalidateIfUnretired returned false for matching retireSeq")
+	// EndLifetime releases per-key guard map cleanly (0 idle memory).
+	tokIdle := latch.BeginLifetime("CloudflareTunnelConfig", keyA)
+	if len(latch.activeGuards) != 1 {
+		t.Fatalf("activeGuards len = %d after BeginLifetime, want 1", len(latch.activeGuards))
 	}
-	if !latch.IsInvalidated("CloudflareTunnelConfig", key) {
-		t.Fatal("expected invalidation latch after ForgetAndInvalidateIfUnretired")
+	latch.EndLifetime(tokIdle)
+	if len(latch.activeGuards) != 0 {
+		t.Fatalf("activeGuards len = %d after EndLifetime, want 0", len(latch.activeGuards))
 	}
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", key, "h1"); ok {
+
+	// Unrelated-key Remove MUST NOT invalidate or block tokA.
+	tokA := latch.BeginLifetime("CloudflareTunnelConfig", keyA)
+	defer latch.EndLifetime(tokA)
+	latch.MarkVerified("CloudflareTunnelConfig", keyA, "h1", now)
+	latch.SetBaseline("CloudflareTunnelConfig", keyA, "h1", func(any) bool { return true })
+	latch.Invalidate("CloudflareTunnelConfig", keyB, "other-drift")
+	latch.Remove("CloudflareTunnelConfig", keyB)
+	if !latch.ForgetAndInvalidateIfUnretired(tokA, "demoted") {
+		t.Fatal("ForgetAndInvalidateIfUnretired failed on unrelated-key Remove")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", keyA) {
+		t.Fatal("expected keyA invalidation latch after ForgetAndInvalidateIfUnretired")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", keyA, "h1"); ok {
 		t.Fatal("expected ForgetAndInvalidateIfUnretired to clear VerifiedAt")
 	}
-	if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", key); gotEpoch == 0 {
-		t.Fatal("expected non-zero InvalidationEpoch after ForgetAndInvalidateIfUnretired")
+
+	// Same-key Remove marks in-flight token retired -> ForgetAndInvalidateIfUnretired returns false.
+	tokRetired := latch.BeginLifetime("CloudflareTunnelConfig", keyA)
+	defer latch.EndLifetime(tokRetired)
+	latch.Remove("CloudflareTunnelConfig", keyA)
+	if latch.ForgetAndInvalidateIfUnretired(tokRetired, "demoted") {
+		t.Fatal("ForgetAndInvalidateIfUnretired succeeded after same-key Remove")
+	}
+	if latch.IsInvalidated("CloudflareTunnelConfig", keyA) {
+		t.Fatal("ForgetAndInvalidateIfUnretired recreated invalidation after same-key Remove")
+	}
+	if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", keyA); gotEpoch != 0 {
+		t.Fatalf("ForgetAndInvalidateIfUnretired set epoch=%d after Remove, want 0", gotEpoch)
 	}
 
-	// Simulate retirement via Remove on another key or same key -> advances retireSeq.
-	latch.Remove("CloudflareTunnel", key)
-	latch.Remove("CloudflareTunnelConfig", key)
-	seqAfterRemove := latch.RetireSequence()
-	if seqAfterRemove <= seq0 {
-		t.Fatalf("RetireSequence did not advance on Remove: before=%d after=%d", seq0, seqAfterRemove)
+	// RemoveIfUntouched returns false and preserves state when touched after BeginLifetime.
+	tokTouch := latch.BeginLifetime("CloudflareTunnelConfig", keyA)
+	defer latch.EndLifetime(tokTouch)
+	latch.Invalidate("CloudflareTunnelConfig", keyA, "replacement-drift")
+	epochAfterTouch := latch.InvalidationEpoch("CloudflareTunnelConfig", keyA)
+	if latch.RemoveIfUntouched(tokTouch) {
+		t.Fatal("RemoveIfUntouched succeeded despite Invalidate after BeginLifetime")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", keyA) {
+		t.Fatal("RemoveIfUntouched wiped post-BeginLifetime invalidation")
+	}
+	if got := latch.InvalidationEpoch("CloudflareTunnelConfig", keyA); got != epochAfterTouch {
+		t.Fatalf("RemoveIfUntouched altered epoch: got %d, want %d", got, epochAfterTouch)
 	}
 
-	// Stale pre-Remove retireSeq MUST NOT recreate invalidation or touch epochs.
-	if latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seq0, "demoted") {
-		t.Fatal("ForgetAndInvalidateIfUnretired succeeded with stale retireSeq")
+	// RemoveIfUntouched succeeds when untouched and retires sibling tokens on same key.
+	tokRemover := latch.BeginLifetime("CloudflareTunnelConfig", keyB)
+	defer latch.EndLifetime(tokRemover)
+	tokSibling := latch.BeginLifetime("CloudflareTunnelConfig", keyB)
+	defer latch.EndLifetime(tokSibling)
+	latch.Invalidate("CloudflareTunnelConfig", keyB, "stale-drift")
+	tokClean := latch.BeginLifetime("CloudflareTunnelConfig", keyB)
+	defer latch.EndLifetime(tokClean)
+	if !latch.RemoveIfUntouched(tokClean) {
+		t.Fatal("RemoveIfUntouched failed on untouched key")
 	}
-	if latch.IsInvalidated("CloudflareTunnelConfig", key) {
-		t.Fatal("stale ForgetAndInvalidateIfUnretired recreated invalidation after Remove")
+	if latch.IsInvalidated("CloudflareTunnelConfig", keyB) {
+		t.Fatal("RemoveIfUntouched did not clear keyB state")
 	}
-	if gotEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", key); gotEpoch != 0 {
-		t.Fatalf("stale ForgetAndInvalidateIfUnretired set epoch=%d, want 0", gotEpoch)
-	}
-
-	// Current retireSeq succeeds.
-	if !latch.ForgetAndInvalidateIfUnretired("CloudflareTunnelConfig", key, seqAfterRemove, "demoted") {
-		t.Fatal("ForgetAndInvalidateIfUnretired failed with current retireSeq")
-	}
-	if !latch.IsInvalidated("CloudflareTunnelConfig", key) {
-		t.Fatal("expected invalidation latch with current retireSeq")
+	if latch.ForgetAndInvalidateIfUnretired(tokSibling, "demoted") {
+		t.Fatal("sibling token succeeded after RemoveIfUntouched")
 	}
 }
