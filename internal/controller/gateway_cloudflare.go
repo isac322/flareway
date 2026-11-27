@@ -1460,7 +1460,7 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		if err := validate(&live); err != nil {
 			return err
 		}
-		if tunnelGatewayDataUnchanged(&live, config, hostnames, listeners) {
+		if tunnelGatewayDataUnchanged(&live, statusMap, config, hostnames, listeners) {
 			return nil
 		}
 		apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
@@ -1483,6 +1483,7 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 
 func tunnelGatewayDataUnchanged(
 	live *v1alpha1.CloudflareTunnel,
+	statusMap map[string]any,
 	config v1alpha1.CloudflareTunnelConfigVersion,
 	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
 	listeners []v1alpha1.CloudflareTunnelListenerStatus,
@@ -1495,7 +1496,7 @@ func tunnelGatewayDataUnchanged(
 		!apiequality.Semantic.DeepEqual(live.Status.Listeners, listeners) {
 		return false
 	}
-	return gatewayDataOwnershipPresent(live)
+	return gatewayDataOwnershipPresent(live, statusMap)
 }
 
 func tunnelConfigVersionEqual(left, right v1alpha1.CloudflareTunnelConfigVersion) bool {
@@ -1514,42 +1515,176 @@ func tunnelTimeEqual(left, right *metav1.Time) bool {
 	return left.Time.Truncate(time.Second).Equal(right.Truncate(time.Second))
 }
 
-func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel) bool {
-	if live == nil {
+func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[string]any) bool {
+	if live == nil || statusMap == nil {
 		return false
 	}
-	needConfigVersion := live.Status.ConfigVersion.Desired != 0 ||
-		live.Status.ConfigVersion.DesiredHash != "" ||
-		live.Status.ConfigVersion.Applied != 0 ||
-		live.Status.ConfigVersion.Remote != 0 ||
-		live.Status.ConfigVersion.AppliedAt != nil ||
-		live.Status.ConfigVersion.CreatedAt != nil
+	covered := false
 	for _, entry := range live.ManagedFields {
-		if entry.Manager != gatewayFieldManager || entry.FieldsV1 == nil {
+		if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.FieldsV1 == nil {
 			continue
 		}
 		var fields map[string]any
 		if err := json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields); err != nil {
 			continue
 		}
-		status, _ := fields["f:status"].(map[string]any)
-		if status == nil {
+		statusFields, _ := fields["f:status"].(map[string]any)
+		if statusFields == nil {
 			continue
 		}
-		if _, ok := status["f:hostnames"]; !ok {
-			continue
+		if _, hasConditions := statusFields["f:conditions"]; hasConditions {
+			return false
 		}
-		if _, ok := status["f:listeners"]; !ok {
-			continue
-		}
-		if needConfigVersion {
-			if _, ok := status["f:configVersion"]; !ok {
-				continue
+		if entry.Operation == metav1.ManagedFieldsOperationApply && !covered {
+			if fieldsV1CoversStatusMap(statusFields, statusMap) {
+				covered = true
 			}
 		}
-		return true
 	}
-	return false
+	return covered
+}
+
+func fieldsV1CoversStatusMap(statusFields, statusMap map[string]any) bool {
+	for key, val := range statusMap {
+		switch key {
+		case "configVersion":
+			cfgMap, ok := val.(map[string]any)
+			if !ok {
+				return false
+			}
+			rawCfg, exists := statusFields["f:configVersion"]
+			if !exists {
+				return false
+			}
+			if len(cfgMap) == 0 {
+				continue
+			}
+			ownedCfg, ok := rawCfg.(map[string]any)
+			if !ok {
+				return false
+			}
+			for leafKey := range cfgMap {
+				if _, leafOwned := ownedCfg["f:"+leafKey]; !leafOwned {
+					return false
+				}
+			}
+		case "hostnames":
+			items, ok := val.([]any)
+			if !ok {
+				return false
+			}
+			if len(items) == 0 {
+				continue
+			}
+			ownedList, ok := statusFields["f:hostnames"].(map[string]any)
+			if !ok {
+				return false
+			}
+			if !fieldsV1CoversMapList(ownedList, items, []string{"hostname", "protectionDomain", "accessApplication"}, nil) {
+				return false
+			}
+		case "listeners":
+			items, ok := val.([]any)
+			if !ok {
+				return false
+			}
+			if len(items) == 0 {
+				continue
+			}
+			ownedList, ok := statusFields["f:listeners"].(map[string]any)
+			if !ok {
+				return false
+			}
+			if !fieldsV1CoversMapList(ownedList, items, []string{"name"}, map[string][]string{"protectionDomains": {"name"}}) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+type fieldsV1ListEntry struct {
+	keys   map[string]any
+	fields map[string]any
+}
+
+func fieldsV1CoversMapList(ownedList map[string]any, items []any, keyFields []string, nestedLists map[string][]string) bool {
+	entries := make([]fieldsV1ListEntry, 0, len(ownedList))
+	for rawKey, rawVal := range ownedList {
+		if !strings.HasPrefix(rawKey, "k:") {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(rawKey, "k:")), &parsed); err != nil {
+			continue
+		}
+		valMap, _ := rawVal.(map[string]any)
+		entries = append(entries, fieldsV1ListEntry{keys: parsed, fields: valMap})
+	}
+	for _, rawItem := range items {
+		elem, ok := rawItem.(map[string]any)
+		if !ok {
+			return false
+		}
+		var matched *fieldsV1ListEntry
+		for index := range entries {
+			if mapKeysMatch(entries[index].keys, elem, keyFields) {
+				matched = &entries[index]
+				break
+			}
+		}
+		if matched == nil || matched.fields == nil {
+			return false
+		}
+		for fieldName, fieldVal := range elem {
+			if nestedKeys, isNested := nestedLists[fieldName]; isNested {
+				nestedItems, ok := fieldVal.([]any)
+				if !ok {
+					return false
+				}
+				rawNested, exists := matched.fields["f:"+fieldName]
+				if !exists {
+					return false
+				}
+				if len(nestedItems) == 0 {
+					continue
+				}
+				ownedNested, ok := rawNested.(map[string]any)
+				if !ok {
+					return false
+				}
+				if !fieldsV1CoversMapList(ownedNested, nestedItems, nestedKeys, nil) {
+					return false
+				}
+				continue
+			}
+			if _, exists := matched.fields["f:"+fieldName]; !exists {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func mapKeysMatch(parsed, elem map[string]any, keyFields []string) bool {
+	for _, kf := range keyFields {
+		if mapKeyString(parsed[kf]) != mapKeyString(elem[kf]) {
+			return false
+		}
+	}
+	return true
+}
+
+func mapKeyString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
 }
 
 // gatewayTunnelCondition stamps an authored condition with the caller's clock.

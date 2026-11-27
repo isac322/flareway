@@ -35,6 +35,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1684,6 +1685,148 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		_, err = f.reconciler.Reconcile(f.ctx, f.request)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(writesAfterClamp), "post-clamp steady-state reconcile must emit 0 status writes")
+
+		applyTunnelStatusUnstructured := func(manager string, status map[string]any) {
+			u := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": v1alpha1.GroupVersion.String(),
+				"kind":       "CloudflareTunnel",
+				"metadata":   map[string]any{"name": f.tunnelKey.Name, "namespace": f.tunnelKey.Namespace},
+				"status":     status,
+			}}
+			gomega.Expect(f.direct.Status().Apply(f.ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(manager), client.ForceOwnership)).To(gomega.Succeed())
+		}
+		assertRecoverInOneWrite := func(desc string) {
+			before := statusCounter.writes.Load()
+			_, recErr := f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(recErr).NotTo(gomega.HaveOccurred())
+			gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(before+1), "%s: first reconcile must emit 1 write to recover ownership", desc)
+
+			after := statusCounter.writes.Load()
+			_, recErr = f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(recErr).NotTo(gomega.HaveOccurred())
+			gomega.Expect(statusCounter.writes.Load()).To(gomega.Equal(after), "%s: second reconcile must emit 0 writes", desc)
+		}
+
+		// Leaf ownership loss 1: configVersion.remote owned solely by alternate manager with identical value 4.
+		applyTunnelStatusUnstructured("other-status-manager", map[string]any{"configVersion": map[string]any{"remote": int64(99)}})
+		applyTunnelStatusUnstructured("other-status-manager", map[string]any{"configVersion": map[string]any{"remote": int64(4)}})
+		assertRecoverInOneWrite("configVersion.remote leaf ownership loss")
+
+		// Leaf ownership loss 2: hostnames[composite key].appliedVersion owned solely by alternate manager with identical value 4.
+		hostLeaf := func(ver int64) map[string]any {
+			return map[string]any{
+				"hostnames": []any{map[string]any{
+					"hostname":          "edge-a.example.com",
+					"protectionDomain":  "http-access-default-pub-drift-app",
+					"accessApplication": ns + "/pub-drift-app",
+					"guard":             "Blocked",
+					"appliedVersion":    ver,
+				}},
+			}
+		}
+		applyTunnelStatusUnstructured("other-status-manager", hostLeaf(99))
+		applyTunnelStatusUnstructured("other-status-manager", hostLeaf(4))
+		assertRecoverInOneWrite("hostnames[].appliedVersion leaf ownership loss")
+
+		// Leaf ownership loss 3: listeners[name].protectionDomains[name].envoyPort owned solely by alternate manager with identical value 18080.
+		listenerLeaf := func(port int64) map[string]any {
+			return map[string]any{
+				"listeners": []any{map[string]any{
+					"name":     "http",
+					"exposure": "Public",
+					"protectionDomains": []any{map[string]any{
+						"name":      "http-access-default-pub-drift-app",
+						"envoyPort": port,
+						"protected": true,
+					}},
+				}},
+			}
+		}
+		applyTunnelStatusUnstructured("other-status-manager", listenerLeaf(19999))
+		applyTunnelStatusUnstructured("other-status-manager", listenerLeaf(18080))
+		assertRecoverInOneWrite("listeners[].protectionDomains[].envoyPort leaf ownership loss")
+
+		// Legacy f:conditions co-ownership on flareway-gateway status ManagedFields must be shed in 1 apply.
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		tunnelDataObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&v1alpha1.CloudflareTunnelStatus{
+			ConfigVersion: tunnel.Status.ConfigVersion,
+			Hostnames:     tunnel.Status.Hostnames,
+			Listeners:     tunnel.Status.Listeners,
+			Conditions:    tunnel.Status.Conditions,
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		applyTunnelStatusUnstructured(gatewayFieldManager, tunnelDataObj)
+		assertRecoverInOneWrite("legacy f:conditions on flareway-gateway status ManagedFields")
+
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		for _, entry := range tunnel.ManagedFields {
+			if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.FieldsV1 == nil {
+				continue
+			}
+			var fields map[string]any
+			gomega.Expect(json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields)).To(gomega.Succeed())
+			statusMap, _ := fields["f:status"].(map[string]any)
+			_, hasConditions := statusMap["f:conditions"]
+			gomega.Expect(hasConditions).To(gomega.BeFalse(), "flareway-gateway status ManagedFields must shed f:conditions")
+		}
+
+		// Case 5: Non-status subresource (Subresource == "") ownership is ignored, and
+		// empty hostnames/listeners list ownership gap + zeroed ConfigVersion converges 1 -> 0.
+		emptyTunnel := &v1alpha1.CloudflareTunnel{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty-list-tunnel", Namespace: ns},
+			Spec:       tunnel.Spec,
+		}
+		gomega.Expect(f.direct.Create(f.ctx, emptyTunnel)).To(gomega.Succeed())
+		mainMetaApply := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": v1alpha1.GroupVersion.String(),
+			"kind":       "CloudflareTunnel",
+			"metadata": map[string]any{
+				"name":      emptyTunnel.Name,
+				"namespace": ns,
+				"labels":    map[string]any{"flareway.test/non-status": "true"},
+			},
+		}}
+		gomega.Expect(f.direct.Apply(f.ctx, client.ApplyConfigurationFromUnstructured(mainMetaApply), client.FieldOwner(gatewayFieldManager), client.ForceOwnership)).To(gomega.Succeed())
+		otherEmptyStatus := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": v1alpha1.GroupVersion.String(),
+			"kind":       "CloudflareTunnel",
+			"metadata":   map[string]any{"name": emptyTunnel.Name, "namespace": ns},
+			"status": map[string]any{
+				"tunnelId":                "empty-tunnel-id",
+				"accountId":               tunnel.Status.AccountID,
+				"ownershipVerified":       true,
+				"gatewayRef":              map[string]any{"name": f.gatewayKey.Name},
+				"gatewayUid":              string(gw.UID),
+				"connectorTokenSecretRef": map[string]any{"name": tunnel.Status.ConnectorTokenSecretRef.Name},
+				"hostnames":               []any{},
+				"listeners":               []any{},
+			},
+		}}
+		gomega.Expect(f.direct.Status().Apply(f.ctx, client.ApplyConfigurationFromUnstructured(otherEmptyStatus), client.FieldOwner("other-status-manager"), client.ForceOwnership)).To(gomega.Succeed())
+
+		emptyCounter := &tunnelStatusWriteCounterClient{Client: f.direct, tunnelName: emptyTunnel.Name}
+		emptyWriter := &GatewayReconciler{Client: emptyCounter, APIReader: f.direct, Scheme: f.direct.Scheme()}
+		irEmpty := &ir.Gateway{Key: f.gatewayKey, UID: gw.UID}
+		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(emptyTunnel), emptyTunnel)).To(gomega.Succeed())
+
+		// Make gw reference emptyTunnel temporarily so validateGatewayTunnelWriter passes.
+		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
+		origParamName := gw.Spec.Infrastructure.ParametersRef.Name
+		gw.Spec.Infrastructure.ParametersRef.Name = emptyTunnel.Name
+		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
+		defer func() {
+			var cur gatewayv1.Gateway
+			if getErr := f.direct.Get(f.ctx, f.gatewayKey, &cur); getErr == nil {
+				cur.Spec.Infrastructure.ParametersRef.Name = origParamName
+				_ = f.direct.Update(f.ctx, &cur)
+			}
+		}()
+
+		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "empty hostnames/listeners ownership gap must trigger 1 SSA apply even with non-status ManagedFields")
+		gomega.Expect(f.direct.Get(f.ctx, client.ObjectKeyFromObject(emptyTunnel), emptyTunnel)).To(gomega.Succeed())
+		gomega.Expect(emptyWriter.patchTunnelGatewayData(f.ctx, irEmpty, emptyTunnel, v1alpha1.CloudflareTunnelConfigVersion{}, nil, nil)).To(gomega.Succeed())
+		gomega.Expect(emptyCounter.writes.Load()).To(gomega.Equal(int64(1)), "steady-state empty hostnames/listeners + zeroed ConfigVersion must emit 0 writes")
 	})
 })
 
