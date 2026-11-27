@@ -5737,9 +5737,245 @@ func TestGatewayConcurrentGenBumpBeforeFullPatchKeepsTunnelConfigLatchInvalidate
 	if liveGW.Generation != 2 {
 		t.Fatalf("expected live Gateway generation 2, got %d", liveGW.Generation)
 	}
-	if prog := meta.FindStatusCondition(liveGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prog != nil && prog.ObservedGeneration == 1 && prog.ObservedGeneration != liveGW.Generation {
-		// Note: Gen 2 should not have received a fresh Gen 1 Programmed=True overwrite; check ObservedGeneration == 1 only if pre-existing,
-		// whereas if patch wrote Programmed=True onto Gen 2 without updating ObservedGeneration, reason/message or RV would have changed.
-		_ = prog
+	prog := meta.FindStatusCondition(liveGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != string(gatewayv1.GatewayReasonPending) || prog.ObservedGeneration != gen1GW.Generation {
+		t.Fatalf("expected live Gen 2 Gateway Programmed to remain seeded ConditionFalse/Pending (ObsGen=%d), got %+v", gen1GW.Generation, prog)
+	}
+}
+
+// Regression test for P3 #4722794742: deleting a Gateway-mode CloudflareTunnel
+// after a failed initial config push (holding a "CloudflareTunnelConfig" demotion
+// latch) MUST retire BOTH "CloudflareTunnel" and "CloudflareTunnelConfig" latch
+// keys on Tunnel NotFound in both CloudflareTunnelReconciler and GatewayReconciler.
+func TestTunnelDeletionRetiresCloudflareTunnelConfigLatchEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-tunnel-del-retire"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cf-token"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-tunnel-del-retire"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "cf-token", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:            []string{"*"},
+				Zones:                []string{"*"},
+				Exposures:            []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				UnprotectedHostnames: []string{"*"},
+				PlatformObjects:      v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	cfg := &v1alpha1.GatewayClassConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg-tunnel-del-retire"},
+		Spec: v1alpha1.GatewayClassConfigSpec{
+			AccountRef: &corev1.LocalObjectReference{Name: account.Name},
+			DNS:        v1alpha1.GatewayClassDNSConfig{Mode: v1alpha1.DNSModeExternal},
+		},
+	}
+	if err := direct.Create(ctx, cfg); err != nil {
+		t.Fatalf("create cfg: %v", err)
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gc-tunnel-del-retire"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayapi.ControllerName,
+			ParametersRef:  &gatewayv1.ParametersReference{Group: v1alpha1.Group, Kind: "GatewayClassConfig", Name: cfg.Name},
+		},
+	}
+	if err := direct.Create(ctx, gc); err != nil {
+		t.Fatalf("create gc: %v", err)
+	}
+	host := gatewayv1.Hostname("del.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "gw-del"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(gc.Name),
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+	gwKey := client.ObjectKeyFromObject(gw)
+	tunnelKey := gwKey
+
+	innerAPI := &tunnelFreshnessGatewayAPI{accountID: account.Spec.AccountID, remoteVersion: 1}
+	gwAPI := &failingTunnelConfigCloudflareAPI{tunnelFreshnessGatewayAPI: innerAPI}
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	snapshots := newFakeSnapshotPublisher()
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+
+	gwReconciler := &GatewayReconciler{
+		Client:            mgr.GetClient(),
+		APIReader:         direct,
+		Scheme:            mgr.GetScheme(),
+		Snapshots:         snapshots,
+		OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+		Prober:            &staticGatewayProber{version: 2, ready: true},
+		Freshness:         policy,
+		Invalidator:       latch,
+	}
+	if err := gwReconciler.registerFieldIndexers(mgr); err != nil {
+		t.Fatalf("register Gateway indexers: %v", err)
+	}
+	tunnelReconciler := &CloudflareTunnelReconciler{
+		Client:              direct,
+		APIReader:           direct,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: tunnelFake.Client,
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+	if err := (&GatewayClassReconciler{Client: direct, Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup GatewayClass: %v", err)
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "GatewayClass accepted", func() (bool, error) {
+		var curGC gatewayv1.GatewayClass
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(gc), &curGC); err != nil {
+			return false, nil
+		}
+		var curCfg v1alpha1.GatewayClassConfig
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(cfg), &curCfg); err != nil {
+			return false, nil
+		}
+		var curGW gatewayv1.Gateway
+		if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+			return false, nil
+		}
+		var curAcc v1alpha1.CloudflareAccount
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &curAcc); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(curGC.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted), curGC.Generation) &&
+			assertConditionTrueForCurrentGen(curAcc.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, curAcc.Generation), nil
+	})
+
+	// Provision tunnel ownership + pod readiness, then fail initial Gateway config push.
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("bootstrap gw reconcile: %v", err)
+	}
+	waitUntilTrue(t, 10*time.Second, "tunnel created in etcd", func() (bool, error) {
+		var curT v1alpha1.CloudflareTunnel
+		return direct.Get(ctx, tunnelKey, &curT) == nil, nil
+	})
+	for i := 0; i < 3; i++ {
+		if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+			t.Fatalf("tunnel reconcile %d: %v", i, err)
+		}
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: "dataplane-0", UID: types.UID("pod-uid-del"),
+			Labels: map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := direct.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.PodIP = "10.0.0.7"
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	waitUntilTrue(t, 10*time.Second, "cache sees Ready pod", func() (bool, error) {
+		var curPod corev1.Pod
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(pod), &curPod); err != nil {
+			return false, nil
+		}
+		return curPod.Status.PodIP == "10.0.0.7", nil
+	})
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err != nil {
+		t.Fatalf("publish snapshot gw reconcile: %v", err)
+	}
+	if err := snapshots.ACK(gwKey.String()); err != nil {
+		t.Fatalf("ack snapshot: %v", err)
+	}
+	gwAPI.failGetTunnel.Store(true)
+	if _, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey}); err == nil {
+		t.Fatal("expected failed config push on GetTunnel")
+	}
+	if !latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("expected failed initial config push to leave CloudflareTunnelConfig invalidated")
+	}
+
+	// Delete the CloudflareTunnel, drive teardown + NotFound in CloudflareTunnelReconciler.
+	// Reconcile passes: (1) mark teardown annotation, (2) Gateway blocks hostnames,
+	// (3) Tunnel deletes remote & removes finalizer, (4) NotFound retires latch keys.
+	var liveTunnel v1alpha1.CloudflareTunnel
+	if err := direct.Get(ctx, tunnelKey, &liveTunnel); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Delete(ctx, &liveTunnel); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("tunnel teardown mark reconcile: %v", err)
+	}
+	// Let Gateway see teardown annotation and block hostnames, or clear hostnames on Gateway delete.
+	waitUntilTrue(t, 10*time.Second, "cache sees teardown annotation on tunnel", func() (bool, error) {
+		var curT v1alpha1.CloudflareTunnel
+		if err := mgr.GetClient().Get(ctx, tunnelKey, &curT); err != nil {
+			return false, nil
+		}
+		return curT.Annotations[v1alpha1.CloudflareTunnelTeardownAnnotation] == "true", nil
+	})
+	_, _ = gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey})
+	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("tunnel delete finalizer reconcile: %v", err)
+	}
+	if err := direct.Get(ctx, tunnelKey, &liveTunnel); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected CloudflareTunnel to be gone from etcd after delete reconcile, err=%v", err)
+	}
+	if _, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey}); err != nil {
+		t.Fatalf("tunnel NotFound reconcile: %v", err)
+	}
+	if latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+		t.Fatal("CloudflareTunnel latch remained after NotFound")
+	}
+	if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("CloudflareTunnelConfig latch remained after CloudflareTunnel NotFound")
+	}
+
+	// Also verify GatewayReconciler retires stale CloudflareTunnelConfig when an
+	// explicitly referenced CloudflareTunnel returns NotFound directly.
+	var latestGW gatewayv1.Gateway
+	if err := direct.Get(ctx, gwKey, &latestGW); err != nil {
+		t.Fatal(err)
+	}
+	latestGW.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+		Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: tunnelKey.Name,
+	}}
+	if err := direct.Update(ctx, &latestGW); err != nil {
+		t.Fatal(err)
+	}
+	waitUntilTrue(t, 10*time.Second, "cache sees explicit Infrastructure ref", func() (bool, error) {
+		var curGW gatewayv1.Gateway
+		if err := mgr.GetClient().Get(ctx, gwKey, &curGW); err != nil {
+			return false, nil
+		}
+		return curGW.Spec.Infrastructure != nil && curGW.Spec.Infrastructure.ParametersRef != nil, nil
+	})
+	latch.Invalidate("CloudflareTunnelConfig", tunnelKey, "stale-demotion")
+	_, _ = gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey})
+	if latch.IsInvalidated("CloudflareTunnelConfig", tunnelKey) {
+		t.Fatal("GatewayReconciler did not retire CloudflareTunnelConfig latch on Tunnel NotFound")
 	}
 }

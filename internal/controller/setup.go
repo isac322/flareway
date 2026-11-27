@@ -185,9 +185,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 		if pnNewClient == nil {
 			pnNewClient = PrivateNetworkClientFromFactory(opts.CloudflareFactory)
 		}
-		vnetClient, _ := clientsFor("VirtualNetwork")
+		vnetClient, vnetReader := clientsFor("VirtualNetwork")
 		if err := (&VirtualNetworkReconciler{
 			Client:              vnetClient,
+			APIReader:           vnetReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: pnNewClient,
 			Freshness:           opts.Freshness,
@@ -196,9 +197,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 		}).SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("set up VirtualNetwork controller: %w", err)
 		}
-		nrClient, _ := clientsFor("NetworkRoute")
+		nrClient, nrReader := clientsFor("NetworkRoute")
 		if err := (&NetworkRouteReconciler{
 			Client:              nrClient,
+			APIReader:           nrReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: pnNewClient,
 			Freshness:           opts.Freshness,
@@ -207,9 +209,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 		}).SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("set up NetworkRoute controller: %w", err)
 		}
-		hrClient, _ := clientsFor("HostnameRoute")
+		hrClient, hrReader := clientsFor("HostnameRoute")
 		if err := (&HostnameRouteReconciler{
 			Client:              hrClient,
+			APIReader:           hrReader,
 			Scheme:              mgr.GetScheme(),
 			OperatorNamespace:   operatorNamespace,
 			NewCloudflareClient: pnNewClient,
@@ -223,9 +226,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 		if wcNewClient == nil {
 			wcNewClient = WARPConnectorClientFromFactory(opts.CloudflareFactory)
 		}
-		wcClient, _ := clientsFor("WARPConnector")
+		wcClient, wcReader := clientsFor("WARPConnector")
 		if err := (&WARPConnectorReconciler{
 			Client:              wcClient,
+			APIReader:           wcReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: wcNewClient,
 			Freshness:           opts.Freshness,
@@ -248,9 +252,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return defaultAccessClient
 		}
 
-		polClient, _ := clientsFor("AccessPolicy")
+		polClient, polReader := clientsFor("AccessPolicy")
 		if err := (&AccessPolicyReconciler{
 			Client:              polClient,
+			APIReader:           polReader,
 			Scheme:              mgr.GetScheme(),
 			Recorder:            mgr.GetEventRecorder("access-policy"),
 			DriftPolicy:         opts.DriftPolicy,
@@ -275,9 +280,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return fmt.Errorf("set up AccessGroup controller: %w", err)
 		}
 
-		idpClient, _ := clientsFor("IdentityProvider")
+		idpClient, idpReader := clientsFor("IdentityProvider")
 		if err := (&IdentityProviderReconciler{
 			Client:              idpClient,
+			APIReader:           idpReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: accessClientOr(opts.IdentityProviderClient),
 			Freshness:           opts.Freshness,
@@ -287,9 +293,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return fmt.Errorf("set up IdentityProvider controller: %w", err)
 		}
 
-		dprClient, _ := clientsFor("DevicePostureRule")
+		dprClient, dprReader := clientsFor("DevicePostureRule")
 		if err := (&DevicePostureRuleReconciler{
 			Client:              dprClient,
+			APIReader:           dprReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: accessClientOr(opts.DevicePostureRuleClient),
 			Freshness:           opts.Freshness,
@@ -330,9 +337,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return fmt.Errorf("set up AccessApplication controller: %w", err)
 		}
 
-		saClient, _ := clientsFor("AccessStandaloneApplication")
+		saClient, saReader := clientsFor("AccessStandaloneApplication")
 		if err := (&AccessStandaloneApplicationReconciler{
 			Client:              saClient,
+			APIReader:           saReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: accessClientOr(opts.AccessStandaloneClient),
 			Freshness:           opts.Freshness,
@@ -355,9 +363,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return fmt.Errorf("set up AccessInfrastructureTarget controller: %w", err)
 		}
 
-		cpClient, _ := clientsFor("AccessCustomPage")
+		cpClient, cpReader := clientsFor("AccessCustomPage")
 		if err := (&AccessCustomPageReconciler{
 			Client:              cpClient,
+			APIReader:           cpReader,
 			Scheme:              mgr.GetScheme(),
 			Recorder:            mgr.GetEventRecorder("access-custom-page"),
 			NewCloudflareClient: accessClientOr(opts.AccessCustomPageClient),
@@ -368,9 +377,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 			return fmt.Errorf("set up AccessCustomPage controller: %w", err)
 		}
 
-		dpiClient, _ := clientsFor("DevicePostureIntegration")
+		dpiClient, dpiReader := clientsFor("DevicePostureIntegration")
 		if err := (&DevicePostureIntegrationReconciler{
 			Client:              dpiClient,
+			APIReader:           dpiReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: accessClientOr(opts.DevicePostureIntegrationClient),
 			Freshness:           opts.Freshness,
@@ -386,9 +396,10 @@ func SetupProductionControllers(mgr ctrl.Manager, opts ProductionControllerOptio
 		if dpNewClient == nil {
 			dpNewClient = DeviceProfileClientFromFactory(opts.CloudflareFactory)
 		}
-		dpClient, _ := clientsFor("DeviceProfile")
+		dpClient, dpReader := clientsFor("DeviceProfile")
 		if err := (&DeviceProfileReconciler{
 			Client:              dpClient,
+			APIReader:           dpReader,
 			Scheme:              mgr.GetScheme(),
 			NewCloudflareClient: dpNewClient,
 			Freshness:           opts.Freshness,

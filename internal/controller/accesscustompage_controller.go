@@ -54,6 +54,7 @@ const (
 // AccessCustomPageReconciler manages account-level Cloudflare Access custom pages.
 type AccessCustomPageReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -130,6 +131,7 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessCustomPage", request.NamespacedName)
 
 	remote, warningsObserved, err := r.reconcileManaged(ctx, api, object, input)
 	if err != nil {
@@ -143,10 +145,9 @@ func (r *AccessCustomPageReconciler) Reconcile(ctx context.Context, request ctrl
 	if err := r.patchStatus(ctx, object, remote, true, metav1.ConditionTrue, "Ready", "Access custom page is synchronized", nil, warnings, warningsObserved, object.Status.AppliedHash, object.Status.AppliedAt); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessCustomPage", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
@@ -318,51 +319,45 @@ func customPageDeletionPolicy(policy v1alpha1.DeletionPolicy) v1alpha1.DeletionP
 	return policy
 }
 
-func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool, appliedHash string, appliedAt *metav1.Time) error {
+func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessCustomPage, remote flarecloudflare.AccessCustomPage, owned bool, status metav1.ConditionStatus, reason, message string, drift []string, warnings []flarecloudflare.AccessCustomPageWarning, warningsObserved bool, _ string, _ *metav1.Time) error {
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessCustomPage", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	object.Status.AppliedHash = appliedHash
-	object.Status.AppliedAt = appliedAt
-	if remote.ID != "" {
-		object.Status.CustomPageID = remote.ID
-		object.Status.OwnershipVerified = owned
-		object.Status.Observed = &v1alpha1.AccessCustomPageObservedStatus{
-			Name: remote.Name, Type: remote.Type, ContractVersion: remote.ContractVersion,
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessCustomPage) error {
+		if remote.ID != "" {
+			live.Status.CustomPageID = remote.ID
+			live.Status.OwnershipVerified = owned
+			live.Status.Observed = &v1alpha1.AccessCustomPageObservedStatus{
+				Name: remote.Name, Type: remote.Type, ContractVersion: remote.ContractVersion,
+			}
 		}
-	}
-	conditions := []metav1.Condition{
-		accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionAccepted, status, reason, message),
-		accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionReady, status, reason, message),
-		accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionCleanupBlocked, metav1.ConditionFalse, "NotBlocked", "No cleanup is pending"),
-	}
-	switch {
-	case status != metav1.ConditionTrue:
-		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, reason, message))
-	case len(warnings) > 0:
-		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "TemplateWarnings", formatCustomPageWarnings(warnings)))
-	case len(drift) > 0:
-		conditions = append(conditions, accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "DriftDetected", "Observed custom page differs in "+strings.Join(drift, ", ")))
-	default:
-		degraded := accessCondition(object.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionFalse, "Healthy", "No custom page drift or template warnings were detected")
-		if previous := meta.FindStatusCondition(object.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); !warningsObserved && previous != nil && previous.Status == metav1.ConditionTrue && previous.Reason == "TemplateWarnings" {
-			// GET cannot re-observe template warnings; keep the last observed signal.
-			degraded.Status = metav1.ConditionTrue
-			degraded.Reason = previous.Reason
-			degraded.Message = previous.Message
+		conditions := []metav1.Condition{
+			accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionAccepted, status, reason, message),
+			accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionReady, status, reason, message),
+			accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionCleanupBlocked, metav1.ConditionFalse, "NotBlocked", "No cleanup is pending"),
 		}
-		conditions = append(conditions, degraded)
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "AccessCustomPage", client.ObjectKeyFromObject(object))
-	}
-	return nil
+		switch {
+		case status != metav1.ConditionTrue:
+			conditions = append(conditions, accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, reason, message))
+		case len(warnings) > 0:
+			conditions = append(conditions, accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "TemplateWarnings", formatCustomPageWarnings(warnings)))
+		case len(drift) > 0:
+			conditions = append(conditions, accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionTrue, "DriftDetected", "Observed custom page differs in "+strings.Join(drift, ", ")))
+		default:
+			degraded := accessCondition(live.Generation, v1alpha1.AccessCustomPageConditionDegraded, metav1.ConditionFalse, "Healthy", "No custom page drift or template warnings were detected")
+			if previous := meta.FindStatusCondition(live.Status.Conditions, v1alpha1.AccessCustomPageConditionDegraded); !warningsObserved && previous != nil && previous.Status == metav1.ConditionTrue && previous.Reason == "TemplateWarnings" {
+				// GET cannot re-observe template warnings; keep the last observed signal.
+				degraded.Status = metav1.ConditionTrue
+				degraded.Reason = previous.Reason
+				degraded.Message = previous.Message
+			}
+			conditions = append(conditions, degraded)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), conditions...)
+		return nil
+	})
+	return err
 }
 
 func (r *AccessCustomPageReconciler) patchCleanupBlocked(ctx context.Context, object *v1alpha1.AccessCustomPage, message string) error {
@@ -425,6 +420,9 @@ func (r *AccessCustomPageReconciler) now() time.Time {
 
 // SetupWithManager registers the AccessCustomPage controller and dependency watches.
 func (r *AccessCustomPageReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.AccessCustomPage{}, accessCustomPageAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.AccessCustomPage).Spec.AccountRef.Name}
 	}); err != nil {

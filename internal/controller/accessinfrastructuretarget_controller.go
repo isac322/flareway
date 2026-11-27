@@ -131,6 +131,7 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessInfrastructureTarget", request.NamespacedName)
 
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
@@ -149,10 +150,9 @@ func (r *AccessInfrastructureTargetReconciler) Reconcile(ctx context.Context, re
 		target, ok := listed.(flarecloudflare.AccessInfrastructureTarget)
 		return ok && target.ID == remote.ID && infrastructureTargetMatches(input, target)
 	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessInfrastructureTarget", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
@@ -306,34 +306,28 @@ func (r *AccessInfrastructureTargetReconciler) finishObserved(ctx context.Contex
 	return ctrl.Result{}, r.patchStatus(ctx, object, remote, owned, wouldApply, metav1.ConditionTrue, ready, reason, message, object.Status.AppliedHash, object.Status.AppliedAt)
 }
 
-func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, owned bool, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
+func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessInfrastructureTarget, remote flarecloudflare.AccessInfrastructureTarget, owned bool, wouldApply *v1alpha1.AccessInfrastructureTargetObservedState, accepted, ready metav1.ConditionStatus, reason, message, _ string, _ *metav1.Time) error {
 	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessInfrastructureTarget", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	object.Status.AppliedHash = appliedHash
-	object.Status.AppliedAt = appliedAt
-	if remote.ID != "" {
-		object.Status.TargetID = remote.ID
-		object.Status.OwnershipVerified = owned
-	}
-	if remote.Hostname != "" {
-		object.Status.Hostname = remote.Hostname
-		object.Status.IP = infrastructureTargetStatusIP(remote)
-	}
-	object.Status.WouldApply = wouldApply
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
-		accessCondition(object.Generation, "Accepted", accepted, reason, message),
-		accessCondition(object.Generation, "Ready", ready, reason, message),
-	)
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if accepted == metav1.ConditionTrue && ready == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "AccessInfrastructureTarget", client.ObjectKeyFromObject(object))
-	}
-	return nil
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessInfrastructureTarget) error {
+		if remote.ID != "" {
+			live.Status.TargetID = remote.ID
+			live.Status.OwnershipVerified = owned
+		}
+		if remote.Hostname != "" {
+			live.Status.Hostname = remote.Hostname
+			live.Status.IP = infrastructureTargetStatusIP(remote)
+		}
+		live.Status.WouldApply = wouldApply
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(),
+			accessCondition(live.Generation, "Accepted", accepted, reason, message),
+			accessCondition(live.Generation, "Ready", ready, reason, message),
+		)
+		return nil
+	})
+	return err
 }
 
 func infrastructureTargetStatusIP(remote flarecloudflare.AccessInfrastructureTarget) v1alpha1.AccessInfrastructureTargetIPStatus {

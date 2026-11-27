@@ -52,6 +52,8 @@ type latchKey struct {
 // storage is sufficient.
 type Latch struct {
 	mu        sync.RWMutex
+	nextEpoch uint64
+	epochs    map[latchKey]uint64
 	reasons   map[latchKey]string
 	verified  map[latchKey]verification
 	baselines map[latchKey]baseline
@@ -79,6 +81,7 @@ type baseline struct {
 // NewLatch returns an empty latch.
 func NewLatch() *Latch {
 	return &Latch{
+		epochs:    make(map[latchKey]uint64),
 		reasons:   make(map[latchKey]string),
 		verified:  make(map[latchKey]verification),
 		baselines: make(map[latchKey]baseline),
@@ -87,19 +90,82 @@ func NewLatch() *Latch {
 }
 
 // Invalidate closes the object's gate and records reason for observability.
-// Repeated calls for the same key keep the latest reason. It also discards the
-// object's last verification: drift was found after that verify, so the record
-// must not re-open the gate if the invalidation is cleared early.
+// Repeated calls for the same key keep the latest reason and advance its
+// monotonic invalidation epoch so an in-flight reconcile cannot clear a newer
+// invalidation. It also discards the object's last verification: drift was
+// found after that verify, so the record must not re-open the gate if the
+// invalidation is cleared early.
 func (l *Latch) Invalidate(kind string, key types.NamespacedName, reason string) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.epochs == nil {
+		l.epochs = make(map[latchKey]uint64)
+	}
+	if l.reasons == nil {
+		l.reasons = make(map[latchKey]string)
+	}
 	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	l.nextEpoch++
+	l.epochs[k] = l.nextEpoch
 	l.reasons[k] = reason
 	delete(l.verified, k)
 	delete(l.confirmed, k)
+}
+
+// InvalidationEpoch returns the object's current invalidation epoch. Callers
+// capture it before executing remote reads/writes and pass it to
+// CompleteVerification so concurrent sweep invalidations are never overwritten.
+func (l *Latch) InvalidationEpoch(kind string, key types.NamespacedName) uint64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.epochs[latchKey{kind: kind, namespace: key.Namespace, name: key.Name}]
+}
+
+// CompleteVerification atomically releases any invalidation matching
+// expectedEpoch and records verification metadata and optional sweep content
+// baseline. If another Invalidate occurred after expectedEpoch was captured,
+// CompleteVerification leaves the newer invalidation untouched and reports
+// false.
+func (l *Latch) CompleteVerification(
+	kind string,
+	key types.NamespacedName,
+	expectedEpoch uint64,
+	hash string,
+	at time.Time,
+	matches ContentMatcher,
+) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	if l.epochs[k] != expectedEpoch {
+		return false
+	}
+	delete(l.reasons, k)
+	delete(l.confirmed, k)
+	if hash != "" {
+		if l.verified == nil {
+			l.verified = make(map[latchKey]verification)
+		}
+		l.verified[k] = verification{hash: hash, at: at}
+	}
+	if hash == "" || matches == nil {
+		delete(l.baselines, k)
+	} else {
+		if l.baselines == nil {
+			l.baselines = make(map[latchKey]baseline)
+		}
+		l.baselines[k] = baseline{hash: hash, matches: matches}
+	}
+	return true
 }
 
 // IsInvalidated reports whether the object's gate is held closed.
@@ -154,6 +220,7 @@ func (l *Latch) Remove(kind string, key types.NamespacedName) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name}
+	delete(l.epochs, k)
 	delete(l.reasons, k)
 	delete(l.verified, k)
 	delete(l.baselines, k)

@@ -62,6 +62,7 @@ const (
 // IdentityProviderReconciler manages Cloudflare Access identity providers.
 type IdentityProviderReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -142,6 +143,7 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("IdentityProvider", request.NamespacedName)
 	id := object.Status.IDPID
 	var remote flarecloudflare.IdentityProvider
 	created := false
@@ -347,10 +349,9 @@ func (r *IdentityProviderReconciler) Reconcile(ctx context.Context, request ctrl
 				identityProviderMatchesInput(provider, input)
 		}, remote))
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "IdentityProvider", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
@@ -933,36 +934,29 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
 	}
-	beforeStatus := object.Status
-	base := client.MergeFrom(object.DeepCopy())
-	if status == metav1.ConditionTrue {
-		object.Status.IDPID = remote.ID
-		object.Status.OwnershipVerified = object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
-	}
-	object.Status.ReadOnly = remote.ReadOnly
-	switch remote.Type {
-	case v1alpha1.IdentityProviderTypeOneTimePIN, v1alpha1.IdentityProviderTypeCloudflare:
-		object.Status.RedirectURL = remote.RedirectURL
-	default:
-		object.Status.RedirectURL = ""
-	}
-	if remote.SAMLCertificateSet != nil {
-		object.Status.SAMLCertificateSet = identityProviderSAMLCertificateStatus(remote.SAMLCertificateSet)
-	}
-	if directory != nil || status == metav1.ConditionTrue {
-		object.Status.SCIMDirectory = directory
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if !reflect.DeepEqual(beforeStatus, object.Status) {
-		if err := r.Status().Patch(ctx, object, base); err != nil {
-			return err
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.IdentityProvider) error {
+		if status == metav1.ConditionTrue {
+			live.Status.IDPID = remote.ID
+			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
 		}
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
-	}
-	return nil
+		live.Status.ReadOnly = remote.ReadOnly
+		switch remote.Type {
+		case v1alpha1.IdentityProviderTypeOneTimePIN, v1alpha1.IdentityProviderTypeCloudflare:
+			live.Status.RedirectURL = remote.RedirectURL
+		default:
+			live.Status.RedirectURL = ""
+		}
+		if remote.SAMLCertificateSet != nil {
+			live.Status.SAMLCertificateSet = identityProviderSAMLCertificateStatus(remote.SAMLCertificateSet)
+		}
+		if directory != nil || status == metav1.ConditionTrue {
+			live.Status.SCIMDirectory = directory
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
+		return nil
+	})
+	return err
 }
 
 // finishRemoteError reports a failed remote call on the object's conditions.
@@ -1042,6 +1036,9 @@ func (r *IdentityProviderReconciler) now() time.Time {
 
 // SetupWithManager registers the IdentityProvider controller and dependency watches.
 func (r *IdentityProviderReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.IdentityProvider{}, identityProviderAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.IdentityProvider).Spec.AccountRef.Name}

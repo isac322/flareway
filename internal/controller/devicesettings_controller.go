@@ -100,6 +100,7 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("DeviceSettings", request.NamespacedName)
 	observed, err := api.GetDeviceSettings(ctx)
 	if err != nil {
 		return r.finishRemoteError(ctx, object, err)
@@ -116,11 +117,10 @@ func (r *DeviceSettingsReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return r.finishRemoteError(ctx, object, err)
 		}
 	}
-	clearGate(r.Invalidator, "DeviceSettings", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, nil, metav1.ConditionTrue, "Ready", "Device settings are synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil
@@ -238,20 +238,16 @@ func (r *DeviceSettingsReconciler) patchStatus(ctx context.Context, object *v1al
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "DeviceSettings", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	if status == metav1.ConditionTrue {
-		object.Status.Observed = deviceSettingsObserved(remote)
-		object.Status.WouldApply = wouldApply
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "DeviceSettings", client.ObjectKeyFromObject(object))
-	}
-	return nil
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DeviceSettings) error {
+		if status == metav1.ConditionTrue {
+			live.Status.Observed = deviceSettingsObserved(remote)
+			live.Status.WouldApply = wouldApply
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	return err
 }
 
 func (r *DeviceSettingsReconciler) now() time.Time {
@@ -263,6 +259,9 @@ func (r *DeviceSettingsReconciler) now() time.Time {
 
 // SetupWithManager registers the DeviceSettings controller and singleton watches.
 func (r *DeviceSettingsReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.DeviceSettings{}, deviceSettingsAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.DeviceSettings).Spec.AccountRef.Name}
 	}); err != nil {

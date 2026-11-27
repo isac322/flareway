@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1018,5 +1019,162 @@ func TestTunnelGatewayDataUnchangedChecksFieldsV1(t *testing.T) {
 		if tunnelGatewayDataUnchanged(makeTunnel(metav1.ManagedFieldsOperationApply, "status", tc.fields), config, hostnames, listeners) {
 			t.Fatalf("tunnelGatewayDataUnchanged accepted invalid keyed-list item (%s)", tc.name)
 		}
+	}
+}
+
+// Regression test for P2 #4722794628: if a concurrent sweep calls
+// latch.Invalidate after Cloudflare verification runs and before
+// patchOwnedStatusChecked finishes committing, post-write completion MUST NOT
+// clear the newer invalidation latch or stamp VerifiedAt, so the next pass
+// still re-verifies Cloudflare instead of serving cached status.
+func TestConcurrentSweepInvalidationDuringRemoteVerifyPreservesLatchAndReverifies(t *testing.T) {
+	ctx := context.Background()
+	scheme := tunnelFreshnessScheme(t)
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "account", Generation: 1},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID: "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{
+				Name: "cloudflare-token", Namespace: "apps", Key: "token",
+			}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "apps"}},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+		Status: v1alpha1.CloudflareAccountStatus{Conditions: []metav1.Condition{
+			{Type: v1alpha1.CloudflareAccountConditionAccepted, Status: metav1.ConditionTrue, Reason: "Accepted", ObservedGeneration: 1},
+			{Type: v1alpha1.CloudflareAccountConditionCredentialsValid, Status: metav1.ConditionTrue, Reason: "Valid", ObservedGeneration: 1},
+		}},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", Namespace: "apps", UID: "gw-uid", Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Infrastructure: &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{
+				Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "edge",
+			}},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "flareway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayapi.ControllerName},
+	}
+	appliedAt := metav1.NewTime(now)
+	tunnel := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "edge", Namespace: "apps", UID: "tunnel-uid", Generation: 1,
+			Finalizers: []string{v1alpha1.CloudflareTunnelFinalizer},
+		},
+		Spec: v1alpha1.CloudflareTunnelSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Tunnel:           v1alpha1.CloudflareTunnelRemoteSpec{Name: "edge"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			DNS:              v1alpha1.CloudflareTunnelDNSConfig{Mode: v1alpha1.DNSModeExternal},
+			Configuration: v1alpha1.CloudflareTunnelConfiguration{
+				Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway,
+			},
+		},
+		Status: v1alpha1.CloudflareTunnelStatus{
+			TunnelID:          "tunnel-1",
+			AccountID:         account.Spec.AccountID,
+			OwnershipVerified: true,
+			GatewayRef:        &corev1.LocalObjectReference{Name: gw.Name},
+			GatewayUID:        gw.UID,
+			ConfigVersion: v1alpha1.CloudflareTunnelConfigVersion{
+				Desired:     1,
+				DesiredHash: "cfg-h1",
+				Applied:     1,
+				Remote:      1,
+				AppliedAt:   &appliedAt,
+			},
+			Conditions: []metav1.Condition{
+				{Type: v1alpha1.CloudflareTunnelConditionReady, Status: metav1.ConditionTrue, Reason: "Ready", ObservedGeneration: 1},
+				{Type: v1alpha1.CloudflareTunnelConditionDNSReady, Status: metav1.ConditionTrue, Reason: "NotApplicable", ObservedGeneration: 1},
+				{Type: v1alpha1.CloudflareTunnelConditionConfigApplied, Status: metav1.ConditionTrue, Reason: "Applied", ObservedGeneration: 1},
+			},
+		},
+	}
+	key := client.ObjectKeyFromObject(tunnel)
+	latch := freshness.NewLatch()
+	policy := freshness.DefaultPolicy()
+	fireSweepDuringStatusApply := false
+	sweepFired := false
+
+	kube := fakeclient.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.CloudflareTunnel{}, &v1alpha1.CloudflareAccount{}, &gatewayv1.Gateway{}).
+		WithObjects(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: types.UID("cluster-id")}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "apps", Labels: map[string]string{"tenant": "apps"}}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "cloudflare-token", Namespace: "apps"}, Data: map[string][]byte{"token": []byte("api-token")}},
+			account, gc, gw, tunnel,
+		).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceApply: func(ctx context.Context, c client.Client, sub string, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+				if fireSweepDuringStatusApply && !sweepFired {
+					if payload, err := json.Marshal(obj); err == nil &&
+						bytes.Contains(payload, []byte(`"type":"TunnelReady"`)) &&
+						bytes.Contains(payload, []byte(`"status":"True"`)) {
+						sweepFired = true
+						latch.Invalidate("CloudflareTunnel", key, "concurrent-sweep-drift")
+					}
+				}
+				return c.SubResource(sub).Apply(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	remote := newFakeTunnelCloudflareFactory()
+	remote.tunnels["tunnel-1"] = RemoteTunnel{
+		ID:           "tunnel-1",
+		AccountTag:   account.Spec.AccountID,
+		Name:         "edge",
+		Type:         flarecloudflare.TunnelTypeCloudflared,
+		ConfigSource: flarecloudflare.TunnelConfigSourceCloudflare,
+		Status:       flarecloudflare.TunnelStatusHealthy,
+	}
+	remote.tokens["tunnel-1"] = "token-tunnel-1"
+	reconciler := &CloudflareTunnelReconciler{
+		Client: kube, APIReader: kube, Scheme: scheme,
+		NewCloudflareClient: remote.Client,
+		Now:                 func() time.Time { return now },
+		Freshness:           policy,
+		Invalidator:         latch,
+	}
+
+	// Seed Secrets so the expiry pass hits Cloudflare verification directly.
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("seed reconcile: %v", err)
+	}
+
+	// Expire gate so next pass goes to Cloudflare, then inject a concurrent
+	// sweep invalidation right as status is being applied.
+	now = now.Add(policy.TTL(freshness.GradeTraffic) + time.Second)
+	fireSweepDuringStatusApply = true
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile across concurrent sweep invalidation: %v", err)
+	}
+	if !sweepFired {
+		t.Fatal("expected SubResourceApply hook to simulate concurrent sweep invalidation")
+	}
+	if !latch.IsInvalidated("CloudflareTunnel", key) {
+		t.Fatal("CloudflareTunnel cleared concurrent sweep invalidation raised during remote verify")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnel", key, "cfg-h1"); ok {
+		t.Fatal("CloudflareTunnel stamped VerifiedAt despite concurrent sweep invalidation")
+	}
+
+	// Next pass MUST re-verify Cloudflare instead of trusting cached status.
+	callsBeforeNext := len(remote.Calls())
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("post-invalidation reconcile: %v", err)
+	}
+	if len(remote.Calls()) == callsBeforeNext {
+		t.Fatal("post-invalidation pass skipped Cloudflare verification")
+	}
+	if latch.IsInvalidated("CloudflareTunnel", key) {
+		t.Fatal("expected clean follow-up verify without new invalidation to clear latch")
 	}
 }

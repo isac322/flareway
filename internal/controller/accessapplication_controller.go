@@ -301,6 +301,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			return ctrl.Result{}, err
 		}
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessApplication", client.ObjectKeyFromObject(application))
 	if err := referenceChecks.run(ctx); err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
@@ -351,7 +352,6 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if !convergedPersisted {
 		return ctrl.Result{}, nil
 	}
-	clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	stamp := newGateStamp(desiredHash, r.now())
 	// The sweep hands the matcher this application as it was listed, together
 	// with the pass's full application listing (bypass children) and, when any
@@ -378,7 +378,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 				listedCustomPages(listing, pages)
 		})
 	}
-	recordGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), stamp)
+	completeGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), verifyEpoch, stamp)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 

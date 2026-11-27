@@ -54,6 +54,7 @@ const (
 // AccessStandaloneApplicationReconciler manages non-Gateway Cloudflare Access applications.
 type AccessStandaloneApplicationReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -144,6 +145,7 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessStandaloneApplication", request.NamespacedName)
 	if err := verifyStandaloneExternalRefs(ctx, object, api); err != nil {
 		return r.finishInputError(ctx, object, err)
 	}
@@ -173,10 +175,9 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 				flarecloudflare.AccessApplicationMatchesInput(application, input)
 		}, remote))
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessStandaloneApplicationRequeue)}, nil
 }
 
@@ -1077,37 +1078,31 @@ func (r *AccessStandaloneApplicationReconciler) finishObserved(ctx context.Conte
 	return ctrl.Result{}, r.patchStatus(ctx, object, remote, scope, owned, standaloneStatusSecretRef(object.Status), metav1.ConditionTrue, ready, reason, message, object.Status.AppliedHash, object.Status.AppliedAt)
 }
 
-func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
+func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, _ string, _ *metav1.Time) error {
 	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	object.Status.AppliedHash = appliedHash
-	object.Status.AppliedAt = appliedAt
-	if remote.ID != "" {
-		object.Status.ApplicationID = remote.ID
-	}
-	if remote.Name != "" {
-		object.Status.Type = v1alpha1.AccessStandaloneApplicationType(remote.Type)
-		object.Status.Name = remote.Name
-		object.Status.Domain = remote.Domain
-		object.Status.ZoneID = scope.ZoneID
-		object.Status.OwnershipVerified = owned
-		object.Status.Tags = slices.Clone(remote.Tags)
-		object.Status.SaaS, object.Status.Bookmark, object.Status.Infrastructure, object.Status.AppLauncher, object.Status.DashSSO, object.Status.MCPPortal = standaloneVariantStatus(object, remote, secretRef)
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
-		accessCondition(object.Generation, "Accepted", accepted, reason, message),
-		accessCondition(object.Generation, "Ready", ready, reason, message),
-	)
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if accepted == metav1.ConditionTrue && ready == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
-	}
-	return nil
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
+		if remote.ID != "" {
+			live.Status.ApplicationID = remote.ID
+		}
+		if remote.Name != "" {
+			live.Status.Type = v1alpha1.AccessStandaloneApplicationType(remote.Type)
+			live.Status.Name = remote.Name
+			live.Status.Domain = remote.Domain
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = owned
+			live.Status.Tags = slices.Clone(remote.Tags)
+			live.Status.SaaS, live.Status.Bookmark, live.Status.Infrastructure, live.Status.AppLauncher, live.Status.DashSSO, live.Status.MCPPortal = standaloneVariantStatus(live, remote, secretRef)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(),
+			accessCondition(live.Generation, "Accepted", accepted, reason, message),
+			accessCondition(live.Generation, "Ready", ready, reason, message),
+		)
+		return nil
+	})
+	return err
 }
 
 func standaloneVariantStatus(_ *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, secretRef *corev1.LocalObjectReference) (*v1alpha1.AccessSaaSApplicationStatus, *v1alpha1.AccessBookmarkApplicationStatus, *v1alpha1.AccessInfrastructureApplicationStatus, *v1alpha1.AccessAppLauncherApplicationStatus, *v1alpha1.AccessDashSSOApplicationStatus, *v1alpha1.AccessMCPPortalApplicationStatus) {
@@ -1282,6 +1277,9 @@ func (r *AccessStandaloneApplicationReconciler) now() time.Time {
 
 // SetupWithManager registers dependency indexes and watches.
 func (r *AccessStandaloneApplicationReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.AccessStandaloneApplication{}, accessStandaloneApplicationAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.AccessStandaloneApplication).Spec.AccountRef.Name}

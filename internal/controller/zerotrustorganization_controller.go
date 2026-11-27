@@ -134,6 +134,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ZeroTrustOrganization", request.NamespacedName)
 	if err := verifyOrganizationExternalRefs(ctx, object, api); err != nil {
 		return r.finishError(ctx, object, err)
 	}
@@ -223,11 +224,10 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		}
 	}
 
-	clearGate(r.Invalidator, "ZeroTrustOrganization", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, observedDOH, nil, observedRevocation, metav1.ConditionTrue, "Ready", "Zero Trust organization is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil
@@ -690,22 +690,18 @@ func (r *ZeroTrustOrganizationReconciler) patchStatus(ctx context.Context, objec
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "ZeroTrustOrganization", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	if status == metav1.ConditionTrue {
-		object.Status.AuthDomain = remote.AuthDomain
-		object.Status.Observed = organizationObserved(remote, doh)
-		object.Status.WouldApply = wouldApply
-		object.Status.ObservedUserRevocationRequest = copyOrganizationTime(observedRevocation)
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "ZeroTrustOrganization", client.ObjectKeyFromObject(object))
-	}
-	return nil
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustOrganization) error {
+		if status == metav1.ConditionTrue {
+			live.Status.AuthDomain = remote.AuthDomain
+			live.Status.Observed = organizationObserved(remote, doh)
+			live.Status.WouldApply = wouldApply
+			live.Status.ObservedUserRevocationRequest = copyOrganizationTime(observedRevocation)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	return err
 }
 
 func (r *ZeroTrustOrganizationReconciler) now() time.Time {
@@ -717,6 +713,9 @@ func (r *ZeroTrustOrganizationReconciler) now() time.Time {
 
 // SetupWithManager registers the ZeroTrustOrganization controller and dependency watches.
 func (r *ZeroTrustOrganizationReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ZeroTrustOrganization{}, organizationAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.ZeroTrustOrganization).Spec.AccountRef.Name}
 	}); err != nil {

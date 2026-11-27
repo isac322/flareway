@@ -19,11 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -212,17 +215,12 @@ func evaluateGateWithHash(
 	return gateDecision{Gate: gate, DesiredHash: desiredHash}
 }
 
-// clearGate drops the invalidation latch for an object whose reconcile has
-// converged, so the next pass is judged on hash and age alone.
-func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
-	latch.Clear(kind, key)
-}
-
 // forgetGate drops cached verification, sweep confirmation, and sweep baseline
 // state and latches a "demoted" invalidation when a reconcile turns status
 // unconverged (pre-gate failure or remote error), so a temporarily stale
 // informer cache carrying Ready=True cannot reopen the gate before the next pass
-// verifies live. Callers clear the latch via clearGate once status converges.
+// verifies live. Callers clear the latch via completeGateVerification once
+// status converges.
 func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
 	latch.Forget(kind, key)
 	latch.Invalidate(kind, key, "demoted")
@@ -311,14 +309,6 @@ func (stamp gateStamp) withContent(matches freshness.ContentMatcher) gateStamp {
 	return stamp
 }
 
-// recordGateVerification records a converged pass in the latch: the verify
-// time, and the content baseline the sweep confirms against. It runs only
-// after the pass has persisted whatever status it had to.
-func recordGateVerification(latch *freshness.Latch, kind string, key types.NamespacedName, stamp gateStamp) {
-	latch.MarkVerified(kind, key, stamp.Hash, stamp.At.Time)
-	latch.SetBaseline(kind, key, stamp.Hash, stamp.Content)
-}
-
 // contentBaseline returns matches only when the remote object this pass just
 // verified satisfies it. A matcher that rejects the very object the reconciler
 // accepted as converged would make the sweep report drift on every pass, so
@@ -344,109 +334,220 @@ func nextGateStamp(storedHash string, storedAt *metav1.Time, stamp gateStamp) (s
 	return stamp.Hash, &at, true
 }
 
-// persistGateStamp records the converged gate stamp and, when the applied
-// hash changed, writes it as its own status patch.
-//
-// It exists because most status patch helpers capture their merge base from
-// the live object (client.MergeFrom(object.DeepCopy())). A caller that assigns
-// the stamp before calling one of those helpers puts the new values into both
-// the base and the target, so the merge patch carries no change and the stamp
-// is silently dropped. The gate then never opens, the object reads the remote
-// on every pass, and nothing anywhere reports a problem — the build, the
-// linter, and the whole test suite stay green while the saving is zero.
-//
-// Re-reading the stored object and diffing against it makes the write
-// independent of how each controller's own helper builds its base, so the
-// mechanism is identical for every kind instead of correct for some.
-//
-// A re-verify that confirms the already-recorded hash writes nothing: the
-// verify time lives in the latch, so a converged object produces no status
-// writes and no watch events in the steady state.
-func persistGateStamp(
+func directStatusReader(writer kubeclient.Client, reader kubeclient.Reader) kubeclient.Reader {
+	if reader != nil {
+		return reader
+	}
+	return writer
+}
+
+// patchStatusWithDirectReader reads the live object from reader (uncached
+// APIReader when configured) inside RetryOnConflict, guards UID/Generation
+// identity, applies mutate, and submits an optimistic-locked status merge patch.
+// It returns (false, nil) without clearing latches if the object was deleted
+// or its UID/Generation changed concurrently.
+func patchStatusWithDirectReader[T kubeclient.Object](
 	ctx context.Context,
 	writer kubeclient.Client,
-	latch *freshness.Latch,
-	object kubeclient.Object,
-	stamp gateStamp,
-) error {
-	if writer == nil || object == nil || stamp.Hash == "" {
-		return nil
-	}
-	current, ok := object.DeepCopyObject().(kubeclient.Object)
-	if !ok {
-		return nil
-	}
-	if err := writer.Get(ctx, kubeclient.ObjectKeyFromObject(object), current); err != nil {
-		// A deleted object has nothing to stamp; anything else is reported so
-		// the caller does not treat an unstamped pass as converged.
-		return kubeclient.IgnoreNotFound(err)
-	}
-	before, ok := current.DeepCopyObject().(kubeclient.Object)
-	if !ok {
-		return nil
-	}
-	kind, hash, at, ok := gateStampFields(current)
-	if !ok {
-		return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", current)
-	}
-	key := kubeclient.ObjectKeyFromObject(current)
-	nextHash, nextAt, changed := nextGateStamp(*hash, *at, stamp)
-	if changed {
-		*hash, *at = nextHash, nextAt
-		if err := writer.Status().Patch(ctx, current, kubeclient.MergeFrom(before)); err != nil {
-			return fmt.Errorf("persist freshness gate stamp: %w", err)
+	reader kubeclient.Reader,
+	observed T,
+	mutate func(live T) error,
+) (bool, error) {
+	key := kubeclient.ObjectKeyFromObject(observed)
+	applied := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live, ok := reflect.New(reflect.TypeOf(observed).Elem()).Interface().(T)
+		if !ok {
+			return fmt.Errorf("allocate live copy for %T", observed)
 		}
+		if err := directStatusReader(writer, reader).Get(ctx, key, live); err != nil {
+			if apierrors.IsNotFound(err) {
+				applied = false
+				return nil
+			}
+			return err
+		}
+		if (observed.GetUID() != "" && live.GetUID() != observed.GetUID()) || live.GetGeneration() != observed.GetGeneration() {
+			applied = false
+			return nil
+		}
+		before, ok := live.DeepCopyObject().(T)
+		if !ok {
+			return fmt.Errorf("deep-copy live object %T", observed)
+		}
+		if err := mutate(live); err != nil {
+			return err
+		}
+		if apiequality.Semantic.DeepEqual(before, live) {
+			applied = true
+			return nil
+		}
+		if err := writer.Status().Patch(ctx, live, kubeclient.MergeFromWithOptions(before, kubeclient.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsNotFound(err) {
+				applied = false
+				return nil
+			}
+			return fmt.Errorf("patch %T status: %w", observed, err)
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	recordGateVerification(latch, kind, key, stamp)
+	return applied, nil
+}
+
+// completeGateVerification atomically releases an invalidation matching
+// expectedEpoch and records verification timestamp and optional sweep baseline.
+func completeGateVerification(latch *freshness.Latch, kind string, key types.NamespacedName, expectedEpoch uint64, stamp gateStamp) bool {
+	return latch.CompleteVerification(kind, key, expectedEpoch, stamp.Hash, stamp.At.Time, stamp.Content)
+}
+
+// persistGateStampChecked re-reads the live object via reader (uncached
+// APIReader), verifies UID, Generation, and converged status conditions on the
+// live object, atomically writes AppliedHash/AppliedAt with optimistic locking
+// if changed, and completes latch verification only when expectedEpoch still
+// matches the latch's current invalidation epoch.
+func persistGateStampChecked(
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	observed kubeclient.Object,
+	stamp gateStamp,
+	expectedEpoch uint64,
+) error {
+	if writer == nil || observed == nil || stamp.Hash == "" {
+		return nil
+	}
+	key := kubeclient.ObjectKeyFromObject(observed)
+	var gateKind string
+	persisted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live, ok := reflect.New(reflect.TypeOf(observed).Elem()).Interface().(kubeclient.Object)
+		if !ok {
+			return fmt.Errorf("allocate live copy for %T", observed)
+		}
+		if err := directStatusReader(writer, reader).Get(ctx, key, live); err != nil {
+			if apierrors.IsNotFound(err) {
+				persisted = false
+				return nil
+			}
+			return err
+		}
+		if (observed.GetUID() != "" && live.GetUID() != observed.GetUID()) || live.GetGeneration() != observed.GetGeneration() {
+			persisted = false
+			return nil
+		}
+		kind, hash, at, converged, ok := gateObjectState(live)
+		if !ok {
+			return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", live)
+		}
+		gateKind = kind
+		if !converged {
+			persisted = false
+			return nil
+		}
+		before, ok := live.DeepCopyObject().(kubeclient.Object)
+		if !ok {
+			return fmt.Errorf("deep-copy live object %T", live)
+		}
+		nextHash, nextAt, changed := nextGateStamp(*hash, *at, stamp)
+		if changed {
+			*hash, *at = nextHash, nextAt
+			if err := writer.Status().Patch(ctx, live, kubeclient.MergeFromWithOptions(before, kubeclient.MergeFromWithOptimisticLock{})); err != nil {
+				if apierrors.IsNotFound(err) {
+					persisted = false
+					return nil
+				}
+				return fmt.Errorf("persist freshness gate stamp: %w", err)
+			}
+		}
+		persisted = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !persisted {
+		return nil
+	}
+	completeGateVerification(latch, gateKind, key, expectedEpoch, stamp)
 	return nil
 }
 
 // gateStampFields returns the gate kind and the status fields holding the
 // stamp of a gated object, and reports whether the kind is one this operator
-// gates. A gated controller whose kind is missing here would otherwise
-// persist nothing and lose its saving silently, so the false result is turned
-// into an error by the caller rather than ignored.
+// gates.
 func gateStampFields(object kubeclient.Object) (string, *string, **metav1.Time, bool) {
+	kind, hash, at, _, ok := gateObjectState(object)
+	return kind, hash, at, ok
+}
+
+// gateObjectState returns the gate kind, stamp field pointers, live status
+// convergence for the object's current generation, and whether the object type
+// is a gated kind.
+func gateObjectState(object kubeclient.Object) (string, *string, **metav1.Time, bool, bool) {
 	switch typed := object.(type) {
 	case *v1alpha1.VirtualNetwork:
-		return "VirtualNetwork", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "VirtualNetwork", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.NetworkRoute:
-		return "NetworkRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "NetworkRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.HostnameRoute:
-		return "HostnameRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "HostnameRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.IdentityProvider:
-		return "IdentityProvider", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "IdentityProvider", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessGroup:
-		return "AccessGroup", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessGroup", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessPolicy:
-		return "AccessPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessCustomPage:
-		return "AccessCustomPage", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessCustomPage", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.AccessCustomPageConditionAccepted, v1alpha1.AccessCustomPageConditionReady), true
 	case *v1alpha1.AccessInfrastructureTarget:
-		return "AccessInfrastructureTarget", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessInfrastructureTarget", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessStandaloneApplication:
-		return "AccessStandaloneApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessStandaloneApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessApplication:
-		return "AccessApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed), true
 	case *v1alpha1.DeviceSettings:
-		return "DeviceSettings", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DeviceSettings", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.DeviceSettingsConditionAccepted, v1alpha1.DeviceSettingsConditionReady), true
 	case *v1alpha1.DeviceProfile:
-		return "DeviceProfile", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DeviceProfile", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady), true
 	case *v1alpha1.DevicePostureRule:
-		return "DevicePostureRule", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DevicePostureRule", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.DevicePostureIntegration:
-		return "DevicePostureIntegration", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DevicePostureIntegration", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.ServiceToken:
-		return "ServiceToken", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ServiceToken", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.WARPConnector:
-		return "WARPConnector", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "WARPConnector", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.WARPConnectorConditionAccepted, v1alpha1.WARPConnectorConditionReady), true
 	case *v1alpha1.ZeroTrustList:
-		return "ZeroTrustList", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustList", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustListConditionAccepted, v1alpha1.ZeroTrustListConditionReady), true
 	case *v1alpha1.ZeroTrustGatewayPolicy:
-		return "ZeroTrustGatewayPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustGatewayPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustGatewayPolicyConditionAccepted, v1alpha1.ZeroTrustGatewayPolicyConditionReady), true
 	case *v1alpha1.ZeroTrustOrganization:
-		return "ZeroTrustOrganization", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustOrganization", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionAccepted, v1alpha1.ZeroTrustOrganizationConditionReady), true
 	default:
-		return "", nil, nil, false
+		return "", nil, nil, false, false
 	}
 }

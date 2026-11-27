@@ -131,6 +131,9 @@ type CloudflareTunnelReconciler struct {
 func (r *CloudflareTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var tunnel v1alpha1.CloudflareTunnel
 	if err := r.Get(ctx, req.NamespacedName, &tunnel); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.Invalidator.Remove(configFreshnessKind, req.NamespacedName)
+		}
 		return ctrl.Result{}, releaseGoneObject(r.Invalidator, "CloudflareTunnel", req.NamespacedName, err)
 	}
 
@@ -443,6 +446,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if err := r.commitTunnelConditions(ctx, tunnel, withoutRemoteVerdicts(ownedConditions), true); err != nil {
 		return ctrl.Result{}, err
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
 	if err != nil {
 		set(tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionFalse, "CloudflareError", err.Error(), tunnel.Generation, now))
@@ -644,10 +648,9 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if readyCommitted && dnsHealthy && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
 		// Release any demotion/sweep invalidation and record the remote
 		// verification timestamp ONLY after patchOwnedStatus durably persists
-		// Ready=True, so a failed or Gateway-pending Ready=False status write
-		// never lets a stale cache open the gate.
-		clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
-		r.Invalidator.MarkVerified("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), status.ConfigVersion.DesiredHash, now.Time)
+		// Ready=True, and only if no newer sweep invalidation superseded
+		// verifyEpoch while remote checks or status commits ran.
+		r.Invalidator.CompleteVerification("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), verifyEpoch, status.ConfigVersion.DesiredHash, now.Time, nil)
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }

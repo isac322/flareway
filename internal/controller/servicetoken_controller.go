@@ -238,6 +238,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ServiceToken", request.NamespacedName)
 	if id == "" {
 		recoveredID, recoverErr := r.recoverTokenID(ctx, object)
 		if recoverErr != nil {
@@ -369,7 +370,6 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			}
 		}
 	}
-	clearGate(r.Invalidator, "ServiceToken", request.NamespacedName)
 	requeue := r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)
 	if ttl := r.Freshness.TTL(freshness.GradeAuthz); ttl > 0 && ttl < requeue {
 		requeue = ttl
@@ -381,7 +381,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	// (missing Secret, previous-credential expiry) and refreshes on expiry,
 	// none of which the sweep's token listing shows. A sweep confirmation
 	// would defer that work for as long as the sweep stays healthy.
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
@@ -647,35 +647,34 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
-	if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
-		object.Status.TokenID = remote.ID
-		object.Status.ClientID = remote.ClientID
-		object.Status.ZoneID = scope.ZoneID
-		object.Status.OwnershipVerified = update.OwnershipVerified
-		object.Status.ObservedName = remote.Name
-		object.Status.ObservedDuration = remote.Duration
-		object.Status.ObservedEnabled = remote.Enabled
-		if !remote.ExpiresAt.IsZero() {
-			stamp := metav1.NewTime(remote.ExpiresAt)
-			object.Status.ExpiresAt = &stamp
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
+		if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
+			live.Status.TokenID = remote.ID
+			live.Status.ClientID = remote.ClientID
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = update.OwnershipVerified
+			live.Status.ObservedName = remote.Name
+			live.Status.ObservedDuration = remote.Duration
+			live.Status.ObservedEnabled = remote.Enabled
+			if !remote.ExpiresAt.IsZero() {
+				stamp := metav1.NewTime(remote.ExpiresAt)
+				live.Status.ExpiresAt = &stamp
+			}
 		}
-	}
-	if update.RotatedAt != nil {
-		object.Status.RotatedAt = update.RotatedAt
-	}
-	if update.ObserveRotationRequest && object.Spec.Rotation.RequestedAt != nil {
-		object.Status.ObservedRotationRequest = object.Spec.Rotation.RequestedAt.DeepCopy()
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if err := r.Status().Patch(ctx, object, base); err != nil {
+		if update.RotatedAt != nil {
+			live.Status.RotatedAt = update.RotatedAt
+		}
+		if update.ObserveRotationRequest && live.Spec.Rotation.RequestedAt != nil {
+			live.Status.ObservedRotationRequest = live.Spec.Rotation.RequestedAt.DeepCopy()
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
-	}
-	if status == metav1.ConditionTrue || remote.ID != "" {
+	if applied && (status == metav1.ConditionTrue || remote.ID != "") {
 		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
 	}
 	return nil

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -737,5 +738,159 @@ func TestDemotionKeepsGateClosedAcrossStaleReadyCacheWithDisableSweep(t *testing
 	}
 	if latch.IsInvalidated("VirtualNetwork", key) {
 		t.Fatal("VirtualNetwork remained invalidated after healthy recovery reconcile")
+	}
+}
+
+// Regression test for P2 #4722795138 / #4721464011: with a single live backing
+// store holding demoted Ready=False and an intentionally stale informer cache
+// serving Ready=True, patchStatus MUST repair live Ready=True via APIReader +
+// optimistic lock, AND preserve the invalidation latch on concurrent generation
+// bump or concurrent sweep invalidation.
+func TestVirtualNetworkStaleCacheRepairsLiveStatusAndPreservesEpoch(t *testing.T) {
+	ctx := context.Background()
+	vnet := virtualNetworkFixture("tenant", "prod", virtualNetworkTestClock)
+	var serveStale atomic.Bool
+	var bumpGenOnPatch atomic.Bool
+	var sweepInvalidateOnPatch atomic.Bool
+	var staleSnapshot *v1alpha1.VirtualNetwork
+	var latch *freshness.Latch
+
+	now := virtualNetworkTestClock
+	policy := freshness.DefaultPolicy()
+
+	// Build base client first, then wrap with interceptors so APIReader reads
+	// uncached live store while Client reads stale Snapshot when serveStale is set.
+	base, scheme := virtualNetworkWriterClient(t, vnet)
+	liveClient := base
+	api := newFakePrivateNetworkCloudflare()
+	latch = freshness.NewLatch()
+	key := client.ObjectKeyFromObject(vnet)
+
+	staleWrapper := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, objKey client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if target, ok := obj.(*v1alpha1.VirtualNetwork); ok && serveStale.Load() && staleSnapshot != nil && objKey == key {
+				*target = *staleSnapshot.DeepCopy()
+				return nil
+			}
+			return c.Get(ctx, objKey, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if _, ok := obj.(*v1alpha1.VirtualNetwork); ok {
+				if bumpGenOnPatch.Swap(false) {
+					var latest v1alpha1.VirtualNetwork
+					if err := c.Get(ctx, key, &latest); err != nil {
+						return err
+					}
+					latest.Generation++
+					latest.Spec.Name = "prod-gen2"
+					if err := c.Update(ctx, &latest); err != nil {
+						return err
+					}
+				}
+				if sweepInvalidateOnPatch.Swap(false) {
+					latch.Invalidate("VirtualNetwork", key, "concurrent-sweep")
+				}
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	reconciler := &VirtualNetworkReconciler{
+		Client: staleWrapper, APIReader: liveClient, Scheme: scheme, NewCloudflareClient: api.Client,
+		Now: func() time.Time { return now }, Freshness: policy, Invalidator: latch,
+	}
+
+	// 1. Converge initially.
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("create reconcile: %v", err)
+	}
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("rebind reconcile: %v", err)
+	}
+	var converged v1alpha1.VirtualNetwork
+	if err := liveClient.Get(ctx, key, &converged); err != nil {
+		t.Fatal(err)
+	}
+	staleSnapshot = converged.DeepCopy()
+
+	// 2. Remove tenant grant label -> live store demoted to Ready=False.
+	var ns corev1.Namespace
+	if err := liveClient.Get(ctx, types.NamespacedName{Name: "tenant"}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Labels = map[string]string{}
+	if err := liveClient.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("demote reconcile: %v", err)
+	}
+
+	// 3. Restore tenant label while cache still serves stale Ready=True.
+	ns.Labels = map[string]string{"tenant": "true"}
+	if err := liveClient.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	serveStale.Store(true)
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("recovery reconcile against stale Ready=True cache: %v", err)
+	}
+	serveStale.Store(false)
+
+	var liveAfter v1alpha1.VirtualNetwork
+	if err := liveClient.Get(ctx, key, &liveAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !conditionTrueForGeneration(liveAfter.Status.Conditions, v1alpha1.PrivateNetworkConditionReady, liveAfter.Generation) {
+		t.Fatalf("live store stayed Ready=False after recovery against stale cache: %+v", liveAfter.Status.Conditions)
+	}
+	if latch.IsInvalidated("VirtualNetwork", key) {
+		t.Fatal("latch stayed invalidated after live store repaired Ready=True")
+	}
+
+	// 4. Concurrent sweep invalidation during status persistence must keep latch closed.
+	var clearStampLive v1alpha1.VirtualNetwork
+	if err := liveClient.Get(ctx, key, &clearStampLive); err != nil {
+		t.Fatal(err)
+	}
+	clearStampLive.Status.AppliedHash = ""
+	if err := liveClient.Status().Update(ctx, &clearStampLive); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(policy.TTL(freshness.GradeTraffic) + time.Second)
+	sweepInvalidateOnPatch.Store(true)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile across concurrent sweep invalidation: %v", err)
+	}
+	if sweepInvalidateOnPatch.Load() {
+		t.Fatal("expected SubResourcePatch hook to trigger concurrent sweep invalidation")
+	}
+	if !latch.IsInvalidated("VirtualNetwork", key) {
+		t.Fatal("VirtualNetwork cleared concurrent sweep invalidation raised during status patch")
+	}
+
+	// 5. Concurrent generation bump during recovery patch must keep latch invalidated.
+	latch.Invalidate("VirtualNetwork", key, "demoted")
+	var liveDemote v1alpha1.VirtualNetwork
+	if err := liveClient.Get(ctx, key, &liveDemote); err != nil {
+		t.Fatal(err)
+	}
+	liveDemote.Status.Conditions = privateConditions(liveDemote.Status.Conditions, liveDemote.Generation, metav1.ConditionFalse, "Pending", "demoted", now)
+	if err := liveClient.Status().Update(ctx, &liveDemote); err != nil {
+		t.Fatal(err)
+	}
+	bumpGenOnPatch.Store(true)
+	now = now.Add(time.Second)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile across concurrent generation bump: %v", err)
+	}
+	if bumpGenOnPatch.Load() {
+		t.Fatal("expected SubResourcePatch hook to trigger concurrent generation bump")
+	}
+	if !latch.IsInvalidated("VirtualNetwork", key) {
+		t.Fatal("VirtualNetwork cleared latch despite concurrent generation bump")
 	}
 }

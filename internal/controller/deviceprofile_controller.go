@@ -153,6 +153,7 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		}
 	}
 
+	verifyEpoch := r.Invalidator.InvalidationEpoch("DeviceProfile", request.NamespacedName)
 	remote, acquired, err := r.resolveRemoteProfile(ctx, api, object, input)
 	if err != nil {
 		return r.finishError(ctx, object, err)
@@ -203,17 +204,12 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishRemoteError(ctx, object, err)
 	}
 	status := deviceProfileStatus(object, profileID, true, desired, nil, nil, metav1.ConditionTrue, "Ready", "Device profile fields and whole lists are synchronized")
-	verifiedAt := time.Now()
-	if decision.DesiredHash != "" {
-		// appliedAt moves only with appliedHash; an unchanged re-verify is
-		// recorded in the latch once status is persisted.
-		status.AppliedHash, status.AppliedAt, _ = nextGateStamp(object.Status.AppliedHash, object.Status.AppliedAt, newGateStamp(decision.DesiredHash, verifiedAt))
-	}
-	clearGate(r.Invalidator, "DeviceProfile", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, status); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.Invalidator.MarkVerified("DeviceProfile", request.NamespacedName, decision.DesiredHash, verifiedAt)
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, time.Now()), verifyEpoch); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
@@ -1207,19 +1203,16 @@ func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alp
 	if !statusConverged(object.Generation, status.ObservedGeneration, status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady) {
 		forgetGate(r.Invalidator, "DeviceProfile", key)
 	}
-	current := new(v1alpha1.DeviceProfile)
-	if err := r.Get(ctx, key, current); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	before := current.DeepCopy()
-	current.Status = status
-	if err := r.Status().Patch(ctx, current, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("patch DeviceProfile status: %w", err)
-	}
-	if statusConverged(object.Generation, status.ObservedGeneration, status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady) {
-		clearGate(r.Invalidator, "DeviceProfile", key)
-	}
-	return nil
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DeviceProfile) error {
+		next := status
+		next.AppliedHash = live.Status.AppliedHash
+		next.AppliedAt = live.Status.AppliedAt
+		next.ObservedGeneration = live.Generation
+		next.Conditions = statusutil.MergeConditions(live.Status.Conditions, metav1.Now(), status.Conditions...)
+		live.Status = next
+		return nil
+	})
+	return err
 }
 
 func effectiveDeviceProfileManagementPolicy(policy v1alpha1.ManagementPolicy) v1alpha1.ManagementPolicy {

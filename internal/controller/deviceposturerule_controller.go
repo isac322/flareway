@@ -51,6 +51,7 @@ const (
 // DevicePostureRuleReconciler manages Cloudflare Zero Trust posture rules.
 type DevicePostureRuleReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -138,6 +139,7 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("DevicePostureRule", request.NamespacedName)
 	if err := verifyExternalDevicePostureIntegration(ctx, object, api); err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, nil, object.Status.RuleID, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -185,10 +187,9 @@ func (r *DevicePostureRuleReconciler) Reconcile(ctx context.Context, request ctr
 	if err := r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture rule is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "DevicePostureRule", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
@@ -567,23 +568,17 @@ func (r *DevicePostureRuleReconciler) patchStatus(ctx context.Context, object *v
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "DevicePostureRule", client.ObjectKeyFromObject(object))
 	}
-	baseObject := object.DeepCopy()
-	if remote != nil {
-		object.Status.RuleID = id
-		object.Status.OwnershipVerified = object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
-		object.Status.Observed = &v1alpha1.DevicePostureRuleObservedState{Name: remote.Name, Type: remote.Type, Description: remote.Description, Enabled: remote.Enabled, Schedule: remote.Schedule, Expiration: remote.Expiration, Match: remote.Match, Input: remote.Input}
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if !reflect.DeepEqual(baseObject.Status, object.Status) {
-		if err := r.Status().Patch(ctx, object, client.MergeFrom(baseObject)); err != nil {
-			return err
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureRule) error {
+		if remote != nil {
+			live.Status.RuleID = id
+			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+			live.Status.Observed = &v1alpha1.DevicePostureRuleObservedState{Name: remote.Name, Type: remote.Type, Description: remote.Description, Enabled: remote.Enabled, Schedule: remote.Schedule, Expiration: remote.Expiration, Match: remote.Match, Input: remote.Input}
 		}
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "DevicePostureRule", client.ObjectKeyFromObject(object))
-	}
-	return nil
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
+		return nil
+	})
+	return err
 }
 
 // finishRemoteError records the remote failure before returning it for retry.
@@ -621,6 +616,9 @@ func (r *DevicePostureRuleReconciler) now() time.Time {
 
 // SetupWithManager registers the DevicePostureRule controller and dependency watches.
 func (r *DevicePostureRuleReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.DevicePostureRule{}, devicePostureAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.DevicePostureRule).Spec.AccountRef.Name}

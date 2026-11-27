@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -777,6 +778,28 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 	}
 
 	prober := &recordingGatewayProber{version: 2, ready: true}
+	rawGWSweep := sweeper.EventsFor("CloudflareTunnel")
+	gwSweepCh := make(chan event.GenericEvent, 64)
+	var gwSweepDelivered atomic.Int64
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-rawGWSweep:
+				if !ok {
+					close(gwSweepCh)
+					return
+				}
+				gwSweepDelivered.Add(1)
+				select {
+				case gwSweepCh <- ev:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
 	gwReconciler := &GatewayReconciler{
 		Client:            mgr.GetClient(),
 		APIReader:         mgr.GetAPIReader(),
@@ -787,7 +810,7 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		Prober:            prober,
 		Freshness:         policy,
 		Invalidator:       latch,
-		SweepEvents:       sweeper.EventsFor("CloudflareTunnel"),
+		SweepEvents:       gwSweepCh,
 	}
 	if err := gwReconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup GatewayReconciler: %v", err)
@@ -928,15 +951,18 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		}
 		return assertConditionTrueForCurrentGen(cur.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), cur.Generation), nil
 	})
-	// Wait until both reconcilers are quiescent (0 probes and 0 tunnel API calls
-	// over 300ms), then snapshot counters and tunnel ResourceVersion so we prove
-	// the subsequent Gateway and Tunnel wakes come directly from post-invalidation
-	// sweep event publication rather than an unrelated queued pass or status watch.
-	waitUntilTrue(t, 10*time.Second, "Gateway and Tunnel reconciles quiescent", func() (bool, error) {
+	// Wait until both reconcilers are quiescent (>2.5s so any pending 2s timer
+	// retry window has completely elapsed with 0 probes and 0 tunnel API calls),
+	// then snapshot counters and tunnel ResourceVersion so we prove the
+	// subsequent Gateway and Tunnel wakes come directly from post-invalidation
+	// SweepEvents delivery into GatewayReconciler rather than an unrelated timer
+	// or status watch.
+	waitUntilTrue(t, 15*time.Second, "Gateway and Tunnel reconciles quiescent", func() (bool, error) {
 		p0 := prober.probes.Load()
 		c0 := len(tunnelFake.Calls())
-		time.Sleep(300 * time.Millisecond)
-		return prober.probes.Load() == p0 && len(tunnelFake.Calls()) == c0, nil
+		d0 := gwSweepDelivered.Load()
+		time.Sleep(2600 * time.Millisecond)
+		return prober.probes.Load() == p0 && len(tunnelFake.Calls()) == c0 && gwSweepDelivered.Load() == d0, nil
 	})
 	for len(tunnelSweepObs) > 0 {
 		<-tunnelSweepObs
@@ -947,6 +973,7 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 	tunnelRVBefore := tunnelObj.ResourceVersion
 	probesBefore := prober.probes.Load()
 	tunnelCallsBefore := len(tunnelFake.Calls())
+	deliveredBefore := gwSweepDelivered.Load()
 
 	emitTunnelDrift.Store(true)
 	select {
@@ -968,8 +995,8 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 	waitUntilTrue(t, 10*time.Second, "CloudflareTunnel reconciler executed remote verify after sweep event", func() (bool, error) {
 		return len(tunnelFake.Calls()) > tunnelCallsBefore && !latch.IsInvalidated("CloudflareTunnel", client.ObjectKeyFromObject(&tunnelObj)), nil
 	})
-	waitUntilTrue(t, 10*time.Second, "GatewayReconciler woken by unstructured tunnel sweep event", func() (bool, error) {
-		return prober.probes.Load() > probesBefore, nil
+	waitUntilTrue(t, 10*time.Second, "GatewayReconciler delivered SweepEvents and woken", func() (bool, error) {
+		return gwSweepDelivered.Load() > deliveredBefore && prober.probes.Load() > probesBefore, nil
 	})
 	var tunnelAfter v1alpha1.CloudflareTunnel
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelAfter); err != nil {

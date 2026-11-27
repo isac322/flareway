@@ -46,6 +46,7 @@ import (
 // NetworkRouteReconciler manages Cloudflare private CIDR routes.
 type NetworkRouteReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	Now                 func() time.Time
@@ -147,6 +148,7 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("NetworkRoute", request.NamespacedName)
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -178,10 +180,9 @@ func (r *NetworkRouteReconciler) Reconcile(ctx context.Context, request ctrl.Req
 				!networkRouteNeedsUpdate(input, route)
 		}, remote))
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "NetworkRoute", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, nil
 }
 
@@ -541,41 +542,37 @@ func (r *NetworkRouteReconciler) patchStatusInternal(ctx context.Context, object
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "NetworkRoute", client.ObjectKeyFromObject(object))
 	}
-	base := client.MergeFrom(object.DeepCopy())
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
-	if persistIdentity {
-		object.Status.RouteID = remote.ID
-		object.Status.Network = remote.Network
-		object.Status.TunnelID = remote.TunnelID
-		object.Status.TunnelName = remote.TunnelName
-		object.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
-		object.Status.VirtualNetworkID = remote.VirtualNetworkID
-		object.Status.VirtualNetworkName = remote.VirtualNetworkName
-		object.Status.Comment = remote.Comment
-		object.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
-		object.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
-		object.Status.OwnershipVerified = owned
-	}
-	if applied && remote.ID != "" {
-		object.Status.Applied = v1alpha1.NetworkRouteAppliedStatus{
-			Network: remote.Network, TunnelID: remote.TunnelID,
-			TunnelType: privateTunnelRemoteType(remote.TunnelType), VirtualNetworkID: remote.VirtualNetworkID,
-			ObservedGeneration: object.Generation,
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.NetworkRoute) error {
+		if persistIdentity {
+			live.Status.RouteID = remote.ID
+			live.Status.Network = remote.Network
+			live.Status.TunnelID = remote.TunnelID
+			live.Status.TunnelName = remote.TunnelName
+			live.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
+			live.Status.VirtualNetworkID = remote.VirtualNetworkID
+			live.Status.VirtualNetworkName = remote.VirtualNetworkName
+			live.Status.Comment = remote.Comment
+			live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+			live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+			live.Status.OwnershipVerified = owned
 		}
-	}
-	if updateLookup {
-		object.Status.IPLookup = lookup
-	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	if err := r.Status().Patch(ctx, object, base); err != nil {
-		return err
-	}
-	if status == metav1.ConditionTrue {
-		clearGate(r.Invalidator, "NetworkRoute", client.ObjectKeyFromObject(object))
-	}
-	return nil
+		if applied && remote.ID != "" {
+			live.Status.Applied = v1alpha1.NetworkRouteAppliedStatus{
+				Network: remote.Network, TunnelID: remote.TunnelID,
+				TunnelType: privateTunnelRemoteType(remote.TunnelType), VirtualNetworkID: remote.VirtualNetworkID,
+				ObservedGeneration: live.Generation,
+			}
+		}
+		if updateLookup {
+			live.Status.IPLookup = lookup
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = privateConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	return err
 }
 
 func networkRouteFromStatus(object *v1alpha1.NetworkRoute) flarecloudflare.NetworkRoute {
@@ -605,6 +602,9 @@ func (r *NetworkRouteReconciler) now() time.Time {
 
 // SetupWithManager registers the NetworkRoute controller and dependency watches.
 func (r *NetworkRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.NetworkRoute{}, networkRouteAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.NetworkRoute).Spec.AccountRef.Name}

@@ -84,6 +84,8 @@ func (e *cloudflaredConfigCompileError) Unwrap() error {
 	return e.err
 }
 
+const configFreshnessKind = "CloudflareTunnelConfig"
+
 type cloudflareConfigResult struct {
 	hash            string
 	version         int64
@@ -107,10 +109,12 @@ type cloudflareConfigResult struct {
 	// UpdateTunnelConfiguration and carries the provider-assigned version.
 	// The caller checkpoints desired=remote before the convergence gate.
 	remoteChanged bool
-	// verifiedGateKey, verifiedHash, and verifiedAt carry the remote verify
-	// confirmation for the caller to record ONLY after ConfigApplied=True and
-	// Gateway Programmed=True durably persist.
+	// verifiedGateKey, verifiedEpoch, verifiedHash, and verifiedAt carry the
+	// remote verify confirmation for the caller to record ONLY after
+	// ConfigApplied=True and Gateway Programmed=True durably persist, and only
+	// if no newer sweep invalidation superseded verifiedEpoch.
 	verifiedGateKey types.NamespacedName
+	verifiedEpoch   uint64
 	verifiedHash    string
 	verifiedAt      time.Time
 }
@@ -308,6 +312,7 @@ func (r *GatewayReconciler) resolveCloudflareContextWithOptions(
 		if !apierrors.IsNotFound(err) {
 			return nil, nil, cfg, nil, fmt.Errorf("get CloudflareTunnel %s: %w", key, err)
 		}
+		r.Invalidator.Remove(configFreshnessKind, key)
 		if explicit {
 			return nil, nil, cfg, nil, &missingExplicitTunnelError{key: key}
 		}
@@ -721,7 +726,6 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	// status recorded by the last converged pass so configVersion.remote and
 	// createdAt keep their values (C14 #9). A closed gate runs the unchanged
 	// remote path below — the lock closure never serves cached state.
-	const configFreshnessKind = "CloudflareTunnelConfig"
 	now := r.gatewayNow()
 	gateKey := client.ObjectKeyFromObject(tunnel)
 	gate := evaluateGateWithHash(
@@ -745,6 +749,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			requeue:         gate.Requeue,
 		}, nil
 	}
+	configEpoch := r.Invalidator.InvalidationEpoch(configFreshnessKind, gateKey)
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
 		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, err)
@@ -757,7 +762,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, err)
 	}
 	freshAppliedAt := metav1.NewTime(now)
-	result := cloudflareConfigResult{hash: hash}
+	result := cloudflareConfigResult{hash: hash, verifiedEpoch: configEpoch}
 	err = api.WithTunnelLock(ctx, tunnel.Status.TunnelID, func() error {
 		remote, err := api.GetTunnelConfiguration(ctx, tunnel.Status.TunnelID)
 		if err != nil {
@@ -859,8 +864,7 @@ func (r *GatewayReconciler) confirmTunnelConfigGate(result cloudflareConfigResul
 	if result.verifiedAt.IsZero() {
 		return
 	}
-	clearGate(r.Invalidator, "CloudflareTunnelConfig", result.verifiedGateKey)
-	r.Invalidator.MarkVerified("CloudflareTunnelConfig", result.verifiedGateKey, result.verifiedHash, result.verifiedAt)
+	r.Invalidator.CompleteVerification(configFreshnessKind, result.verifiedGateKey, result.verifiedEpoch, result.verifiedHash, result.verifiedAt, nil)
 }
 
 // tunnelConfigConvergedForGate requires affirmative current-generation
