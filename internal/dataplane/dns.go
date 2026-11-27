@@ -105,6 +105,13 @@ func writePrivateDNSTemplate(builder *strings.Builder, pattern, addr string) {
 	builder.WriteString("        fallthrough\n    }\n")
 }
 
+func writePrivateDNSEmptyAAAATemplate(builder *strings.Builder, pattern string) {
+	builder.WriteString("    template IN AAAA {\n")
+	fmt.Fprintf(builder, "        match %q\n", pattern)
+	builder.WriteString("        rcode NOERROR\n")
+	builder.WriteString("        fallthrough\n    }\n")
+}
+
 func renderPrivateCorefile(entries []privateDNSEntry) string {
 	exact := make([]privateDNSEntry, 0, len(entries))
 	wildcards := make([]privateDNSEntry, 0, len(entries))
@@ -120,10 +127,13 @@ func renderPrivateCorefile(entries []privateDNSEntry) string {
 	builder.WriteString(".:53 {\n    bind 127.0.0.1\n")
 	// CoreDNS executes template plugins before hosts in plugin.cfg order.
 	// Render exact hostnames as template blocks ahead of wildcards so an exact
-	// hostname always takes precedence over an overlapping wildcard binding.
+	// hostname always takes precedence over an overlapping wildcard binding, and
+	// return authoritative empty NOERROR for exact-name AAAA queries so IPv4-only
+	// exact Private hostnames do not fall through to upstream AAAA resolvers.
 	for _, entry := range exact {
 		pattern := "^" + escapeCoreDNSRegex(entry.hostname) + "[.]?$"
 		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
+		writePrivateDNSEmptyAAAATemplate(&builder, pattern)
 	}
 	for _, entry := range wildcards {
 		suffix := strings.TrimPrefix(entry.hostname, "*.")

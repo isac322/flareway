@@ -252,21 +252,26 @@ unverified.
 **D13. Private hostnames resolve through a Pod-local DNS sidecar.** A
 Gateway with at least one private listener runs a CoreDNS sidecar in its
 data-plane Pod, bound to `127.0.0.1:53`. It resolves private listener
-hostnames (exact and single-label wildcard) using per-listener binding lookup—answering
-`127.0.0.1` for Loopback listeners and `{$POD_IP}` for listeners in Pod IP
-fallback—and forwards everything else to the Pod's resolver
-(`internal/dataplane/dns.go`). Exact hostnames are ordered before wildcard rules
-in CoreDNS so an exact hostname always takes precedence over an overlapping
-wildcard regardless of binding, and if both bindings share the same exact
-hostname, `127.0.0.1` wins. For each listener where the edge does not accept a
-loopback answer, that listener falls back to Pod IP binding: CoreDNS answers its
-hostname with `{$POD_IP}`, Envoy binds that listener on `0.0.0.0`, a
-NetworkPolicy restricts access, and the tunnel reports
+hostnames (exact and single-label wildcard) using per-listener binding lookup—selecting
+`127.0.0.1` by default and `{$POD_IP}` for any listener whose recorded
+`CloudflareTunnel.status.listeners[*].binding` is `PodIP`
+(`internal/gatewayapi/translate.go`)—and forwards everything else to the Pod's
+resolver (`internal/dataplane/dns.go`). Exact hostnames are ordered before
+wildcard rules in CoreDNS (returning `127.0.0.1` or `{$POD_IP}` for `A`, and
+authoritative empty `NOERROR` for `AAAA` so exact IPv4-only hostnames do not
+fall through upstream) so an exact hostname always takes precedence over an
+overlapping wildcard regardless of binding, and if both bindings share the same
+exact hostname, `127.0.0.1` wins. When a listener carries a recorded `PodIP`
+binding, CoreDNS answers its hostname with `{$POD_IP}`, Envoy binds that
+listener on `0.0.0.0`, a NetworkPolicy restricts access, and the tunnel reports
 `PrivateListenerDegraded=True` with reason `PodIPFallback` while any active
-listener uses Pod IP binding (`internal/controller/gateway_private.go`). Rationale:
-`cloudflared` dials the IP the edge sends and resolves hostnames through its DNS
-resolver setting. `hostAliases` is invisible to that path, and changing cluster
-DNS would affect every workload.
+listener uses `PodIP` (`internal/controller/gateway_private.go`). There is no
+automatic detection of edge loopback rejection (`CloudflareTunnel` status
+reflects the binding read during translation), and live Cloudflare edge and
+WARP validation of loopback answers remains outside local test runs
+([Limits](../concepts/limits.md)). Rationale: `cloudflared` dials the IP the
+edge sends and resolves hostnames through its DNS resolver setting. `hostAliases`
+is invisible to that path, and changing cluster DNS would affect every workload.
 
 **D14. Conformance mode relaxes the Cloudflare constraints.** With
 `conformanceMode: true`, listeners may use any hostname and port, HTTPS

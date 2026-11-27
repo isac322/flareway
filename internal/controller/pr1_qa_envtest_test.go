@@ -18,26 +18,29 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
 
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	ginkgo "github.com/onsi/ginkgo/v2"
 	gomega "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/gatewayapi"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -98,10 +101,11 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		tunnel := *f.tunnel()
 		accountName := tunnel.Spec.AccountRef.Name
 
-		// Allow wildcard *.internal.example and edge-a.example.com in account grants.
+		// Allow wildcard *.internal.example and edge-a.example.com in account grants (Public + Private).
 		var acct v1alpha1.CloudflareAccount
 		gomega.Expect(f.direct.Get(f.ctx, types.NamespacedName{Name: accountName}, &acct)).To(gomega.Succeed())
 		acct.Spec.Grants[0].Hostnames = []string{"edge-a.example.com", "*.internal.example"}
+		acct.Spec.Grants[0].Exposures = []v1alpha1.Exposure{v1alpha1.ExposurePublic, v1alpha1.ExposurePrivate}
 		acct.Spec.Grants[0].Backends = &v1alpha1.CloudflareBackendGrant{
 			Namespaces: v1alpha1.BackendNamespaceSame,
 			Kinds:      []v1alpha1.BackendKind{v1alpha1.BackendKindService},
@@ -116,7 +120,7 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gw.Spec.Listeners[1].Hostname = &privWild
 		gomega.Expect(f.direct.Update(f.ctx, &gw)).To(gomega.Succeed())
 
-		// Create ready VirtualNetwork & DeviceSettings for the Private listener.
+		// Create ready VirtualNetwork and HostnameRoute prerequisites for *.internal.example.
 		vnet := &v1alpha1.VirtualNetwork{
 			ObjectMeta: metav1.ObjectMeta{Name: "private-vnet", Namespace: ns},
 			Spec:       v1alpha1.VirtualNetworkSpec{Name: "private-vnet", AccountRef: corev1.LocalObjectReference{Name: accountName}},
@@ -135,6 +139,32 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			Name: "private", Exposure: v1alpha1.ExposurePrivate, VirtualNetworkRef: &corev1.LocalObjectReference{Name: vnet.Name},
 		}}
 		gomega.Expect(f.direct.Update(f.ctx, &tunnel)).To(gomega.Succeed())
+
+		hr := &v1alpha1.HostnameRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "hr-wild-internal", Namespace: ns},
+			Spec: v1alpha1.HostnameRouteSpec{
+				AccountRef: corev1.LocalObjectReference{Name: accountName},
+				Hostname:   "*.internal.example",
+				TunnelRef:  v1alpha1.TunnelReference{Name: tunnel.Name},
+			},
+		}
+		gomega.Expect(f.direct.Create(f.ctx, hr)).To(gomega.Succeed())
+		hr.Status = v1alpha1.HostnameRouteStatus{
+			RouteID:            "route-wild-internal",
+			Hostname:           "*.internal.example",
+			TunnelID:           tunnel.Status.TunnelID,
+			ObservedGeneration: hr.Generation,
+			Applied: v1alpha1.HostnameRouteAppliedStatus{
+				Hostname:           "*.internal.example",
+				TunnelID:           tunnel.Status.TunnelID,
+				ObservedGeneration: hr.Generation,
+			},
+			Conditions: []metav1.Condition{{
+				Type: v1alpha1.PrivateNetworkConditionAccepted, Status: metav1.ConditionTrue,
+				Reason: "Accepted", ObservedGeneration: hr.Generation, LastTransitionTime: metav1.Now(),
+			}},
+		}
+		gomega.Expect(f.direct.Status().Update(f.ctx, hr)).To(gomega.Succeed())
 
 		// Create backend Service + HTTPRoutes for edge-a.example.com, a.internal.example, b.internal.example.
 		svc := &corev1.Service{
@@ -296,10 +326,16 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		goodCond := meta.FindStatusCondition(storedGood.Status.Conditions, accessApplicationConditionAccepted)
 		gomega.Expect(goodCond).NotTo(gomega.BeNil())
 		gomega.Expect(goodCond.Status).To(gomega.Equal(metav1.ConditionTrue))
+		gomega.Expect(storedGood.Status.ApplicationID).NotTo(gomega.BeEmpty(), "goodApp failed remote provision / AUD handoff: conditions=%#v", storedGood.Status.Conditions)
 
-		// Reconcile GatewayReconciler: it must NOT fail snapshot build and must keep
-		// healthy Public and Private listeners operational.
+		// Reconcile GatewayReconciler through the block-first transition:
+		// first converge records Blocked + AccessBinding on tunnel status;
+		// second converge transitions good-private to Forwarding in xDS.
 		f.converge()
+		f.converge()
+		gomega.Expect(f.condition(v1alpha1.CloudflareTunnelConditionConfigApplied).Status).To(gomega.Equal(metav1.ConditionTrue))
+		privDegraded := f.condition(v1alpha1.CloudflareTunnelConditionPrivateListenerDegraded)
+		gomega.Expect(privDegraded.Reason).To(gomega.Equal("Loopback"), "private listener prerequisite block: %#v", privDegraded)
 
 		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
 		pubListener := listenerStatusByName(gw.Status.Listeners, "http")
@@ -310,24 +346,38 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(privListener).NotTo(gomega.BeNil())
 		gomega.Expect(meta.FindStatusCondition(privListener.Conditions, string(gatewayv1.ListenerConditionAccepted)).Status).To(gomega.Equal(metav1.ConditionTrue))
 
-		// Verify xDS snapshot was built and contains both healthy sibling routes.
+		// Verify xDS snapshot was built and both healthy sibling routes actually
+		// forward (not 403), with b.internal.example requiring Access JWT.
 		f.snapshots.publisher.mu.RLock()
 		snap := f.snapshots.publisher.snapshots[f.gatewayKey.String()]
 		f.snapshots.publisher.mu.RUnlock()
 		gomega.Expect(snap).NotTo(gomega.BeNil())
-		foundHosts := map[string]bool{}
+		forwardingHosts := map[string]bool{}
+		jwtProtectedHosts := map[string]bool{}
 		for _, res := range snap.GetResources(resourcev3.RouteType) {
 			rc := res.(*routev3.RouteConfiguration)
 			for _, vh := range rc.GetVirtualHosts() {
+				hasForward := len(vh.GetRoutes()) > 0 && vh.GetRoutes()[0].GetRoute() != nil
+				var hasJWTRequirement bool
+				if filterCfg := vh.GetTypedPerFilterConfig()["envoy.filters.http.jwt_authn"]; filterCfg != nil {
+					var perRoute jwtauthnv3.PerRouteConfig
+					if err := filterCfg.UnmarshalTo(&perRoute); err == nil && perRoute.GetRequirementName() != "" {
+						hasJWTRequirement = true
+					}
+				}
 				for _, dom := range vh.GetDomains() {
-					if len(vh.GetRoutes()) > 0 {
-						foundHosts[dom] = true
+					if hasForward {
+						forwardingHosts[dom] = true
+					}
+					if hasJWTRequirement {
+						jwtProtectedHosts[dom] = true
 					}
 				}
 			}
 		}
-		gomega.Expect(foundHosts["edge-a.example.com"]).To(gomega.BeTrue(), "healthy Public sibling route missing from xDS RouteConfiguration: %#v", foundHosts)
-		gomega.Expect(foundHosts["b.internal.example"]).To(gomega.BeTrue(), "healthy Private sibling route missing from xDS RouteConfiguration: %#v", foundHosts)
+		gomega.Expect(forwardingHosts["edge-a.example.com"]).To(gomega.BeTrue(), "healthy Public sibling route missing forwarding action in xDS RouteConfiguration: %#v", forwardingHosts)
+		gomega.Expect(forwardingHosts["b.internal.example"]).To(gomega.BeTrue(), "healthy Private sibling route missing forwarding action (must not be 403) in xDS RouteConfiguration: %#v", forwardingHosts)
+		gomega.Expect(jwtProtectedHosts["b.internal.example"]).To(gomega.BeTrue(), "healthy Private sibling route missing JWT requirement in xDS RouteConfiguration: %#v", jwtProtectedHosts)
 	})
 
 	// QA-1G-1: Reserved dataplane pod ports (53, 2000, 18000, 19000, 19001)
@@ -539,12 +589,30 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		}
 		gomega.Expect(f.direct.Create(f.ctx, pubRoute)).To(gomega.Succeed())
 
-		// Retained deleting Private AccessApplication holding port 19000 tombstone state.
+		// Settle the baseline remote version with the healthy Public sibling and
+		// rejected reserved-port Private listener before introducing the latched
+		// Private revocation tombstone, so the remote config version stays unchanged.
+		f.converge()
+		baselineVersion := f.tunnel().Status.ConfigVersion.Applied
+		gomega.Expect(baselineVersion).To(gomega.BeNumerically(">", 0))
+
+		// Retained deleting Private AccessApplication holding port 19000 tombstone
+		// state and an existing revocation latch at the settled baseline version.
+		latchPayload, err := json.Marshal(gatewayapi.AccessRevocationLatch{
+			Claims: []gatewayapi.AccessRevocationClaim{{
+				Tunnel:           tunnel.Name,
+				ProtectionDomain: "private-access-default-app-a",
+				Hostname:         "revoked-reserved.internal.example",
+				BaselineVersion:  baselineVersion,
+			}},
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		app := &v1alpha1.AccessApplication{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:       "app-a",
-				Namespace:  ns,
-				Finalizers: []string{"flareway.bhyoo.com/access-application"},
+				Name:        "app-a",
+				Namespace:   ns,
+				Finalizers:  []string{v1alpha1.AccessApplicationFinalizer},
+				Annotations: map[string]string{gatewayapi.AccessRevocationAnnotation: string(latchPayload)},
 			},
 			Spec: v1alpha1.AccessApplicationSpec{
 				AccountRef: corev1.LocalObjectReference{Name: acct.Name},
@@ -572,9 +640,13 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		}}
 		gomega.Expect(f.direct.Status().Update(f.ctx, app)).To(gomega.Succeed())
 		gomega.Expect(f.direct.Delete(f.ctx, app)).To(gomega.Succeed())
-		_ = controllerutil.ContainsFinalizer(app, "flareway.bhyoo.com/access-application")
 
 		f.converge()
+
+		// Remote version must remain unchanged at baselineVersion because Private
+		// tombstones are excluded from remote cloudflared ingress.
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.ConfigVersion.Applied).To(gomega.Equal(baselineVersion))
 
 		gomega.Expect(f.direct.Get(f.ctx, f.gatewayKey, &gw)).To(gomega.Succeed())
 		privLS := listenerStatusByName(gw.Status.Listeners, "private")
@@ -601,15 +673,14 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		for _, res := range snap.GetResources(resourcev3.RouteType) {
 			rc := res.(*routev3.RouteConfiguration)
 			for _, vh := range rc.GetVirtualHosts() {
-				if slices.Contains(vh.GetDomains(), "edge-a.example.com") && len(vh.GetRoutes()) > 0 {
+				if slices.Contains(vh.GetDomains(), "edge-a.example.com") && len(vh.GetRoutes()) > 0 && vh.GetRoutes()[0].GetRoute() != nil {
 					sawSibling = true
 				}
 			}
 		}
-		gomega.Expect(sawSibling).To(gomega.BeTrue(), "healthy sibling edge-a.example.com missing from xDS snapshot")
+		gomega.Expect(sawSibling).To(gomega.BeTrue(), "healthy sibling edge-a.example.com missing forwarding route from xDS snapshot")
 
 		// Revocation proof for old Private hostname remains recorded as Blocked.
-		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
 		var sawBlockedProof bool
 		for _, h := range tunnel.Status.Hostnames {
 			if h.Hostname == "revoked-reserved.internal.example" && h.Guard == v1alpha1.HostnameGuardBlocked {
@@ -617,6 +688,24 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			}
 		}
 		gomega.Expect(sawBlockedProof).To(gomega.BeTrue(), "expected Blocked revocation status for revoked-reserved.internal.example in %#v", tunnel.Status.Hostnames)
+
+		// AccessApplicationReconciler MUST acknowledge the Blocked status at the
+		// unchanged baselineVersion (requiring Private listener status identity)
+		// and finish removing its finalizer.
+		indexedClient := handoffIndexedClient{Client: f.direct}
+		accessReconciler := &AccessApplicationReconciler{
+			Client:              indexedClient,
+			APIReader:           indexedClient,
+			Scheme:              f.direct.Scheme(),
+			NewCloudflareClient: newFakeAccessApplicationCloudflare().Client,
+			OperatorNamespace:   accessApplicationAUDNamespace,
+			Now:                 func() time.Time { return f.clock },
+		}
+		_, err = accessReconciler.Reconcile(f.ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		var deletedCheck v1alpha1.AccessApplication
+		err = f.direct.Get(f.ctx, client.ObjectKeyFromObject(app), &deletedCheck)
+		gomega.Expect(apierrors.IsNotFound(err)).To(gomega.BeTrue(), "deleting Private reserved-port AccessApplication stalled instead of acknowledging Blocked at unchanged version %d; err=%v conditions=%#v", baselineVersion, err, deletedCheck.Status.Conditions)
 	})
 
 	// QA-1-REG-2: A retained Private revocation tombstone blocks its old Private

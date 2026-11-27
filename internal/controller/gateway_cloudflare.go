@@ -1090,40 +1090,79 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 
 func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelListenerStatus {
 	result := make([]v1alpha1.CloudflareTunnelListenerStatus, 0, len(gateway.Listeners))
+	recordedListeners := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
-		status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(listener.Name), Exposure: v1alpha1.Exposure(listener.Exposure)}
-		if listener.Exposure == ir.ExposurePrivate {
-			status.Binding = v1alpha1.ListenerBindingLoopback
-			if listener.Binding == ir.ListenerBindingPodIP {
-				status.Binding = v1alpha1.ListenerBindingPodIP
-			}
+		recordedListeners[listener.Name] = struct{}{}
+		result = append(result, tunnelListenerStatus(listener.Name, listener.Exposure, listener.Binding, gateway.Domains))
+	}
+	// Preserve listener exposure metadata for retained GuardBlocked tombstones
+	// whose invalid/reserved Envoy listener was omitted from gateway.Listeners so
+	// xDS never binds it. Access revocation acknowledgment at an unchanged remote
+	// version reads listener.Exposure through listener.ProtectionDomains.
+	var retainedNames []string
+	retainedExposure := make(map[string]string)
+	for _, domain := range gateway.Domains {
+		if domain.ListenerName == "" {
+			continue
 		}
-		// One ir.ProtectionDomain is produced per virtual host. Fragments that
-		// share a name are one Envoy route table on one port: hosts with no
-		// Access claim reuse the listener's base domain, and private Access
-		// hosts share the listener port. translator.Build rejects a name that
-		// maps to more than one route table, so the fragments are identical
-		// here, and each public Access host carries its own name and port.
-		//
-		// ProtectionDomains is +listMapKey=name, so emitting fragments
-		// one-for-one makes the whole status object unpatchable: server-side
-		// apply rejects it with "duplicate entries for key [name=...]" and the
-		// Gateway reconcile fails before any route status is written. Report
-		// each distinct protection domain once instead.
-		seen := make(map[string]struct{}, len(gateway.Domains))
-		for _, domain := range gateway.Domains {
-			if domain.ListenerName != listener.Name {
-				continue
-			}
-			if _, duplicate := seen[domain.Name]; duplicate {
-				continue
-			}
-			seen[domain.Name] = struct{}{}
-			status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+		if _, recorded := recordedListeners[domain.ListenerName]; recorded {
+			continue
 		}
-		result = append(result, status)
+		if _, seen := retainedExposure[domain.ListenerName]; !seen {
+			retainedNames = append(retainedNames, domain.ListenerName)
+			exposure := domain.Exposure
+			if exposure == "" {
+				exposure = ir.ExposurePublic
+			}
+			retainedExposure[domain.ListenerName] = exposure
+		} else if domain.Exposure == ir.ExposurePrivate {
+			retainedExposure[domain.ListenerName] = ir.ExposurePrivate
+		}
+	}
+	sort.Strings(retainedNames)
+	for _, name := range retainedNames {
+		exposure := retainedExposure[name]
+		binding := ""
+		if exposure == ir.ExposurePrivate {
+			binding = ir.ListenerBindingLoopback
+		}
+		result = append(result, tunnelListenerStatus(name, exposure, binding, gateway.Domains))
 	}
 	return result
+}
+
+func tunnelListenerStatus(name, exposure, binding string, domains []ir.ProtectionDomain) v1alpha1.CloudflareTunnelListenerStatus {
+	status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(name), Exposure: v1alpha1.Exposure(exposure)}
+	if exposure == ir.ExposurePrivate {
+		status.Binding = v1alpha1.ListenerBindingLoopback
+		if binding == ir.ListenerBindingPodIP {
+			status.Binding = v1alpha1.ListenerBindingPodIP
+		}
+	}
+	// One ir.ProtectionDomain is produced per virtual host. Fragments that
+	// share a name are one Envoy route table on one port: hosts with no
+	// Access claim reuse the listener's base domain, and private Access
+	// hosts share the listener port. translator.Build rejects a name that
+	// maps to more than one route table, so the fragments are identical
+	// here, and each public Access host carries its own name and port.
+	//
+	// ProtectionDomains is +listMapKey=name, so emitting fragments
+	// one-for-one makes the whole status object unpatchable: server-side
+	// apply rejects it with "duplicate entries for key [name=...]" and the
+	// Gateway reconcile fails before any route status is written. Report
+	// each distinct protection domain once instead.
+	seen := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		if domain.ListenerName != name {
+			continue
+		}
+		if _, duplicate := seen[domain.Name]; duplicate {
+			continue
+		}
+		seen[domain.Name] = struct{}{}
+		status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+	}
+	return status
 }
 
 func tunnelGatewayAddresses(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []gatewayv1.GatewayStatusAddress {

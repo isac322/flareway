@@ -744,11 +744,15 @@ func TestEnvoyUnprotectedAndProtectedHeaderStrippingEndToEnd(t *testing.T) {
 	})
 }
 
-// QA-1D-1 (CoreDNS runtime precedence): Real CoreDNS 1.15.0 answers exact
-// hostnames ahead of overlapping wildcards regardless of PodIP vs Loopback
-// binding order, and prefers 127.0.0.1 for duplicate exact hostnames.
+// QA-1D-1 & QA-1-REG-5 (CoreDNS runtime precedence & AAAA handling): Real
+// CoreDNS 1.15.0 answers exact hostnames ahead of overlapping wildcards
+// regardless of PodIP vs Loopback binding order, prefers 127.0.0.1 for
+// duplicate exact hostnames, returns authoritative NOERROR with zero answers
+// for exact Private AAAA queries (never leaking to upstream), and still forwards
+// wildcard and unrelated AAAA queries upstream.
 func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	requireDocker(t)
+	upstreamPort := startMockAAAAUpstream(t, net.ParseIP("2001:db8::7"))
 	gw := &ir.Gateway{
 		Key: types.NamespacedName{Namespace: "demo", Name: "dns"},
 		Listeners: []ir.Listener{
@@ -767,6 +771,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	corefile := strings.ReplaceAll(cm.Data["Corefile"], ".:53 {", ".:5353 {")
 	// Bind wildcard inside the container so host UDP port forwarding can reach CoreDNS.
 	corefile = strings.ReplaceAll(corefile, "    bind 127.0.0.1\n", "")
+	corefile = strings.ReplaceAll(corefile, "    forward . /etc/resolv.conf\n", fmt.Sprintf("    forward . host.docker.internal:%d\n", upstreamPort))
 	corefilePath := filepath.Join(t.TempDir(), "Corefile")
 	if err := os.WriteFile(corefilePath, []byte(corefile), 0o600); err != nil {
 		t.Fatalf("write Corefile: %v", err)
@@ -777,6 +782,7 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	defer cancel()
 	args := []string{
 		"run", "-d", "--name", name,
+		"--add-host", "host.docker.internal:host-gateway",
 		"-e", "POD_IP=192.0.2.7",
 		"-p", "127.0.0.1::5353/udp",
 		"-v", corefilePath + ":/Corefile:ro",
@@ -802,28 +808,48 @@ func TestCoreDNSPrivateMixedExactAndWildcardPrecedence(t *testing.T) {
 	}
 
 	cases := []struct {
-		host string
-		want string
+		host     string
+		wantA    string
+		wantAAAA string // "" means authoritative NOERROR with zero AAAA answers
 	}{
-		{"api.internal.example", "127.0.0.1"},
-		{"other.internal.example", "192.0.2.7"},
-		{"podexact.loop.example", "192.0.2.7"},
-		{"other.loop.example", "127.0.0.1"},
-		{"dup.internal.example", "127.0.0.1"},
+		{"api.internal.example", "127.0.0.1", ""},
+		{"other.internal.example", "192.0.2.7", "2001:db8::7"},
+		{"podexact.loop.example", "192.0.2.7", ""},
+		{"other.loop.example", "127.0.0.1", "2001:db8::7"},
+		{"dup.internal.example", "127.0.0.1", ""},
+		{"unrelated.example", "", "2001:db8::7"},
 	}
 	for _, tc := range cases {
-		var got string
+		if tc.wantA != "" {
+			var got string
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				ip, err := queryDNS(dnsAddr, tc.host, 1)
+				if err == nil && ip != "" {
+					got = ip
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			if got != tc.wantA {
+				t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s\nLogs:\n%s", tc.host, got, tc.wantA, corefile, containerLogs(name))
+			}
+		}
+		var gotAAAA string
+		var gotErr error
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
-			ip, err := queryDNSA(dnsAddr, tc.host)
-			if err == nil && ip != "" {
-				got = ip
+			ip, err := queryDNS(dnsAddr, tc.host, 28)
+			if err == nil {
+				gotAAAA = ip
+				gotErr = nil
 				break
 			}
+			gotErr = err
 			time.Sleep(200 * time.Millisecond)
 		}
-		if got != tc.want {
-			t.Fatalf("CoreDNS A(%s) = %q, want %q\nCorefile:\n%s\nLogs:\n%s", tc.host, got, tc.want, corefile, containerLogs(name))
+		if gotErr != nil || gotAAAA != tc.wantAAAA {
+			t.Fatalf("CoreDNS AAAA(%s) = (%q, err=%v), want (%q, nil)\nCorefile:\n%s\nLogs:\n%s", tc.host, gotAAAA, gotErr, tc.wantAAAA, corefile, containerLogs(name))
 		}
 	}
 }
@@ -880,7 +906,7 @@ func firstMatchingIngressService(t *testing.T, params zero_trust.TunnelCloudflar
 	return ""
 }
 
-func queryDNSA(serverAddr, host string) (string, error) {
+func queryDNS(serverAddr, host string, qtype uint16) (string, error) {
 	conn, err := net.DialTimeout("udp", serverAddr, 2*time.Second)
 	if err != nil {
 		return "", err
@@ -896,7 +922,9 @@ func queryDNSA(serverAddr, host string) (string, error) {
 		pkt = append(pkt, byte(len(label)))
 		pkt = append(pkt, label...)
 	}
-	pkt = append(pkt, 0, 0, 1, 0, 1) // root, QTYPE=A, QCLASS=IN
+	pkt = append(pkt, 0)
+	pkt = binary.BigEndian.AppendUint16(pkt, qtype)
+	pkt = binary.BigEndian.AppendUint16(pkt, 1) // QCLASS=IN
 	if _, err := conn.Write(pkt); err != nil {
 		return "", err
 	}
@@ -907,6 +935,9 @@ func queryDNSA(serverAddr, host string) (string, error) {
 	}
 	if n < 12 {
 		return "", fmt.Errorf("short DNS response %d", n)
+	}
+	if rcode := resp[3] & 0x0F; rcode != 0 {
+		return "", fmt.Errorf("DNS RCODE=%d", rcode)
 	}
 	qd := int(binary.BigEndian.Uint16(resp[4:6]))
 	an := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -945,12 +976,57 @@ func queryDNSA(serverAddr, host string) (string, error) {
 		if off+rdLen > n {
 			return "", fmt.Errorf("truncated RR data")
 		}
-		if rrType == 1 && rdLen == 4 {
-			return net.IP(resp[off : off+4]).String(), nil
+		if rrType == qtype && ((qtype == 1 && rdLen == 4) || (qtype == 28 && rdLen == 16)) {
+			return net.IP(resp[off : off+rdLen]).String(), nil
 		}
 		off += rdLen
 	}
-	return "", fmt.Errorf("no A record in DNS response (ancount=%d)", an)
+	return "", nil
+}
+
+func startMockAAAAUpstream(t *testing.T, ipv6 net.IP) int {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("listen mock upstream UDP: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			off := 12
+			for off < n && buf[off] != 0 {
+				off += 1 + int(buf[off])
+			}
+			if off+5 > n {
+				continue
+			}
+			qend := off + 5
+			qtype := binary.BigEndian.Uint16(buf[off+1 : off+3])
+			resp := make([]byte, qend, qend+32)
+			copy(resp, buf[:qend])
+			resp[2] = 0x81
+			resp[3] = 0x80 // QR=1, RA=1, NOERROR
+			binary.BigEndian.PutUint16(resp[4:6], 1)
+			binary.BigEndian.PutUint16(resp[8:12], 0)
+			if qtype == 28 {
+				binary.BigEndian.PutUint16(resp[6:8], 1)
+				resp = append(resp, 0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 0, 30, 0, 16)
+				resp = append(resp, ipv6.To16()...)
+			} else {
+				binary.BigEndian.PutUint16(resp[6:8], 0)
+			}
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().(*net.UDPAddr).Port
 }
 
 func startHeaderEchoOrigin(t *testing.T, jwks []byte) int {
