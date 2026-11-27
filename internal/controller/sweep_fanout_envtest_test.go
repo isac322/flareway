@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,11 +41,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -168,10 +166,37 @@ func assertConditionTrueForCurrentGen(conditions []metav1.Condition, condType st
 	return c != nil && c.Status == metav1.ConditionTrue && c.ObservedGeneration == generation
 }
 
-// QA-2A-1: Multi-controller manager per-kind fan-out must deliver every
-// targeted drift wakeup to its owning controller without competing across
-// consumers, and a slow/full subscriber for one kind must never block or drop
-// wakeups for any other kind.
+type subWatchReader struct {
+	client.Reader
+	expected    types.NamespacedName
+	matchesType func(client.Object) bool
+	hits        *atomic.Int64
+	foreignHits *atomic.Int64
+}
+
+func (r *subWatchReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if r.matchesType(obj) {
+		if key == r.expected {
+			r.hits.Add(1)
+		} else if strings.HasPrefix(key.Name, "probe-") {
+			r.foreignHits.Add(1)
+		}
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+type subWatchClient struct {
+	client.Client
+	reader *subWatchReader
+}
+
+func (c *subWatchClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+// QA-2A-1: Per-kind sweep fan-out delivers drift invalidations independently to
+// all 19 production subscriptions across 18 event kinds using real SetupWithManager
+// registrations, without slow-subscriber blocking or cross-kind leakage.
 func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
@@ -182,7 +207,9 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 	// so TTL expiry NEVER fires during the test — ONLY sweep wakeups can
 	// repair drift inside the test timeout!
 	var emitDrift atomic.Bool
+	var emitAllKinds atomic.Bool
 	var policyPassCount, vnetPassCount atomic.Int64
+	var listProbeOnce, policyProbeOnce, vnetProbeOnce atomic.Int64
 	var blockedListMu sync.Mutex
 	var blockedListTriggered atomic.Bool
 
@@ -198,7 +225,20 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 				blockedListTriggered.Store(true)
 				blockedListMu.Lock()
 				defer blockedListMu.Unlock()
-				// Overflow a small EventBufferSize=3 channel for ZeroTrustList.
+				if emitAllKinds.Load() {
+					if listProbeOnce.Add(1) == 1 {
+						return []sweep.DriftItem{{
+							Kind:           "ZeroTrustList",
+							TargetKind:     "ZeroTrustList",
+							NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-ZeroTrustList"},
+							RemoteID:       "remote-ZeroTrustList",
+							Case:           sweep.DriftCaseMismatch,
+							Reason:         "per-kind positive fanout probe",
+						}}, nil
+					}
+					return []sweep.DriftItem{}, nil
+				}
+				// Overflow a small EventBufferSize=3 channel for the undrained slow ZeroTrustList consumer in Phase 1.
 				items := make([]sweep.DriftItem, 0, 8)
 				for i := range 8 {
 					items = append(items, sweep.DriftItem{
@@ -221,21 +261,31 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 				if !emitDrift.Load() {
 					return []sweep.DriftItem{}, nil
 				}
-				if policyPassCount.Add(1) > 1 {
-					return []sweep.DriftItem{}, nil
+				if policyPassCount.Add(1) == 1 {
+					items := make([]sweep.DriftItem, 0, 3)
+					for i := range 3 {
+						items = append(items, sweep.DriftItem{
+							Kind:           "AccessPolicy",
+							TargetKind:     "AccessPolicy",
+							NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: fmt.Sprintf("pol-%d", i)},
+							RemoteID:       fmt.Sprintf("policy-%d", i+1),
+							Case:           sweep.DriftCaseMismatch,
+							Reason:         "out-of-band policy drift",
+						})
+					}
+					return items, nil
 				}
-				items := make([]sweep.DriftItem, 0, 3)
-				for i := range 3 {
-					items = append(items, sweep.DriftItem{
+				if emitAllKinds.Load() && policyProbeOnce.Add(1) == 1 {
+					return []sweep.DriftItem{{
 						Kind:           "AccessPolicy",
 						TargetKind:     "AccessPolicy",
-						NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: fmt.Sprintf("pol-%d", i)},
-						RemoteID:       fmt.Sprintf("policy-%d", i+1),
+						NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-AccessPolicy"},
+						RemoteID:       "remote-AccessPolicy",
 						Case:           sweep.DriftCaseMismatch,
-						Reason:         "out-of-band policy drift",
-					})
+						Reason:         "per-kind positive fanout probe",
+					}}, nil
 				}
-				return items, nil
+				return []sweep.DriftItem{}, nil
 			},
 		},
 		{
@@ -246,26 +296,35 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 				if !emitDrift.Load() {
 					return []sweep.DriftItem{}, nil
 				}
-				if vnetPassCount.Add(1) > 1 {
-					return []sweep.DriftItem{}, nil
+				if vnetPassCount.Add(1) == 1 {
+					items := make([]sweep.DriftItem, 0, 3)
+					for i := range 3 {
+						items = append(items, sweep.DriftItem{
+							Kind:           "VirtualNetwork",
+							TargetKind:     "VirtualNetwork",
+							NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: fmt.Sprintf("vnet-%d", i)},
+							RemoteID:       fmt.Sprintf("vnet-%d", i+1),
+							Case:           sweep.DriftCaseMismatch,
+							Reason:         "out-of-band vnet drift",
+						})
+					}
+					return items, nil
 				}
-				items := make([]sweep.DriftItem, 0, 3)
-				for i := range 3 {
-					items = append(items, sweep.DriftItem{
+				if emitAllKinds.Load() && vnetProbeOnce.Add(1) == 1 {
+					return []sweep.DriftItem{{
 						Kind:           "VirtualNetwork",
 						TargetKind:     "VirtualNetwork",
-						NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: fmt.Sprintf("vnet-%d", i)},
-						RemoteID:       fmt.Sprintf("vnet-%d", i+1),
+						NamespacedName: types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-VirtualNetwork"},
+						RemoteID:       "remote-VirtualNetwork",
 						Case:           sweep.DriftCaseMismatch,
-						Reason:         "out-of-band vnet drift",
-					})
+						Reason:         "per-kind positive fanout probe",
+					}}, nil
 				}
-				return items, nil
+				return []sweep.DriftItem{}, nil
 			},
 		},
 	}
 
-	var emitAllKinds atomic.Bool
 	otherProductionKinds := []string{
 		"AccessApplication",
 		"AccessStandaloneApplication",
@@ -283,10 +342,15 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 		"ZeroTrustGatewayPolicy",
 		"CloudflareTunnel",
 	}
-	otherSubHits := make(map[string]*atomic.Int64, len(otherProductionKinds)+1)
+	subHits := map[string]*atomic.Int64{
+		"AccessPolicy":             new(atomic.Int64),
+		"VirtualNetwork":           new(atomic.Int64),
+		"ZeroTrustList":            new(atomic.Int64),
+		"Gateway-CloudflareTunnel": new(atomic.Int64),
+	}
 	for _, kind := range otherProductionKinds {
 		k := kind
-		otherSubHits[k] = new(atomic.Int64)
+		subHits[k] = new(atomic.Int64)
 		var kindOnce atomic.Int64
 		targets = append(targets, sweep.TargetDescriptor{
 			Kind:         k,
@@ -307,8 +371,6 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 			},
 		})
 	}
-	gwTunnelSubHits := new(atomic.Int64)
-	otherSubHits["Gateway-CloudflareTunnel"] = gwTunnelSubHits
 
 	sweeper := sweep.NewSweeper(sweep.SweeperOptions{
 		Client:              mgr.GetClient(),
@@ -328,75 +390,91 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 
 	accessFake := newFakeAccessResourceCloudflare()
 	vnetFake := newFakePrivateNetworkCloudflare()
+	standaloneFake := &fakeStandaloneCloudflare{applications: map[string]flarecloudflare.AccessApplication{}, tags: map[string]flarecloudflare.AccessTag{}}
+	infraFake := &fakeInfrastructureTargetCloudflare{targets: map[string]flarecloudflare.AccessInfrastructureTarget{}}
+	idpFake := &scimIdentityProviderFakeAPI{identityProviderFakeAPI: &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{}}}
+	appFake := newFakeAccessApplicationCloudflare()
+	customPageFake := newFakeCustomPageCloudflare()
+	integrationFake := &fakeDevicePostureIntegrationCloudflare{integrations: map[string]flarecloudflare.DevicePostureIntegration{}}
+	warpFake := newFakeWARPConnectorCloudflare()
+	profileFake := newFakeDeviceProfileCloudflare()
+	gatewayFake := newFakeGlobalGatewayCloudflare()
+	tunnelFake := newFakeTunnelCloudflareFactory()
+	gwAPI := &tunnelFreshnessGatewayAPI{accountID: "0123456789abcdef0123456789abcdef", remoteVersion: 1}
+	snapshots := newFakeSnapshotPublisher()
 
-	// Subscribe ALL 19 production sweep subscriptions across 18 target kinds matching cmd/main.go,
-	// plus an independent undrained slow consumer on ZeroTrustList (buffer=3, 8 items sent):
-	// - AccessPolicy & VirtualNetwork: full production reconcilers repairing out-of-band drift
-	// - Remaining 16 production target kinds + 2nd CloudflareTunnel (Gateway): controllers enqueuing
-	//   reconcile.Request and executing Reconcile on addressed deliveries while rejecting foreign keys.
-	_ = sweeper.EventsFor("ZeroTrustList")
-	if err := (&AccessPolicyReconciler{
-		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
-		NewCloudflareClient: accessFake.Client,
-		Freshness:           policy,
-		Invalidator:         latch,
-		SweepEvents:         sweeper.EventsFor("AccessPolicy"),
-	}).SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup AccessPolicyReconciler: %v", err)
-	}
-	if err := (&VirtualNetworkReconciler{
-		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
-		NewCloudflareClient: vnetFake.Client,
-		Freshness:           policy,
-		Invalidator:         latch,
-		SweepEvents:         sweeper.EventsFor("VirtualNetwork"),
-	}).SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup VirtualNetworkReconciler: %v", err)
-	}
 	var foreignHits atomic.Int64
-	for _, kind := range otherProductionKinds {
-		k := kind
-		counter := otherSubHits[k]
-		expectedReq := types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-" + k}
-		if err := ctrl.NewControllerManagedBy(mgr).
-			Named("prod-sub-" + k).
-			WatchesRawSource(source.Channel(sweeper.EventsFor(k), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-				if obj == nil {
-					foreignHits.Add(1)
-					return nil
-				}
-				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
-			}))).
-			Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (ctrl.Result, error) {
-				if req.NamespacedName == expectedReq {
-					counter.Add(1)
-				} else {
-					foreignHits.Add(1)
-				}
-				return ctrl.Result{}, nil
-			})); err != nil {
-			t.Fatalf("setup subscriber %s: %v", k, err)
+	wrapClient := func(subName string, expected types.NamespacedName, matches func(client.Object) bool) (*subWatchClient, *subWatchReader) {
+		reader := &subWatchReader{
+			Reader:      mgr.GetAPIReader(),
+			expected:    expected,
+			matchesType: matches,
+			hits:        subHits[subName],
+			foreignHits: &foreignHits,
 		}
+		return &subWatchClient{
+			Client: mgr.GetClient(),
+			reader: &subWatchReader{
+				Reader:      mgr.GetClient(),
+				expected:    expected,
+				matchesType: matches,
+				hits:        subHits[subName],
+				foreignHits: &foreignHits,
+			},
+		}, reader
 	}
-	expectedTunnelReq := types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-CloudflareTunnel"}
-	if err := ctrl.NewControllerManagedBy(mgr).
-		Named("prod-sub-gateway-tunnel").
-		WatchesRawSource(source.Channel(sweeper.EventsFor("CloudflareTunnel"), handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-			if obj == nil {
-				foreignHits.Add(1)
-				return nil
-			}
-			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
-		}))).
-		Complete(reconcile.Func(func(_ context.Context, req reconcile.Request) (ctrl.Result, error) {
-			if req.NamespacedName == expectedTunnelReq {
-				gwTunnelSubHits.Add(1)
-			} else {
-				foreignHits.Add(1)
-			}
-			return ctrl.Result{}, nil
-		})); err != nil {
-		t.Fatalf("setup subscriber Gateway-CloudflareTunnel: %v", err)
+	probeKey := func(kind string) types.NamespacedName {
+		return types.NamespacedName{Namespace: "tenant-fanout", Name: "probe-" + kind}
+	}
+
+	// Separate undrained slow subscriber overflowing buffer=3 on ZeroTrustList.
+	_ = sweeper.EventsFor("ZeroTrustList")
+
+	// Register ALL 19 real production reconcilers matching cmd/main.go:357-595.
+	polClient, _ := wrapClient("AccessPolicy", probeKey("AccessPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessPolicy); return ok })
+	vnetClient, _ := wrapClient("VirtualNetwork", probeKey("VirtualNetwork"), func(o client.Object) bool { _, ok := o.(*v1alpha1.VirtualNetwork); return ok })
+	tunnelClient, _ := wrapClient("CloudflareTunnel", probeKey("CloudflareTunnel"), func(o client.Object) bool { _, ok := o.(*v1alpha1.CloudflareTunnel); return ok })
+	gwSubClient, _ := wrapClient("Gateway-CloudflareTunnel", types.NamespacedName{Namespace: "tenant-fanout", Name: "gw-target-for-tunnel"}, func(o client.Object) bool { _, ok := o.(*gatewayv1.Gateway); return ok })
+	nrClient, _ := wrapClient("NetworkRoute", probeKey("NetworkRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.NetworkRoute); return ok })
+	hrClient, _ := wrapClient("HostnameRoute", probeKey("HostnameRoute"), func(o client.Object) bool { _, ok := o.(*v1alpha1.HostnameRoute); return ok })
+	wcClient, _ := wrapClient("WARPConnector", probeKey("WARPConnector"), func(o client.Object) bool { _, ok := o.(*v1alpha1.WARPConnector); return ok })
+	grpClient, grpReader := wrapClient("AccessGroup", probeKey("AccessGroup"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessGroup); return ok })
+	idpClient, _ := wrapClient("IdentityProvider", probeKey("IdentityProvider"), func(o client.Object) bool { _, ok := o.(*v1alpha1.IdentityProvider); return ok })
+	dprClient, _ := wrapClient("DevicePostureRule", probeKey("DevicePostureRule"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureRule); return ok })
+	dpiClient, _ := wrapClient("DevicePostureIntegration", probeKey("DevicePostureIntegration"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DevicePostureIntegration); return ok })
+	stClient, _ := wrapClient("ServiceToken", probeKey("ServiceToken"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ServiceToken); return ok })
+	appClient, _ := wrapClient("AccessApplication", probeKey("AccessApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessApplication); return ok })
+	saClient, _ := wrapClient("AccessStandaloneApplication", probeKey("AccessStandaloneApplication"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessStandaloneApplication); return ok })
+	infraClient, infraReader := wrapClient("AccessInfrastructureTarget", probeKey("AccessInfrastructureTarget"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessInfrastructureTarget); return ok })
+	cpClient, _ := wrapClient("AccessCustomPage", probeKey("AccessCustomPage"), func(o client.Object) bool { _, ok := o.(*v1alpha1.AccessCustomPage); return ok })
+	dpClient, _ := wrapClient("DeviceProfile", probeKey("DeviceProfile"), func(o client.Object) bool { _, ok := o.(*v1alpha1.DeviceProfile); return ok })
+	ztlClient, _ := wrapClient("ZeroTrustList", probeKey("ZeroTrustList"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustList); return ok })
+	gwPolClient, _ := wrapClient("ZeroTrustGatewayPolicy", probeKey("ZeroTrustGatewayPolicy"), func(o client.Object) bool { _, ok := o.(*v1alpha1.ZeroTrustGatewayPolicy); return ok })
+
+	for _, err := range []error{
+		(&AccessPolicyReconciler{Client: polClient, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessPolicy")}).SetupWithManager(mgr),
+		(&VirtualNetworkReconciler{Client: vnetClient, Scheme: mgr.GetScheme(), NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("VirtualNetwork")}).SetupWithManager(mgr),
+		(&CloudflareTunnelReconciler{Client: tunnelClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: tunnelFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("CloudflareTunnel")}).SetupWithManager(mgr),
+		(&GatewayReconciler{Client: gwSubClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace, CloudflareFactory: gatewayCloudflareFactory{api: gwAPI}, Prober: &staticGatewayProber{version: 1, ready: true}, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("CloudflareTunnel")}).SetupWithManager(mgr),
+		(&NetworkRouteReconciler{Client: nrClient, Scheme: mgr.GetScheme(), NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("NetworkRoute")}).SetupWithManager(mgr),
+		(&HostnameRouteReconciler{Client: hrClient, Scheme: mgr.GetScheme(), OperatorNamespace: dataplane.DefaultOperatorNamespace, NewCloudflareClient: vnetFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("HostnameRoute")}).SetupWithManager(mgr),
+		(&WARPConnectorReconciler{Client: wcClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.WARPConnectorAPI, error) { return warpFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("WARPConnector")}).SetupWithManager(mgr),
+		(&AccessGroupReconciler{Client: grpClient, APIReader: grpReader, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessGroup")}).SetupWithManager(mgr),
+		(&IdentityProviderReconciler{Client: idpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return idpFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("IdentityProvider")}).SetupWithManager(mgr),
+		(&DevicePostureRuleReconciler{Client: dprClient, Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DevicePostureRule")}).SetupWithManager(mgr),
+		(&DevicePostureIntegrationReconciler{Client: dpiClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return integrationFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DevicePostureIntegration")}).SetupWithManager(mgr),
+		(&ServiceTokenReconciler{Client: stClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: accessFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ServiceToken")}).SetupWithManager(mgr),
+		(&AccessApplicationReconciler{Client: appClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), OperatorNamespace: dataplane.DefaultOperatorNamespace, NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return appFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessApplication")}).SetupWithManager(mgr),
+		(&AccessStandaloneApplicationReconciler{Client: saClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessStandaloneApplication")}).SetupWithManager(mgr),
+		(&AccessInfrastructureTargetReconciler{Client: infraClient, APIReader: infraReader, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return infraFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessInfrastructureTarget")}).SetupWithManager(mgr),
+		(&AccessCustomPageReconciler{Client: cpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return customPageFake, nil }, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("AccessCustomPage")}).SetupWithManager(mgr),
+		(&DeviceProfileReconciler{Client: dpClient, Scheme: mgr.GetScheme(), NewCloudflareClient: profileFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("DeviceProfile")}).SetupWithManager(mgr),
+		(&ZeroTrustListReconciler{Client: ztlClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: gatewayFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ZeroTrustList")}).SetupWithManager(mgr),
+		(&ZeroTrustGatewayPolicyReconciler{Client: gwPolClient, APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), NewCloudflareClient: gatewayFake.Client, Freshness: policy, Invalidator: latch, SweepEvents: sweeper.EventsFor("ZeroTrustGatewayPolicy")}).SetupWithManager(mgr),
+	} {
+		if err != nil {
+			t.Fatalf("setup production reconciler: %v", err)
+		}
 	}
 
 	startManagerAndWait(t, mgr)
@@ -523,23 +601,49 @@ func TestQA2A1PerKindSweepFanoutEnvtest(t *testing.T) {
 		vnetFake.mu.Unlock()
 		return true, nil
 	})
-	// Phase 1 check: allow one tick to confirm zero cross-kind delivery onto the 16 other subscriptions.
+	// Phase 1 check: allow one tick to confirm zero cross-kind delivery onto any subscription.
 	time.Sleep(100 * time.Millisecond)
 	if got := foreignHits.Load(); got != 0 {
 		t.Fatalf("foreign/cross-kind subscriptions received %d unexpected events, want 0", got)
 	}
 
-	// Phase 2: trigger 1 targeted drift event per remaining production target kind and verify
-	// positive delivery to every single subscription (including both CloudflareTunnel subscribers)
-	// with zero cross-kind hits.
+	// Create Gateway referencing probe-CloudflareTunnel so GatewayReconciler maps
+	// CloudflareTunnel sweep events via its real SetupWithManager watch & mapTunnelToGateways.
+	gwTargetHost := gatewayv1.Hostname("fanout-gw.example.com")
+	gwTarget := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-fanout", Name: "gw-target-for-tunnel"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "nonexistent-fanout-class",
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &gwTargetHost}},
+			Infrastructure:   &gatewayv1.GatewayInfrastructure{ParametersRef: &gatewayv1.LocalParametersReference{Group: v1alpha1.Group, Kind: "CloudflareTunnel", Name: "probe-CloudflareTunnel"}},
+		},
+	}
+	if err := direct.Create(ctx, gwTarget); err != nil {
+		t.Fatalf("create gw-target-for-tunnel: %v", err)
+	}
+	waitUntilTrue(t, 5*time.Second, "Gateway initial create reconcile observed", func() (bool, error) {
+		return subHits["Gateway-CloudflareTunnel"].Load() >= 1, nil
+	})
+	time.Sleep(100 * time.Millisecond)
+	subHits["Gateway-CloudflareTunnel"].Store(0)
+
+	// Phase 2: trigger 1 targeted drift event per production target kind and verify
+	// positive Reconcile execution across ALL 19 real production subscriptions with zero cross-kind hits.
 	emitAllKinds.Store(true)
-	waitUntilTrue(t, 10*time.Second, "all remaining production sweep subscriptions receive their addressed event", func() (bool, error) {
-		for _, c := range otherSubHits {
-			if c.Load() != 1 {
-				return false, nil
+	var missing []string
+	defer func() {
+		if t.Failed() && len(missing) > 0 {
+			t.Logf("subscriptions with 0 hits: %v", missing)
+		}
+	}()
+	waitUntilTrue(t, 10*time.Second, "all 19 production sweep subscriptions execute Reconcile for their addressed event", func() (bool, error) {
+		missing = missing[:0]
+		for name, c := range subHits {
+			if c.Load() < 1 {
+				missing = append(missing, name)
 			}
 		}
-		return true, nil
+		return len(missing) == 0, nil
 	})
 	if got := foreignHits.Load(); got != 0 {
 		t.Fatalf("Phase 2 cross-kind subscriptions received %d unexpected events, want 0", got)

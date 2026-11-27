@@ -412,11 +412,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
-	// Preserve previously published Addresses across the early admission status
-	// patch so a steady-state reconcile does not flash Addresses to nil and
-	// back to the same tunnel hostname (avoiding two redundant status writes).
-	// Unprogrammed/compile-failure paths clear Addresses explicitly.
-	statuses.Gateway.Addresses = slices.Clone(gateway.Status.Addresses)
+	// Admission-only patch: patchGatewayStatus preserves live Programmed,
+	// listener Programmed, and Addresses from the freshly fetched current
+	// revision so a stale reconcile-start snapshot can never republish True
+	// over a newer demotion or churn Addresses on steady-state passes.
 	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1609,7 +1608,7 @@ func (r *GatewayReconciler) reportDataplaneRejection(
 		marked.reason,
 	)
 
-	before := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	before := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	if before != nil {
 		before = before.DeepCopy()
 	}
@@ -1728,35 +1727,19 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 	if r.Now != nil {
 		now = metav1.NewTime(r.Now())
 	}
-	if meta.FindStatusCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed)) == nil {
-		if prev := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prev != nil {
-			status.Conditions = append(status.Conditions, *prev.DeepCopy())
-		}
-	}
 	status.Conditions = prepareConditions(
 		status.Conditions,
 		gateway.Generation,
 		now,
 		map[string]struct{}{
-			string(gatewayv1.GatewayConditionAccepted):   {},
-			string(gatewayv1.GatewayConditionProgrammed): {},
+			string(gatewayv1.GatewayConditionAccepted): {},
 		},
-		string(gatewayv1.GatewayConditionProgrammed),
-		string(gatewayv1.GatewayReasonPending),
-		"Reconciling Gateway configuration",
+		"",
+		"",
+		"",
 	)
 	for index := range status.Listeners {
 		listener := &status.Listeners[index]
-		if meta.FindStatusCondition(listener.Conditions, string(gatewayv1.ListenerConditionProgrammed)) == nil {
-			for j := range gateway.Status.Listeners {
-				if gateway.Status.Listeners[j].Name == listener.Name {
-					if prev := meta.FindStatusCondition(gateway.Status.Listeners[j].Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
-						listener.Conditions = append(listener.Conditions, *prev.DeepCopy())
-					}
-					break
-				}
-			}
-		}
 		listener.Conditions = prepareConditions(
 			listener.Conditions,
 			gateway.Generation,
@@ -1765,11 +1748,10 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 				string(gatewayv1.ListenerConditionAccepted):     {},
 				string(gatewayv1.ListenerConditionResolvedRefs): {},
 				string(gatewayv1.ListenerConditionConflicted):   {},
-				string(gatewayv1.ListenerConditionProgrammed):   {},
 			},
-			string(gatewayv1.ListenerConditionProgrammed),
-			string(gatewayv1.ListenerReasonPending),
-			"Reconciling listener configuration",
+			"",
+			"",
+			"",
 		)
 	}
 }
@@ -1789,7 +1771,7 @@ func prepareConditions(
 		if _, ok := owned[condition.Type]; !ok {
 			continue
 		}
-		if condition.Type == programmedType {
+		if programmedType != "" && condition.Type == programmedType {
 			programmedFound = true
 			if condition.ObservedGeneration != generation && condition.Status == metav1.ConditionTrue {
 				condition.Status = metav1.ConditionUnknown
@@ -1800,7 +1782,7 @@ func prepareConditions(
 		}
 		condition.ObservedGeneration = generation
 	}
-	if !programmedFound {
+	if programmedType != "" && !programmedFound {
 		result = append(result, metav1.Condition{
 			Type:               programmedType,
 			Status:             metav1.ConditionUnknown,
@@ -1816,6 +1798,11 @@ func prepareConditions(
 func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
 	deleted := false
 	var patched gatewayv1.GatewayStatus
+	now := metav1.Now()
+	if r.Now != nil {
+		now = metav1.NewTime(r.Now())
+	}
+	admissionOnly := meta.FindStatusCondition(desired.Conditions, string(gatewayv1.GatewayConditionProgrammed)) == nil
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current gatewayv1.Gateway
 		if err := r.Get(ctx, key, &current); err != nil {
@@ -1830,15 +1817,38 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 			string(gatewayv1.GatewayConditionAccepted):   {},
 			string(gatewayv1.GatewayConditionProgrammed): {},
 		}
+		if admissionOnly {
+			delete(ownedGatewayConditions, string(gatewayv1.GatewayConditionProgrammed))
+		}
 		merged := desired
+		if admissionOnly {
+			merged.Addresses = slices.Clone(current.Status.Addresses)
+		}
 		merged.Conditions = make([]metav1.Condition, 0, len(current.Status.Conditions)+len(desired.Conditions))
 		for _, condition := range desired.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
 				merged.Conditions = append(merged.Conditions, condition)
 			}
 		}
+		if admissionOnly {
+			if prev := meta.FindStatusCondition(current.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prev != nil {
+				merged.Conditions = append(merged.Conditions, *prev.DeepCopy())
+			}
+			merged.Conditions = prepareConditions(
+				merged.Conditions,
+				current.Generation,
+				now,
+				map[string]struct{}{string(gatewayv1.GatewayConditionProgrammed): {}},
+				string(gatewayv1.GatewayConditionProgrammed),
+				string(gatewayv1.GatewayReasonPending),
+				"Reconciling Gateway configuration",
+			)
+		}
 		for _, condition := range current.Status.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				continue
+			}
+			if admissionOnly && condition.Type == string(gatewayv1.GatewayConditionProgrammed) {
 				continue
 			}
 			merged.Conditions = append(merged.Conditions, condition)
@@ -1849,6 +1859,9 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 				string(gatewayv1.ListenerConditionResolvedRefs): {},
 				string(gatewayv1.ListenerConditionConflicted):   {},
 				string(gatewayv1.ListenerConditionProgrammed):   {},
+			}
+			if admissionOnly {
+				delete(ownedListenerConditions, string(gatewayv1.ListenerConditionProgrammed))
 			}
 			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
 			for i := range desired.Listeners {
@@ -1863,13 +1876,32 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 					if current.Status.Listeners[j].Name != merged.Listeners[i].Name {
 						continue
 					}
+					if admissionOnly {
+						if prev := meta.FindStatusCondition(current.Status.Listeners[j].Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
+							merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, *prev.DeepCopy())
+						}
+					}
 					for _, condition := range current.Status.Listeners[j].Conditions {
 						if _, owned := ownedListenerConditions[condition.Type]; owned {
+							continue
+						}
+						if admissionOnly && condition.Type == string(gatewayv1.ListenerConditionProgrammed) {
 							continue
 						}
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
 					break
+				}
+				if admissionOnly {
+					merged.Listeners[i].Conditions = prepareConditions(
+						merged.Listeners[i].Conditions,
+						current.Generation,
+						now,
+						map[string]struct{}{string(gatewayv1.ListenerConditionProgrammed): {}},
+						string(gatewayv1.ListenerConditionProgrammed),
+						string(gatewayv1.ListenerReasonPending),
+						"Reconciling listener configuration",
+					)
 				}
 			}
 		}

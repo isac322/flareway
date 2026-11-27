@@ -24,13 +24,13 @@ Every Cloudflare-backed kind carries a grade chosen by how directly a stale judg
 |---|---|---|---|
 | T0 | none | always fresh | Reads before destructive writes, ownership and adoption claims, reads inside the tunnel configuration lock, and all `ObserveOnly` observation. Never gated, not tunable. |
 | T1 | `--freshness-authz` | `60s` | `AccessApplication`, `AccessStandaloneApplication`, `AccessPolicy`, `AccessGroup`, `AccessCustomPage`, `AccessInfrastructureTarget`, `ServiceToken`, `IdentityProvider` |
-| T2 | `--freshness-traffic` | `300s` | `CloudflareTunnel`, DNS records, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute` |
+| T2 | `--freshness-traffic` | `300s` | `CloudflareTunnel`, `Gateway` tunnel configuration (`CloudflareTunnelConfig`), DNS records, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute` |
 | T3 | `--freshness-indirect` | `1800s` | `DeviceProfile`, `DeviceSettings`, `DevicePostureRule`, `DevicePostureIntegration`, `ZeroTrustOrganization`, `WARPConnector` |
 | T4 | `--freshness-display` | `0` | Display-only reads. `0` means no periodic read. |
 
 `CloudflareAccount` has no grade. Its remote calls are the resource's own liveness and authorization evidence rather than convergence reads, and they run on a ten-minute cycle.
 
-The manager rejects a negative duration and requires `--freshness-authz` ≤ `--freshness-traffic` ≤ `--freshness-indirect` among the positive values. A grade set to `0` is on-demand and exempt from that ordering.
+The manager rejects a negative duration and requires `--freshness-authz` ≤ `--freshness-traffic` ≤ `--freshness-indirect` among the positive values. A grade set to `0` disables that grade's read-skip gate and sweep loops (retaining the watch-driven or periodic behavior below) and is exempt from that ordering.
 
 ### Choosing a profile
 
@@ -133,7 +133,7 @@ A DNS or zone-scoped Access pass with isolated zone failures reports `result="pa
 
 ## Disabling the sweep or gates
 
-`--disable-sweep` stops the sweep worker. Freshness gates keep working, and every object reads its remote once per TTL, so out-of-band drift is detected only when that TTL expires.
+`--disable-sweep` stops the sweep worker. Freshness gates with a positive TTL keep working, and every object on a positive grade reads its remote once per TTL so out-of-band drift is detected when that TTL expires (grade-0 controllers follow their fallback intervals, such as `10s` on a programmed `Gateway`).
 
 Setting a freshness flag to `0` stops that grade's target sweep loops (even if `--disable-sweep` is unset) and keeps its gates closed, so reconcilers read Cloudflare on every reconcile pass. Controllers with periodic drift loops (`AccessApplication`, `AccessStandaloneApplication`, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `ZeroTrustOrganization`, `WARPConnector`, `DeviceSettings`, `CloudflareTunnel`, and `Gateway`) fall back to their periodic requeue intervals even when freshness is `0`; `ServiceToken` keeps its credential-expiry scheduler independently of freshness TTL; and event-driven controllers (`AccessPolicy`, `AccessGroup`, `AccessInfrastructureTarget`, `AccessCustomPage`, `IdentityProvider`, `DevicePostureRule`, `DevicePostureIntegration`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute`, and `DeviceProfile`) return `RequeueAfter=0s` and recheck on Kubernetes watch events:
 

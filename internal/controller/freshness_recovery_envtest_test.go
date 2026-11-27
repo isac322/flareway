@@ -1720,11 +1720,26 @@ func (f *reg1OrganizationAPI) GetServiceToken(context.Context, flarecloudflare.A
 	return flarecloudflare.ServiceToken{ID: "ext-st-reg1", Name: "ext-st-reg1"}, nil
 }
 
+type standaloneWithExternalLookupAPI struct {
+	*fakeStandaloneCloudflare
+	policies flarecloudflare.AccessAPI
+	pages    flarecloudflare.AccessAPI
+}
+
+func (s *standaloneWithExternalLookupAPI) GetAccessPolicy(ctx context.Context, id string) (flarecloudflare.AccessPolicy, error) {
+	return s.policies.GetAccessPolicy(ctx, id)
+}
+
+func (s *standaloneWithExternalLookupAPI) GetAccessCustomPage(ctx context.Context, id string) (flarecloudflare.AccessCustomPage, error) {
+	return s.pages.GetAccessCustomPage(ctx, id)
+}
+
 // QA-2-REG-1: Steady-state 0 remote reads and 0 K8s status write requests for
 // healthy converged resources across ALL 19 ordinary gated CRDs (including SCIM
 // IdentityProvider, Gateway-backed AccessApplication, external-ref AccessPolicy,
-// external-ref DevicePostureRule, external-ref ZeroTrustOrganization, and
-// sweep-confirmed variants), Direct External DNS CloudflareTunnel, and Gateway.
+// external-ref AccessGroup, external-ref AccessStandaloneApplication, external-ref
+// DevicePostureRule, external-ref ZeroTrustOrganization, and sweep-confirmed
+// variants), Direct External DNS CloudflareTunnel, and Gateway.
 func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
 	ctx := context.Background()
@@ -1740,6 +1755,19 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed external AccessGroup: %v", err)
 	}
+	extPolStandalone, err := store.CreateAccessPolicy(ctx, flarecloudflare.AccessPolicyInput{
+		Name: "ext-pol-standalone-reg1", Decision: "Allow", Include: []flarecloudflare.ResolvedAccessRule{{Kind: "everyone"}},
+	})
+	if err != nil {
+		t.Fatalf("seed external standalone AccessPolicy: %v", err)
+	}
+	customPageBase := newFakeCustomPageCloudflare()
+	extCPStandalone, err := customPageBase.CreateAccessCustomPage(ctx, flarecloudflare.AccessCustomPageInput{
+		Name: "ext-cp-standalone-reg1", Type: v1alpha1.AccessCustomPageTypeForbidden, HTML: "<p>ext</p>",
+	})
+	if err != nil {
+		t.Fatalf("seed external standalone AccessCustomPage: %v", err)
+	}
 	integrationBase := &fakeDevicePostureIntegrationCloudflare{
 		integrations: map[string]flarecloudflare.DevicePostureIntegration{
 			"ext-tanium-1": {ID: "ext-tanium-1", Name: "ext-tanium", Type: v1alpha1.DevicePostureIntegrationTypeTaniumS2S},
@@ -1749,11 +1777,14 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 		recordingAccessAPI: &recordingAccessAPI{AccessAPI: store},
 		integrations:       integrationBase,
 	}
-	standaloneBase := &fakeStandaloneCloudflare{applications: map[string]flarecloudflare.AccessApplication{}, tags: map[string]flarecloudflare.AccessTag{}}
+	standaloneBase := &standaloneWithExternalLookupAPI{
+		fakeStandaloneCloudflare: &fakeStandaloneCloudflare{applications: map[string]flarecloudflare.AccessApplication{}, tags: map[string]flarecloudflare.AccessTag{}},
+		policies:                 store,
+		pages:                    customPageBase,
+	}
 	standaloneRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: standaloneBase}}
 	infraBase := &fakeInfrastructureTargetCloudflare{targets: map[string]flarecloudflare.AccessInfrastructureTarget{}}
 	infraRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: infraBase}}
-	customPageBase := newFakeCustomPageCloudflare()
 	customPageRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: customPageBase}}
 	integrationRemote := &countingAccessExtendedAPI{
 		recordingAccessAPI: &recordingAccessAPI{AccessAPI: store},
@@ -2151,12 +2182,34 @@ func TestQA2REG1SteadyStateZeroRemoteReadsAndStatusWritesEnvtest(t *testing.T) {
 				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
 			},
 		}, "Ready", grpReconciler.Reconcile},
+		{"AccessGroup-ext", &v1alpha1.AccessGroup{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "grp-ext-steady"},
+			Spec: v1alpha1.AccessGroupSpec{
+				AccountRef: accountRef, Name: "grp-ext-steady",
+				Include:          []v1alpha1.AccessRule{{Group: &v1alpha1.AccessGroupRule{GroupRef: v1alpha1.AccessObjectReference{ExternalID: extGroup.ID}}}},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", grpReconciler.Reconcile},
 		{"AccessStandaloneApplication", &v1alpha1.AccessStandaloneApplication{
 			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "standalone-steady"},
 			Spec: v1alpha1.AccessStandaloneApplicationSpec{
 				AccountRef: accountRef, Type: v1alpha1.AccessStandaloneApplicationTypeWARP,
 				Application:      v1alpha1.AccessApplicationSettings{SessionDuration: "24h"},
 				WARP:             &v1alpha1.AccessWARPApplicationSpec{},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
+			},
+		}, "Ready", standaloneReconciler.Reconcile},
+		{"AccessStandaloneApplication-ext", &v1alpha1.AccessStandaloneApplication{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "standalone-ext-steady"},
+			Spec: v1alpha1.AccessStandaloneApplicationSpec{
+				AccountRef: accountRef, Type: v1alpha1.AccessStandaloneApplicationTypeBookmark,
+				Bookmark: &v1alpha1.AccessBookmarkApplicationSpec{URL: "https://ext-bookmark.example.com"},
+				Application: v1alpha1.AccessApplicationSettings{
+					Name:            "standalone-ext-steady",
+					SessionDuration: "1h",
+					CustomPageRefs:  []v1alpha1.AccessCustomPageReference{{ExternalID: extCPStandalone.ID}},
+				},
+				Policies:         []v1alpha1.AccessApplicationPolicyReference{{ExternalRef: &v1alpha1.AccessApplicationPolicyExternalReference{PolicyID: extPolStandalone.ID}}},
 				ManagementPolicy: v1alpha1.ManagementPolicyManaged, DeletionPolicy: v1alpha1.DeletionPolicyDelete,
 			},
 		}, "Ready", standaloneReconciler.Reconcile},
@@ -3315,6 +3368,7 @@ func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
 		applications: map[string]flarecloudflare.AccessApplication{},
 		tags:         map[string]flarecloudflare.AccessTag{},
 	}
+	standaloneRemote := &countingAccessExtendedAPI{recordingAccessAPI: &recordingAccessAPI{AccessAPI: standaloneFake}}
 
 	polReconciler := &AccessPolicyReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
@@ -3328,7 +3382,7 @@ func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
 	}
 	standaloneReconciler := &AccessStandaloneApplicationReconciler{
 		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
-		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneFake, nil },
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return standaloneRemote, nil },
 		Freshness:           policy, Invalidator: latch, Now: nowFn,
 	}
 	if err := polReconciler.SetupWithManager(mgr); err != nil {
@@ -3466,28 +3520,42 @@ func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
 		t.Fatalf("AccessStandaloneApplication ConfirmedAt = %v, want zero", ts)
 	}
 
-	// Delete the external Group out of band while parent Policy & Group listings remain unchanged.
+	// Delete the external Group and external IdentityProvider out of band while parent listings remain unchanged.
 	if err := store.DeleteAccessGroup(ctx, flarecloudflare.AccessScope{}, extGroup.ID); err != nil {
 		t.Fatalf("delete external group: %v", err)
 	}
+	if err := store.DeleteIdentityProvider(ctx, extIDP.ID); err != nil {
+		t.Fatalf("delete external identity provider: %v", err)
+	}
+	standaloneFake.mu.Lock()
+	standaloneFake.idpLookupErr = globalOrganizationNotFound()
+	standaloneFake.mu.Unlock()
 
 	// Advance inside TTL (+30s) and confirm parent listings again: gate stays open within TTL (0 reads).
 	advanceClock(30 * time.Second)
 	_ = latch.ConfirmContent("AccessPolicy", polKey, listedPol, nowFn())
 	_ = latch.ConfirmContent("AccessGroup", grpKey, listedGrp, nowFn())
+	_ = latch.ConfirmContent("AccessStandaloneApplication", standaloneKey, listedApp, nowFn())
 	callsBefore := remote.count()
+	standaloneCallsBefore := standaloneRemote.count()
 	if _, err := polReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
 		t.Fatalf("within-TTL policy reconcile: %v", err)
 	}
 	if _, err := grpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
 		t.Fatalf("within-TTL group reconcile: %v", err)
 	}
+	if _, err := standaloneReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: standaloneKey}); err != nil {
+		t.Fatalf("within-TTL standalone reconcile: %v", err)
+	}
 	if got := remote.count() - callsBefore; got != 0 {
 		t.Fatalf("within-TTL reconciles issued %d remote calls, want 0", got)
 	}
+	if got := standaloneRemote.count() - standaloneCallsBefore; got != 0 {
+		t.Fatalf("within-TTL standalone reconcile issued %d remote calls, want 0", got)
+	}
 
 	// Advance past 60s TTL (+35s) even while parent-only sweep keeps calling ConfirmContent:
-	// the gate MUST expire and detect the deleted external group as RefNotPermitted!
+	// the gate MUST expire and detect the deleted external group / IDP!
 	advanceClock(35 * time.Second)
 	_ = latch.ConfirmContent("AccessPolicy", polKey, listedPol, nowFn())
 	if ts, ok := latch.ConfirmedAt("AccessPolicy", polKey, curPol.Status.AppliedHash); ok && !ts.IsZero() {
@@ -3497,12 +3565,19 @@ func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
 	if ts, ok := latch.ConfirmedAt("AccessGroup", grpKey, curGrp.Status.AppliedHash); ok && !ts.IsZero() {
 		t.Fatalf("parent-only sweep confirmed AccessGroup past TTL: %v", ts)
 	}
+	_ = latch.ConfirmContent("AccessStandaloneApplication", standaloneKey, listedApp, nowFn())
+	if ts, ok := latch.ConfirmedAt("AccessStandaloneApplication", standaloneKey, curStandalone.Status.AppliedHash); ok && !ts.IsZero() {
+		t.Fatalf("parent-only sweep confirmed AccessStandaloneApplication past TTL: %v", ts)
+	}
 
 	if _, err := polReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
 		t.Fatalf("post-TTL policy reconcile: %v", err)
 	}
 	if _, err := grpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
 		t.Fatalf("post-TTL group reconcile: %v", err)
+	}
+	if _, err := standaloneReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: standaloneKey}); err != nil {
+		t.Fatalf("post-TTL standalone reconcile: %v", err)
 	}
 
 	if err := direct.Get(ctx, polKey, &curPol); err != nil {
@@ -3518,6 +3593,13 @@ func TestQA2SweepDoesNotExtendExternalRefPastTTLEnvtest(t *testing.T) {
 	grpReady := meta.FindStatusCondition(curGrp.Status.Conditions, "Ready")
 	if grpReady == nil || grpReady.Status != metav1.ConditionFalse || grpReady.Reason != "RefNotPermitted" {
 		t.Fatalf("AccessGroup after external group deletion + TTL expiry = %#v, want Ready=False (RefNotPermitted)", grpReady)
+	}
+	if err := direct.Get(ctx, standaloneKey, &curStandalone); err != nil {
+		t.Fatal(err)
+	}
+	standaloneReady := meta.FindStatusCondition(curStandalone.Status.Conditions, "Ready")
+	if standaloneReady == nil || standaloneReady.Status != metav1.ConditionFalse {
+		t.Fatalf("AccessStandaloneApplication after external IDP deletion + TTL expiry = %#v, want Ready=False", standaloneReady)
 	}
 }
 
@@ -3562,6 +3644,14 @@ func TestQA2REG4ZeroFreshnessGatewayPeriodicDriftEnvtest(t *testing.T) {
 	snapshots := newFakeSnapshotPublisher()
 	prober := &staticGatewayProber{version: 2, ready: true}
 
+	gwReconciler := &GatewayReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
+		Prober:            prober,
+		Freshness:         freshness.Policy{}, // zero freshness (--freshness-traffic=0)
+		Invalidator:       latch,
+	}
 	for _, err := range []error{
 		(&CloudflareTunnelReconciler{
 			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
@@ -3570,14 +3660,7 @@ func TestQA2REG4ZeroFreshnessGatewayPeriodicDriftEnvtest(t *testing.T) {
 			Invalidator:         latch,
 		}).SetupWithManager(mgr),
 		(&GatewayClassReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
-		(&GatewayReconciler{
-			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
-			Snapshots: snapshots, OperatorNamespace: dataplane.DefaultOperatorNamespace,
-			CloudflareFactory: gatewayCloudflareFactory{api: gwAPI},
-			Prober:            prober,
-			Freshness:         freshness.Policy{}, // zero freshness (--freshness-traffic=0)
-			Invalidator:       latch,
-		}).SetupWithManager(mgr),
+		gwReconciler.SetupWithManager(mgr),
 	} {
 		if err != nil {
 			t.Fatalf("setup controller: %v", err)
@@ -3682,6 +3765,27 @@ func TestQA2REG4ZeroFreshnessGatewayPeriodicDriftEnvtest(t *testing.T) {
 			assertConditionTrueForCurrentGen(curT.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied, curT.Generation), nil
 	})
 
+	// Drain startup reconciles and queued watches completely before testing the timer.
+	waitUntilTrue(t, 10*time.Second, "Gateway startup reconciles drained", func() (bool, error) {
+		gwAPI.mu.Lock()
+		before := len(gwAPI.calls)
+		gwAPI.mu.Unlock()
+		time.Sleep(1500 * time.Millisecond)
+		gwAPI.mu.Lock()
+		after := len(gwAPI.calls)
+		gwAPI.mu.Unlock()
+		return after == before, nil
+	})
+
+	// Directly assert converged Gateway schedules gatewayZeroFreshnessRequeue (10s) at zero traffic freshness.
+	directRes, err := gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(gw)})
+	if err != nil {
+		t.Fatalf("direct steady zero-freshness Gateway reconcile: %v", err)
+	}
+	if directRes.RequeueAfter != gatewayZeroFreshnessRequeue {
+		t.Fatalf("zero-freshness programmed Gateway RequeueAfter = %v, want %v", directRes.RequeueAfter, gatewayZeroFreshnessRequeue)
+	}
+
 	// Mutate remote tunnel config version out of band WITHOUT any Kubernetes event.
 	gwAPI.mu.Lock()
 	updatesBefore := gwAPI.updateCount
@@ -3694,4 +3798,117 @@ func TestQA2REG4ZeroFreshnessGatewayPeriodicDriftEnvtest(t *testing.T) {
 		defer gwAPI.mu.Unlock()
 		return gwAPI.updateCount > updatesBefore && gwAPI.remoteVersion != 99, nil
 	})
+}
+
+// Regression test for stale-snapshot admission overwrite on Gateway:
+// an admission-only prepareGatewayStatus + patchGatewayStatus starting from an
+// older revision (Programmed=True, stale Addresses) MUST NOT overwrite a newer
+// live demotion (Programmed=False, Addresses=nil).
+func TestDefensiveGatewayAdmissionDoesNotRepublishAStaleProgrammedCondition(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-stale-admission"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatalf("create ns: %v", err)
+	}
+	host := gatewayv1.Hostname("stale-guard.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "stale-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "flareway",
+			Listeners:        []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: &host}},
+		},
+	}
+	if err := direct.Create(ctx, gw); err != nil {
+		t.Fatalf("create gw: %v", err)
+	}
+
+	// Step 1: Persist rev A with Accepted=True, Programmed=True, Addresses=[host].
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), gw); err != nil {
+		t.Fatal(err)
+	}
+	t1 := metav1.Now()
+	addrType := gatewayv1.HostnameAddressType
+	gw.Status = gatewayv1.GatewayStatus{
+		Addresses: []gatewayv1.GatewayStatusAddress{{Type: &addrType, Value: string(host)}},
+		Conditions: []metav1.Condition{
+			{Type: string(gatewayv1.GatewayConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+			{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+		},
+		Listeners: []gatewayv1.ListenerStatus{{
+			Name: "http",
+			Conditions: []metav1.Condition{
+				{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+				{Type: string(gatewayv1.ListenerConditionResolvedRefs), Status: metav1.ConditionTrue, Reason: "ResolvedRefs", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+				{Type: string(gatewayv1.ListenerConditionConflicted), Status: metav1.ConditionFalse, Reason: "NoConflicts", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+				{Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed", Message: "ok", ObservedGeneration: gw.Generation, LastTransitionTime: t1},
+			},
+		}},
+	}
+	if err := direct.Status().Update(ctx, gw); err != nil {
+		t.Fatalf("write rev A status: %v", err)
+	}
+	staleSnapshot := gw.DeepCopy()
+
+	// Step 2: Live demotion (rev B): Programmed=False/Pending, listener Programmed=False/Pending, Addresses=nil.
+	var liveGW gatewayv1.Gateway
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &liveGW); err != nil {
+		t.Fatal(err)
+	}
+	t2 := metav1.NewTime(t1.Add(time.Second))
+	liveGW.Status.Addresses = nil
+	meta.SetStatusCondition(&liveGW.Status.Conditions, metav1.Condition{
+		Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionFalse, Reason: "Pending", Message: "probe down", ObservedGeneration: liveGW.Generation, LastTransitionTime: t2,
+	})
+	meta.SetStatusCondition(&liveGW.Status.Listeners[0].Conditions, metav1.Condition{
+		Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionFalse, Reason: "Pending", Message: "probe down", ObservedGeneration: liveGW.Generation, LastTransitionTime: t2,
+	})
+	if err := direct.Status().Update(ctx, &liveGW); err != nil {
+		t.Fatalf("write rev B demotion: %v", err)
+	}
+	demotedRV := liveGW.ResourceVersion
+
+	// Step 3: Run the real admission prepare + patch functions using staleSnapshot (rev A).
+	reconciler := &GatewayReconciler{
+		Client:    direct,
+		APIReader: direct,
+		Scheme:    mgr.GetScheme(),
+	}
+	admissionStatus := gatewayv1.GatewayStatus{
+		Conditions: []metav1.Condition{
+			{Type: string(gatewayv1.GatewayConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
+		},
+		Listeners: []gatewayv1.ListenerStatus{{
+			Name: "http",
+			Conditions: []metav1.Condition{
+				{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
+				{Type: string(gatewayv1.ListenerConditionResolvedRefs), Status: metav1.ConditionTrue, Reason: "ResolvedRefs", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
+				{Type: string(gatewayv1.ListenerConditionConflicted), Status: metav1.ConditionFalse, Reason: "NoConflicts", Message: "ok", ObservedGeneration: staleSnapshot.Generation, LastTransitionTime: t1},
+			},
+		}},
+	}
+	reconciler.prepareGatewayStatus(&admissionStatus, staleSnapshot)
+	if err := reconciler.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gw), admissionStatus); err != nil {
+		t.Fatalf("patchGatewayStatus with stale admission snapshot: %v", err)
+	}
+
+	var after gatewayv1.Gateway
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(gw), &after); err != nil {
+		t.Fatal(err)
+	}
+	prog := meta.FindStatusCondition(after.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "Pending" {
+		t.Fatalf("stale admission patch overwrote live Programmed condition: got %#v, want False/Pending", prog)
+	}
+	lprog := meta.FindStatusCondition(after.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if lprog == nil || lprog.Status != metav1.ConditionFalse || lprog.Reason != "Pending" {
+		t.Fatalf("stale admission patch overwrote live listener Programmed condition: got %#v, want False/Pending", lprog)
+	}
+	if len(after.Status.Addresses) != 0 {
+		t.Fatalf("stale admission patch restored stale Addresses %#v, want nil", after.Status.Addresses)
+	}
+	if after.ResourceVersion != demotedRV {
+		t.Fatalf("admission no-op bumped ResourceVersion %s -> %s, want unchanged %s", demotedRV, after.ResourceVersion, demotedRV)
+	}
 }
