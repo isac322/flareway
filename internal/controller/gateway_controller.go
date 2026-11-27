@@ -558,6 +558,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	pending := false
+	tunnelConfigCommitted := false
 	requeueDelay := programmedRequeue
 	if compiled.ConformanceMode {
 		addresses, addressReady, addressMessage, err := r.serviceAddresses(ctx, compiled)
@@ -725,6 +726,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					// onto another owner's or another generation's object.
 					return ctrl.Result{}, err
 				}
+			} else {
+				tunnelConfigCommitted = true
 			}
 		} else {
 			// Demotion commits before the data apply.
@@ -737,6 +740,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
+	}
+	if tunnelConfigCommitted && !pending {
+		r.confirmTunnelConfigGate(cloudflareResult)
 	}
 	if compiled.ConformanceMode {
 		observability.Default.SetConfigVersions(req.String(), 0, 0)
@@ -2339,17 +2345,7 @@ func applyObject(ctx context.Context, kube client.Client, scheme *runtime.Scheme
 	return kube.Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), options...)
 }
 
-// SetupWithManager registers the Gateway API and Cloudflare-mode cache watches.
-func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.OperatorNamespace == "" {
-		r.OperatorNamespace = dataplane.DefaultOperatorNamespace
-	}
-	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorder("flareway-gateway")
-	}
-	if r.APIReader == nil {
-		r.APIReader = mgr.GetAPIReader()
-	}
+func (r *GatewayReconciler) registerFieldIndexers(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.HTTPRoute{}, httpRouteParentGatewayIndex, func(object client.Object) []string {
 		return httpRouteParentGatewayKeys(object.(*gatewayv1.HTTPRoute))
 	}); err != nil {
@@ -2375,7 +2371,6 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index GatewayClass parametersRef: %w", err)
 	}
-
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.BackendTLSPolicy{}, backendTLSPolicyTargetServiceIndex, func(object client.Object) []string {
 		return backendTLSPolicyTargetServiceKeys(object.(*gatewayv1.BackendTLSPolicy))
 	}); err != nil {
@@ -2395,6 +2390,23 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return accessApplicationTargetKeys(object.(*v1alpha1.AccessApplication), "HTTPRoute")
 	}); err != nil {
 		return fmt.Errorf("index AccessApplication target HTTPRoutes: %w", err)
+	}
+	return nil
+}
+
+// SetupWithManager registers the Gateway API and Cloudflare-mode cache watches.
+func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.OperatorNamespace == "" {
+		r.OperatorNamespace = dataplane.DefaultOperatorNamespace
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("flareway-gateway")
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	if err := r.registerFieldIndexers(mgr); err != nil {
+		return err
 	}
 
 	blder := ctrl.NewControllerManagedBy(mgr).

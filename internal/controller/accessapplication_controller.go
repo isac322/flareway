@@ -338,7 +338,6 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		if desiredHash != "" {
 			status.AppliedHash, status.AppliedAt, _ = nextGateStamp(application.Status.AppliedHash, application.Status.AppliedAt, newGateStamp(desiredHash, r.now()))
 		}
-		clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	}
 	if err := r.patchStatus(ctx, application, status); err != nil {
 		return ctrl.Result{}, err
@@ -346,6 +345,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
 	}
+	clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	stamp := newGateStamp(desiredHash, r.now())
 	// The sweep hands the matcher this application as it was listed, together
 	// with the pass's full application listing (bypass children) and, when any
@@ -2413,11 +2413,7 @@ func (r *AccessApplicationReconciler) now() time.Time {
 	return time.Now()
 }
 
-// SetupWithManager registers all indexes and watches that can change Access application compilation or cleanup.
-func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.APIReader == nil {
-		r.APIReader = mgr.GetAPIReader()
-	}
+func (r *AccessApplicationReconciler) registerFieldIndexers(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.AccessApplication{}, accessApplicationTargetIndex, func(object client.Object) []string {
 		return accessApplicationIndexTargetKeys(object.(*v1alpha1.AccessApplication))
 	}); err != nil {
@@ -2435,6 +2431,17 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Secret{}, accessApplicationHandoffOwnerIndex, accessHandoffOwnerIndexKeys(r.operatorNamespace())); err != nil {
 		return fmt.Errorf("index Access handoff Secret owners: %w", err)
+	}
+	return nil
+}
+
+// SetupWithManager registers all indexes and watches that can change Access application compilation or cleanup.
+func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	if err := r.registerFieldIndexers(mgr); err != nil {
+		return err
 	}
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.AccessApplication{}, builder.WithPredicates(desiredStateChangedPredicate)).

@@ -420,6 +420,10 @@ func TestGatewayTunnelConfigConfirmKeepsAppliedAt(t *testing.T) {
 	if counter.writes != 0 {
 		t.Fatalf("confirm of the recorded version wrote configVersion %d times", counter.writes)
 	}
+	if result.verifiedAt.IsZero() {
+		t.Fatal("confirm did not populate verifiedAt for post-commit confirmation")
+	}
+	reconciler.confirmTunnelConfigGate(result)
 
 	// Shortly after the confirm the gate is open although status still holds
 	// the old appliedAt: the confirm time is anchored in memory.
@@ -951,5 +955,68 @@ func TestTunnelGatewayDataUnchangedChecksFieldsV1(t *testing.T) {
 		`}}`
 	if tunnelGatewayDataUnchanged(makeTunnel(metav1.ManagedFieldsOperationApply, "status", missingProtectionDomainLeaf), config, hostnames, listeners) {
 		t.Fatal("tunnelGatewayDataUnchanged returned true when listeners[].protectionDomains[].envoyPort leaf is unowned")
+	}
+
+	// Empty associative lists leave no f:hostnames / f:listeners entry in kube-apiserver FieldsV1.
+	emptyListsTunnel := makeTunnel(metav1.ManagedFieldsOperationApply, "status", `{"f:status":{"f:configVersion":{"f:applied":{},"f:appliedAt":{},"f:desired":{},"f:desiredHash":{},"f:remote":{}}}}`)
+	emptyListsTunnel.Status.Hostnames = nil
+	emptyListsTunnel.Status.Listeners = nil
+	if !tunnelGatewayDataUnchanged(emptyListsTunnel, config, nil, nil) {
+		t.Fatal("tunnelGatewayDataUnchanged returned false when both live and desired associative lists are empty")
+	}
+	emptyListsTunnel.Status.Hostnames = hostnames
+	if tunnelGatewayDataUnchanged(emptyListsTunnel, config, nil, nil) {
+		t.Fatal("tunnelGatewayDataUnchanged returned true when live.Status.Hostnames is non-empty and desired is empty")
+	}
+
+	// A lingering legacy Update entry carrying f:conditions alongside a clean
+	// Apply entry must not force endless steady-state SSA applies (since Apply
+	// cannot clear Update entries).
+	cleanWithLegacyUpdate := makeTunnel(metav1.ManagedFieldsOperationApply, "status", fullClean)
+	cleanWithLegacyUpdate.ManagedFields = append(cleanWithLegacyUpdate.ManagedFields, metav1.ManagedFieldsEntry{
+		Manager:     gatewayFieldManager,
+		Operation:   metav1.ManagedFieldsOperationUpdate,
+		Subresource: "status",
+		FieldsType:  "FieldsV1",
+		FieldsV1:    metav1.NewFieldsV1(`{"f:status":{"f:conditions":{}}}`),
+	})
+	if !tunnelGatewayDataUnchanged(cleanWithLegacyUpdate, config, hostnames, listeners) {
+		t.Fatal("lingering Update entry with f:conditions triggered steady-state write alongside clean Apply entry")
+	}
+
+	// Composite keyed-list matching must reject missing, null, extra, or non-string keys.
+	badKeys := []struct {
+		name   string
+		fields string
+	}{
+		{
+			name: "missing key field",
+			fields: `{"f:status":{"f:configVersion":{"f:applied":{},"f:appliedAt":{},"f:desired":{},"f:desiredHash":{},"f:remote":{}},` +
+				`"f:hostnames":{"k:{\"hostname\":\"app.example.com\",\"protectionDomain\":\"pd-1\"}":{"f:accessApplication":{},"f:appliedVersion":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}},` +
+				`"f:listeners":{"k:{\"name\":\"http\"}":{"f:exposure":{},"f:name":{},"f:protectionDomains":{"k:{\"name\":\"pd-1\"}":{"f:envoyPort":{},"f:name":{},"f:protected":{}}}}}}}`,
+		},
+		{
+			name: "null key value",
+			fields: `{"f:status":{"f:configVersion":{"f:applied":{},"f:appliedAt":{},"f:desired":{},"f:desiredHash":{},"f:remote":{}},` +
+				`"f:hostnames":{"k:{\"accessApplication\":null,\"hostname\":\"app.example.com\",\"protectionDomain\":\"pd-1\"}":{"f:accessApplication":{},"f:appliedVersion":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}},` +
+				`"f:listeners":{"k:{\"name\":\"http\"}":{"f:exposure":{},"f:name":{},"f:protectionDomains":{"k:{\"name\":\"pd-1\"}":{"f:envoyPort":{},"f:name":{},"f:protected":{}}}}}}}`,
+		},
+		{
+			name: "extra key field",
+			fields: `{"f:status":{"f:configVersion":{"f:applied":{},"f:appliedAt":{},"f:desired":{},"f:desiredHash":{},"f:remote":{}},` +
+				`"f:hostnames":{"k:{\"accessApplication\":\"apps/app\",\"extra\":\"x\",\"hostname\":\"app.example.com\",\"protectionDomain\":\"pd-1\"}":{"f:accessApplication":{},"f:appliedVersion":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}},` +
+				`"f:listeners":{"k:{\"name\":\"http\"}":{"f:exposure":{},"f:name":{},"f:protectionDomains":{"k:{\"name\":\"pd-1\"}":{"f:envoyPort":{},"f:name":{},"f:protected":{}}}}}}}`,
+		},
+		{
+			name: "non-string key value",
+			fields: `{"f:status":{"f:configVersion":{"f:applied":{},"f:appliedAt":{},"f:desired":{},"f:desiredHash":{},"f:remote":{}},` +
+				`"f:hostnames":{"k:{\"accessApplication\":123,\"hostname\":\"app.example.com\",\"protectionDomain\":\"pd-1\"}":{"f:accessApplication":{},"f:appliedVersion":{},"f:guard":{},"f:hostname":{},"f:protectionDomain":{}}},` +
+				`"f:listeners":{"k:{\"name\":\"http\"}":{"f:exposure":{},"f:name":{},"f:protectionDomains":{"k:{\"name\":\"pd-1\"}":{"f:envoyPort":{},"f:name":{},"f:protected":{}}}}}}}`,
+		},
+	}
+	for _, tc := range badKeys {
+		if tunnelGatewayDataUnchanged(makeTunnel(metav1.ManagedFieldsOperationApply, "status", tc.fields), config, hostnames, listeners) {
+			t.Fatalf("tunnelGatewayDataUnchanged accepted invalid keyed-list item (%s)", tc.name)
+		}
 	}
 }

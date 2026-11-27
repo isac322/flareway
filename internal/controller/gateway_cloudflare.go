@@ -107,6 +107,12 @@ type cloudflareConfigResult struct {
 	// UpdateTunnelConfiguration and carries the provider-assigned version.
 	// The caller checkpoints desired=remote before the convergence gate.
 	remoteChanged bool
+	// verifiedGateKey, verifiedHash, and verifiedAt carry the remote verify
+	// confirmation for the caller to record ONLY after ConfigApplied=True and
+	// Gateway Programmed=True durably persist.
+	verifiedGateKey types.NamespacedName
+	verifiedHash    string
+	verifiedAt      time.Time
 }
 
 func accessBlockFirstGateway(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) (*ir.Gateway, bool, error) {
@@ -837,15 +843,24 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		}
 	}
 	if result.appliedAt != nil {
-		// The remote state was freshly confirmed or written: release any
-		// sweep invalidation, record the verify time, and record the
-		// freshness horizon (0 when disabled so timed-out pending waits do
-		// not fall back to periodic polling).
-		clearGate(r.Invalidator, configFreshnessKind, gateKey)
-		r.Invalidator.MarkVerified(configFreshnessKind, gateKey, hash, now)
+		// Carry verify metadata back to GatewayReconciler.Reconcile so the gate
+		// is cleared and MarkedVerified ONLY after ConfigApplied=True and
+		// Programmed=True durably persist. Keep requeue populated here so any
+		// caller-side fallback honors the configured TTL.
+		result.verifiedGateKey = gateKey
+		result.verifiedHash = hash
+		result.verifiedAt = now
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
 	}
 	return result, nil
+}
+
+func (r *GatewayReconciler) confirmTunnelConfigGate(result cloudflareConfigResult) {
+	if result.verifiedAt.IsZero() {
+		return
+	}
+	clearGate(r.Invalidator, "CloudflareTunnelConfig", result.verifiedGateKey)
+	r.Invalidator.MarkVerified("CloudflareTunnelConfig", result.verifiedGateKey, result.verifiedHash, result.verifiedAt)
 }
 
 // tunnelConfigConvergedForGate requires affirmative current-generation
@@ -1507,7 +1522,7 @@ var tunnelDataListMapKeys = map[string][]string{
 func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[string]any) bool {
 	hasCleanApply := false
 	for _, mf := range live.ManagedFields {
-		if mf.Manager != gatewayFieldManager || mf.Subresource != "status" || mf.FieldsV1 == nil {
+		if mf.Manager != gatewayFieldManager || mf.Subresource != "status" || mf.Operation != metav1.ManagedFieldsOperationApply || mf.FieldsV1 == nil {
 			continue
 		}
 		var fields map[string]any
@@ -1518,11 +1533,11 @@ func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[
 		if statusFields == nil {
 			continue
 		}
-		// Shed legacy co-ownership of status.conditions per ADR 0004 before skipping.
+		// Shed legacy Apply co-ownership of status.conditions per ADR 0004 before skipping.
 		if _, hasConditions := statusFields["f:conditions"]; hasConditions {
 			return false
 		}
-		if mf.Operation == metav1.ManagedFieldsOperationApply && fieldsV1CoversMap(statusFields, statusMap) {
+		if fieldsV1CoversMap(statusFields, statusMap) {
 			hasCleanApply = true
 		}
 	}
@@ -1541,12 +1556,17 @@ func fieldsV1CoversMap(owned map[string]any, desired map[string]any) bool {
 				return false
 			}
 		case []any:
+			if len(typed) == 0 {
+				// Real kube-apiserver omits empty associative lists from FieldsV1;
+				// live emptiness was already checked by tunnelGatewayDataUnchangedWithMap.
+				continue
+			}
 			ownedList, ok := owned["f:"+fieldName].(map[string]any)
 			if !ok {
 				return false
 			}
 			keyFields := tunnelDataListMapKeys[fieldName]
-			if len(keyFields) == 0 && len(typed) > 0 {
+			if len(keyFields) == 0 {
 				return false
 			}
 			for _, elemRaw := range typed {
@@ -1582,8 +1602,9 @@ func fieldsV1FindKeyedItem(ownedList map[string]any, elem map[string]any, keyFie
 		}
 		matched := true
 		for _, kf := range keyFields {
-			parsedVal, exists := parsed[kf]
-			if !exists || fmt.Sprint(parsedVal) != fmt.Sprint(elem[kf]) {
+			pStr, pOK := parsed[kf].(string)
+			eStr, eOK := elem[kf].(string)
+			if !pOK || !eOK || pStr != eStr {
 				matched = false
 				break
 			}

@@ -528,11 +528,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionTunnelReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed Cloudflare Tunnel %s without adopting it", remote.ID), tunnel.Generation, now), now)
 		setStatusCondition(&status, tunnelCondition(v1alpha1.CloudflareTunnelConditionDNSReady, metav1.ConditionTrue, "ObserveOnly", "ObserveOnly does not manage DNS records", tunnel.Generation, now), now)
 		setTunnelReadyPolicy(&status, tunnel, now)
-		if err := r.patchOwnedStatus(ctx, tunnel, status, observeClear); err != nil {
-			return ctrl.Result{}, err
-		}
-		clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
-		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
+		return ctrl.Result{RequeueAfter: tunnelRequeue}, r.patchOwnedStatus(ctx, tunnel, status, observeClear)
 	}
 
 	checkpoint := tunnelOwnedStatus(tunnel, gatewayRef, gatewayUID, ownedConditions)
@@ -634,7 +630,6 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 
 	setTunnelReadyPolicy(&status, tunnel, now)
 	clearIntent.DNSRecords = true
-	clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
 	// A disabled gate (zero TTL) preserves the pre-gate polling cadence:
 	// without gate expiry or a sweep, the periodic remote read is the only
 	// drift-detection path left.
@@ -646,9 +641,10 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		return ctrl.Result{}, err
 	}
 	if dnsHealthy && tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
-		// Record the remote verification timestamp for both Direct and Gateway
-		// modes so an expired Gateway-mode tunnel also renews its gate without
-		// rewriting Gateway-owned status.configVersion.appliedAt.
+		// Release any demotion/sweep invalidation and record the remote
+		// verification timestamp ONLY after patchOwnedStatus durably persists
+		// Ready=True, so a failed status write never lets a stale cache open the gate.
+		clearGate(r.Invalidator, "CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
 		r.Invalidator.MarkVerified("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), status.ConfigVersion.DesiredHash, now.Time)
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
