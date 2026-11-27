@@ -137,13 +137,6 @@ func evaluateGate(
 
 // evaluateGateWithHash is evaluateGate for callers that already hold an
 // authoritative desired hash and must not recompute one.
-//
-// The Gateway-mode tunnel configuration is the motivating case: its desired
-// state is the compiled cloudflared configuration, and the hash that
-// status.configVersion.desiredHash is compared against is the one
-// cloudflaredconfig.Compile returns. Hashing the spec again here would produce
-// a different value than the one the write path persists, so the gate would
-// never open.
 func evaluateGateWithHash(
 	policy freshness.Policy,
 	latch *freshness.Latch,
@@ -155,60 +148,79 @@ func evaluateGateWithHash(
 	converged bool,
 	now time.Time,
 ) gateDecision {
+	return evaluateGateWithHashForUID(policy, latch, grade, kind, key, "", appliedHash, desiredHash, appliedAt, converged, now)
+}
+
+// evaluateGateWithHashForUID is evaluateGateWithHash scoped optionally to a
+// live object UID so replacements (e.g., deleted/recreated CloudflareTunnel UIDs)
+// never observe or clear each other's freshness latch slots.
+func evaluateGateWithHashForUID(
+	policy freshness.Policy,
+	latch *freshness.Latch,
+	grade freshness.Grade,
+	kind string,
+	key types.NamespacedName,
+	uid types.UID,
+	appliedHash, desiredHash string,
+	appliedAt *metav1.Time,
+	converged bool,
+	now time.Time,
+) gateDecision {
 	if grade == freshness.GradeAlways {
 		return gateDecision{
 			Gate:        freshness.Gate{Decision: freshness.DecisionNotGated},
 			DesiredHash: desiredHash,
 		}
 	}
-	if !converged {
+	forget := func() {
+		if uid != "" {
+			latch.ForgetForUID(kind, key, uid)
+			return
+		}
 		latch.Forget(kind, key)
+	}
+	if !converged {
+		forget()
 		observability.ObserveGate(kind, string(freshness.DecisionClosedUnconverged))
 		return gateDecision{
 			Gate:        freshness.Gate{Decision: freshness.DecisionClosedUnconverged},
 			DesiredHash: desiredHash,
 		}
 	}
-	invalidated := latch.IsInvalidated(kind, key)
+	var invalidated bool
+	if uid != "" {
+		invalidated = latch.IsInvalidatedForUID(kind, key, uid)
+	} else {
+		invalidated = latch.IsInvalidated(kind, key)
+	}
 
-	// The gate's age is measured from the most recent confirmation of this
-	// exact desired hash: either the persisted appliedAt, or a later re-verify
-	// kept in memory so that an unchanged re-verify need not write status. A
-	// restart loses the in-memory record, which only ever makes the age
-	// larger and the gate more likely to close.
 	var applied time.Time
 	if appliedAt != nil {
 		applied = appliedAt.Time
 	}
-	if verified, ok := latch.VerifiedAt(kind, key, desiredHash); ok && verified.After(applied) {
+	var verified time.Time
+	var ok bool
+	if uid != "" {
+		verified, ok = latch.VerifiedAtForUID(kind, key, uid, desiredHash)
+	} else {
+		verified, ok = latch.VerifiedAt(kind, key, desiredHash)
+	}
+	if ok && verified.After(applied) {
 		applied = verified
 	}
 
 	gate := policy.Evaluate(grade, appliedHash, desiredHash, applied, now, invalidated)
-	// A sweep listing that confirmed the content of this exact desired hash
-	// counts as a verify with a longer window (two grade periods), so that a
-	// healthy sweep keeps the object from reading the remote itself. When
-	// both are valid, the later expiry wins so the object wakes no earlier
-	// than it has to. Invalidation and hash mismatches close it the same way.
-	if confirmed, ok := latch.ConfirmedAt(kind, key, desiredHash); ok {
-		swept := policy.EvaluateSweepConfirmed(grade, appliedHash, desiredHash, confirmed, now, invalidated)
-		if swept.Open && (!gate.Open || swept.Requeue > gate.Requeue) {
-			gate = swept
+	if uid == "" {
+		if confirmed, ok := latch.ConfirmedAt(kind, key, desiredHash); ok {
+			swept := policy.EvaluateSweepConfirmed(grade, appliedHash, desiredHash, confirmed, now, invalidated)
+			if swept.Open && (!gate.Open || swept.Requeue > gate.Requeue) {
+				gate = swept
+			}
 		}
 	}
-	// A closed gate sends this pass to the remote. Until it converges and
-	// records again, nothing verified earlier may re-open the gate: a desired
-	// state that changes and then changes back must not find an old verify
-	// or a sweep confirmation the sweep kept renewing, and skip the pass that
-	// brings status back in line.
 	if !gate.Open && gate.Decision != freshness.DecisionNotGated {
-		latch.Forget(kind, key)
+		forget()
 	}
-	// freshness.Policy.Evaluate already names the first condition that closed
-	// the gate, so the label is never recomputed here and cannot drift from the
-	// judgement it describes. DecisionNotGated means a T0 caller reached this
-	// helper, which is a programming error rather than a gate outcome; leaving
-	// it unobserved keeps the metric to real evaluations.
 	if gate.Decision != freshness.DecisionNotGated {
 		observability.ObserveGate(kind, string(gate.Decision))
 	}

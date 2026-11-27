@@ -673,7 +673,7 @@ func TestGatewayPreGateDemotionsForgetOwnConfigGateButProtectForeignOwner(t *tes
 	}
 
 	// Seed both keys so we also verify key isolation.
-	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	latch.MarkVerifiedForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1", now)
 	latch.MarkVerified("CloudflareTunnel", tunnelKey, "tun-h1", now)
 
 	// 1. A non-owner (conflicting) Gateway demoting itself must NOT forget the real owner's config gate.
@@ -681,14 +681,14 @@ func TestGatewayPreGateDemotionsForgetOwnConfigGateButProtectForeignOwner(t *tes
 		Gateway: *foreignGW.Status.DeepCopy(),
 	}
 	_ = reconciler.reportDataplaneRejection(ctx, client.ObjectKeyFromObject(foreignGW), foreignGW, foreignStatuses, foreignGW, &dataplaneRejectionError{reason: "Invalid"})
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); !ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); !ok {
 		t.Fatal("non-owner Gateway demotion cleared the legitimate owner's CloudflareTunnelConfig gate")
 	}
 
 	// 2. Owner Gateway demoting via handleSnapshotBuildFailure MUST forget CloudflareTunnelConfig (and keep CloudflareTunnel).
 	ownerStatuses := &gatewayapi.Statuses{Gateway: *ownerGW.Status.DeepCopy()}
 	_ = reconciler.handleSnapshotBuildFailure(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, nil, nil, ownerStatuses, errors.New("snapshot boom"))
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); ok {
 		t.Fatal("owner Gateway handleSnapshotBuildFailure did not forget CloudflareTunnelConfig")
 	}
 	if _, ok := latch.VerifiedAt("CloudflareTunnel", tunnelKey, "tun-h1"); !ok {
@@ -696,35 +696,35 @@ func TestGatewayPreGateDemotionsForgetOwnConfigGateButProtectForeignOwner(t *tes
 	}
 
 	// 3. Owner Gateway demoting via reportDataplaneRejection MUST forget CloudflareTunnelConfig.
-	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	latch.MarkVerifiedForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1", now)
 	_ = reconciler.reportDataplaneRejection(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, ownerStatuses, ownerGW, &dataplaneRejectionError{reason: "Invalid"})
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); ok {
 		t.Fatal("owner Gateway reportDataplaneRejection did not forget CloudflareTunnelConfig")
 	}
 
 	// 4. Owner Gateway demoting via reportCloudflareUnprogrammed MUST forget CloudflareTunnelConfig.
-	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	latch.MarkVerifiedForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1", now)
 	if err := reconciler.reportCloudflareUnprogrammed(ctx, client.ObjectKeyFromObject(ownerGW), ownerGW, nil, nil, ownerStatuses, "unprogrammed", false); err != nil {
 		t.Fatalf("owner reportCloudflareUnprogrammed: %v", err)
 	}
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); ok {
 		t.Fatal("owner Gateway reportCloudflareUnprogrammed did not forget CloudflareTunnelConfig")
 	}
 
 	// 5. Owner Gateway demoting via rejectGatewayAdmission (e.g., loadGatewayClassConfig invalid
 	// parametersRef) MUST forget CloudflareTunnelConfig while preserving CloudflareTunnel, and
 	// a non-owner Gateway hitting rejectGatewayAdmission MUST NOT clear the real owner's key.
-	latch.MarkVerified("CloudflareTunnelConfig", tunnelKey, "cfg-h1", now)
+	latch.MarkVerifiedForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1", now)
 	if err := reconciler.rejectGatewayAdmission(ctx, foreignGW, "InvalidParameters", "bad class", "bad class"); err != nil {
 		t.Fatalf("foreign rejectGatewayAdmission: %v", err)
 	}
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); !ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); !ok {
 		t.Fatal("non-owner rejectGatewayAdmission cleared the real owner's CloudflareTunnelConfig gate")
 	}
 	if err := reconciler.rejectGatewayAdmission(ctx, ownerGW, "InvalidParameters", "missing GatewayClassConfig", "GatewayClass parametersRef cannot be resolved"); err != nil {
 		t.Fatalf("owner rejectGatewayAdmission: %v", err)
 	}
-	if _, ok := latch.VerifiedAt("CloudflareTunnelConfig", tunnelKey, "cfg-h1"); ok {
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", tunnelKey, tunnel.UID, "cfg-h1"); ok {
 		t.Fatal("owner Gateway rejectGatewayAdmission did not forget CloudflareTunnelConfig")
 	}
 	if _, ok := latch.VerifiedAt("CloudflareTunnel", tunnelKey, "tun-h1"); !ok {

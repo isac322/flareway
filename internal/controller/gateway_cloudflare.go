@@ -114,6 +114,7 @@ type cloudflareConfigResult struct {
 	// ConfigApplied=True and Gateway Programmed=True durably persist, and only
 	// if no newer sweep invalidation superseded verifiedEpoch.
 	verifiedGateKey types.NamespacedName
+	verifiedUID     types.UID
 	verifiedEpoch   uint64
 	verifiedHash    string
 	verifiedAt      time.Time
@@ -731,12 +732,14 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	// remote path below — the lock closure never serves cached state.
 	now := r.gatewayNow()
 	gateKey := client.ObjectKeyFromObject(tunnel)
-	gate := evaluateGateWithHash(
+	r.Invalidator.PruneOtherUIDs(configFreshnessKind, gateKey, tunnel.UID)
+	gate := evaluateGateWithHashForUID(
 		r.Freshness,
 		r.Invalidator,
 		freshness.GradeTraffic,
 		configFreshnessKind,
 		gateKey,
+		tunnel.UID,
 		tunnel.Status.ConfigVersion.DesiredHash,
 		hash,
 		tunnel.Status.ConfigVersion.AppliedAt,
@@ -752,7 +755,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			requeue:         gate.Requeue,
 		}, nil
 	}
-	configEpoch := r.Invalidator.InvalidationEpoch(configFreshnessKind, gateKey)
+	configEpoch := r.Invalidator.InvalidationEpochForUID(configFreshnessKind, gateKey, tunnel.UID)
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
 		return cloudflareConfigResult{}, r.remoteConfigFailure(ctx, gateway, tunnel, now, err)
@@ -856,6 +859,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		// Programmed=True durably persist. Keep requeue populated here so any
 		// caller-side fallback honors the configured TTL.
 		result.verifiedGateKey = gateKey
+		result.verifiedUID = tunnel.UID
 		result.verifiedHash = hash
 		result.verifiedAt = now
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
@@ -867,7 +871,7 @@ func (r *GatewayReconciler) confirmTunnelConfigGate(result cloudflareConfigResul
 	if result.verifiedAt.IsZero() {
 		return
 	}
-	r.Invalidator.CompleteVerification(configFreshnessKind, result.verifiedGateKey, result.verifiedEpoch, result.verifiedHash, result.verifiedAt, nil)
+	r.Invalidator.CompleteVerificationForUID(configFreshnessKind, result.verifiedGateKey, result.verifiedUID, result.verifiedEpoch, result.verifiedHash, result.verifiedAt, nil)
 }
 
 // tunnelConfigConvergedForGate requires affirmative current-generation
@@ -932,7 +936,13 @@ func (r *GatewayReconciler) forgetTunnelConfigGateIfWriter(ctx context.Context, 
 	if !sameGatewayIdentity(gateway, selected) || !tunnelGatewayStatusIdentityMatches(&liveTunnel, gateway) {
 		return
 	}
-	forgetGateForLiveTunnelUID(ctx, reader, r.Invalidator, tokConfig, liveTunnel.UID)
+	targetUID := liveTunnel.UID
+	if tunnel != nil && tunnel.UID != "" {
+		targetUID = tunnel.UID
+	}
+	tokUID := r.Invalidator.BeginLifetimeForUID(configFreshnessKind, tunnelKey, targetUID)
+	defer r.Invalidator.EndLifetime(tokUID)
+	forgetGateForLiveTunnelUID(ctx, reader, r.Invalidator, tokUID, targetUID)
 }
 
 // remoteConfigFailure records ConfigApplied=False before returning a remote
@@ -959,7 +969,7 @@ func (r *GatewayReconciler) demoteTunnelConfigApplied(ctx context.Context, gatew
 		return errors.New("demoteTunnelConfigApplied requires an observed CloudflareTunnel")
 	}
 	key := client.ObjectKeyFromObject(tunnel)
-	tok := r.Invalidator.BeginLifetime(configFreshnessKind, key)
+	tok := r.Invalidator.BeginLifetimeForUID(configFreshnessKind, key, tunnel.UID)
 	defer r.Invalidator.EndLifetime(tok)
 	err := r.patchTunnelGatewayConditions(ctx, gateway, tunnel, metav1.NewTime(now),
 		gatewayTunnelCondition(tunnel, v1alpha1.CloudflareTunnelConditionConfigApplied, metav1.ConditionFalse, reason, message, metav1.NewTime(now)))

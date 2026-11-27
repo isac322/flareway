@@ -192,3 +192,138 @@ func TestLatchLifetimeTokenIsolationAndCleanup(t *testing.T) {
 		t.Fatal("sibling token succeeded after RemoveIfUntouched")
 	}
 }
+
+func TestLatchUIDBoundIsolationAndPruning(t *testing.T) {
+	latch := NewLatch()
+	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	otherKey := types.NamespacedName{Namespace: "tenant", Name: "other"}
+	const uid1 = types.UID("uid-1")
+	const uid2 = types.UID("uid-2")
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+	// nil / empty UID safety.
+	var nilLatch *Latch
+	nilLatch.InvalidateForUID("CloudflareTunnelConfig", key, uid1, "drift")
+	if nilLatch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("nil latch IsInvalidatedForUID returned true")
+	}
+	if nilLatch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid1) != 0 {
+		t.Fatal("nil latch InvalidationEpochForUID non-zero")
+	}
+	if _, ok := nilLatch.VerifiedAtForUID("CloudflareTunnelConfig", key, uid1, "h1"); ok {
+		t.Fatal("nil latch VerifiedAtForUID returned true")
+	}
+	if nilLatch.CompleteVerificationForUID("CloudflareTunnelConfig", key, uid1, 0, "h1", now, nil) {
+		t.Fatal("nil latch CompleteVerificationForUID returned true")
+	}
+	nilTok := nilLatch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	if nilTok.UID() != uid1 {
+		t.Fatalf("nil BeginLifetimeForUID UID = %q, want %q", nilTok.UID(), uid1)
+	}
+	nilLatch.PruneOtherUIDs("CloudflareTunnelConfig", key, uid2)
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, "", "empty-uid")
+	if latch.IsInvalidated("CloudflareTunnelConfig", key) {
+		t.Fatal("empty uid wrote to name-scoped latch")
+	}
+
+	// UID1 token cannot mutate UID2 or name-scoped slot.
+	tokUID1 := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid2, "replacement-drift")
+	uid2Epoch := latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid2)
+	latch.Invalidate("CloudflareTunnelConfig", key, "name-scoped")
+	nameEpoch := latch.InvalidationEpoch("CloudflareTunnelConfig", key)
+
+	if !latch.ForgetAndInvalidateIfUnretired(tokUID1, "demoted") {
+		t.Fatal("UID1 ForgetAndInvalidateIfUnretired unexpectedly failed")
+	}
+	latch.EndLifetime(tokUID1)
+	if len(latch.activeGuards) != 0 {
+		t.Fatalf("activeGuards not emptied after EndLifetime: len=%d", len(latch.activeGuards))
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("expected UID1 invalidation after ForgetAndInvalidateIfUnretired")
+	}
+	if got := latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid2); got != uid2Epoch {
+		t.Fatalf("UID1 demote modified UID2 epoch: got %d, want %d", got, uid2Epoch)
+	}
+	if got := latch.InvalidationEpoch("CloudflareTunnelConfig", key); got != nameEpoch {
+		t.Fatalf("UID1 demote modified name-scoped epoch: got %d, want %d", got, nameEpoch)
+	}
+	if !latch.CompleteVerificationForUID("CloudflareTunnelConfig", key, uid2, uid2Epoch, "h2", now, nil) {
+		t.Fatal("UID2 CompleteVerificationForUID failed")
+	}
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2) {
+		t.Fatal("UID2 still invalidated after CompleteVerificationForUID")
+	}
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", key, uid2, "h2"); !ok {
+		t.Fatal("UID2 VerifiedAtForUID missing after CompleteVerificationForUID")
+	}
+
+	// PruneOtherUIDs drops UID1 and retires in-flight UID1 tokens, while keeping UID2 and name-scoped entries.
+	tokUID1Stale := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	tokUID2Live := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2)
+	latch.PruneOtherUIDs("CloudflareTunnelConfig", key, uid2)
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("PruneOtherUIDs kept UID1 invalidation")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokUID1Stale, "demoted") {
+		t.Fatal("retired UID1 token succeeded after PruneOtherUIDs")
+	}
+	if !latch.ForgetAndInvalidateIfUnretired(tokUID2Live, "demoted") {
+		t.Fatal("PruneOtherUIDs retired live UID2 token")
+	}
+	if got := latch.InvalidationEpoch("CloudflareTunnelConfig", key); got != nameEpoch {
+		t.Fatalf("PruneOtherUIDs touched name-scoped slot: got %d, want %d", got, nameEpoch)
+	}
+	latch.EndLifetime(tokUID1Stale)
+	latch.EndLifetime(tokUID2Live)
+	if len(latch.activeGuards) != 0 {
+		t.Fatalf("activeGuards not emptied after PruneOtherUIDs + EndLifetime: len=%d", len(latch.activeGuards))
+	}
+
+	// Name-scoped BeginLifetime + RemoveIfUntouched is marked touched by InvalidateForUID,
+	// and when untouched clears both name-scoped and UID-scoped entries.
+	tokName := latch.BeginLifetime("CloudflareTunnelConfig", key)
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid2, "new-uid2-drift")
+	if latch.RemoveIfUntouched(tokName) {
+		t.Fatal("RemoveIfUntouched succeeded despite InvalidateForUID after BeginLifetime")
+	}
+	latch.EndLifetime(tokName)
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2) {
+		t.Fatal("RemoveIfUntouched cleared UID2 state despite InvalidateForUID")
+	}
+
+	// Untouched name-scoped token clears UID2 and name-scoped entries, leaving otherKey intact.
+	latch.InvalidateForUID("CloudflareTunnelConfig", otherKey, uid1, "other-drift")
+	tokClean := latch.BeginLifetime("CloudflareTunnelConfig", key)
+	tokUID2Sibling := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2)
+	if !latch.RemoveIfUntouched(tokClean) {
+		t.Fatal("untouched RemoveIfUntouched returned false")
+	}
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2) || latch.IsInvalidated("CloudflareTunnelConfig", key) {
+		t.Fatal("RemoveIfUntouched did not clear all UID variants for key")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokUID2Sibling, "demoted") {
+		t.Fatal("RemoveIfUntouched did not retire sibling UID2 token")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", otherKey, uid1) {
+		t.Fatal("RemoveIfUntouched touched unrelated otherKey")
+	}
+	latch.EndLifetime(tokClean)
+	latch.EndLifetime(tokUID2Sibling)
+
+	// Remove clears both name-scoped and UID-scoped variants for key, leaving otherKey intact.
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid1, "stale")
+	tokForRemove := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	latch.Remove("CloudflareTunnelConfig", key)
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("Remove did not clear UID1 variant")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokForRemove, "demoted") {
+		t.Fatal("Remove did not retire UID1 token")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", otherKey, uid1) {
+		t.Fatal("Remove touched unrelated otherKey")
+	}
+	latch.EndLifetime(tokForRemove)
+}

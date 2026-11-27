@@ -146,6 +146,9 @@ func (r *CloudflareTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// the live tunnel: preserve both latch keys and requeue cleanly.
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 	}
+	if tunnel.UID != "" {
+		r.Invalidator.PruneOtherUIDs(configFreshnessKind, req.NamespacedName, tunnel.UID)
+	}
 
 	if !tunnel.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, &tunnel)
