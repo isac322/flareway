@@ -605,9 +605,15 @@ func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alp
 	if err != nil {
 		return err
 	}
-	if !patched && persistIdentity {
+	observedOwned := owned && effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !patched && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
+			if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			setIdentity(live)
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

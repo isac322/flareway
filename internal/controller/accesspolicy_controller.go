@@ -563,10 +563,15 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 	if err != nil {
 		return err
 	}
-	if !applied && persistIdentity {
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote != nil && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			live.Status.PolicyID = remote.ID
-			live.Status.OwnershipVerified = owned
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

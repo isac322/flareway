@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -460,6 +461,8 @@ func directStatusReader(writer kubeclient.Client, reader kubeclient.Reader) kube
 	return writer
 }
 
+var errSkipStatusPatch = errors.New("skip status patch")
+
 func patchLiveStatusWithDirectReader[T kubeclient.Object](
 	ctx context.Context,
 	writer kubeclient.Client,
@@ -495,6 +498,10 @@ func patchLiveStatusWithDirectReader[T kubeclient.Object](
 			return fmt.Errorf("deep-copy live object %T", observed)
 		}
 		if err := mutate(live); err != nil {
+			if errors.Is(err, errSkipStatusPatch) {
+				applied = false
+				return nil
+			}
 			return err
 		}
 		if apiequality.Semantic.DeepEqual(before, live) {

@@ -404,11 +404,17 @@ func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha
 	if err != nil {
 		return err
 	}
-	if !applied && persistIdentity {
+	observedOwned := owned && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessGroup) error {
+			if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+				live.Spec.Zone != object.Spec.Zone {
+				return errSkipStatusPatch
+			}
 			live.Status.GroupID = remote.ID
 			live.Status.ZoneID = scope.ZoneID
-			live.Status.OwnershipVerified = owned
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

@@ -611,12 +611,15 @@ func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, obje
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || owned) {
+	observedOwned := owned && effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && status == metav1.ConditionTrue && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
-			live.Status.RuleID = remote.ID
-			if status == metav1.ConditionTrue {
-				live.Status.OwnershipVerified = owned
+			if effectiveGlobalManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
 			}
+			live.Status.RuleID = remote.ID
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

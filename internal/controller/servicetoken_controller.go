@@ -619,6 +619,7 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 		attemptMarked = false
 	}
 	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
+		var deletedAccount *v1alpha1.CloudflareAccount
 		if object.Status.TokenID != "" && object.Status.OwnershipVerified {
 			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 			if err != nil {
@@ -634,10 +635,21 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 			if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
 				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
+			deletedAccount = account
 		}
 		if journal != nil {
-			if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {
-				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+			skipJournalCleanup := false
+			if deletedAccount != nil {
+				clusterID, clusterErr := r.authoritativeClusterID(ctx)
+				if clusterErr != nil {
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", clusterErr)
+				}
+				skipJournalCleanup = journal.matchesCheckpointedToken(object, deletedAccount, clusterID)
+			}
+			if !skipJournalCleanup {
+				if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+				}
 			}
 		} else if object.Status.TokenID == "" && attemptMarked {
 			if err := r.cleanupUntrackedServiceTokenAttempts(ctx, object); err != nil {
@@ -671,10 +683,16 @@ func applyServiceTokenIdentityFields(live *v1alpha1.ServiceToken, scope flareclo
 }
 
 func (r *ServiceTokenReconciler) persistIdentity(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, update serviceTokenStatusUpdate) (bool, error) {
-	if remote.ID == "" {
+	observedOwned := update.OwnershipVerified && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if remote.ID == "" || !observedOwned {
 		return false, nil
 	}
 	persisted, err := persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
+		if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+			live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+			live.Spec.Zone != object.Spec.Zone {
+			return errSkipStatusPatch
+		}
 		applyServiceTokenIdentityFields(live, scope, remote, update)
 		if update.RotatedAt != nil {
 			live.Status.RotatedAt = update.RotatedAt
@@ -722,7 +740,8 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
+	observedOwned := update.OwnershipVerified && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = r.persistIdentity(ctx, object, scope, remote, update)
 		return err
 	}

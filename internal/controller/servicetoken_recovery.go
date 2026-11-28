@@ -301,6 +301,23 @@ func (journal *serviceTokenJournal) matchesIdentity(object *v1alpha1.ServiceToke
 	return journal.matchesSpecIdentity(object, account) && journal.clusterUID == clusterID
 }
 
+// matchesCheckpointedToken reports whether the journal describes the exact
+// remote token already checkpointed and owned on object.Status.TokenID so a
+// teardown after a spec.secretRef.name edit can reap the journal safely once
+// the remote token itself has been deleted.
+func (journal *serviceTokenJournal) matchesCheckpointedToken(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, clusterID string) bool {
+	return journal.phase == serviceTokenJournalPhaseDispatched &&
+		journal.crUID == string(object.UID) &&
+		journal.clusterUID == clusterID &&
+		journal.accountName == object.Spec.AccountRef.Name &&
+		journal.accountUID == string(account.UID) &&
+		journal.accountID == account.Spec.AccountID &&
+		journal.zoneID == object.Status.ZoneID &&
+		journal.issuedID != "" &&
+		journal.issuedID == object.Status.TokenID &&
+		journal.retiringID == ""
+}
+
 // createServiceTokenJournal persists a fresh prepared journal. AlreadyExists is
 // returned to the caller so the next pass resumes through the journal path.
 func (r *ServiceTokenReconciler) createServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, clusterID, nonce string) (*corev1.Secret, *serviceTokenJournal, error) {

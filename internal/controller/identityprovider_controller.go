@@ -959,10 +959,15 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 	if err != nil {
 		return err
 	}
-	if !applied && status == metav1.ConditionTrue && remote.ID != "" {
+	observedOwned := object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
+	if !applied && status == metav1.ConditionTrue && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.IdentityProvider) error {
+			if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			live.Status.IDPID = remote.ID
-			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
+			live.Status.OwnershipVerified = true
 			live.Status.ReadOnly = remote.ReadOnly
 			return nil
 		})

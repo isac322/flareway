@@ -7652,10 +7652,11 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 // (2) when replacement UID2 exists with an active/invalidated demotion guard,
 //     post-write recheck cleans UID1 ONLY and preserves UID2's state & guard.
 func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.T) {
-	runVariant := func(t *testing.T, suffix string, recreateUID2 bool) {
+	runVariant := func(t *testing.T, suffix string, recreateUID2 bool, earlyExitBeforeGW bool) {
 		t.Helper()
 		f := setupDemoteEnvtest(t, suffix)
 		ctx := context.Background()
+		workerCtx, cancelWorkers := context.WithCancel(ctx)
 		tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
 		uid1 := f.tunnel.UID
 
@@ -7667,20 +7668,43 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 		// pauses BEFORE its uncached Get hits etcd.
 		tunnelBeforeGet := make(chan struct{})
 		releaseTunnelGet := make(chan struct{})
+		releaseGWAfterGet := make(chan struct{})
+		var releaseTunnelOnce, releaseGWOnce sync.Once
+		closeTunnelBarrier := func() {
+			releaseTunnelOnce.Do(func() { close(releaseTunnelGet) })
+		}
+		closeGWBarrier := func() {
+			releaseGWOnce.Do(func() { close(releaseGWAfterGet) })
+		}
+		var workersWG sync.WaitGroup
 		t.Cleanup(func() {
+			// Release all barriers and cancel workerCtx BEFORE waiting so LIFO
+			// cleanup order can never deadlock one barrier behind another join.
+			closeTunnelBarrier()
+			closeGWBarrier()
+			cancelWorkers()
+			joined := make(chan struct{})
+			go func() {
+				workersWG.Wait()
+				close(joined)
+			}()
 			select {
-			case <-releaseTunnelGet:
-			default:
-				close(releaseTunnelGet)
+			case <-joined:
+			case <-time.After(15 * time.Second):
+				t.Errorf("timed out waiting for worker goroutines to exit during cleanup")
 			}
 		})
+
 		var tunnelGetPaused atomic.Bool
 		tunnelAPIReader := &failingStatusClient{
 			Client: f.direct,
 			onBeforeTunnelGet: func(key client.ObjectKey) {
 				if key == tunnelKey && !tunnelGetPaused.Swap(true) {
 					close(tunnelBeforeGet)
-					<-releaseTunnelGet
+					select {
+					case <-releaseTunnelGet:
+					case <-workerCtx.Done():
+					}
 				}
 			},
 		}
@@ -7694,19 +7718,10 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 			Invalidator:         f.latch,
 		}
 		tunnelDone := make(chan error, 1)
-		var workersWG sync.WaitGroup
 		workersWG.Add(1)
-		t.Cleanup(func() {
-			select {
-			case <-releaseTunnelGet:
-			default:
-				close(releaseTunnelGet)
-			}
-			workersWG.Wait()
-		})
 		go func() {
 			defer workersWG.Done()
-			_, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+			_, err := tunnelReconciler.Reconcile(workerCtx, ctrl.Request{NamespacedName: tunnelKey})
 			tunnelDone <- err
 		}()
 		select {
@@ -7729,27 +7744,42 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 			}
 		}
 		gwReadUID1 := make(chan struct{})
-		releaseGWAfterGet := make(chan struct{})
-		t.Cleanup(func() {
-			select {
-			case <-releaseGWAfterGet:
-			default:
-				close(releaseGWAfterGet)
-			}
-			workersWG.Wait()
-		})
 		var gwPaused atomic.Bool
 		f.faultReader.onAfterTunnelGet = func(key client.ObjectKey, got *v1alpha1.CloudflareTunnel, err error) {
 			if key == tunnelKey && err == nil && got.UID == uid1 && applyFailed.Load() && !gwPaused.Swap(true) {
 				close(gwReadUID1)
-				<-releaseGWAfterGet
+				select {
+				case <-releaseGWAfterGet:
+				case <-workerCtx.Done():
+				}
 			}
 		}
 		gwDone := make(chan error, 1)
+		if earlyExitBeforeGW {
+			// Verify that exiting early before reaching gwReadUID1 while
+			// tunnelReconcile is still blocked on releaseTunnelGet returns
+			// immediately from t.Cleanup without LIFO deadlock.
+			earlyCtx, cancelEarly := context.WithCancel(workerCtx)
+			cancelEarly()
+			workersWG.Add(1)
+			go func() {
+				defer workersWG.Done()
+				gwDone <- f.gwReconciler.demoteTunnelConfigApplied(earlyCtx, f.irGW, &f.tunnel, time.Now(), "Applying", "applying")
+			}()
+			select {
+			case err := <-gwDone:
+				if err == nil {
+					t.Fatal("expected canceled early demoteTunnelConfigApplied to return error")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("timed out waiting for early demoteTunnelConfigApplied exit")
+			}
+			return
+		}
 		workersWG.Add(1)
 		go func() {
 			defer workersWG.Done()
-			gwDone <- f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &f.tunnel, time.Now(), "Applying", "applying")
+			gwDone <- f.gwReconciler.demoteTunnelConfigApplied(workerCtx, f.irGW, &f.tunnel, time.Now(), "Applying", "applying")
 		}()
 		select {
 		case <-gwReadUID1:
@@ -7785,7 +7815,7 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 		})
 
 		// 4. Release Tunnel Reconcile: reads NotFound, runs RemoveIfUntouched(tok).
-		close(releaseTunnelGet)
+		closeTunnelBarrier()
 		select {
 		case err := <-tunnelDone:
 			if err != nil {
@@ -7821,7 +7851,7 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 
 		// 5. Resume Gateway demoteTunnelConfigApplied (runs ForgetAndInvalidateIfUnretired
 		// with stale UID1 read, then rechecks live API server).
-		close(releaseGWAfterGet)
+		closeGWBarrier()
 		select {
 		case err := <-gwDone:
 			if err == nil {
@@ -7863,10 +7893,13 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 	}
 
 	t.Run("deleted_UID1_leaves_clean_absent_latch", func(t *testing.T) {
-		runVariant(t, "late-dead-del", false)
+		runVariant(t, "late-dead-del", false, false)
 	})
 	t.Run("replaced_UID2_cleans_UID1_and_preserves_UID2", func(t *testing.T) {
-		runVariant(t, "late-dead-uid2", true)
+		runVariant(t, "late-dead-uid2", true, false)
+	})
+	t.Run("early_failure_before_gw_barrier_does_not_deadlock_cleanup", func(t *testing.T) {
+		runVariant(t, "late-dead-early", false, true)
 	})
 }
 
@@ -8503,5 +8536,424 @@ func TestGatewayCompleteVerificationRejectedWhenTokenRetiredAtZeroEpochEnvtest(t
 	}
 	if _, ok := f.latch.VerifiedAtForUID(configFreshnessKind, tunnelKey, f.tunnel.UID, updatedTunnel.Status.ConfigVersion.DesiredHash); ok {
 		t.Fatal("CompleteVerification recorded VerifiedAtForUID at epoch==0 despite retired verifyTok")
+	}
+}
+
+// Regression test (Finding 1, G2): ObserveOnly reads MUST NEVER escalate to
+// OwnershipVerified=true or checkpoint an external remote ID onto a concurrently
+// switched Managed generation (whose externalRef was removed), nor allow
+// subsequent Delete(DeletionPolicy=Delete) to destroy the unowned remote object.
+func TestObserveOnlyModeSwitchCannotClaimOwnershipEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-observe-mode-switch"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "kolide-secret"}, Data: map[string][]byte{"client-secret": []byte("kolide-client-secret")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-observe-switch"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	idpFake := &scimIdentityProviderFakeAPI{identityProviderFakeAPI: &identityProviderFakeAPI{providers: map[string]flarecloudflare.IdentityProvider{
+		"ext-idp-1": {ID: "ext-idp-1", Name: "external-idp", Type: v1alpha1.IdentityProviderTypeOneTimePIN},
+	}}}
+	accessFake := newFakeAccessResourceCloudflare()
+	accessFake.posture["ext-rule-1"] = flarecloudflare.DevicePostureRule{
+		ID: "ext-rule-1", Name: "external-rule", Type: v1alpha1.DevicePostureRuleTypeWARP,
+		Match: []v1alpha1.DevicePostureMatch{{Platform: v1alpha1.DevicePosturePlatformWindows}},
+	}
+	integrationFake := &fakeDevicePostureIntegrationCloudflare{integrations: map[string]flarecloudflare.DevicePostureIntegration{
+		"ext-int-1": {ID: "ext-int-1", Name: "external-int", Type: v1alpha1.DevicePostureIntegrationTypeKolide, Interval: "1h"},
+	}}
+
+	apiReader := &failingStatusClient{Client: direct}
+	idpReconciler := &IdentityProviderReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return idpFake, nil },
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	ruleReconciler := &DevicePostureRuleReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: accessFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	intReconciler := &DevicePostureIntegrationReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) { return integrationFake, nil },
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "ObserveOnly mode-switch account accepted", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	idpObj := &v1alpha1.IdentityProvider{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "idp-mode-switch"},
+		Spec: v1alpha1.IdentityProviderSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "external-idp",
+			Type:             v1alpha1.IdentityProviderTypeOneTimePIN,
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			DeletionPolicy:   v1alpha1.DeletionPolicyOrphan,
+			ExternalRef:      &v1alpha1.IdentityProviderExternalReference{IDPID: "ext-idp-1"},
+		},
+	}
+	ruleObj := &v1alpha1.DevicePostureRule{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "rule-mode-switch"},
+		Spec: v1alpha1.DevicePostureRuleSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "external-rule",
+			Type:             v1alpha1.DevicePostureRuleTypeWARP,
+			Match:            []v1alpha1.DevicePostureMatch{{Platform: v1alpha1.DevicePosturePlatformWindows}},
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			DeletionPolicy:   v1alpha1.DeletionPolicyOrphan,
+			ExternalRef:      &v1alpha1.DevicePostureRuleExternalReference{RuleID: "ext-rule-1"},
+		},
+	}
+	intObj := &v1alpha1.DevicePostureIntegration{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "int-mode-switch"},
+		Spec: v1alpha1.DevicePostureIntegrationSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Name:       "external-int",
+			Type:       v1alpha1.DevicePostureIntegrationTypeKolide,
+			Interval:   "1h",
+			Config: v1alpha1.DevicePostureIntegrationConfig{
+				ClientID:        "kolide-id",
+				ClientSecretRef: &v1alpha1.DevicePostureIntegrationSecretReference{Name: "kolide-secret", Key: "client-secret"},
+			},
+			ManagementPolicy: v1alpha1.ManagementPolicyObserveOnly,
+			DeletionPolicy:   v1alpha1.DeletionPolicyOrphan,
+			ExternalRef:      &v1alpha1.DevicePostureIntegrationExternalReference{IntegrationID: "ext-int-1"},
+		},
+	}
+	for _, obj := range []client.Object{idpObj, ruleObj, intObj} {
+		if err := direct.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idpKey := client.ObjectKeyFromObject(idpObj)
+	ruleKey := client.ObjectKeyFromObject(ruleObj)
+	intKey := client.ObjectKeyFromObject(intObj)
+
+	// Pass 1 on each adds its finalizer.
+	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
+		t.Fatalf("idp pass 1: %v", err)
+	}
+	if _, err := ruleReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: ruleKey}); err != nil {
+		t.Fatalf("rule pass 1: %v", err)
+	}
+	if _, err := intReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: intKey}); err != nil {
+		t.Fatalf("int pass 1: %v", err)
+	}
+
+	// Pass 2 observes in ObserveOnly, and right before patchStatusWithDirectReader
+	// reads live, switch ManagementPolicy -> Managed, DeletionPolicy -> Delete,
+	// and remove ExternalRef.
+	var idpSwitched, ruleSwitched, intSwitched atomic.Bool
+	var switchErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		switch obj.(type) {
+		case *v1alpha1.IdentityProvider:
+			if key != idpKey || idpSwitched.Swap(true) {
+				return
+			}
+			var latest v1alpha1.IdentityProvider
+			if err := direct.Get(ctx, idpKey, &latest); err != nil {
+				switchErr = err
+				return
+			}
+			latest.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
+			latest.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
+			latest.Spec.ExternalRef = nil
+			switchErr = direct.Update(ctx, &latest)
+		case *v1alpha1.DevicePostureRule:
+			if key != ruleKey || ruleSwitched.Swap(true) {
+				return
+			}
+			var latest v1alpha1.DevicePostureRule
+			if err := direct.Get(ctx, ruleKey, &latest); err != nil {
+				switchErr = err
+				return
+			}
+			latest.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
+			latest.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
+			latest.Spec.ExternalRef = nil
+			switchErr = direct.Update(ctx, &latest)
+		case *v1alpha1.DevicePostureIntegration:
+			if key != intKey || intSwitched.Swap(true) {
+				return
+			}
+			var latest v1alpha1.DevicePostureIntegration
+			if err := direct.Get(ctx, intKey, &latest); err != nil {
+				switchErr = err
+				return
+			}
+			latest.Spec.ManagementPolicy = v1alpha1.ManagementPolicyManaged
+			latest.Spec.DeletionPolicy = v1alpha1.DeletionPolicyDelete
+			latest.Spec.ExternalRef = nil
+			switchErr = direct.Update(ctx, &latest)
+		}
+	}
+
+	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
+		t.Fatalf("idp pass 2: %v", err)
+	}
+	if _, err := ruleReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: ruleKey}); err != nil {
+		t.Fatalf("rule pass 2: %v", err)
+	}
+	if _, err := intReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: intKey}); err != nil {
+		t.Fatalf("int pass 2: %v", err)
+	}
+	if switchErr != nil {
+		t.Fatalf("mode-switch hook error: %v", switchErr)
+	}
+	if !idpSwitched.Load() || !ruleSwitched.Load() || !intSwitched.Load() {
+		t.Fatalf("expected all 3 mode-switch hooks to fire: idp=%v rule=%v int=%v", idpSwitched.Load(), ruleSwitched.Load(), intSwitched.Load())
+	}
+
+	var idpAfter v1alpha1.IdentityProvider
+	if err := direct.Get(ctx, idpKey, &idpAfter); err != nil {
+		t.Fatal(err)
+	}
+	if idpAfter.Status.IDPID != "" || idpAfter.Status.OwnershipVerified {
+		t.Fatalf("ObserveOnly IdentityProvider escalated to owned/bound on mode switch: id=%q owned=%v", idpAfter.Status.IDPID, idpAfter.Status.OwnershipVerified)
+	}
+	var ruleAfter v1alpha1.DevicePostureRule
+	if err := direct.Get(ctx, ruleKey, &ruleAfter); err != nil {
+		t.Fatal(err)
+	}
+	if ruleAfter.Status.RuleID != "" || ruleAfter.Status.OwnershipVerified {
+		t.Fatalf("ObserveOnly DevicePostureRule escalated to owned/bound on mode switch: id=%q owned=%v", ruleAfter.Status.RuleID, ruleAfter.Status.OwnershipVerified)
+	}
+	var intAfter v1alpha1.DevicePostureIntegration
+	if err := direct.Get(ctx, intKey, &intAfter); err != nil {
+		t.Fatal(err)
+	}
+	if intAfter.Status.IntegrationID != "" || intAfter.Status.OwnershipVerified {
+		t.Fatalf("ObserveOnly DevicePostureIntegration escalated to owned/bound on mode switch: id=%q owned=%v", intAfter.Status.IntegrationID, intAfter.Status.OwnershipVerified)
+	}
+
+	// Deleting the now-Managed CRs MUST leave all 3 external Cloudflare objects untouched.
+	for _, obj := range []client.Object{&idpAfter, &ruleAfter, &intAfter} {
+		if err := direct.Delete(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := idpReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: idpKey}); err != nil {
+		t.Fatalf("idp delete: %v", err)
+	}
+	if _, err := ruleReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: ruleKey}); err != nil {
+		t.Fatalf("rule delete: %v", err)
+	}
+	if _, err := intReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: intKey}); err != nil {
+		t.Fatalf("int delete: %v", err)
+	}
+	if _, ok := idpFake.providers["ext-idp-1"]; !ok {
+		t.Fatal("external IdentityProvider ext-idp-1 was deleted after ObserveOnly->Managed mode switch")
+	}
+	accessFake.mu.Lock()
+	_, ruleExists := accessFake.posture["ext-rule-1"]
+	accessFake.mu.Unlock()
+	if !ruleExists {
+		t.Fatal("external DevicePostureRule ext-rule-1 was deleted after ObserveOnly->Managed mode switch")
+	}
+	if _, intExists := integrationFake.integrations["ext-int-1"]; !intExists {
+		t.Fatal("external DevicePostureIntegration ext-int-1 was deleted after ObserveOnly->Managed mode switch")
+	}
+}
+
+// Regression test (Finding 2): when spec.secretRef.name changes concurrently
+// during convergeCapturedServiceToken (so persistIdentityWithDirectReader
+// checkpoints TokenID+OwnershipVerified while keeping the journal), and Delete
+// arrives IMMEDIATELY without any intervening active reconcile, reconcileDelete
+// MUST delete the remote token, reap the journal Secret, remove both finalizers,
+// and allow the ServiceToken object to delete cleanly without CleanupBlocked deadlock.
+func TestServiceTokenConvergeSecretRefEditAndImmediateDeleteEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-st-secretref-del"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-st-secretref-del"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	accessFake := newFakeAccessResourceCloudflare()
+	apiReader := &failingStatusClient{Client: direct}
+	reconciler := &ServiceTokenReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: accessFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "ServiceToken secretRef account accepted", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	st := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-secretref-del"},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "st-secretref-del",
+			Enabled:          true,
+			Duration:         "8760h",
+			SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	stKey := client.ObjectKeyFromObject(st)
+
+	var bumped atomic.Bool
+	var bumpErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		if _, ok := obj.(*v1alpha1.ServiceToken); !ok || key != stKey || bumped.Load() {
+			return
+		}
+		var latest v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &latest); err != nil || latest.Status.TokenID != "" {
+			return
+		}
+		var secrets corev1.SecretList
+		if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+			return
+		}
+		hasCommittedCreds, hasJournal := false, false
+		for i := range secrets.Items {
+			s := &secrets.Items[i]
+			if s.Name == "st-creds-v1" && len(s.Data) > 0 {
+				hasCommittedCreds = true
+			}
+			if strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && len(s.Data[serviceTokenJournalKeyIssuedID]) > 0 {
+				hasJournal = true
+			}
+		}
+		if !hasCommittedCreds || !hasJournal || bumped.Swap(true) {
+			return
+		}
+		latest.Spec.SecretRef = corev1.LocalObjectReference{Name: "st-creds-v2"}
+		bumpErr = direct.Update(ctx, &latest)
+	}
+
+	var res ctrl.Result
+	for i := 0; i < 4; i++ {
+		var err error
+		res, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey})
+		if err != nil {
+			t.Fatalf("reconcile pass %d: %v", i, err)
+		}
+		if bumped.Load() {
+			break
+		}
+	}
+	if bumpErr != nil {
+		t.Fatalf("concurrent secretRef edit: %v", bumpErr)
+	}
+	if !bumped.Load() || res.RequeueAfter == 0 {
+		t.Fatalf("expected secretRef bump and immediate requeue, bumped=%v res=%+v", bumped.Load(), res)
+	}
+
+	var afterBump v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if afterBump.Status.TokenID == "" || !afterBump.Status.OwnershipVerified {
+		t.Fatalf("expected checkpointed TokenID+OwnershipVerified, got id=%q owned=%v", afterBump.Status.TokenID, afterBump.Status.OwnershipVerified)
+	}
+
+	// Delete IMMEDIATELY WITHOUT any intervening active reconcile pass.
+	if err := direct.Delete(ctx, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+		t.Fatalf("immediate delete reconcile failed: %v", err)
+	}
+
+	accessFake.mu.Lock()
+	remainingTokens := len(accessFake.tokens)
+	accessFake.mu.Unlock()
+	if remainingTokens != 0 {
+		t.Fatalf("expected 0 remote Cloudflare tokens after immediate delete, got %d", remainingTokens)
+	}
+
+	var secretsAfter corev1.SecretList
+	if err := direct.List(ctx, &secretsAfter, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	for i := range secretsAfter.Items {
+		if strings.HasPrefix(secretsAfter.Items[i].Name, serviceTokenJournalPrefix) {
+			t.Fatalf("journal Secret %q leaked after immediate delete", secretsAfter.Items[i].Name)
+		}
+	}
+
+	var deletedCheck v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &deletedCheck); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected ServiceToken to be completely deleted (no CleanupBlocked deadlock), got err=%v conditions=%+v finalizers=%v",
+			err, deletedCheck.Status.Conditions, deletedCheck.Finalizers)
 	}
 }

@@ -418,12 +418,15 @@ func (r *ZeroTrustListReconciler) patchStatus(ctx context.Context, object *v1alp
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || owned) {
+	observedOwned := owned && effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && status == metav1.ConditionTrue && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustList) error {
-			live.Status.ListID = remote.ID
-			if status == metav1.ConditionTrue {
-				live.Status.OwnershipVerified = owned
+			if effectiveGlobalManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
 			}
+			live.Status.ListID = remote.ID
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

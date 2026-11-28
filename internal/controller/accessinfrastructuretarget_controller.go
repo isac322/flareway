@@ -330,10 +330,15 @@ func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (owned || accepted == metav1.ConditionTrue) {
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessInfrastructureTarget) error {
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			live.Status.TargetID = remote.ID
-			live.Status.OwnershipVerified = owned
+			live.Status.OwnershipVerified = true
 			if remote.Hostname != "" {
 				live.Status.Hostname = remote.Hostname
 				live.Status.IP = infrastructureTargetStatusIP(remote)

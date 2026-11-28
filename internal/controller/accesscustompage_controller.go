@@ -360,10 +360,15 @@ func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || owned) {
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessCustomPage) error {
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			live.Status.CustomPageID = remote.ID
-			live.Status.OwnershipVerified = owned
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

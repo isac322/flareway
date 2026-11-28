@@ -832,9 +832,15 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" {
+	observedOwned := owned && effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+			if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) != flarewayv1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			setIdentity(live)
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

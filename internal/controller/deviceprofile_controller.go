@@ -1212,12 +1212,17 @@ func deviceProfileStatus(object *v1alpha1.DeviceProfile, profileID string, owner
 }
 
 func (r *DeviceProfileReconciler) persistIdentity(ctx context.Context, object *v1alpha1.DeviceProfile, profileID string, ownershipVerified bool) (bool, error) {
-	if profileID == "" {
+	if profileID == "" || !ownershipVerified || effectiveDeviceProfileManagementPolicy(object.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged {
 		return false, nil
 	}
 	return persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DeviceProfile) error {
+		if effectiveDeviceProfileManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+			live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+			live.Spec.Profile.Kind != object.Spec.Profile.Kind {
+			return errSkipStatusPatch
+		}
 		live.Status.ProfileID = profileID
-		live.Status.OwnershipVerified = ownershipVerified
+		live.Status.OwnershipVerified = true
 		return nil
 	})
 }
@@ -1243,8 +1248,9 @@ func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alp
 	if err != nil {
 		return err
 	}
-	if !applied && status.ProfileID != "" && status.OwnershipVerified {
-		_, err = r.persistIdentity(ctx, object, status.ProfileID, status.OwnershipVerified)
+	observedOwned := status.ProfileID != "" && status.OwnershipVerified && effectiveDeviceProfileManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && observedOwned {
+		_, err = r.persistIdentity(ctx, object, status.ProfileID, true)
 		return err
 	}
 	return nil

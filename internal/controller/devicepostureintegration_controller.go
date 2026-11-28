@@ -368,10 +368,15 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 	if err != nil {
 		return err
 	}
-	if !applied && remote != nil && id != "" && status == metav1.ConditionTrue {
+	observedOwned := object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote != nil && id != "" && status == metav1.ConditionTrue && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
+			if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
 			live.Status.IntegrationID = id
-			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}

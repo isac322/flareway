@@ -1105,13 +1105,17 @@ func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	if !applied && remote.ID != "" && (owned || accepted == metav1.ConditionTrue) {
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
 		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
-			live.Status.ApplicationID = remote.ID
-			if remote.Name != "" {
-				live.Status.ZoneID = scope.ZoneID
-				live.Status.OwnershipVerified = owned
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+				live.Spec.Zone != object.Spec.Zone {
+				return errSkipStatusPatch
 			}
+			live.Status.ApplicationID = remote.ID
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = true
 			return nil
 		})
 	}
