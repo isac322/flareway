@@ -383,3 +383,54 @@ func TestLatchUIDBoundIsolationAndPruning(t *testing.T) {
 	}
 	latch.EndLifetime(tokForRemove)
 }
+
+func TestLatchRemoveIfUntouchedPreservesUnseenPostBeginUIDGuard(t *testing.T) {
+	latch := NewLatch()
+	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	const uid1 = types.UID("uid-1")
+	const uidPre = types.UID("uid-pre")
+	const uid2New = types.UID("uid-2-new")
+
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid1, "old-drift")
+	tokPre := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uidPre)
+	defer latch.EndLifetime(tokPre)
+
+	// Name-scoped absence guard snapshots uid1 and uidPre in knownUIDs.
+	tokAbsent := latch.BeginLifetime("CloudflareTunnelConfig", key)
+	defer latch.EndLifetime(tokAbsent)
+
+	// After BeginLifetime:
+	// - uid2New is an unseen replacement UID (gid > tokAbsent.id, !known)
+	// - uid1Late is a late stale-cache guard for deleted uid1 (gid > tokAbsent.id, known)
+	tokUID2New := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2New)
+	defer latch.EndLifetime(tokUID2New)
+	tokUID1Late := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	defer latch.EndLifetime(tokUID1Late)
+
+	if !latch.RemoveIfUntouched(tokAbsent) {
+		t.Fatal("expected untouched RemoveIfUntouched to apply")
+	}
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("RemoveIfUntouched did not delete uid1 state")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokPre, "demoted") {
+		t.Fatal("pre-BeginLifetime guard was not retired by RemoveIfUntouched")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokUID1Late, "demoted") {
+		t.Fatal("late guard for known uid1 was not retired by RemoveIfUntouched")
+	}
+	if !latch.ForgetAndInvalidateIfUnretired(tokUID2New, "demoted") {
+		t.Fatal("RemoveIfUntouched retired unseen post-BeginLifetime replacement UID2 guard")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2New) || latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid2New) == 0 {
+		t.Fatal("expected unseen replacement UID2 guard to record fail-closed invalidation")
+	}
+
+	latch.EndLifetime(tokPre)
+	latch.EndLifetime(tokAbsent)
+	latch.EndLifetime(tokUID2New)
+	latch.EndLifetime(tokUID1Late)
+	if len(latch.activeGuards) != 0 {
+		t.Fatalf("activeGuards not empty after EndLifetime: len=%d", len(latch.activeGuards))
+	}
+}

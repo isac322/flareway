@@ -67,10 +67,11 @@ type Latch struct {
 // key against concurrent retirement or replacement-UID updates without retaining
 // any per-key state after EndLifetime.
 type LifetimeToken struct {
-	kind string
-	key  types.NamespacedName
-	uid  types.UID
-	id   uint64
+	kind      string
+	key       types.NamespacedName
+	uid       types.UID
+	id        uint64
+	knownUIDs map[types.UID]struct{}
 }
 
 // Key returns the NamespacedName guarded by this LifetimeToken.
@@ -179,7 +180,11 @@ func (l *Latch) beginLifetime(kind string, key types.NamespacedName, uid types.U
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	id := l.registerGuardLocked(latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid})
-	return LifetimeToken{kind: kind, key: key, uid: uid, id: id}
+	var knownUIDs map[types.UID]struct{}
+	if uid == "" {
+		knownUIDs = l.collectKnownUIDsLocked(kind, key.Namespace, key.Name)
+	}
+	return LifetimeToken{kind: kind, key: key, uid: uid, id: id, knownUIDs: knownUIDs}
 }
 
 // BeginLifetime registers an in-flight name-scoped guard token for (kind, key).
@@ -413,12 +418,26 @@ func mapHasOtherUID[V any](m map[latchKey]V, kind, ns, name string, excludeUID t
 	return false
 }
 
-func collectCandidateUIDs[V any](m map[latchKey]V, kind, ns, name string, out map[types.UID]struct{}) {
+func collectCandidateUIDs[V any](m map[latchKey]V, kind, ns, name string, out *map[types.UID]struct{}) {
 	for k := range m {
 		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" {
-			out[k.uid] = struct{}{}
+			if *out == nil {
+				*out = make(map[types.UID]struct{})
+			}
+			(*out)[k.uid] = struct{}{}
 		}
 	}
+}
+
+func (l *Latch) collectKnownUIDsLocked(kind, ns, name string) map[types.UID]struct{} {
+	var out map[types.UID]struct{}
+	collectCandidateUIDs(l.epochs, kind, ns, name, &out)
+	collectCandidateUIDs(l.reasons, kind, ns, name, &out)
+	collectCandidateUIDs(l.verified, kind, ns, name, &out)
+	collectCandidateUIDs(l.baselines, kind, ns, name, &out)
+	collectCandidateUIDs(l.confirmed, kind, ns, name, &out)
+	collectCandidateUIDs(l.activeGuards, kind, ns, name, &out)
+	return out
 }
 
 func deleteMatchingKeys[V any](m map[latchKey]V, kind, ns, name string, shouldDeleteUID func(types.UID) bool) {
@@ -478,13 +497,7 @@ func (l *Latch) BeginPrune(kind string, key types.NamespacedName) PruneToken {
 	defer l.mu.Unlock()
 	ns, name := key.Namespace, key.Name
 	id := l.registerGuardLocked(latchKey{kind: kind, namespace: ns, name: name})
-	candidates := make(map[types.UID]struct{})
-	collectCandidateUIDs(l.epochs, kind, ns, name, candidates)
-	collectCandidateUIDs(l.reasons, kind, ns, name, candidates)
-	collectCandidateUIDs(l.verified, kind, ns, name, candidates)
-	collectCandidateUIDs(l.baselines, kind, ns, name, candidates)
-	collectCandidateUIDs(l.confirmed, kind, ns, name, candidates)
-	collectCandidateUIDs(l.activeGuards, kind, ns, name, candidates)
+	candidates := l.collectKnownUIDsLocked(kind, ns, name)
 	candidateGuards := make(map[latchKey]map[uint64]struct{})
 	for k, guards := range l.activeGuards {
 		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" && len(guards) > 0 {
@@ -598,14 +611,29 @@ func (l *Latch) RemoveIfUntouched(tok LifetimeToken) bool {
 	if !ok || st.touched {
 		return false
 	}
-	notSelf := func(gk latchKey, gid uint64) bool {
-		return gk != k || gid != tok.id
-	}
 	if tok.uid == "" {
 		l.purgeMatchingLocked(tok.kind, tok.key.Namespace, tok.key.Name, func(types.UID) bool {
 			return true
-		}, notSelf)
+		}, func(gk latchKey, gid uint64) bool {
+			if gk == k && gid == tok.id {
+				return false
+			}
+			if gk.uid == "" {
+				return true
+			}
+			// Only retire UID-scoped guards that either pre-date this absence
+			// observation (gid < tok.id) or belong to a UID already known when
+			// BeginLifetime started (late stale-cache guards for the deleted UID).
+			// Replacement UID guards registered afterward (gid > tok.id) for
+			// unseen UIDs have not yet written state and must stay unretired so
+			// concurrent fail-closed demotion works.
+			_, known := tok.knownUIDs[gk.uid]
+			return gid < tok.id || known
+		})
 	} else {
+		notSelf := func(gk latchKey, gid uint64) bool {
+			return gk != k || gid != tok.id
+		}
 		l.purgeMatchingLocked(tok.kind, tok.key.Namespace, tok.key.Name, func(u types.UID) bool {
 			return u == tok.uid
 		}, notSelf)

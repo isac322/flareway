@@ -4555,18 +4555,22 @@ func (w *failingStatusWriter) Patch(ctx context.Context, obj client.Object, patc
 }
 
 func (w *failingStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+	var err error
 	if w.parent.failStatusWrite.Load() {
 		if w.parent.failStatusKind == "" {
-			return fmt.Errorf("injected status Apply failure")
-		}
-		var document struct {
-			Kind string `json:"kind"`
-		}
-		if payload, err := json.Marshal(obj); err == nil && json.Unmarshal(payload, &document) == nil && document.Kind == w.parent.failStatusKind {
-			return fmt.Errorf("injected status Apply failure for %s", document.Kind)
+			err = fmt.Errorf("injected status Apply failure")
+		} else {
+			var document struct {
+				Kind string `json:"kind"`
+			}
+			if payload, marshalErr := json.Marshal(obj); marshalErr == nil && json.Unmarshal(payload, &document) == nil && document.Kind == w.parent.failStatusKind {
+				err = fmt.Errorf("injected status Apply failure for %s", document.Kind)
+			}
 		}
 	}
-	err := w.SubResourceWriter.Apply(ctx, obj, opts...)
+	if err == nil {
+		err = w.SubResourceWriter.Apply(ctx, obj, opts...)
+	}
 	if w.parent.onAfterStatusApply != nil {
 		w.parent.onAfterStatusApply(err)
 	}
@@ -7423,4 +7427,163 @@ func convergeUID2WithGateway(ctx context.Context, t *testing.T, f *demoteEnvtest
 		return cur.UID == uid2 && cur.Status.GatewayUID == f.gw.UID && cur.Status.OwnershipVerified && cur.Status.TunnelID != "" && cur.Status.ConnectorTokenSecretRef != nil, nil
 	})
 	return cur
+}
+
+// Regression test: holding a name-scoped absence guard across replacement UID2
+// creation and starting UID2's demoteTunnelConfigApplied (which registers an
+// unseen UID2 BeginLifetimeForUID guard after BeginLifetime started), then
+// completing UID1's RemoveIfUntouched before UID2's Status().Apply fails
+// transiently MUST preserve UID2's guard unretired so ForgetAndInvalidateIfUnretired
+// latches UID2's fail-closed invalidation and keeps UID2's gate closed.
+func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing.T) {
+	f := setupDemoteEnvtest(t, "absence-inflight-guard")
+	ctx := context.Background()
+	tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+
+	// Delete UID1 cleanly from etcd (including owned connector Secret) and clear
+	// any pre-existing UID1 latch entry so tokAbsent starts with an empty latch.
+	var uid1Obj v1alpha1.CloudflareTunnel
+	if err := f.direct.Get(ctx, tunnelKey, &uid1Obj); err != nil {
+		t.Fatal(err)
+	}
+	uid1Obj.Finalizers = nil
+	if err := f.direct.Update(ctx, &uid1Obj); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.direct.Delete(ctx, &uid1Obj); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	if f.tunnel.Status.ConnectorTokenSecretRef != nil {
+		if err := f.direct.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: tunnelKey.Namespace,
+			Name:      f.tunnel.Status.ConnectorTokenSecretRef.Name,
+		}}); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	waitUntilTrue(t, 10*time.Second, "UID1 deleted", func() (bool, error) {
+		var check v1alpha1.CloudflareTunnel
+		return apierrors.IsNotFound(f.direct.Get(ctx, tunnelKey, &check)), nil
+	})
+	f.latch.Remove(configFreshnessKind, tunnelKey)
+	f.latch.Remove("CloudflareTunnel", tunnelKey)
+
+	// Block retireTunnelIfConfirmedAbsent right after its uncached Get confirms NotFound.
+	gotNotFound := make(chan struct{})
+	releaseNotFound := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseNotFound:
+		default:
+			close(releaseNotFound)
+		}
+	})
+	var blockedOnce atomic.Bool
+	blockingReader := &failingStatusClient{
+		Client: f.direct,
+		onAfterTunnelGet: func(key client.ObjectKey, _ *v1alpha1.CloudflareTunnel, err error) {
+			if key == tunnelKey && apierrors.IsNotFound(err) && !blockedOnce.Swap(true) {
+				close(gotNotFound)
+				<-releaseNotFound
+			}
+		},
+	}
+
+	absentDone := make(chan bool, 1)
+	go func() {
+		retired, err := retireTunnelIfConfirmedAbsent(
+			ctx,
+			blockingReader,
+			f.latch,
+			tunnelKey,
+			apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, tunnelKey.Name),
+		)
+		if err != nil {
+			t.Errorf("retireTunnelIfConfirmedAbsent error: %v", err)
+		}
+		absentDone <- retired
+	}()
+	<-gotNotFound
+
+	// Create UID2 and bind Gateway ownership via bootstrap reconcilers with nil
+	// Invalidator so tokAbsent remains untouched and UID2 stays unseen in latch.
+	uid2Spec := f.tunnel.Spec.DeepCopy()
+	uid2Spec.Tunnel.Name = "uid2-remote-inflight"
+	uid2 := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       tunnelKey.Namespace,
+			Name:            tunnelKey.Name,
+			OwnerReferences: append([]metav1.OwnerReference(nil), f.tunnel.OwnerReferences...),
+		},
+		Spec: *uid2Spec,
+	}
+	if err := f.direct.Create(ctx, uid2); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapTunnel := *f.tunnelReconciler
+	bootstrapTunnel.Invalidator = nil
+	bootstrapGW := *f.gwReconciler
+	bootstrapGW.Invalidator = nil
+	var uid2Obj v1alpha1.CloudflareTunnel
+	waitUntilTrue(t, 10*time.Second, "UID2 bound to Gateway for demote test", func() (bool, error) {
+		if err := bootstrapGW.Get(ctx, tunnelKey, &uid2Obj); err != nil || uid2Obj.UID != uid2.UID {
+			return false, nil
+		}
+		_, _ = bootstrapTunnel.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+		_, _ = bootstrapGW.Reconcile(ctx, ctrl.Request{NamespacedName: f.irGW.Key})
+		if err := f.direct.Get(ctx, tunnelKey, &uid2Obj); err != nil {
+			return false, nil
+		}
+		return uid2Obj.UID == uid2.UID && uid2Obj.Status.GatewayUID == f.gw.UID && uid2Obj.Status.OwnershipVerified && uid2Obj.Status.TunnelID != "" && uid2Obj.Status.ConnectorTokenSecretRef != nil, nil
+	})
+
+	// Run production demoteTunnelConfigApplied on UID2: its BeginLifetimeForUID
+	// guard is registered BEFORE Status().Apply fails. Right after Apply fails
+	// (and BEFORE ForgetAndInvalidateIfUnretired runs), release the delayed
+	// RemoveIfUntouched and wait for it to finish.
+	f.statusClient.failStatusKind = "CloudflareTunnel"
+	f.statusClient.failStatusWrite.Store(true)
+	var releasedInApply atomic.Bool
+	var absentRetired bool
+	f.statusClient.onAfterStatusApply = func(applyErr error) {
+		if applyErr != nil && !releasedInApply.Swap(true) {
+			close(releaseNotFound)
+			absentRetired = <-absentDone
+		}
+	}
+
+	err := f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &uid2Obj, time.Now(), "Applying", "applying")
+	if err == nil {
+		t.Fatal("expected injected Status().Apply error")
+	}
+	if !releasedInApply.Load() {
+		t.Fatal("expected onAfterStatusApply to release delayed RemoveIfUntouched")
+	}
+	if !absentRetired {
+		t.Fatal("expected untouched delayed RemoveIfUntouched to complete")
+	}
+	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
+		t.Fatal("delayed RemoveIfUntouched retired in-flight UID2 guard and blocked fail-closed demotion")
+	}
+	if got := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID); got == 0 {
+		t.Fatal("expected non-zero invalidation epoch on UID2 after transient demote failure")
+	}
+	now := time.Now()
+	nowApplied := metav1.NewTime(now)
+	decision := evaluateGateWithHashForUID(
+		freshness.DefaultPolicy(),
+		f.latch,
+		freshness.GradeTraffic,
+		configFreshnessKind,
+		tunnelKey,
+		uid2Obj.UID,
+		"h2",
+		"h2",
+		&nowApplied,
+		true,
+		now,
+	)
+	if decision.Open {
+		t.Fatalf("expected UID2 config gate to stay closed after transient demote failure, got %+v", decision.Gate)
+	}
 }
