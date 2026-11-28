@@ -386,20 +386,32 @@ func (r *VirtualNetworkReconciler) patchStatus(ctx context.Context, object *v1al
 	}
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.VirtualNetwork) error {
+	setIdentity := func(live *v1alpha1.VirtualNetwork) {
+		live.Status.VirtualNetworkID = remote.ID
+		live.Status.Name = remote.Name
+		live.Status.IsDefault = remote.IsDefault
+		live.Status.Comment = remote.Comment
+		live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+		live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
+	}
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.VirtualNetwork) error {
 		if persistIdentity {
-			live.Status.VirtualNetworkID = remote.ID
-			live.Status.Name = remote.Name
-			live.Status.IsDefault = remote.IsDefault
-			live.Status.Comment = remote.Comment
-			live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
-			live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
-			live.Status.OwnershipVerified = owned
+			setIdentity(live)
 		}
 		live.Status.ObservedGeneration = live.Generation
 		live.Status.Conditions = privateConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && persistIdentity {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.VirtualNetwork) error {
+			setIdentity(live)
+			return nil
+		})
+	}
 	return err
 }
 

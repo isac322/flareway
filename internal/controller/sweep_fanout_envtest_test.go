@@ -777,25 +777,36 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 	rawGWSweep := sweeper.EventsFor("CloudflareTunnel")
 	gwSweepCh := make(chan event.GenericEvent, 64)
 	var gwSweepDelivered atomic.Int64
+	var gwSweepEnqueued atomic.Int64
+	var probesAtLastSweepEnqueue atomic.Int64
+	gwKey := types.NamespacedName{Namespace: "gw-fanout", Name: "edge"}
+	relayCtx, cancelRelay := context.WithCancel(ctx)
+	var relayWG sync.WaitGroup
+	relayWG.Add(1)
 	go func() {
+		defer relayWG.Done()
+		defer close(gwSweepCh)
 		for {
 			select {
-			case <-ctx.Done():
+			case <-relayCtx.Done():
 				return
 			case ev, ok := <-rawGWSweep:
 				if !ok {
-					close(gwSweepCh)
 					return
 				}
 				gwSweepDelivered.Add(1)
 				select {
 				case gwSweepCh <- ev:
-				case <-ctx.Done():
+				case <-relayCtx.Done():
 					return
 				}
 			}
 		}
 	}()
+	t.Cleanup(func() {
+		cancelRelay()
+		relayWG.Wait()
+	})
 	gwReconciler := &GatewayReconciler{
 		Client:            mgr.GetClient(),
 		APIReader:         mgr.GetAPIReader(),
@@ -807,6 +818,14 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		Freshness:         policy,
 		Invalidator:       latch,
 		SweepEvents:       gwSweepCh,
+		onSweepEnqueue: func(reqs []ctrl.Request) {
+			for _, req := range reqs {
+				if req.NamespacedName == gwKey {
+					probesAtLastSweepEnqueue.Store(prober.probes.Load())
+					gwSweepEnqueued.Add(1)
+				}
+			}
+		},
 	}
 	if err := gwReconciler.SetupWithManager(mgr); err != nil {
 		t.Fatalf("setup GatewayReconciler: %v", err)
@@ -968,6 +987,7 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		probesBefore := prober.probes.Load()
 		tunnelCallsBefore := len(tunnelFake.Calls())
 		deliveredBefore := gwSweepDelivered.Load()
+		enqueuedBefore := gwSweepEnqueued.Load()
 
 		emitTunnelDrift.Store(true)
 		select {
@@ -988,8 +1008,11 @@ func TestQA2A2GatewayReceivesUnstructuredTunnelSweepEventEnvtest(t *testing.T) {
 		waitUntilTrue(t, 10*time.Second, fmt.Sprintf("pulse %d CloudflareTunnel reconciler executed remote verify after sweep event", pulse), func() (bool, error) {
 			return len(tunnelFake.Calls()) > tunnelCallsBefore && !latch.IsInvalidated("CloudflareTunnel", client.ObjectKeyFromObject(&tunnelObj)), nil
 		})
-		waitUntilTrue(t, 10*time.Second, fmt.Sprintf("pulse %d GatewayReconciler delivered SweepEvents and woken", pulse), func() (bool, error) {
-			return gwSweepDelivered.Load() > deliveredBefore && prober.probes.Load() > probesBefore, nil
+		waitUntilTrue(t, 10*time.Second, fmt.Sprintf("pulse %d GatewayReconciler SweepEvents enqueued gwKey and woke", pulse), func() (bool, error) {
+			return gwSweepDelivered.Load() > deliveredBefore &&
+				gwSweepEnqueued.Load() > enqueuedBefore &&
+				probesAtLastSweepEnqueue.Load() == probesBefore &&
+				prober.probes.Load() > probesBefore, nil
 		})
 		var tunnelAfter v1alpha1.CloudflareTunnel
 		if err := direct.Get(ctx, client.ObjectKeyFromObject(&tunnelObj), &tunnelAfter); err != nil {

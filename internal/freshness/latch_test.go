@@ -433,6 +433,10 @@ func TestLatchRemoveIfUntouchedPreservesUnseenPostBeginUIDGuard(t *testing.T) {
 	if len(latch.activeGuards) != 0 {
 		t.Fatalf("activeGuards not empty after EndLifetime: len=%d", len(latch.activeGuards))
 	}
+	latch.Remove("CloudflareTunnelConfig", key)
+	if len(latch.nameUIDs) != 0 {
+		t.Fatalf("nameUIDs not empty after Remove: len=%d", len(latch.nameUIDs))
+	}
 }
 
 func TestLatchRemoveForUIDAtEpoch(t *testing.T) {
@@ -513,5 +517,86 @@ func TestLatchRemoveForUIDAtEpoch(t *testing.T) {
 	latch.EndLifetime(tokUID2)
 	if len(latch.activeGuards) != 0 {
 		t.Fatalf("activeGuards not empty after EndLifetime: len=%d", len(latch.activeGuards))
+	}
+	latch.Remove("CloudflareTunnelConfig", key)
+	if len(latch.nameUIDs) != 0 {
+		t.Fatalf("nameUIDs not empty after Remove: len=%d", len(latch.nameUIDs))
+	}
+}
+
+func TestLatchCompleteVerificationWithTokenAndNameUIDsIndex(t *testing.T) {
+	latch := NewLatch()
+	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	const uid1 = types.UID("uid-1")
+	const uid2 = types.UID("uid-2")
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+	// nil / zero-token safety.
+	var nilLatch *Latch
+	if nilLatch.CompleteVerificationWithToken(LifetimeToken{}, 0, "h1", now, nil) {
+		t.Fatal("nil CompleteVerificationWithToken returned true")
+	}
+	if latch.CompleteVerificationWithToken(LifetimeToken{}, 0, "h1", now, nil) {
+		t.Fatal("zero-token CompleteVerificationWithToken returned true")
+	}
+
+	// Active token at epoch==0 succeeds.
+	tokZero := latch.BeginLifetime("CloudflareTunnel", key)
+	if !latch.CompleteVerificationWithToken(tokZero, 0, "h0", now, nil) {
+		t.Fatal("CompleteVerificationWithToken failed for active token at epoch 0")
+	}
+	if _, ok := latch.VerifiedAt("CloudflareTunnel", key, "h0"); !ok {
+		t.Fatal("expected VerifiedAt after CompleteVerificationWithToken")
+	}
+	latch.EndLifetime(tokZero)
+	latch.Remove("CloudflareTunnel", key)
+
+	// Retired token at epoch==0 MUST be rejected even though expectedEpoch == 0 && epochs[k] == 0.
+	tokRetiredZero := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	tokAbsent := latch.BeginLifetime("CloudflareTunnelConfig", key)
+	if !latch.RemoveIfUntouched(tokAbsent) {
+		t.Fatal("expected untouched RemoveIfUntouched to succeed")
+	}
+	latch.EndLifetime(tokAbsent)
+	if latch.CompleteVerificationWithToken(tokRetiredZero, 0, "h1", now, nil) {
+		t.Fatal("CompleteVerificationWithToken succeeded at epoch==0 after token retired by RemoveIfUntouched")
+	}
+	if _, ok := latch.VerifiedAtForUID("CloudflareTunnelConfig", key, uid1, "h1"); ok {
+		t.Fatal("rejected CompleteVerificationWithToken recorded VerifiedAtForUID")
+	}
+	latch.EndLifetime(tokRetiredZero)
+
+	// UID-scoped CompleteVerificationWithToken matching epoch succeeds, clears invalidation, and updates nameUIDs.
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid2, "drift")
+	epoch2 := latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid2)
+	tokUID2 := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2)
+	if !latch.CompleteVerificationWithToken(tokUID2, epoch2, "h2", now, nil) {
+		t.Fatal("UID2 CompleteVerificationWithToken failed on matching epoch")
+	}
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2) {
+		t.Fatal("UID2 invalidation not cleared by CompleteVerificationWithToken")
+	}
+	if !latch.HasOtherUIDs("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("expected HasOtherUIDs=true for uid2 via nameUIDs index")
+	}
+	latch.EndLifetime(tokUID2)
+
+	// Remove cleans nameUIDs completely (zero idle footprint).
+	latch.Remove("CloudflareTunnelConfig", key)
+	if latch.HasOtherUIDs("CloudflareTunnelConfig", key, uid1) {
+		t.Fatal("HasOtherUIDs=true after Remove")
+	}
+	if len(latch.nameUIDs) != 0 || len(latch.activeGuards) != 0 {
+		t.Fatalf("expected empty nameUIDs and activeGuards after Remove+EndLifetime, got nameUIDs=%d activeGuards=%d", len(latch.nameUIDs), len(latch.activeGuards))
+	}
+
+	// MarkVerifiedForUID + ForgetForUID cleans nameUIDs when no other entries exist for that UID.
+	latch.MarkVerifiedForUID("CloudflareTunnelConfig", key, uid1, "h-only", now)
+	if len(latch.nameUIDs) != 1 {
+		t.Fatalf("expected nameUIDs len 1 after MarkVerifiedForUID, got %d", len(latch.nameUIDs))
+	}
+	latch.ForgetForUID("CloudflareTunnelConfig", key, uid1)
+	if len(latch.nameUIDs) != 0 {
+		t.Fatalf("expected nameUIDs len 0 after ForgetForUID removed sole entry, got %d", len(latch.nameUIDs))
 	}
 }

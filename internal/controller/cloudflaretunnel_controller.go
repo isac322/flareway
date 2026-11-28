@@ -459,6 +459,8 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 	if err := r.commitTunnelConditions(ctx, tunnel, withoutRemoteVerdicts(ownedConditions), true); err != nil {
 		return ctrl.Result{}, err
 	}
+	verifyTok := r.Invalidator.BeginLifetime("CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
+	defer r.Invalidator.EndLifetime(verifyTok)
 	verifyEpoch := r.Invalidator.InvalidationEpoch("CloudflareTunnel", client.ObjectKeyFromObject(tunnel))
 	remote, conflictReason, err := r.ensureRemoteTunnel(ctx, cf, tunnel, clusterID, account.Spec.AccountID)
 	if err != nil {
@@ -663,7 +665,7 @@ func (r *CloudflareTunnelReconciler) reconcileActive(ctx context.Context, tunnel
 		// verification timestamp ONLY after patchOwnedStatus durably persists
 		// Ready=True, and only if no newer sweep invalidation superseded
 		// verifyEpoch while remote checks or status commits ran.
-		r.Invalidator.CompleteVerification("CloudflareTunnel", client.ObjectKeyFromObject(tunnel), verifyEpoch, status.ConfigVersion.DesiredHash, now.Time, nil)
+		r.Invalidator.CompleteVerificationWithToken(verifyTok, verifyEpoch, status.ConfigVersion.DesiredHash, now.Time, nil)
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }

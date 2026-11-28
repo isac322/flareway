@@ -460,16 +460,12 @@ func directStatusReader(writer kubeclient.Client, reader kubeclient.Reader) kube
 	return writer
 }
 
-// patchStatusWithDirectReader reads the live object from reader (uncached
-// APIReader when configured) inside RetryOnConflict, guards UID/Generation
-// identity, applies mutate, and submits an optimistic-locked status merge patch.
-// It returns (false, nil) without clearing latches if the object was deleted
-// or its UID/Generation changed concurrently.
-func patchStatusWithDirectReader[T kubeclient.Object](
+func patchLiveStatusWithDirectReader[T kubeclient.Object](
 	ctx context.Context,
 	writer kubeclient.Client,
 	reader kubeclient.Reader,
 	observed T,
+	requireSameGeneration bool,
 	mutate func(live T) error,
 ) (bool, error) {
 	key := kubeclient.ObjectKeyFromObject(observed)
@@ -486,7 +482,11 @@ func patchStatusWithDirectReader[T kubeclient.Object](
 			}
 			return err
 		}
-		if (observed.GetUID() != "" && live.GetUID() != observed.GetUID()) || live.GetGeneration() != observed.GetGeneration() {
+		if observed.GetUID() != "" && live.GetUID() != observed.GetUID() {
+			applied = false
+			return nil
+		}
+		if requireSameGeneration && live.GetGeneration() != observed.GetGeneration() {
 			applied = false
 			return nil
 		}
@@ -515,6 +515,38 @@ func patchStatusWithDirectReader[T kubeclient.Object](
 		return false, err
 	}
 	return applied, nil
+}
+
+// patchStatusWithDirectReader reads the live object from reader (uncached
+// APIReader when configured) inside RetryOnConflict, guards UID/Generation
+// identity, applies mutate, and submits an optimistic-locked status merge patch.
+// It returns (false, nil) without clearing latches if the object was deleted
+// or its UID/Generation changed concurrently.
+func patchStatusWithDirectReader[T kubeclient.Object](
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	observed T,
+	mutate func(live T) error,
+) (bool, error) {
+	return patchLiveStatusWithDirectReader(ctx, writer, reader, observed, true, mutate)
+}
+
+// persistIdentityWithDirectReader checkpoints remote resource identity and
+// ownership fields onto the live object even if Spec changed concurrently
+// (live.Generation != observed.Generation), guarding only UID and NotFound.
+// Callers must mutate ONLY identity/ownership fields (never ObservedGeneration,
+// Conditions, AppliedHash, or AppliedAt). Returns (true, nil) when the live
+// object retains or commits the identity, or (false, nil) on UID mismatch /
+// NotFound.
+func persistIdentityWithDirectReader[T kubeclient.Object](
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	observed T,
+	mutate func(live T) error,
+) (bool, error) {
+	return patchLiveStatusWithDirectReader(ctx, writer, reader, observed, false, mutate)
 }
 
 // completeGateVerification atomically releases an invalidation matching

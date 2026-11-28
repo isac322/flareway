@@ -116,6 +116,7 @@ type cloudflareConfigResult struct {
 	verifiedGateKey types.NamespacedName
 	verifiedUID     types.UID
 	verifiedEpoch   uint64
+	verifiedTok     freshness.LifetimeToken
 	verifiedHash    string
 	verifiedAt      time.Time
 }
@@ -755,6 +756,13 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 			requeue:         gate.Requeue,
 		}, nil
 	}
+	verifyTok := r.Invalidator.BeginLifetimeForUID(configFreshnessKind, gateKey, tunnel.UID)
+	keepVerifyTok := false
+	defer func() {
+		if !keepVerifyTok {
+			r.Invalidator.EndLifetime(verifyTok)
+		}
+	}()
 	configEpoch := r.Invalidator.InvalidationEpochForUID(configFreshnessKind, gateKey, tunnel.UID)
 	api, err := r.cloudflareClient(ctx, account)
 	if err != nil {
@@ -860,9 +868,11 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		// caller-side fallback honors the configured TTL.
 		result.verifiedGateKey = gateKey
 		result.verifiedUID = tunnel.UID
+		result.verifiedTok = verifyTok
 		result.verifiedHash = hash
 		result.verifiedAt = now
 		result.requeue = r.Freshness.TTL(freshness.GradeTraffic)
+		keepVerifyTok = true
 	}
 	return result, nil
 }
@@ -871,7 +881,7 @@ func (r *GatewayReconciler) confirmTunnelConfigGate(result cloudflareConfigResul
 	if result.verifiedAt.IsZero() {
 		return
 	}
-	r.Invalidator.CompleteVerificationForUID(configFreshnessKind, result.verifiedGateKey, result.verifiedUID, result.verifiedEpoch, result.verifiedHash, result.verifiedAt, nil)
+	r.Invalidator.CompleteVerificationWithToken(result.verifiedTok, result.verifiedEpoch, result.verifiedHash, result.verifiedAt, nil)
 }
 
 // tunnelConfigConvergedForGate requires affirmative current-generation

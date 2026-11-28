@@ -934,7 +934,7 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "IdentityProvider", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.IdentityProvider) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.IdentityProvider) error {
 		if status == metav1.ConditionTrue {
 			live.Status.IDPID = remote.ID
 			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
@@ -956,6 +956,17 @@ func (r *IdentityProviderReconciler) patchStatus(ctx context.Context, object *v1
 		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && status == metav1.ConditionTrue && remote.ID != "" {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.IdentityProvider) error {
+			live.Status.IDPID = remote.ID
+			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && !remote.ReadOnly
+			live.Status.ReadOnly = remote.ReadOnly
+			return nil
+		})
+	}
 	return err
 }
 

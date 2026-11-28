@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -4467,6 +4468,7 @@ type failingStatusClient struct {
 	staleGateway        *gatewayv1.Gateway
 	onStatusPatch       func(obj client.Object)
 	onAfterStatusApply  func(err error)
+	onBeforeGet         func(key client.ObjectKey, obj client.Object)
 	onBeforeTunnelGet   func(key client.ObjectKey)
 	onAfterTunnelGet    func(key client.ObjectKey, tunnel *v1alpha1.CloudflareTunnel, err error)
 	onList              func(list client.ObjectList)
@@ -4505,6 +4507,9 @@ func (c *failingStatusClient) Get(ctx context.Context, key client.ObjectKey, obj
 			*target = *c.staleGateway.DeepCopy()
 			return nil
 		}
+	}
+	if c.onBeforeGet != nil {
+		c.onBeforeGet(key, obj)
 	}
 	err := c.Client.Get(ctx, key, obj, opts...)
 	if tunnelTarget, ok := obj.(*v1alpha1.CloudflareTunnel); ok && c.onAfterTunnelGet != nil {
@@ -6684,6 +6689,11 @@ type demoteEnvtestFixture struct {
 	tunnelReconciler *CloudflareTunnelReconciler
 }
 
+type absentResult struct {
+	retired bool
+	err     error
+}
+
 func setupDemoteEnvtest(t *testing.T, suffix string) *demoteEnvtestFixture {
 	t.Helper()
 	_, mgr, direct, _ := startPR2EnvtestManager(t)
@@ -7281,8 +7291,19 @@ func TestAbsenceCheckDoesNotRetireReplacementDemotionEnvtest(t *testing.T) {
 		},
 	}
 
-	absentDone := make(chan bool, 1)
+	absentDone := make(chan absentResult, 1)
+	var absentWG sync.WaitGroup
+	absentWG.Add(1)
+	t.Cleanup(func() {
+		select {
+		case <-releaseNotFound:
+		default:
+			close(releaseNotFound)
+		}
+		absentWG.Wait()
+	})
 	go func() {
+		defer absentWG.Done()
 		retired, err := retireTunnelIfConfirmedAbsent(
 			ctx,
 			blockingReader,
@@ -7290,12 +7311,15 @@ func TestAbsenceCheckDoesNotRetireReplacementDemotionEnvtest(t *testing.T) {
 			tunnelKey,
 			apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, tunnelKey.Name),
 		)
-		if err != nil {
-			t.Errorf("retireTunnelIfConfirmedAbsent error: %v", err)
-		}
-		absentDone <- retired
+		absentDone <- absentResult{retired: retired, err: err}
 	}()
-	<-gotNotFound
+	select {
+	case <-gotNotFound:
+	case res := <-absentDone:
+		t.Fatalf("retireTunnelIfConfirmedAbsent finished before NotFound barrier (retired=%v err=%v)", res.retired, res.err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for retireTunnelIfConfirmedAbsent NotFound barrier")
+	}
 
 	// While retireTunnelIfConfirmedAbsent holds the delayed NotFound, create
 	// replacement UID2, converge its tunnel verification, and run
@@ -7312,7 +7336,6 @@ func TestAbsenceCheckDoesNotRetireReplacementDemotionEnvtest(t *testing.T) {
 		Spec: *uid2Spec,
 	}
 	if err := f.direct.Create(ctx, uid2); err != nil {
-		close(releaseNotFound)
 		t.Fatal(err)
 	}
 	uid2Obj := convergeUID2WithGateway(ctx, t, f, uid2.UID)
@@ -7320,18 +7343,23 @@ func TestAbsenceCheckDoesNotRetireReplacementDemotionEnvtest(t *testing.T) {
 	f.statusClient.failStatusWrite.Store(true)
 	err := f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &uid2Obj, time.Now(), "Applying", "applying")
 	if err == nil {
-		close(releaseNotFound)
 		t.Fatal("expected injected Status().Apply error")
 	}
 	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
-		close(releaseNotFound)
 		t.Fatal("expected demoteTunnelConfigApplied to latch UID2 invalidation")
 	}
 	uid2Epoch := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID)
 
 	// Release delayed NotFound -> RemoveIfUntouched MUST NOT wipe UID2's demotion.
 	close(releaseNotFound)
-	<-absentDone
+	select {
+	case res := <-absentDone:
+		if res.err != nil {
+			t.Fatalf("retireTunnelIfConfirmedAbsent error: %v", res.err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for retireTunnelIfConfirmedAbsent completion")
+	}
 
 	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
 		t.Fatal("delayed NotFound RemoveIfUntouched wiped UID2 demotion invalidation")
@@ -7493,8 +7521,19 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 		},
 	}
 
-	absentDone := make(chan bool, 1)
+	absentDone := make(chan absentResult, 1)
+	var absentWG sync.WaitGroup
+	absentWG.Add(1)
+	t.Cleanup(func() {
+		select {
+		case <-releaseNotFound:
+		default:
+			close(releaseNotFound)
+		}
+		absentWG.Wait()
+	})
 	go func() {
+		defer absentWG.Done()
 		retired, err := retireTunnelIfConfirmedAbsent(
 			ctx,
 			blockingReader,
@@ -7502,12 +7541,15 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 			tunnelKey,
 			apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, tunnelKey.Name),
 		)
-		if err != nil {
-			t.Errorf("retireTunnelIfConfirmedAbsent error: %v", err)
-		}
-		absentDone <- retired
+		absentDone <- absentResult{retired: retired, err: err}
 	}()
-	<-gotNotFound
+	select {
+	case <-gotNotFound:
+	case res := <-absentDone:
+		t.Fatalf("retireTunnelIfConfirmedAbsent finished before NotFound barrier (retired=%v err=%v)", res.retired, res.err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for retireTunnelIfConfirmedAbsent NotFound barrier")
+	}
 
 	// Create UID2 and bind Gateway ownership via bootstrap reconcilers with nil
 	// Invalidator so tokAbsent remains untouched and UID2 stays unseen in latch.
@@ -7548,11 +7590,15 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 	f.statusClient.failStatusKind = "CloudflareTunnel"
 	f.statusClient.failStatusWrite.Store(true)
 	var releasedInApply atomic.Bool
-	var absentRetired bool
+	var absentRes absentResult
 	f.statusClient.onAfterStatusApply = func(applyErr error) {
 		if applyErr != nil && !releasedInApply.Swap(true) {
 			close(releaseNotFound)
-			absentRetired = <-absentDone
+			select {
+			case absentRes = <-absentDone:
+			case <-time.After(15 * time.Second):
+				absentRes = absentResult{err: errors.New("timed out waiting for delayed RemoveIfUntouched")}
+			}
 		}
 	}
 
@@ -7563,7 +7609,10 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 	if !releasedInApply.Load() {
 		t.Fatal("expected onAfterStatusApply to release delayed RemoveIfUntouched")
 	}
-	if !absentRetired {
+	if absentRes.err != nil {
+		t.Fatalf("retireTunnelIfConfirmedAbsent error: %v", absentRes.err)
+	}
+	if !absentRes.retired {
 		t.Fatal("expected untouched delayed RemoveIfUntouched to complete")
 	}
 	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
@@ -7645,11 +7694,28 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 			Invalidator:         f.latch,
 		}
 		tunnelDone := make(chan error, 1)
+		var workersWG sync.WaitGroup
+		workersWG.Add(1)
+		t.Cleanup(func() {
+			select {
+			case <-releaseTunnelGet:
+			default:
+				close(releaseTunnelGet)
+			}
+			workersWG.Wait()
+		})
 		go func() {
+			defer workersWG.Done()
 			_, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
 			tunnelDone <- err
 		}()
-		<-tunnelBeforeGet
+		select {
+		case <-tunnelBeforeGet:
+		case err := <-tunnelDone:
+			t.Fatalf("tunnel Reconcile exited before Get barrier: %v", err)
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for tunnel Reconcile Get barrier")
+		}
 
 		// 2. Gateway demoteTunnelConfigApplied registers BeginLifetimeForUID(UID1)
 		// (gid > tok.id), hits transient Apply error, reads live UID1 in
@@ -7670,6 +7736,7 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 			default:
 				close(releaseGWAfterGet)
 			}
+			workersWG.Wait()
 		})
 		var gwPaused atomic.Bool
 		f.faultReader.onAfterTunnelGet = func(key client.ObjectKey, got *v1alpha1.CloudflareTunnel, err error) {
@@ -7679,10 +7746,18 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 			}
 		}
 		gwDone := make(chan error, 1)
+		workersWG.Add(1)
 		go func() {
+			defer workersWG.Done()
 			gwDone <- f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &f.tunnel, time.Now(), "Applying", "applying")
 		}()
-		<-gwReadUID1
+		select {
+		case <-gwReadUID1:
+		case err := <-gwDone:
+			t.Fatalf("demoteTunnelConfigApplied exited before Get barrier: %v", err)
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for demoteTunnelConfigApplied Get barrier")
+		}
 
 		// 3. Delete UID1 cleanly from etcd.
 		var cur v1alpha1.CloudflareTunnel
@@ -7711,8 +7786,13 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 
 		// 4. Release Tunnel Reconcile: reads NotFound, runs RemoveIfUntouched(tok).
 		close(releaseTunnelGet)
-		if err := <-tunnelDone; err != nil {
-			t.Fatalf("tunnel Reconcile after NotFound: %v", err)
+		select {
+		case err := <-tunnelDone:
+			if err != nil {
+				t.Fatalf("tunnel Reconcile after NotFound: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for tunnel Reconcile completion")
 		}
 
 		var uid2UID types.UID
@@ -7742,8 +7822,13 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 		// 5. Resume Gateway demoteTunnelConfigApplied (runs ForgetAndInvalidateIfUnretired
 		// with stale UID1 read, then rechecks live API server).
 		close(releaseGWAfterGet)
-		if err := <-gwDone; err == nil {
-			t.Fatal("expected transient Apply error from demoteTunnelConfigApplied")
+		select {
+		case err := <-gwDone:
+			if err == nil {
+				t.Fatal("expected transient Apply error from demoteTunnelConfigApplied")
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for demoteTunnelConfigApplied completion")
 		}
 
 		if f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid1) || f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid1) != 0 {
@@ -7783,4 +7868,640 @@ func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.
 	t.Run("replaced_UID2_cleans_UID1_and_preserves_UID2", func(t *testing.T) {
 		runVariant(t, "late-dead-uid2", true)
 	})
+}
+
+// Regression test (#4725121045 / #4725121078): concurrent spec.secretRef edit
+// after CreateServiceToken + Secret capture (during convergeCapturedServiceToken)
+// MUST persist TokenID + OwnershipVerified on the live UID via
+// persistIdentityWithDirectReader and MUST NOT reap journalSecret or
+// serviceTokenAttemptFinalizer until the next generation converges, so
+// subsequent deletion revokes the remote service token cleanly.
+func TestServiceTokenConvergePersistsTokenIDAcrossGenerationBumpEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-st-gen-bump"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-st-gen-bump"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	accessFake := newFakeAccessResourceCloudflare()
+	apiReader := &failingStatusClient{Client: direct}
+	reconciler := &ServiceTokenReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: accessFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "ServiceToken account accepted", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	st := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-gen-bump"},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "st-gen-bump",
+			Enabled:          true,
+			Duration:         "8760h",
+			SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	stKey := client.ObjectKeyFromObject(st)
+
+	// Reconcile until finalizer & journal exist and CreateServiceToken runs.
+	var bumped atomic.Bool
+	var bumpErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		if _, ok := obj.(*v1alpha1.ServiceToken); !ok || key != stKey || bumped.Load() {
+			return
+		}
+		var latest v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &latest); err != nil {
+			return
+		}
+		if latest.Status.TokenID != "" {
+			return
+		}
+		var secrets corev1.SecretList
+		if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+			return
+		}
+		hasCommittedCreds := false
+		hasJournal := false
+		for i := range secrets.Items {
+			s := &secrets.Items[i]
+			if s.Name == "st-creds-v1" && len(s.Data) > 0 {
+				hasCommittedCreds = true
+			}
+			if strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && len(s.Data[serviceTokenJournalKeyIssuedID]) > 0 {
+				hasJournal = true
+			}
+		}
+		if !hasCommittedCreds || !hasJournal || bumped.Swap(true) {
+			return
+		}
+		latest.Spec.Duration = "4380h"
+		bumpErr = direct.Update(ctx, &latest)
+	}
+
+	var res ctrl.Result
+	var recErr error
+	for i := 0; i < 4; i++ {
+		res, recErr = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey})
+		if recErr != nil {
+			t.Fatalf("reconcile pass %d: %v", i, recErr)
+		}
+		if bumped.Load() {
+			break
+		}
+	}
+	if bumpErr != nil {
+		t.Fatalf("concurrent secretRef update: %v", bumpErr)
+	}
+	if !bumped.Load() {
+		t.Fatal("expected concurrent secretRef bump hook during convergeCapturedServiceToken")
+	}
+
+	var afterBump v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if afterBump.Status.TokenID == "" || !afterBump.Status.OwnershipVerified {
+		t.Fatalf("identity checkpoint lost on generation bump: tokenID=%q ownershipVerified=%v", afterBump.Status.TokenID, afterBump.Status.OwnershipVerified)
+	}
+	if afterBump.Generation != 2 || afterBump.Status.ObservedGeneration == afterBump.Generation {
+		t.Fatalf("expected gen 2 with unconverged ObservedGeneration %d, res=%+v", afterBump.Status.ObservedGeneration, res)
+	}
+	// Journal & attempt finalizer MUST NOT have been reaped in the skipped generation pass.
+	if !slices.Contains(afterBump.Finalizers, serviceTokenAttemptFinalizer) {
+		t.Fatal("serviceTokenAttemptFinalizer reaped prematurely when patchStatusChecked skipped")
+	}
+	var secretsAfter corev1.SecretList
+	if err := direct.List(ctx, &secretsAfter, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	journalStillPresent := false
+	for i := range secretsAfter.Items {
+		if strings.HasPrefix(secretsAfter.Items[i].Name, serviceTokenJournalPrefix) {
+			journalStillPresent = true
+			break
+		}
+	}
+	if !journalStillPresent {
+		t.Fatal("journal Secret deleted prematurely before TokenID checkpoint landed cleanly")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected immediate requeue when persistIdentity landed across generation bump, got %+v", res)
+	}
+
+	// Next reconcile sees TokenID != "" + journal != nil, reaps cleanly, and converges Gen 2.
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+		t.Fatalf("reap and converge gen 2: %v", err)
+	}
+	var converged v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &converged); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(converged.Finalizers, serviceTokenAttemptFinalizer) {
+		t.Fatal("attempt finalizer still present after reap pass")
+	}
+	if !assertConditionTrueForCurrentGen(converged.Status.Conditions, "Ready", converged.Generation) {
+		t.Fatalf("expected Ready=True on Gen 2, got %+v", converged.Status.Conditions)
+	}
+
+	// Delete ServiceToken -> must invoke DeleteServiceToken cleanly (no remote leak).
+	if err := direct.Delete(ctx, &converged); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+		t.Fatalf("delete ServiceToken: %v", err)
+	}
+	accessFake.mu.Lock()
+	remainingTokens := len(accessFake.tokens)
+	createCount := accessFake.tokenCreates
+	accessFake.mu.Unlock()
+	if remainingTokens != 0 {
+		t.Fatalf("expected DeleteServiceToken to remove remote token, remaining=%d", remainingTokens)
+	}
+	if createCount != 1 {
+		t.Fatalf("expected 1 CreateServiceToken call, got %d", createCount)
+	}
+}
+
+// Regression test (#4725121045 / #4725121078): concurrent DeviceProfile spec
+// edit during the acquired checkpoint MUST persist ProfileID + OwnershipVerified
+// via persistIdentityWithDirectReader, skip syncDeviceProfile for the stale
+// pass, and reuse ProfileID on the next pass without calling CreateCustomDeviceProfile twice.
+func TestDeviceProfileAcquiredPersistsProfileIDAcrossGenerationBumpEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-dp-gen-bump"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-dp-gen-bump"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, nil)
+
+	profileFake := newFakeDeviceProfileCloudflare()
+	apiReader := &failingStatusClient{Client: direct}
+	reconciler := &DeviceProfileReconciler{
+		Client:              mgr.GetClient(),
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: profileFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha1.DeviceProfile{}, deviceProfileAccountIndex, func(object client.Object) []string {
+		return []string{object.(*v1alpha1.DeviceProfile).Spec.AccountRef.Name}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha1.CloudflareAccount{}, deviceProfileCloudflareAccountIDIndex, func(object client.Object) []string {
+		accountID := object.(*v1alpha1.CloudflareAccount).Spec.AccountID
+		if accountID == "" {
+			return nil
+		}
+		return []string{accountID}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha1.CloudflareAccount{}, deviceProfileAccountCredentialIndex, func(object client.Object) []string {
+		ref := object.(*v1alpha1.CloudflareAccount).Spec.Credentials.APITokenSecretRef
+		if ref.Namespace == "" || ref.Name == "" {
+			return nil
+		}
+		return []string{ref.Namespace + "/" + ref.Name}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "DeviceProfile account cached and ready", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := mgr.GetClient().Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	addr10 := "10.0.0.0/8"
+	dp := &v1alpha1.DeviceProfile{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "dp-gen-bump"},
+		Spec: v1alpha1.DeviceProfileSpec{
+			AccountRef: corev1.LocalObjectReference{Name: account.Name},
+			Profile: v1alpha1.DeviceProfileTarget{
+				Kind:       v1alpha1.DeviceProfileKindCustom,
+				Match:      new("identity.email == \"user@example.com\""),
+				Precedence: new(int64(100)),
+				Fields:     &v1alpha1.DeviceProfileFields{Name: new("dp-v1"), Enabled: new(true)},
+			},
+			SplitTunnel: v1alpha1.DeviceProfileSplitTunnel{
+				Mode:   v1alpha1.DeviceProfileSplitTunnelModeInclude,
+				Static: []v1alpha1.DeviceProfileSplitTunnelEntry{{Address: &addr10, Description: "static"}},
+			},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, dp); err != nil {
+		t.Fatal(err)
+	}
+	dpKey := client.ObjectKeyFromObject(dp)
+	waitUntilTrue(t, 10*time.Second, "DeviceProfile cached", func() (bool, error) {
+		var cur v1alpha1.DeviceProfile
+		return mgr.GetClient().Get(ctx, dpKey, &cur) == nil, nil
+	})
+
+	// Bump Spec right after CreateCustomDeviceProfile ran and before patchStatusChecked checks Generation.
+	var bumped atomic.Bool
+	var bumpErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		if _, ok := obj.(*v1alpha1.DeviceProfile); !ok || key != dpKey || bumped.Load() {
+			return
+		}
+		if profileFake.callCount("CreateCustom") == 0 {
+			return
+		}
+		var latest v1alpha1.DeviceProfile
+		if err := direct.Get(ctx, dpKey, &latest); err != nil {
+			return
+		}
+		if latest.Status.ProfileID != "" || bumped.Swap(true) {
+			return
+		}
+		latest.Spec.Profile.Fields.Name = new("dp-v2")
+		bumpErr = direct.Update(ctx, &latest)
+	}
+
+	// Pass 1 adds finalizer; wait for cache; Pass 2 creates custom profile + hits bump hook.
+	var res ctrl.Result
+	for i := 0; i < 4; i++ {
+		var err error
+		res, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: dpKey})
+		if err != nil {
+			t.Fatalf("device profile reconcile %d: %v", i, err)
+		}
+		if bumped.Load() {
+			break
+		}
+		waitUntilTrue(t, 10*time.Second, "DeviceProfile cache sync", func() (bool, error) {
+			var cur v1alpha1.DeviceProfile
+			if err := mgr.GetClient().Get(ctx, dpKey, &cur); err != nil {
+				return false, nil
+			}
+			return len(cur.Finalizers) > 0, nil
+		})
+	}
+	if bumpErr != nil {
+		t.Fatalf("concurrent DeviceProfile update: %v", bumpErr)
+	}
+	if !bumped.Load() {
+		t.Fatal("expected concurrent DeviceProfile generation bump hook to fire")
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected requeue after persistIdentity, got %+v", res)
+	}
+	// syncDeviceProfile MUST NOT have run in the skipped generation pass.
+	if profileFake.callCount("ReplaceInclude") > 0 || profileFake.callCount("ReplaceExclude") > 0 || profileFake.callCount("ReplaceFallback") > 0 {
+		t.Fatalf("syncDeviceProfile ran despite skipped acquired checkpoint: calls=%v", profileFake.callsSnapshot())
+	}
+	var afterBump v1alpha1.DeviceProfile
+	if err := direct.Get(ctx, dpKey, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if afterBump.Status.ProfileID == "" || !afterBump.Status.OwnershipVerified {
+		t.Fatalf("DeviceProfile identity checkpoint lost on generation bump: profileID=%q ownershipVerified=%v", afterBump.Status.ProfileID, afterBump.Status.OwnershipVerified)
+	}
+
+	// Next reconcile reuses persisted ProfileID without duplicate CreateCustomDeviceProfile.
+	waitUntilTrue(t, 10*time.Second, "DeviceProfile Gen 2 cached", func() (bool, error) {
+		var cur v1alpha1.DeviceProfile
+		if err := mgr.GetClient().Get(ctx, dpKey, &cur); err != nil {
+			return false, nil
+		}
+		return cur.Generation == 2 && cur.Status.ProfileID != "", nil
+	})
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: dpKey}); err != nil {
+		t.Fatalf("follow-up device profile reconcile: %v", err)
+	}
+	if got := profileFake.callCount("CreateCustom"); got != 1 {
+		t.Fatalf("expected exactly 1 CreateCustomDeviceProfile call, got %d (%v)", got, profileFake.callsSnapshot())
+	}
+	var converged v1alpha1.DeviceProfile
+	if err := direct.Get(ctx, dpKey, &converged); err != nil {
+		t.Fatal(err)
+	}
+	if !assertConditionTrueForCurrentGen(converged.Status.Conditions, v1alpha1.DeviceProfileConditionReady, converged.Generation) {
+		t.Fatalf("expected DeviceProfile Ready=True on Gen 2, got %+v", converged.Status.Conditions)
+	}
+}
+
+// Regression test (#4725121045 / #4725121078): concurrent spec.name edit on
+// AccessGroup and AccessPolicy right after CreateAccessGroup / CreateAccessPolicy
+// MUST persist GroupID / PolicyID + OwnershipVerified on the live UID so the
+// next reconcile updates the existing remote resource instead of creating a duplicate.
+func TestAccessGroupAndPolicyPersistIdentityAcrossGenerationBumpEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-access-gen-bump"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-access-gen-bump"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "example.com"}})
+
+	accessFake := newFakeAccessResourceCloudflare()
+	apiReader := &failingStatusClient{Client: direct}
+	groupReconciler := &AccessGroupReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: accessFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	policyReconciler := &AccessPolicyReconciler{
+		Client:              direct,
+		APIReader:           apiReader,
+		Scheme:              mgr.GetScheme(),
+		NewCloudflareClient: accessFake.Client,
+		Freshness:           freshness.DefaultPolicy(),
+		Invalidator:         freshness.NewLatch(),
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "Access account accepted", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	grp := &v1alpha1.AccessGroup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "grp-gen-bump"},
+		Spec: v1alpha1.AccessGroupSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "grp-v1",
+			Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	pol := &v1alpha1.AccessPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pol-gen-bump"},
+		Spec: v1alpha1.AccessPolicySpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Name:             "pol-v1",
+			Decision:         v1alpha1.AccessPolicyDecisionAllow,
+			Include:          []v1alpha1.AccessRule{{Everyone: &v1alpha1.AccessEveryoneRule{}}},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, grp); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, pol); err != nil {
+		t.Fatal(err)
+	}
+	grpKey := client.ObjectKeyFromObject(grp)
+	polKey := client.ObjectKeyFromObject(pol)
+
+	var grpBumped, polBumped atomic.Bool
+	var bumpErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		switch obj.(type) {
+		case *v1alpha1.AccessGroup:
+			accessFake.mu.Lock()
+			createdGroup := len(accessFake.groups) > 0
+			accessFake.mu.Unlock()
+			if key != grpKey || grpBumped.Load() || !createdGroup {
+				return
+			}
+			var latest v1alpha1.AccessGroup
+			if err := direct.Get(ctx, grpKey, &latest); err != nil || latest.Status.GroupID != "" || grpBumped.Swap(true) {
+				return
+			}
+			latest.Spec.Name = "grp-v2"
+			bumpErr = direct.Update(ctx, &latest)
+		case *v1alpha1.AccessPolicy:
+			accessFake.mu.Lock()
+			createdPolicy := len(accessFake.policies) > 0
+			accessFake.mu.Unlock()
+			if key != polKey || polBumped.Load() || !createdPolicy {
+				return
+			}
+			var latest v1alpha1.AccessPolicy
+			if err := direct.Get(ctx, polKey, &latest); err != nil || latest.Status.PolicyID != "" || polBumped.Swap(true) {
+				return
+			}
+			latest.Spec.Name = "pol-v2"
+			bumpErr = direct.Update(ctx, &latest)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := groupReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
+			t.Fatalf("group reconcile %d: %v", i, err)
+		}
+		if grpBumped.Load() {
+			break
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := policyReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+			t.Fatalf("policy reconcile %d: %v", i, err)
+		}
+		if polBumped.Load() {
+			break
+		}
+	}
+	if bumpErr != nil {
+		t.Fatalf("concurrent update error: %v", bumpErr)
+	}
+	if !grpBumped.Load() || !polBumped.Load() {
+		t.Fatalf("expected both bump hooks: grp=%v pol=%v", grpBumped.Load(), polBumped.Load())
+	}
+
+	var grpAfter v1alpha1.AccessGroup
+	if err := direct.Get(ctx, grpKey, &grpAfter); err != nil {
+		t.Fatal(err)
+	}
+	if grpAfter.Status.GroupID == "" || !grpAfter.Status.OwnershipVerified {
+		t.Fatalf("AccessGroup identity checkpoint lost: groupID=%q ownershipVerified=%v", grpAfter.Status.GroupID, grpAfter.Status.OwnershipVerified)
+	}
+	var polAfter v1alpha1.AccessPolicy
+	if err := direct.Get(ctx, polKey, &polAfter); err != nil {
+		t.Fatal(err)
+	}
+	if polAfter.Status.PolicyID == "" || !polAfter.Status.OwnershipVerified {
+		t.Fatalf("AccessPolicy identity checkpoint lost: policyID=%q ownershipVerified=%v", polAfter.Status.PolicyID, polAfter.Status.OwnershipVerified)
+	}
+
+	// Follow-up reconciles update existing remote IDs without duplicate creates.
+	if _, err := groupReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: grpKey}); err != nil {
+		t.Fatalf("follow-up group reconcile: %v", err)
+	}
+	if _, err := policyReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: polKey}); err != nil {
+		t.Fatalf("follow-up policy reconcile: %v", err)
+	}
+	accessFake.mu.Lock()
+	groupCount := len(accessFake.groups)
+	policyCount := len(accessFake.policies)
+	grpRemote := accessFake.groups[grpAfter.Status.GroupID]
+	polRemote := accessFake.policies[polAfter.Status.PolicyID]
+	accessFake.mu.Unlock()
+	if groupCount != 1 || policyCount != 1 {
+		t.Fatalf("expected 1 remote AccessGroup and 1 remote AccessPolicy, got group=%d policy=%d", groupCount, policyCount)
+	}
+	if !strings.HasSuffix(grpRemote.Name, "grp-v2") || !strings.HasSuffix(polRemote.Name, "pol-v2") {
+		t.Fatalf("expected remote resources updated to v2 using persisted IDs, got group=%q policy=%q", grpRemote.Name, polRemote.Name)
+	}
+}
+
+// Regression test (#4725121140): when GatewayReconciler completes remote
+// verification at epoch == 0 and a concurrent RemoveIfUntouched retires
+// verifyTok before confirmTunnelConfigGate runs, CompleteVerificationWithToken
+// MUST reject the stale zero-epoch write so VerifiedAtForUID stays empty.
+func TestGatewayCompleteVerificationRejectedWhenTokenRetiredAtZeroEpochEnvtest(t *testing.T) {
+	f := setupDemoteEnvtest(t, "tok-zero-retire")
+	ctx := context.Background()
+	tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: f.gw.Namespace,
+			Name:      "dp-zero-retire",
+			UID:       types.UID("pod-zero-retire"),
+			Labels:    map[string]string{dataplane.StandardGatewayLabelKey: dataplane.StandardGatewayLabelValue(f.gw.Name)},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "envoy", Image: "example.invalid/envoy"}}},
+	}
+	if err := f.direct.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.PodIP = "10.0.0.9"
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := f.direct.Status().Update(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	waitUntilTrue(t, 10*time.Second, "Gateway snapshot published", func() (bool, error) {
+		if _, err := f.gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: f.irGW.Key}); err != nil {
+			return false, err
+		}
+		return f.gwReconciler.Snapshots.(*fakeSnapshotPublisher).ACK(f.irGW.Key.String()) == nil, nil
+	})
+	f.latch.Remove(configFreshnessKind, tunnelKey)
+
+	// When Gateway status Patch writes Programmed=True (right before
+	// confirmTunnelConfigGate runs), simulate a concurrent RemoveIfUntouched
+	// retiring verifyTok while epoch == 0.
+	var retiredOnce atomic.Bool
+	var removeApplied bool
+	f.statusClient.onStatusPatch = func(obj client.Object) {
+		gwObj, ok := obj.(*gatewayv1.Gateway)
+		if !ok || retiredOnce.Load() {
+			return
+		}
+		prog := meta.FindStatusCondition(gwObj.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		if prog == nil || prog.Status != metav1.ConditionTrue {
+			return
+		}
+		retiredOnce.Store(true)
+		tokAbsent := f.latch.BeginLifetime(configFreshnessKind, tunnelKey)
+		removeApplied = f.latch.RemoveIfUntouched(tokAbsent)
+		f.latch.EndLifetime(tokAbsent)
+	}
+
+	if _, err := f.gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: f.irGW.Key}); err != nil {
+		t.Fatalf("gateway reconcile across retired verifyTok: %v", err)
+	}
+	if !retiredOnce.Load() || !removeApplied {
+		t.Fatalf("expected onStatusPatch to apply RemoveIfUntouched (fired=%v applied=%v)", retiredOnce.Load(), removeApplied)
+	}
+	var updatedTunnel v1alpha1.CloudflareTunnel
+	if err := f.direct.Get(ctx, tunnelKey, &updatedTunnel); err != nil {
+		t.Fatal(err)
+	}
+	if updatedTunnel.Status.ConfigVersion.DesiredHash == "" {
+		t.Fatal("expected non-empty DesiredHash on updated tunnel")
+	}
+	if _, ok := f.latch.VerifiedAtForUID(configFreshnessKind, tunnelKey, f.tunnel.UID, updatedTunnel.Status.ConfigVersion.DesiredHash); ok {
+		t.Fatal("CompleteVerification recorded VerifiedAtForUID at epoch==0 despite retired verifyTok")
+	}
 }

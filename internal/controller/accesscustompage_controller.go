@@ -323,7 +323,7 @@ func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessCustomPage", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessCustomPage) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessCustomPage) error {
 		if remote.ID != "" {
 			live.Status.CustomPageID = remote.ID
 			live.Status.OwnershipVerified = owned
@@ -357,6 +357,16 @@ func (r *AccessCustomPageReconciler) patchStatus(ctx context.Context, object *v1
 		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), conditions...)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || owned) {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessCustomPage) error {
+			live.Status.CustomPageID = remote.ID
+			live.Status.OwnershipVerified = owned
+			return nil
+		})
+	}
 	return err
 }
 

@@ -355,7 +355,7 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "DevicePostureIntegration", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
 		if remote != nil {
 			live.Status.IntegrationID = id
 			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
@@ -365,6 +365,16 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote != nil && id != "" && status == metav1.ConditionTrue {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
+			live.Status.IntegrationID = id
+			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+			return nil
+		})
+	}
 	return err
 }
 

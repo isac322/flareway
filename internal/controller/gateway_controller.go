@@ -136,6 +136,8 @@ type GatewayReconciler struct {
 	// Programmed drops when a dataplane stream closes. When nil no raw source
 	// is registered in SetupWithManager.
 	XDSEvents <-chan event.GenericEvent
+
+	onSweepEnqueue func([]reconcile.Request)
 }
 
 func (r *GatewayReconciler) operatorNamespace() string {
@@ -481,6 +483,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var cloudflareResult cloudflareConfigResult
 	if !compiled.ConformanceMode {
 		cloudflareResult, err = r.reconcileCloudflaredConfiguration(ctx, compiled, tunnel, account)
+		defer r.Invalidator.EndLifetime(cloudflareResult.verifiedTok)
 		if err != nil {
 			var compileErr *cloudflaredConfigCompileError
 			if errors.As(err, &compileErr) {
@@ -2466,7 +2469,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// wakeup so a drifted object reconciles before its TTL expires (C10).
 		// Events carry the drifted CloudflareTunnel, so they map through the
 		// same tunnel→Gateway lookup as the regular Tunnel watch.
-		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToGateways)))
+		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			reqs := r.mapTunnelToGateways(ctx, object)
+			if r.onSweepEnqueue != nil {
+				r.onSweepEnqueue(reqs)
+			}
+			return reqs
+		})))
 	}
 	if r.XDSEvents != nil {
 		// Events carry PartialObjectMetadata addressed to the Gateway

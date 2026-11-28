@@ -310,7 +310,7 @@ func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, 
 	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessInfrastructureTarget", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessInfrastructureTarget) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessInfrastructureTarget) error {
 		if remote.ID != "" {
 			live.Status.TargetID = remote.ID
 			live.Status.OwnershipVerified = owned
@@ -327,6 +327,20 @@ func (r *AccessInfrastructureTargetReconciler) patchStatus(ctx context.Context, 
 		)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" && (owned || accepted == metav1.ConditionTrue) {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessInfrastructureTarget) error {
+			live.Status.TargetID = remote.ID
+			live.Status.OwnershipVerified = owned
+			if remote.Hostname != "" {
+				live.Status.Hostname = remote.Hostname
+				live.Status.IP = infrastructureTargetStatusIP(remote)
+			}
+			return nil
+		})
+	}
 	return err
 }
 

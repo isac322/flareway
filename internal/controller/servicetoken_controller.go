@@ -249,7 +249,20 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			if getErr != nil {
 				return ctrl.Result{}, r.finishRemoteError(ctx, object, getErr)
 			}
-			return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Recovered", "Recovered service token ownership from its Secret", serviceTokenStatusUpdate{OwnershipVerified: true})
+			applied, patchErr := r.patchStatusChecked(ctx, object, scope, remote, metav1.ConditionTrue, "Recovered", "Recovered service token ownership from its Secret", serviceTokenStatusUpdate{OwnershipVerified: true})
+			if patchErr != nil {
+				return ctrl.Result{}, patchErr
+			}
+			if !applied && remote.ID != "" {
+				persisted, persistErr := r.persistIdentity(ctx, object, scope, remote, serviceTokenStatusUpdate{OwnershipVerified: true})
+				if persistErr != nil {
+					return ctrl.Result{}, persistErr
+				}
+				if persisted {
+					return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+				}
+			}
+			return ctrl.Result{}, nil
 		}
 	}
 
@@ -643,23 +656,47 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 	return r.Patch(ctx, object, base)
 }
 
-func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) error {
+func applyServiceTokenIdentityFields(live *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, update serviceTokenStatusUpdate) {
+	live.Status.TokenID = remote.ID
+	live.Status.ClientID = remote.ClientID
+	live.Status.ZoneID = scope.ZoneID
+	live.Status.OwnershipVerified = update.OwnershipVerified
+	live.Status.ObservedName = remote.Name
+	live.Status.ObservedDuration = remote.Duration
+	live.Status.ObservedEnabled = remote.Enabled
+	if !remote.ExpiresAt.IsZero() {
+		stamp := metav1.NewTime(remote.ExpiresAt)
+		live.Status.ExpiresAt = &stamp
+	}
+}
+
+func (r *ServiceTokenReconciler) persistIdentity(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, update serviceTokenStatusUpdate) (bool, error) {
+	if remote.ID == "" {
+		return false, nil
+	}
+	persisted, err := persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
+		applyServiceTokenIdentityFields(live, scope, remote, update)
+		if update.RotatedAt != nil {
+			live.Status.RotatedAt = update.RotatedAt
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if persisted {
+		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
+	}
+	return persisted, nil
+}
+
+func (r *ServiceTokenReconciler) patchStatusChecked(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) (bool, error) {
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
 	}
 	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
 		if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
-			live.Status.TokenID = remote.ID
-			live.Status.ClientID = remote.ClientID
-			live.Status.ZoneID = scope.ZoneID
-			live.Status.OwnershipVerified = update.OwnershipVerified
-			live.Status.ObservedName = remote.Name
-			live.Status.ObservedDuration = remote.Duration
-			live.Status.ObservedEnabled = remote.Enabled
-			if !remote.ExpiresAt.IsZero() {
-				stamp := metav1.NewTime(remote.ExpiresAt)
-				live.Status.ExpiresAt = &stamp
-			}
+			applyServiceTokenIdentityFields(live, scope, remote, update)
 		}
 		if update.RotatedAt != nil {
 			live.Status.RotatedAt = update.RotatedAt
@@ -672,10 +709,22 @@ func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alph
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if applied && (status == metav1.ConditionTrue || remote.ID != "") {
 		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
+	}
+	return applied, nil
+}
+
+func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) error {
+	applied, err := r.patchStatusChecked(ctx, object, scope, remote, status, reason, message, update)
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
+		_, err = r.persistIdentity(ctx, object, scope, remote, update)
+		return err
 	}
 	return nil
 }

@@ -549,7 +549,7 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 			return err
 		}
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
 		if persistIdentity {
 			live.Status.PolicyID = remote.ID
 			live.Status.OwnershipVerified = owned
@@ -560,6 +560,16 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && persistIdentity {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
+			live.Status.PolicyID = remote.ID
+			live.Status.OwnershipVerified = owned
+			return nil
+		})
+	}
 	return err
 }
 

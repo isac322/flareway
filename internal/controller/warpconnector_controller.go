@@ -781,17 +781,20 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 			configurationMessage = "Observed WARP Connector HA configuration differs from the desired configuration"
 		}
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+	setIdentity := func(live *flarewayv1alpha1.WARPConnector) {
 		live.Status.TunnelID = remote.ID
 		live.Status.AccountID = remote.AccountTag
 		live.Status.Name = remote.Name
 		live.Status.TunnelType = warpConnectorTunnelType(remote.TunnelType)
-		live.Status.ConnectorState = warpConnectorState(remote.Status)
 		live.Status.CreatedAt = warpMetaTime(remote.CreatedAt)
 		live.Status.DeletedAt = warpMetaTime(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
+	}
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+		setIdentity(live)
+		live.Status.ConnectorState = warpConnectorState(remote.Status)
 		live.Status.ConnectionsActiveAt = warpMetaTime(remote.ConnsActiveAt)
 		live.Status.ConnectionsInactiveAt = warpMetaTime(remote.ConnsInactiveAt)
-		live.Status.OwnershipVerified = owned
 		live.Status.CreateAttemptName = ""
 		live.Status.CreateAttemptGeneration = 0
 		live.Status.ObservedGeneration = live.Generation
@@ -826,6 +829,15 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), conditions...)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+			setIdentity(live)
+			return nil
+		})
+	}
 	return err
 }
 

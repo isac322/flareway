@@ -1082,7 +1082,7 @@ func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context,
 	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
 		if remote.ID != "" {
 			live.Status.ApplicationID = remote.ID
 		}
@@ -1102,6 +1102,19 @@ func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context,
 		)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" && (owned || accepted == metav1.ConditionTrue) {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
+			live.Status.ApplicationID = remote.ID
+			if remote.Name != "" {
+				live.Status.ZoneID = scope.ZoneID
+				live.Status.OwnershipVerified = owned
+			}
+			return nil
+		})
+	}
 	return err
 }
 

@@ -898,8 +898,21 @@ func (r *ServiceTokenReconciler) convergeCapturedServiceToken(ctx context.Contex
 			return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 		}
 	}
-	if err := r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true}); err != nil {
+	applied, err := r.patchStatusChecked(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true})
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !applied {
+		if remote.ID != "" {
+			persisted, persistErr := r.persistIdentity(ctx, object, scope, remote, serviceTokenStatusUpdate{OwnershipVerified: true})
+			if persistErr != nil {
+				return ctrl.Result{}, persistErr
+			}
+			if persisted {
+				return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+			}
+		}
+		return ctrl.Result{}, nil
 	}
 	if err := r.deleteServiceTokenJournalSecret(ctx, journalSecret); err != nil {
 		return ctrl.Result{}, err

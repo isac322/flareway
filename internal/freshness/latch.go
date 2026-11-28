@@ -31,6 +31,14 @@ type latchKey struct {
 	uid       types.UID
 }
 
+// latchNameKey indexes UID-scoped entries by (kind, namespace, name) for O(1)
+// lookup in HasOtherUIDs, BeginLifetime, and BeginPrune.
+type latchNameKey struct {
+	kind      string
+	namespace string
+	name      string
+}
+
 // Latch is the thread-safe in-memory freshness store. It holds two records per
 // gated object:
 //
@@ -61,6 +69,7 @@ type Latch struct {
 	baselines    map[latchKey]baseline
 	confirmed    map[latchKey]verification
 	activeGuards map[latchKey]map[uint64]*guardState
+	nameUIDs     map[latchNameKey]map[types.UID]struct{}
 }
 
 // LifetimeToken guards a single in-flight read-and-update cycle on one latch
@@ -132,6 +141,60 @@ func NewLatch() *Latch {
 		baselines:    make(map[latchKey]baseline),
 		confirmed:    make(map[latchKey]verification),
 		activeGuards: make(map[latchKey]map[uint64]*guardState),
+		nameUIDs:     make(map[latchNameKey]map[types.UID]struct{}),
+	}
+}
+
+func (l *Latch) recordNameUIDLocked(k latchKey) {
+	if k.uid == "" {
+		return
+	}
+	if l.nameUIDs == nil {
+		l.nameUIDs = make(map[latchNameKey]map[types.UID]struct{})
+	}
+	nk := latchNameKey{kind: k.kind, namespace: k.namespace, name: k.name}
+	uids := l.nameUIDs[nk]
+	if uids == nil {
+		uids = make(map[types.UID]struct{})
+		l.nameUIDs[nk] = uids
+	}
+	uids[k.uid] = struct{}{}
+}
+
+func (l *Latch) keyHasAnyEntryLocked(k latchKey) bool {
+	if _, ok := l.epochs[k]; ok {
+		return true
+	}
+	if _, ok := l.reasons[k]; ok {
+		return true
+	}
+	if _, ok := l.verified[k]; ok {
+		return true
+	}
+	if _, ok := l.baselines[k]; ok {
+		return true
+	}
+	if _, ok := l.confirmed[k]; ok {
+		return true
+	}
+	if guards := l.activeGuards[k]; len(guards) > 0 {
+		return true
+	}
+	return false
+}
+
+func (l *Latch) pruneNameUIDIfUnusedLocked(k latchKey) {
+	if k.uid == "" || l.nameUIDs == nil || l.keyHasAnyEntryLocked(k) {
+		return
+	}
+	nk := latchNameKey{kind: k.kind, namespace: k.namespace, name: k.name}
+	uids := l.nameUIDs[nk]
+	if uids == nil {
+		return
+	}
+	delete(uids, k.uid)
+	if len(uids) == 0 {
+		delete(l.nameUIDs, nk)
 	}
 }
 
@@ -159,6 +222,7 @@ func (l *Latch) registerGuardLocked(k latchKey) uint64 {
 		l.activeGuards[k] = guards
 	}
 	guards[id] = &guardState{}
+	l.recordNameUIDLocked(k)
 	return id
 }
 
@@ -176,6 +240,7 @@ func (l *Latch) endGuard(k latchKey, id uint64) {
 	if len(guards) == 0 {
 		delete(l.activeGuards, k)
 	}
+	l.pruneNameUIDIfUnusedLocked(k)
 }
 
 func (l *Latch) beginLifetime(kind string, key types.NamespacedName, uid types.UID) LifetimeToken {
@@ -226,6 +291,7 @@ func (l *Latch) invalidateKey(k latchKey, reason string) {
 	l.reasons[k] = reason
 	delete(l.verified, k)
 	delete(l.confirmed, k)
+	l.recordNameUIDLocked(k)
 	l.markGuardsTouchedLocked(k)
 }
 
@@ -276,12 +342,19 @@ func (l *Latch) completeVerificationKey(
 	hash string,
 	at time.Time,
 	matches ContentMatcher,
+	requireGuardID *uint64,
 ) bool {
 	if l == nil {
 		return false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if requireGuardID != nil {
+		st, ok := l.activeGuards[k][*requireGuardID]
+		if !ok || st.retired {
+			return false
+		}
+	}
 	if l.epochs[k] != expectedEpoch {
 		return false
 	}
@@ -292,6 +365,7 @@ func (l *Latch) completeVerificationKey(
 			l.verified = make(map[latchKey]verification)
 		}
 		l.verified[k] = verification{hash: hash, at: at}
+		l.recordNameUIDLocked(k)
 	}
 	if hash == "" || matches == nil {
 		delete(l.baselines, k)
@@ -301,6 +375,7 @@ func (l *Latch) completeVerificationKey(
 		}
 		l.baselines[k] = baseline{hash: hash, matches: matches}
 	}
+	l.pruneNameUIDIfUnusedLocked(k)
 	l.markGuardsTouchedLocked(k)
 	return true
 }
@@ -318,7 +393,7 @@ func (l *Latch) CompleteVerification(
 	at time.Time,
 	matches ContentMatcher,
 ) bool {
-	return l.completeVerificationKey(latchKey{kind: kind, namespace: key.Namespace, name: key.Name}, expectedEpoch, hash, at, matches)
+	return l.completeVerificationKey(latchKey{kind: kind, namespace: key.Namespace, name: key.Name}, expectedEpoch, hash, at, matches, nil)
 }
 
 // CompleteVerificationForUID is CompleteVerification scoped to uid.
@@ -334,7 +409,24 @@ func (l *Latch) CompleteVerificationForUID(
 	if uid == "" {
 		return false
 	}
-	return l.completeVerificationKey(latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid}, expectedEpoch, hash, at, matches)
+	return l.completeVerificationKey(latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid}, expectedEpoch, hash, at, matches, nil)
+}
+
+// CompleteVerificationWithToken behaves like CompleteVerification /
+// CompleteVerificationForUID and additionally requires tok to remain active
+// and unretired, rejecting stale zero-epoch writes after concurrent removal.
+func (l *Latch) CompleteVerificationWithToken(
+	tok LifetimeToken,
+	expectedEpoch uint64,
+	hash string,
+	at time.Time,
+	matches ContentMatcher,
+) bool {
+	if l == nil || tok.id == 0 {
+		return false
+	}
+	k := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name, uid: tok.uid}
+	return l.completeVerificationKey(k, expectedEpoch, hash, at, matches, &tok.id)
 }
 
 // IsInvalidated reports whether the object's gate is held closed.
@@ -378,7 +470,9 @@ func (l *Latch) ClearForUID(kind string, key types.NamespacedName, uid types.UID
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.reasons, latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid})
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid}
+	delete(l.reasons, k)
+	l.pruneNameUIDIfUnusedLocked(k)
 }
 
 // Forget drops the object's verification, content baseline, and sweep
@@ -412,45 +506,33 @@ func (l *Latch) ForgetForUID(kind string, key types.NamespacedName, uid types.UI
 	delete(l.verified, k)
 	delete(l.baselines, k)
 	delete(l.confirmed, k)
-}
-
-func mapHasOtherUID[V any](m map[latchKey]V, kind, ns, name string, excludeUID types.UID) bool {
-	for k := range m {
-		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" && k.uid != excludeUID {
-			return true
-		}
-	}
-	return false
-}
-
-func collectCandidateUIDs[V any](m map[latchKey]V, kind, ns, name string, out *map[types.UID]struct{}) {
-	for k := range m {
-		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" {
-			if *out == nil {
-				*out = make(map[types.UID]struct{})
-			}
-			(*out)[k.uid] = struct{}{}
-		}
-	}
+	l.pruneNameUIDIfUnusedLocked(k)
 }
 
 func (l *Latch) collectKnownUIDsLocked(kind, ns, name string) map[types.UID]struct{} {
-	var out map[types.UID]struct{}
-	collectCandidateUIDs(l.epochs, kind, ns, name, &out)
-	collectCandidateUIDs(l.reasons, kind, ns, name, &out)
-	collectCandidateUIDs(l.verified, kind, ns, name, &out)
-	collectCandidateUIDs(l.baselines, kind, ns, name, &out)
-	collectCandidateUIDs(l.confirmed, kind, ns, name, &out)
-	collectCandidateUIDs(l.activeGuards, kind, ns, name, &out)
+	uids := l.nameUIDs[latchNameKey{kind: kind, namespace: ns, name: name}]
+	if len(uids) == 0 {
+		return nil
+	}
+	out := make(map[types.UID]struct{}, len(uids))
+	for u := range uids {
+		out[u] = struct{}{}
+	}
 	return out
 }
 
-func deleteMatchingKeys[V any](m map[latchKey]V, kind, ns, name string, shouldDeleteUID func(types.UID) bool) {
-	for k := range m {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(m, k)
+func (l *Latch) purgeSingleKeyLocked(k latchKey, shouldRetireGuard func(latchKey, uint64) bool) {
+	delete(l.epochs, k)
+	delete(l.reasons, k)
+	delete(l.verified, k)
+	delete(l.baselines, k)
+	delete(l.confirmed, k)
+	for id, st := range l.activeGuards[k] {
+		if shouldRetireGuard(k, id) {
+			st.retired = true
 		}
 	}
+	l.pruneNameUIDIfUnusedLocked(k)
 }
 
 func (l *Latch) purgeMatchingLocked(
@@ -458,18 +540,13 @@ func (l *Latch) purgeMatchingLocked(
 	shouldDeleteUID func(types.UID) bool,
 	shouldRetireGuard func(latchKey, uint64) bool,
 ) {
-	deleteMatchingKeys(l.epochs, kind, ns, name, shouldDeleteUID)
-	deleteMatchingKeys(l.reasons, kind, ns, name, shouldDeleteUID)
-	deleteMatchingKeys(l.verified, kind, ns, name, shouldDeleteUID)
-	deleteMatchingKeys(l.baselines, kind, ns, name, shouldDeleteUID)
-	deleteMatchingKeys(l.confirmed, kind, ns, name, shouldDeleteUID)
-	for k, guards := range l.activeGuards {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			for id, st := range guards {
-				if shouldRetireGuard(k, id) {
-					st.retired = true
-				}
-			}
+	if shouldDeleteUID("") {
+		l.purgeSingleKeyLocked(latchKey{kind: kind, namespace: ns, name: name}, shouldRetireGuard)
+	}
+	nk := latchNameKey{kind: kind, namespace: ns, name: name}
+	for u := range l.nameUIDs[nk] {
+		if shouldDeleteUID(u) {
+			l.purgeSingleKeyLocked(latchKey{kind: kind, namespace: ns, name: name, uid: u}, shouldRetireGuard)
 		}
 	}
 }
@@ -482,13 +559,12 @@ func (l *Latch) HasOtherUIDs(kind string, key types.NamespacedName, excludeUID t
 	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	ns, name := key.Namespace, key.Name
-	return mapHasOtherUID(l.epochs, kind, ns, name, excludeUID) ||
-		mapHasOtherUID(l.reasons, kind, ns, name, excludeUID) ||
-		mapHasOtherUID(l.verified, kind, ns, name, excludeUID) ||
-		mapHasOtherUID(l.baselines, kind, ns, name, excludeUID) ||
-		mapHasOtherUID(l.confirmed, kind, ns, name, excludeUID) ||
-		mapHasOtherUID(l.activeGuards, kind, ns, name, excludeUID)
+	for u := range l.nameUIDs[latchNameKey{kind: kind, namespace: key.Namespace, name: key.Name}] {
+		if u != "" && u != excludeUID {
+			return true
+		}
+	}
+	return false
 }
 
 // BeginPrune registers a name-scoped prune guard for (kind, key) and snapshots
@@ -504,14 +580,17 @@ func (l *Latch) BeginPrune(kind string, key types.NamespacedName) PruneToken {
 	id := l.registerGuardLocked(latchKey{kind: kind, namespace: ns, name: name})
 	candidates := l.collectKnownUIDsLocked(kind, ns, name)
 	candidateGuards := make(map[latchKey]map[uint64]struct{})
-	for k, guards := range l.activeGuards {
-		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" && len(guards) > 0 {
-			ids := make(map[uint64]struct{}, len(guards))
-			for gid := range guards {
-				ids[gid] = struct{}{}
-			}
-			candidateGuards[k] = ids
+	for u := range candidates {
+		k := latchKey{kind: kind, namespace: ns, name: name, uid: u}
+		guards := l.activeGuards[k]
+		if len(guards) == 0 {
+			continue
 		}
+		ids := make(map[uint64]struct{}, len(guards))
+		for gid := range guards {
+			ids[gid] = struct{}{}
+		}
+		candidateGuards[k] = ids
 	}
 	return PruneToken{
 		kind:            kind,
@@ -592,6 +671,7 @@ func (l *Latch) ForgetAndInvalidateIfUnretiredWithEpoch(tok LifetimeToken, reaso
 	delete(l.verified, k)
 	delete(l.baselines, k)
 	delete(l.confirmed, k)
+	l.recordNameUIDLocked(k)
 	for id, other := range guards {
 		if id != tok.id {
 			other.touched = true
@@ -702,6 +782,7 @@ func (l *Latch) markVerifiedKey(k latchKey, hash string, at time.Time) {
 		l.verified = make(map[latchKey]verification)
 	}
 	l.verified[k] = verification{hash: hash, at: at}
+	l.recordNameUIDLocked(k)
 	l.markGuardsTouchedLocked(k)
 }
 

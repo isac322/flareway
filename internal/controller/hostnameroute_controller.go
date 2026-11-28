@@ -577,17 +577,20 @@ func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alp
 	}
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
+	setIdentity := func(live *v1alpha1.HostnameRoute) {
+		live.Status.RouteID = remote.ID
+		live.Status.Hostname = remote.Hostname
+		live.Status.TunnelID = remote.TunnelID
+		live.Status.TunnelName = remote.TunnelName
+		live.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
+		live.Status.Comment = remote.Comment
+		live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+		live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
+	}
+	patched, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
 		if persistIdentity {
-			live.Status.RouteID = remote.ID
-			live.Status.Hostname = remote.Hostname
-			live.Status.TunnelID = remote.TunnelID
-			live.Status.TunnelName = remote.TunnelName
-			live.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
-			live.Status.Comment = remote.Comment
-			live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
-			live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
-			live.Status.OwnershipVerified = owned
+			setIdentity(live)
 		}
 		if applied && remote.ID != "" {
 			live.Status.Applied = v1alpha1.HostnameRouteAppliedStatus{
@@ -599,6 +602,15 @@ func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alp
 		live.Status.Conditions = privateConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !patched && persistIdentity {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
+			setIdentity(live)
+			return nil
+		})
+	}
 	return err
 }
 

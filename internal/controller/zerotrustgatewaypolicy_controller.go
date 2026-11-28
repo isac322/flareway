@@ -594,7 +594,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, obje
 	if status != metav1.ConditionTrue {
 		forgetGate(r.Invalidator, "ZeroTrustGatewayPolicy", client.ObjectKeyFromObject(object))
 	}
-	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
 		if remote.ID != "" {
 			live.Status.RuleID = remote.ID
 		}
@@ -608,6 +608,18 @@ func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, obje
 		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !applied && remote.ID != "" && (status == metav1.ConditionTrue || owned) {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
+			live.Status.RuleID = remote.ID
+			if status == metav1.ConditionTrue {
+				live.Status.OwnershipVerified = owned
+			}
+			return nil
+		})
+	}
 	return err
 }
 
