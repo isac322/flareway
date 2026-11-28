@@ -375,6 +375,19 @@ const (
 	publicHashRange int32 = 40000
 )
 
+// PublicPortRange returns the inclusive Envoy port range allocated to public
+// ProtectionDomains.
+func PublicPortRange() (minPort, maxPort int32) {
+	return publicPortMin, publicPortMax
+}
+
+// PublicDomainHashPort returns the deterministic initial hash port probed by
+// public Envoy port allocation for (listenerName, domainName).
+func PublicDomainHashPort(listenerName, domainName string) int32 {
+	sum := sha256.Sum256([]byte(listenerName + "\x00" + domainName))
+	return publicPortMin + int32(binary.BigEndian.Uint32(sum[:4])%uint32(publicHashRange))
+}
+
 // publicEnvoyPorts hands out loopback Envoy ports for public listeners and
 // public Access domains. Persisted (listener, domain) bindings from
 // CloudflareTunnel.Status.Listeners keep their recorded ports across
@@ -603,8 +616,7 @@ func (ports *publicEnvoyPorts) takeFresh(listenerName, domainName string) int32 
 			}
 		}
 	}
-	sum := sha256.Sum256([]byte(listenerName + "\x00" + domainName))
-	offset := int32(binary.BigEndian.Uint32(sum[:4]) % uint32(publicHashRange))
+	offset := PublicDomainHashPort(listenerName, domainName) - publicPortMin
 	span := publicPortMax - publicPortMin + 1
 	for i := int32(0); i < span; i++ {
 		port := publicPortMin + ((offset + i) % span)

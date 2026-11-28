@@ -1136,11 +1136,31 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 }
 
 func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []v1alpha1.CloudflareTunnelListenerStatus {
+	var appliedDomains map[string]struct{}
+	if tunnel != nil && len(tunnel.Status.Hostnames) > 0 {
+		appliedDomains = make(map[string]struct{}, len(tunnel.Status.Hostnames))
+		for _, hs := range tunnel.Status.Hostnames {
+			if hs.ProtectionDomain != "" {
+				appliedDomains[hs.ProtectionDomain] = struct{}{}
+			}
+		}
+	}
+	baseReservedPorts := make(map[int32]struct{}, len(dataplane.ReservedPodPorts())+len(gateway.Listeners))
+	for _, internalPort := range dataplane.ReservedPodPorts() {
+		baseReservedPorts[internalPort] = struct{}{}
+	}
+	_, publicMaxPort := gatewayapi.PublicPortRange()
+	for _, listener := range gateway.Listeners {
+		if listener.Exposure == ir.ExposurePrivate && listener.Port > 0 && listener.Port <= publicMaxPort {
+			baseReservedPorts[listener.Port] = struct{}{}
+		}
+	}
+
 	result := make([]v1alpha1.CloudflareTunnelListenerStatus, 0, len(gateway.Listeners))
 	recordedListeners := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
 		recordedListeners[listener.Name] = struct{}{}
-		result = append(result, tunnelListenerStatus(listener.Name, listener.Exposure, listener.Binding, gateway.Domains))
+		result = append(result, tunnelListenerStatusWithContext(listener.Name, listener.Exposure, listener.Binding, gateway.Domains, appliedDomains, baseReservedPorts))
 	}
 	recordedBindings := tunnelRecordedPrivateBindings(tunnel)
 	// Preserve listener exposure and binding metadata for retained GuardBlocked
@@ -1178,7 +1198,7 @@ func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunn
 				binding = ir.ListenerBindingLoopback
 			}
 		}
-		result = append(result, tunnelListenerStatus(name, exposure, binding, gateway.Domains))
+		result = append(result, tunnelListenerStatusWithContext(name, exposure, binding, gateway.Domains, appliedDomains, baseReservedPorts))
 	}
 	// Preserve recorded Private exposure and binding for listeners temporarily
 	// omitted from gateway.Listeners without an Access tombstone (for example,
@@ -1216,7 +1236,7 @@ func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunn
 		}
 		sort.Strings(preservedNames)
 		for _, name := range preservedNames {
-			result = append(result, tunnelListenerStatus(name, ir.ExposurePrivate, recordedBindings[name], gateway.Domains))
+			result = append(result, tunnelListenerStatusWithContext(name, ir.ExposurePrivate, recordedBindings[name], gateway.Domains, appliedDomains, baseReservedPorts))
 		}
 	}
 	return result
@@ -1284,6 +1304,15 @@ func validateDesiredTunnelStatusLimits(gateway *ir.Gateway, tunnel *v1alpha1.Clo
 }
 
 func tunnelListenerStatus(name, exposure, binding string, domains []ir.ProtectionDomain) v1alpha1.CloudflareTunnelListenerStatus {
+	return tunnelListenerStatusWithContext(name, exposure, binding, domains, nil, nil)
+}
+
+func tunnelListenerStatusWithContext(
+	name, exposure, binding string,
+	domains []ir.ProtectionDomain,
+	appliedDomains map[string]struct{},
+	baseReservedPorts map[int32]struct{},
+) v1alpha1.CloudflareTunnelListenerStatus {
 	status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(name), Exposure: v1alpha1.Exposure(exposure)}
 	if exposure == ir.ExposurePrivate {
 		status.Binding = v1alpha1.ListenerBindingLoopback
@@ -1308,9 +1337,10 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 	// when the listener's literal base domain is present. Pass 2 collects
 	// distinct ShadowOnly domains that cannot piggyback on basePort (Case B).
 	// When <=256 live domains plus required shadows would exceed MaxItems=256,
-	// trailing new unprotected carve-out live status rows (!Protected && Name!=name)
-	// are deferred until connector ACK drops the legacy shadow, keeping deterministic
-	// port allocation stable with zero extra Cloudflare PUTs.
+	// only unapplied (!appliedDomains) unprotected carve-out live status rows
+	// (!Protected && Name!=name) whose Pass 1 port deterministically reconstructs
+	// from keptPorts alone are deferred until connector ACK drops the legacy
+	// shadow, preventing Pass 2 port shifts and keeping applied v1 ports live.
 	seen := make(map[string]struct{}, len(domains))
 	var liveList []v1alpha1.CloudflareProtectionDomainStatus
 	var basePort int32
@@ -1347,8 +1377,16 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 		deficit := len(liveList) + len(requiredShadows) - maxTunnelListenerProtectionDomains
 		deferred = make(map[int]bool, deficit)
 		for i := len(liveList) - 1; i >= 0 && len(deferred) < deficit; i-- {
-			if !liveList[i].Protected && liveList[i].Name != name {
-				deferred[i] = true
+			pd := liveList[i]
+			if pd.Protected || pd.Name == name {
+				continue
+			}
+			if _, applied := appliedDomains[pd.Name]; applied {
+				continue
+			}
+			deferred[i] = true
+			if !canReconstructDeferred(name, liveList, deferred, requiredShadows, baseReservedPorts) {
+				delete(deferred, i)
 			}
 		}
 	}
@@ -1367,6 +1405,62 @@ func tunnelListenerStatus(name, exposure, binding string, domains []ir.Protectio
 		status.ProtectionDomains = append(status.ProtectionDomains, pd)
 	}
 	return status
+}
+
+func canReconstructDeferred(
+	listenerName string,
+	liveList []v1alpha1.CloudflareProtectionDomainStatus,
+	deferred map[int]bool,
+	requiredShadows []v1alpha1.CloudflareProtectionDomainStatus,
+	baseReservedPorts map[int32]struct{},
+) bool {
+	simBlocked := make(map[int32]struct{}, len(baseReservedPorts)+len(liveList)+len(requiredShadows))
+	for port := range baseReservedPorts {
+		simBlocked[port] = struct{}{}
+	}
+	for _, shadow := range requiredShadows {
+		if shadow.EnvoyPort > 0 {
+			simBlocked[shadow.EnvoyPort] = struct{}{}
+		}
+	}
+	deferredOrder := make([]int, 0, len(deferred))
+	for i, pd := range liveList {
+		if deferred[i] {
+			deferredOrder = append(deferredOrder, i)
+			continue
+		}
+		if pd.EnvoyPort > 0 {
+			simBlocked[pd.EnvoyPort] = struct{}{}
+		}
+	}
+	for _, idx := range deferredOrder {
+		pd := liveList[idx]
+		if _, busy := simBlocked[pd.EnvoyPort]; busy {
+			return false
+		}
+		reconstructed, ok := reconstructFreshPort(listenerName, pd.Name, simBlocked)
+		if !ok || reconstructed != pd.EnvoyPort {
+			return false
+		}
+		simBlocked[reconstructed] = struct{}{}
+	}
+	return true
+}
+
+func reconstructFreshPort(listenerName, domainName string, blocked map[int32]struct{}) (int32, bool) {
+	minPort, maxPort := gatewayapi.PublicPortRange()
+	span := maxPort - minPort + 1
+	if span <= 0 {
+		return 0, false
+	}
+	offset := gatewayapi.PublicDomainHashPort(listenerName, domainName) - minPort
+	for i := int32(0); i < span; i++ {
+		candidate := minPort + ((offset + i) % span)
+		if _, busy := blocked[candidate]; !busy {
+			return candidate, true
+		}
+	}
+	return 0, false
 }
 
 func tunnelGatewayAddresses(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []gatewayv1.GatewayStatusAddress {
