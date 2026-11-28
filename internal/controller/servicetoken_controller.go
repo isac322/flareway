@@ -424,6 +424,18 @@ func serviceTokenScope(zoneName string, zones []v1alpha1.CloudflareVerifiedZone)
 	return flarecloudflare.AccessScope{}, fmt.Errorf("zone %q was not verified for the referenced CloudflareAccount", zoneName)
 }
 
+func serviceTokenVerifiedZoneName(zoneID string, zones []v1alpha1.CloudflareVerifiedZone) (string, error) {
+	if zoneID == "" {
+		return "", nil
+	}
+	for _, zone := range zones {
+		if zone.ID == zoneID && zone.Name != "" {
+			return zone.Name, nil
+		}
+	}
+	return "", fmt.Errorf("zone ID %q was not verified for the referenced CloudflareAccount", zoneID)
+}
+
 func serviceTokenMatchesInput(remote flarecloudflare.ServiceToken, input flarecloudflare.ServiceTokenInput) bool {
 	if remote.Name != input.Name || remote.Enabled != input.Enabled {
 		return false
@@ -620,22 +632,36 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 	}
 	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
 		var deletedAccount *v1alpha1.CloudflareAccount
+		var deletedScope flarecloudflare.AccessScope
 		if object.Status.TokenID != "" && object.Status.OwnershipVerified {
-			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
+			if journal != nil && journal.crUID == string(object.UID) && journal.accountName != object.Spec.AccountRef.Name {
+				return r.patchCleanupBlocked(ctx, object, "Invalid", errors.New("service token accountRef does not match the journaled account binding"))
+			}
+			deleteZoneName := ""
+			if object.Status.ZoneID != "" {
+				if object.Spec.AccountRef.Name == "" {
+					return r.patchCleanupBlocked(ctx, object, "Invalid", errors.New("accountRef.name is required"))
+				}
+				accountObj := new(v1alpha1.CloudflareAccount)
+				if err := r.apiReader().Get(ctx, types.NamespacedName{Name: object.Spec.AccountRef.Name}, accountObj); err != nil {
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", fmt.Errorf("get CloudflareAccount %q: %w", object.Spec.AccountRef.Name, err))
+				}
+				var zoneErr error
+				deleteZoneName, zoneErr = serviceTokenVerifiedZoneName(object.Status.ZoneID, accountObj.Status.Verified.Zones)
+				if zoneErr != nil {
+					return r.patchCleanupBlocked(ctx, object, "Invalid", zoneErr)
+				}
+			}
+			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: deleteZoneName, PlatformObject: true}, r.NewCloudflareClient)
 			if err != nil {
 				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
-			scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
-			if scopeErr != nil {
-				if object.Status.ZoneID == "" {
-					return r.patchCleanupBlocked(ctx, object, "Invalid", scopeErr)
-				}
-				scope.ZoneID = object.Status.ZoneID
-			}
+			scope := flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}
 			if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
 				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
 			deletedAccount = account
+			deletedScope = scope
 		}
 		if journal != nil {
 			skipJournalCleanup := false
@@ -644,7 +670,7 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 				if clusterErr != nil {
 					return r.patchCleanupBlocked(ctx, object, "RemoteError", clusterErr)
 				}
-				skipJournalCleanup = journal.matchesCheckpointedToken(object, deletedAccount, clusterID)
+				skipJournalCleanup = journal.matchesCheckpointedToken(object, deletedAccount, deletedScope, clusterID)
 			}
 			if !skipJournalCleanup {
 				if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {

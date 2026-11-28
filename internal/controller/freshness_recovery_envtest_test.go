@@ -8957,3 +8957,282 @@ func TestServiceTokenConvergeSecretRefEditAndImmediateDeleteEnvtest(t *testing.T
 			err, deletedCheck.Status.Conditions, deletedCheck.Finalizers)
 	}
 }
+
+// Regression test (P1): when convergeCapturedServiceToken checkpoints
+// Status.TokenID + Status.ZoneID across a spec.secretRef.name edit while
+// retaining the journal Secret, and spec.zone (or spec.accountRef / verified
+// zones) changes before an immediate Delete without an intervening reconcile,
+// teardown MUST authorize and delete using the checkpointed Status.ZoneID
+// scope (failing closed on unverified/ungranted zone or accountRef mismatch).
+func TestServiceTokenConvergeZoneAndSecretRefEditImmediateDeleteEnvtest(t *testing.T) {
+	runCase := func(
+		t *testing.T,
+		suffix string,
+		initialZone string,
+		wantZoneID string,
+		editedZone string,
+		dropZ1FromVerified bool,
+		restrictGrantToZ2 bool,
+		switchToOtherAccount bool,
+	) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+
+		ns := "tenant-st-zone-del-" + suffix
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatal(err)
+		}
+
+		allZones := []v1alpha1.CloudflareVerifiedZone{
+			{ID: "z1", Name: "z1.example.com"},
+			{ID: "z2", Name: "z2.example.com"},
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "acct-st-zone-" + suffix},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:         []string{"*"},
+					Zones:             []string{"*"},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+		markAccountReady(ctx, t, direct, account, allZones)
+
+		var otherAccount *v1alpha1.CloudflareAccount
+		if switchToOtherAccount {
+			otherAccount = &v1alpha1.CloudflareAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "acct-st-zone-other-" + suffix},
+				Spec: v1alpha1.CloudflareAccountSpec{
+					AccountID:   "fedcba9876543210fedcba9876543210",
+					Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+					Grants: []v1alpha1.CloudflareAccountGrant{{
+						NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+						Hostnames:         []string{"*"},
+						Zones:             []string{"*"},
+						Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+						PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+					}},
+				},
+			}
+			if err := direct.Create(ctx, otherAccount); err != nil {
+				t.Fatal(err)
+			}
+			markAccountReady(ctx, t, direct, otherAccount, allZones)
+		}
+
+		accessFake := newFakeAccessResourceCloudflare()
+		apiReader := &failingStatusClient{Client: direct}
+		reconciler := &ServiceTokenReconciler{
+			Client:              direct,
+			APIReader:           apiReader,
+			Scheme:              mgr.GetScheme(),
+			NewCloudflareClient: accessFake.Client,
+			Freshness:           freshness.DefaultPolicy(),
+			Invalidator:         freshness.NewLatch(),
+		}
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "ServiceToken zone account accepted", func() (bool, error) {
+			var cur v1alpha1.CloudflareAccount
+			if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+		})
+
+		st := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-zone-del"},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+				Zone:             initialZone,
+				Name:             "st-zone-del",
+				Enabled:          true,
+				Duration:         "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		if err := direct.Create(ctx, st); err != nil {
+			t.Fatal(err)
+		}
+		stKey := client.ObjectKeyFromObject(st)
+
+		// Bump secretRef during convergeCapturedServiceToken so persistIdentity
+		// checkpoints TokenID + ZoneID + OwnershipVerified while leaving the
+		// journal Secret intact.
+		var bumped atomic.Bool
+		var bumpErr error
+		apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+			if _, ok := obj.(*v1alpha1.ServiceToken); !ok || key != stKey || bumped.Load() {
+				return
+			}
+			var latest v1alpha1.ServiceToken
+			if err := direct.Get(ctx, stKey, &latest); err != nil || latest.Status.TokenID != "" {
+				return
+			}
+			var secrets corev1.SecretList
+			if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+				return
+			}
+			hasCommittedCreds, hasJournal := false, false
+			for i := range secrets.Items {
+				s := &secrets.Items[i]
+				if s.Name == "st-creds-v1" && len(s.Data) > 0 {
+					hasCommittedCreds = true
+				}
+				if strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && len(s.Data[serviceTokenJournalKeyIssuedID]) > 0 {
+					hasJournal = true
+				}
+			}
+			if !hasCommittedCreds || !hasJournal || bumped.Swap(true) {
+				return
+			}
+			latest.Spec.SecretRef = corev1.LocalObjectReference{Name: "st-creds-v2"}
+			bumpErr = direct.Update(ctx, &latest)
+		}
+
+		var res ctrl.Result
+		for i := 0; i < 4; i++ {
+			var err error
+			res, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey})
+			if err != nil {
+				t.Fatalf("reconcile pass %d: %v", i, err)
+			}
+			if bumped.Load() {
+				break
+			}
+		}
+		if bumpErr != nil {
+			t.Fatalf("concurrent secretRef edit: %v", bumpErr)
+		}
+		if !bumped.Load() || res.RequeueAfter == 0 {
+			t.Fatalf("expected secretRef bump and immediate requeue, bumped=%v res=%+v", bumped.Load(), res)
+		}
+
+		var afterBump v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &afterBump); err != nil {
+			t.Fatal(err)
+		}
+		if afterBump.Status.TokenID == "" || !afterBump.Status.OwnershipVerified || afterBump.Status.ZoneID != wantZoneID {
+			t.Fatalf("unexpected checkpoint status: id=%q owned=%v zoneID=%q (want %q)",
+				afterBump.Status.TokenID, afterBump.Status.OwnershipVerified, afterBump.Status.ZoneID, wantZoneID)
+		}
+
+		// Edit spec.zone (and optional negative-control account/grant drift)
+		// immediately before Delete without an intervening active reconcile.
+		afterBump.Spec.Zone = editedZone
+		if switchToOtherAccount {
+			afterBump.Spec.AccountRef.Name = otherAccount.Name
+		}
+		if err := direct.Update(ctx, &afterBump); err != nil {
+			t.Fatal(err)
+		}
+		if dropZ1FromVerified {
+			markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z2", Name: "z2.example.com"}})
+		}
+		if restrictGrantToZ2 {
+			var latestAcct v1alpha1.CloudflareAccount
+			if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &latestAcct); err != nil {
+				t.Fatal(err)
+			}
+			latestAcct.Spec.Grants[0].Zones = []string{"z2.example.com"}
+			if err := direct.Update(ctx, &latestAcct); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := direct.Delete(ctx, &afterBump); err != nil {
+			t.Fatal(err)
+		}
+		_, delErr := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey})
+
+		expectBlocked := dropZ1FromVerified || restrictGrantToZ2 || switchToOtherAccount
+		accessFake.mu.Lock()
+		remainingTokens := len(accessFake.tokens)
+		_, origStillExists := accessFake.tokens[fakeServiceTokenKey(flarecloudflare.AccessScope{ZoneID: wantZoneID}, afterBump.Status.TokenID)]
+		accessFake.mu.Unlock()
+
+		var secretsAfter corev1.SecretList
+		if err := direct.List(ctx, &secretsAfter, client.InNamespace(ns)); err != nil {
+			t.Fatal(err)
+		}
+		journalPresent := false
+		for i := range secretsAfter.Items {
+			if strings.HasPrefix(secretsAfter.Items[i].Name, serviceTokenJournalPrefix) {
+				journalPresent = true
+				break
+			}
+		}
+
+		if expectBlocked {
+			if delErr == nil {
+				t.Fatal("expected immediate delete reconcile to fail closed with CleanupBlocked")
+			}
+			if !origStillExists || remainingTokens != 1 {
+				t.Fatalf("expected original remote token in %q to be retained on fail-closed teardown, origStillExists=%v remaining=%d", wantZoneID, origStillExists, remainingTokens)
+			}
+			if !journalPresent {
+				t.Fatal("expected journal Secret to be retained on fail-closed teardown")
+			}
+			var blockedObj v1alpha1.ServiceToken
+			if err := direct.Get(ctx, stKey, &blockedObj); err != nil {
+				t.Fatalf("expected blocked ServiceToken to still exist, got %v", err)
+			}
+			blockedCond := serviceTokenCondition(blockedObj.Status.Conditions, "CleanupBlocked")
+			if blockedCond == nil || blockedCond.Status != metav1.ConditionTrue {
+				t.Fatalf("expected CleanupBlocked=True, got %+v", blockedObj.Status.Conditions)
+			}
+			if !slices.Contains(blockedObj.Finalizers, v1alpha1.ServiceTokenFinalizer) ||
+				!slices.Contains(blockedObj.Finalizers, serviceTokenAttemptFinalizer) {
+				t.Fatalf("expected both finalizers retained on CleanupBlocked, got %v", blockedObj.Finalizers)
+			}
+			return
+		}
+
+		if delErr != nil {
+			t.Fatalf("immediate delete reconcile failed: %v", delErr)
+		}
+		if remainingTokens != 0 {
+			t.Fatalf("expected 0 remote Cloudflare tokens across all scopes after immediate delete, got %d (origStillExists=%v)", remainingTokens, origStillExists)
+		}
+		if journalPresent {
+			t.Fatal("journal Secret leaked after immediate delete")
+		}
+		var deletedCheck v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &deletedCheck); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected ServiceToken to be deleted, got err=%v conditions=%+v finalizers=%v",
+				err, deletedCheck.Status.Conditions, deletedCheck.Finalizers)
+		}
+	}
+
+	t.Run("zone_z1_to_z2_deletes_z1_and_cleans_journal", func(t *testing.T) {
+		runCase(t, "z1-z2", "z1.example.com", "z1", "z2.example.com", false, false, false)
+	})
+	t.Run("account_to_zone_z2_deletes_account_and_cleans_journal", func(t *testing.T) {
+		runCase(t, "acct-z2", "", "", "z2.example.com", false, false, false)
+	})
+	t.Run("zone_z1_to_account_deletes_z1_and_cleans_journal", func(t *testing.T) {
+		runCase(t, "z1-acct", "z1.example.com", "z1", "", false, false, false)
+	})
+	t.Run("missing_verified_z1_fails_closed", func(t *testing.T) {
+		runCase(t, "no-z1", "z1.example.com", "z1", "z2.example.com", true, false, false)
+	})
+	t.Run("ungranted_z1_fails_closed", func(t *testing.T) {
+		runCase(t, "ungranted-z1", "z1.example.com", "z1", "z2.example.com", false, true, false)
+	})
+	t.Run("mismatched_accountRef_fails_closed", func(t *testing.T) {
+		runCase(t, "bad-acct", "z1.example.com", "z1", "z1.example.com", false, false, true)
+	})
+}

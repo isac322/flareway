@@ -305,7 +305,7 @@ func (journal *serviceTokenJournal) matchesIdentity(object *v1alpha1.ServiceToke
 // remote token already checkpointed and owned on object.Status.TokenID so a
 // teardown after a spec.secretRef.name edit can reap the journal safely once
 // the remote token itself has been deleted.
-func (journal *serviceTokenJournal) matchesCheckpointedToken(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, clusterID string) bool {
+func (journal *serviceTokenJournal) matchesCheckpointedToken(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, deletedScope flarecloudflare.AccessScope, clusterID string) bool {
 	return journal.phase == serviceTokenJournalPhaseDispatched &&
 		journal.crUID == string(object.UID) &&
 		journal.clusterUID == clusterID &&
@@ -313,6 +313,7 @@ func (journal *serviceTokenJournal) matchesCheckpointedToken(object *v1alpha1.Se
 		journal.accountUID == string(account.UID) &&
 		journal.accountID == account.Spec.AccountID &&
 		journal.zoneID == object.Status.ZoneID &&
+		deletedScope.ZoneID == journal.zoneID &&
 		journal.issuedID != "" &&
 		journal.issuedID == object.Status.TokenID &&
 		journal.retiringID == ""
@@ -1063,10 +1064,7 @@ func (r *ServiceTokenReconciler) cleanupUntrackedServiceTokenAttempts(ctx contex
 	}
 	scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
 	if scopeErr != nil {
-		if object.Status.ZoneID == "" {
-			return scopeErr
-		}
-		scope.ZoneID = object.Status.ZoneID
+		return scopeErr
 	}
 	clusterID, err := r.authoritativeClusterID(ctx)
 	if err != nil {
