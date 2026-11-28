@@ -1220,3 +1220,118 @@ func TestWildcardPublicLegacyCarveOutShadowDuringUpgrade(t *testing.T) {
 		}
 	})
 }
+
+func TestCanReconstructPublicPortsUsesRawNameBeforeDisambiguation(t *testing.T) {
+	in := accessInputs(true)
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com"}
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{
+		{Name: "web", Hostname: new(gatewayv1.Hostname("*.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "web-public-5134f5ea", Hostname: new(gatewayv1.Hostname("sibling.example.com")), Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-tpvb", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway", SectionName: new(gatewayv1.SectionName("web"))}}},
+			Hostnames:       []gatewayv1.Hostname{"tpvb.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				namedRouteRule("admin", "/admin", "backend"),
+				namedRouteRule("health", "/health", "backend"),
+			},
+		},
+	}}
+	in.AccessApplications = []v1alpha1.AccessApplication{accessApplication("app-a", "HTTPRoute", "route-tpvb", "admin")}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{{Namespace: "default", Name: "app-a"}: {AUD: "aud-a", ApplicationID: "id-a", Ready: true}}
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "web",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: "web-public", EnvoyPort: 18080},
+		},
+	}}
+
+	gw, _ := Translate(in)
+
+	var carveOutIdx = -1
+	for i, d := range gw.Domains {
+		if d.ListenerName == "web" && !d.Protected && d.Name != "web" && !d.ShadowOnly {
+			carveOutIdx = i
+			break
+		}
+	}
+	if carveOutIdx < 0 {
+		t.Fatalf("expected unprotected disambiguated carve-out domain, got: %#v", gw.Domains)
+	}
+	carveOut := gw.Domains[carveOutIdx]
+	wantRenamed := "web-public-5134f5ea-" + disambiguateListenerHash("web")
+	if carveOut.Name != wantRenamed {
+		t.Fatalf("carveOut.Name = %q, want %q", carveOut.Name, wantRenamed)
+	}
+	if carveOut.EnvoyPort != 21349 {
+		t.Fatalf("carveOut.EnvoyPort = %d, want 21349 (21348 blocked by takeBase)", carveOut.EnvoyPort)
+	}
+
+	// Build projected listeners omitting the disambiguated carve-out row.
+	var projected []v1alpha1.CloudflareTunnelListenerStatus
+	for _, l := range gw.Listeners {
+		var pds []v1alpha1.CloudflareProtectionDomainStatus
+		for _, d := range gw.Domains {
+			if d.ListenerName != l.Name || d.Name == carveOut.Name {
+				continue
+			}
+			pds = append(pds, v1alpha1.CloudflareProtectionDomainStatus{Name: d.Name, EnvoyPort: d.EnvoyPort, Protected: d.Protected})
+		}
+		projected = append(projected, v1alpha1.CloudflareTunnelListenerStatus{
+			Name:              gatewayv1.SectionName(l.Name),
+			Exposure:          v1alpha1.Exposure(l.Exposure),
+			ProtectionDomains: pds,
+		})
+	}
+
+	if !CanReconstructPublicPorts(gw, projected) {
+		t.Fatalf("expected CanReconstructPublicPorts to accept raw-allocated port %d when %q is omitted", carveOut.EnvoyPort, carveOut.Name)
+	}
+
+	// Simulate an unapplied checkpoint holding the hash of the renamed string instead of raw 21349:
+	// omitting it would shift to raw-allocated 21349 on Pass 2, so replay MUST reject it.
+	renamedHashPort := PublicDomainHashPort("web", carveOut.Name)
+	if renamedHashPort == carveOut.EnvoyPort {
+		t.Fatalf("unexpected hash collision between renamed port %d and raw port %d", renamedHashPort, carveOut.EnvoyPort)
+	}
+	inMismatch := in
+	inMismatch.CloudflareTunnel = in.CloudflareTunnel.DeepCopy()
+	inMismatch.CloudflareTunnel.Status.Listeners[0].ProtectionDomains = append(
+		inMismatch.CloudflareTunnel.Status.Listeners[0].ProtectionDomains,
+		v1alpha1.CloudflareProtectionDomainStatus{Name: carveOut.Name, EnvoyPort: renamedHashPort},
+	)
+	gwMismatch, _ := Translate(inMismatch)
+	if CanReconstructPublicPorts(gwMismatch, projected) {
+		t.Fatalf("expected CanReconstructPublicPorts to reject renamed-hash port %d (omitting %q would shift to %d)", renamedHashPort, carveOut.Name, carveOut.EnvoyPort)
+	}
+
+	// PublicPortSpec is json:"-" and must leave serialized IR and xDS snapshot identical.
+	withSpecJSON, err := json.Marshal(gw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapWithSpec, err := translator.Build(gw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwNoSpec := *gw
+	gwNoSpec.PublicPortSpec = nil
+	withoutSpecJSON, err := json.Marshal(&gwNoSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapWithoutSpec, err := translator.Build(&gwNoSpec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(withSpecJSON) != string(withoutSpecJSON) {
+		t.Fatalf("PublicPortSpec altered serialized IR JSON")
+	}
+	if fmt.Sprintf("%v", snapWithSpec) != fmt.Sprintf("%v", snapWithoutSpec) {
+		t.Fatalf("PublicPortSpec altered translator.Build snapshot")
+	}
+}

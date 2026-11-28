@@ -458,6 +458,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		tunnel = currentTunnel
+		if tunnelConfigurationMode(tunnel) == v1alpha1.CloudflareTunnelConfigurationModeGateway &&
+			tunnel.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly {
+			if err := validateDesiredGatewayCloudflareConfig(compiled, tunnel); err != nil {
+				return ctrl.Result{}, r.failCloudflaredCompile(ctx, req.NamespacedName, compiled, tunnel, &gateway, routes, inputs.BackendTLSPolicies, &statuses, err)
+			}
+		}
 	}
 
 	if err := r.ensureXDSClientCertificate(ctx, &gateway); err != nil {

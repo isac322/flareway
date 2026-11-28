@@ -69,12 +69,36 @@ type Gateway struct {
 	PublicPortSpec            *PublicPortSpec      `json:"-"`
 }
 
-// PublicPortSpec captures listener spec order and hold reservations needed to
-// replay public Envoy port allocation without changing serialized IR or xDS output.
+// PublicPortSpec captures listener spec order, hold reservations, and the raw
+// pre-disambiguation allocation journal needed to replay public Envoy port
+// allocation without changing serialized IR or xDS output.
 type PublicPortSpec struct {
 	SpecListeners         []PublicPortListenerSpec `json:"-"`
 	HoldReservedPorts     []int32                  `json:"-"`
 	HasPersistedListeners bool                     `json:"-"`
+	Allocations           []PublicPortAllocation   `json:"-"`
+}
+
+// PublicPortAllocOp identifies one step in public Envoy port allocation during
+// Gateway translation.
+type PublicPortAllocOp string
+
+// PublicPortAllocOp values classify the allocator steps recorded in PublicPortSpec.Allocations.
+const (
+	PublicPortAllocBase                PublicPortAllocOp = "base"
+	PublicPortAllocDomain              PublicPortAllocOp = "domain"
+	PublicPortAllocExactPublicCarveOut PublicPortAllocOp = "exact-carve-out"
+)
+
+// PublicPortAllocation records one port allocation call with its raw
+// pre-disambiguation domain name so status deferral replay reproduces the
+// exact allocator sequence.
+type PublicPortAllocation struct {
+	Op           PublicPortAllocOp `json:"-"`
+	ListenerName string            `json:"-"`
+	DomainName   string            `json:"-"`
+	WantPort     int32             `json:"-"`
+	MustMatch    bool              `json:"-"`
 }
 
 // PublicPortListenerSpec captures one Gateway listener spec entry in declaration order.

@@ -1359,6 +1359,16 @@ const (
 	maxTunnelStatusHostnames           = 256
 )
 
+func validateDesiredGatewayCloudflareConfig(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) error {
+	if _, _, err := cloudflaredconfig.Compile(gateway); err != nil {
+		return &cloudflaredConfigCompileError{err: err}
+	}
+	if err := validateDesiredTunnelStatusLimits(gateway, tunnel); err != nil {
+		return &cloudflaredConfigCompileError{err: err}
+	}
+	return nil
+}
+
 func validateDesiredTunnelStatusLimits(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) error {
 	if gateway == nil {
 		return nil

@@ -565,6 +565,22 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listen
 		sortAccessCompilation(&compiled)
 		statuses.AccessApplications[key] = compiled
 	}
+	if gateway.PublicPortSpec != nil && len(gateway.PublicPortSpec.Allocations) > 0 {
+		liveBaseListeners := make(map[string]struct{}, len(gateway.Listeners))
+		for _, domain := range gateway.Domains {
+			if !domain.ShadowOnly && domain.Name == domain.ListenerName {
+				liveBaseListeners[domain.ListenerName] = struct{}{}
+			}
+		}
+		for i := range gateway.PublicPortSpec.Allocations {
+			alloc := &gateway.PublicPortSpec.Allocations[i]
+			if alloc.Op == ir.PublicPortAllocBase {
+				if _, liveBase := liveBaseListeners[alloc.ListenerName]; liveBase {
+					alloc.MustMatch = true
+				}
+			}
+		}
+	}
 }
 
 // filterCollidingShadowDomains drops any ShadowOnly upgrade domain whose
@@ -927,17 +943,14 @@ func assignDerivedDomainPort(gateway *ir.Gateway, publicPorts *publicEnvoyPorts,
 		domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
 		return
 	}
-	if port, ok := publicPorts.claimStickyDomain(listenerName, domain.Name); ok {
-		domain.EnvoyPort = port
-		return
-	}
-	if kind == "public" && listener != nil && listener.Hostname != "" && domain.EnvoyPort > 0 {
+	if kind == "public" && listener != nil && listener.Hostname != "" {
 		// Exact Public listeners host a single hostname whose base domain is not
 		// emitted once split by AccessApplication, so a newly created "-public"
 		// carve-out preserves the base port already allocated on base.EnvoyPort.
+		domain.EnvoyPort = publicPorts.takeExactPublicCarveOut(listenerName, domain.Name, domain.EnvoyPort)
 		return
 	}
-	domain.EnvoyPort = publicPorts.takeFresh(listenerName, domain.Name)
+	domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
 }
 
 func validatePrivateHostClaimCoverage(gateway *ir.Gateway, claims []accessClaim) error {

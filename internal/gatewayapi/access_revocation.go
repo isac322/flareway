@@ -403,6 +403,20 @@ type publicEnvoyPorts struct {
 	stickyBaseFallback    map[string]int32
 	legacyCarveOutPort    map[string]int32
 	hasPersistedListeners bool
+	allocs                *[]ir.PublicPortAllocation
+}
+
+func (ports *publicEnvoyPorts) record(op ir.PublicPortAllocOp, listenerName, domainName string, port int32, mustMatch bool) {
+	if ports == nil || ports.allocs == nil {
+		return
+	}
+	*ports.allocs = append(*ports.allocs, ir.PublicPortAllocation{
+		Op:           op,
+		ListenerName: listenerName,
+		DomainName:   domainName,
+		WantPort:     port,
+		MustMatch:    mustMatch,
+	})
 }
 
 func buildPublicPortSpec(in Inputs, reserved map[int32]struct{}) *ir.PublicPortSpec {
@@ -586,7 +600,7 @@ func fallbackPublicPortSpec(gateway *ir.Gateway) *ir.PublicPortSpec {
 // projected CloudflareTunnel.Status.Listeners reproduces the exact EnvoyPort
 // for every live (!ShadowOnly) Public ProtectionDomain without shifting ports.
 func CanReconstructPublicPorts(gateway *ir.Gateway, projected []v1alpha1.CloudflareTunnelListenerStatus) bool {
-	if gateway == nil || gateway.ConformanceMode {
+	if gateway == nil || gateway.ConformanceMode || len(gateway.Domains) == 0 {
 		return true
 	}
 	spec := gateway.PublicPortSpec
@@ -594,6 +608,28 @@ func CanReconstructPublicPorts(gateway *ir.Gateway, projected []v1alpha1.Cloudfl
 		spec = fallbackPublicPortSpec(gateway)
 	}
 	ports := newPublicEnvoyPortsFromProjected(spec, gateway.ConformanceMode, projected)
+
+	if len(spec.Allocations) > 0 {
+		basePorts := make(map[string]int32, len(spec.SpecListeners))
+		for _, alloc := range spec.Allocations {
+			var got int32
+			switch alloc.Op {
+			case ir.PublicPortAllocBase:
+				got = ports.takeBase(alloc.ListenerName)
+				basePorts[alloc.ListenerName] = got
+			case ir.PublicPortAllocExactPublicCarveOut:
+				got = ports.takeExactPublicCarveOut(alloc.ListenerName, alloc.DomainName, basePorts[alloc.ListenerName])
+			case ir.PublicPortAllocDomain:
+				got = ports.takeDomain(alloc.ListenerName, alloc.DomainName)
+			default:
+				return false
+			}
+			if alloc.MustMatch && got != alloc.WantPort {
+				return false
+			}
+		}
+		return true
+	}
 
 	holdReserved := make(map[int32]struct{}, len(spec.HoldReservedPorts))
 	for _, p := range spec.HoldReservedPorts {
@@ -738,13 +774,27 @@ func (ports *publicEnvoyPorts) claimUnused(port int32) bool {
 }
 
 func (ports *publicEnvoyPorts) takeBase(listenerName string) int32 {
-	if port, ok := ports.stickyBase[listenerName]; ok && ports.claimUnused(port) {
-		return port
+	var port int32
+	switch {
+	case ports.hasStickyBase(listenerName):
+		port = ports.stickyBase[listenerName]
+	case ports.hasStickyBaseFallback(listenerName):
+		port = ports.stickyBaseFallback[listenerName]
+	default:
+		port = ports.takeFresh(listenerName, listenerName)
 	}
-	if port, ok := ports.stickyBaseFallback[listenerName]; ok && ports.claimUnused(port) {
-		return port
-	}
-	return ports.takeFresh(listenerName, listenerName)
+	ports.record(ir.PublicPortAllocBase, listenerName, listenerName, port, false)
+	return port
+}
+
+func (ports *publicEnvoyPorts) hasStickyBase(listenerName string) bool {
+	port, ok := ports.stickyBase[listenerName]
+	return ok && ports.claimUnused(port)
+}
+
+func (ports *publicEnvoyPorts) hasStickyBaseFallback(listenerName string) bool {
+	port, ok := ports.stickyBaseFallback[listenerName]
+	return ok && ports.claimUnused(port)
 }
 
 func (ports *publicEnvoyPorts) claimStickyDomain(listenerName, domainName string) (int32, bool) {
@@ -756,11 +806,27 @@ func (ports *publicEnvoyPorts) claimStickyDomain(listenerName, domainName string
 	return 0, false
 }
 
-func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
-	if port, ok := ports.claimStickyDomain(listenerName, domainName); ok {
-		return port
+func (ports *publicEnvoyPorts) takeExactPublicCarveOut(listenerName, domainName string, fallbackBasePort int32) int32 {
+	var port int32
+	switch sticky, ok := ports.claimStickyDomain(listenerName, domainName); {
+	case ok:
+		port = sticky
+	case fallbackBasePort > 0:
+		port = fallbackBasePort
+	default:
+		port = ports.takeFresh(listenerName, domainName)
 	}
-	return ports.takeFresh(listenerName, domainName)
+	ports.record(ir.PublicPortAllocExactPublicCarveOut, listenerName, domainName, port, true)
+	return port
+}
+
+func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
+	port, ok := ports.claimStickyDomain(listenerName, domainName)
+	if !ok {
+		port = ports.takeFresh(listenerName, domainName)
+	}
+	ports.record(ir.PublicPortAllocDomain, listenerName, domainName, port, true)
+	return port
 }
 
 func (ports *publicEnvoyPorts) takeFresh(listenerName, domainName string) int32 {

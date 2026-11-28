@@ -163,6 +163,7 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 		persistedListeners = in.CloudflareTunnel.Status.Listeners
 	}
 	publicPorts := newPublicEnvoyPortsFromProjected(out.PublicPortSpec, conformanceMode, persistedListeners)
+	publicPorts.allocs = &out.PublicPortSpec.Allocations
 	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, publicPorts)
 	topLevelReason, topLevelMessage, globalInvalid := ValidateTopLevelGateway(in.Gateway)
 	if globalInvalid {
