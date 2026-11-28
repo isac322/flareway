@@ -2895,7 +2895,7 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		findEnvoyPort  func(host string) (int32, bool)
 		listenerPDPort func(tObj *v1alpha1.CloudflareTunnel, pdName string) (int32, bool)
 	}
-	setupCaseB256 := func(seedFn func(ns string, splitHosts []string, protOnlyHost, wildHost, appDigest string, pubHashFor, appHashFor func(string) string) ([]v1alpha1.CloudflareTunnelHostnameStatus, []v1alpha1.CloudflareProtectionDomainStatus)) caseB256Setup {
+	setupCaseB256WithHosts := func(hostOverrides map[int]string, seedFn func(ns string, splitHosts []string, protOnlyHost, wildHost, appDigest string, pubHashFor, appHashFor func(string) string) ([]v1alpha1.CloudflareTunnelHostnameStatus, []v1alpha1.CloudflareProtectionDomainStatus)) caseB256Setup {
 		f := newQA92Fixture(ginkgo.GinkgoT(), qa92FixtureOptions{})
 		ns := f.gatewayKey.Namespace
 
@@ -2941,7 +2941,11 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			}
 			hostnames := make([]gatewayv1.Hostname, 0, count)
 			for j := range count {
-				h := fmt.Sprintf("s%03d.example.com", chunk*16+j)
+				idx := chunk*16 + j
+				h := fmt.Sprintf("s%03d.example.com", idx)
+				if override, ok := hostOverrides[idx]; ok {
+					h = override
+				}
 				hostnames = append(hostnames, gatewayv1.Hostname(h))
 				splitHosts = append(splitHosts, h)
 			}
@@ -3178,6 +3182,9 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 			f: f, tunnel: tunnel, splitHosts: splitHosts, pubHashFor: pubHashFor, appHashFor: appHashFor,
 			inspectHostOn: inspectHostOn, findEnvoyPort: findEnvoyPort, listenerPDPort: listenerPDPort,
 		}
+	}
+	setupCaseB256 := func(seedFn func(ns string, splitHosts []string, protOnlyHost, wildHost, appDigest string, pubHashFor, appHashFor func(string) string) ([]v1alpha1.CloudflareTunnelHostnameStatus, []v1alpha1.CloudflareProtectionDomainStatus)) caseB256Setup {
+		return setupCaseB256WithHosts(nil, seedFn)
 	}
 
 	ginkgo.It("Finding 4C: Case B 256 live-domain boundary retains shadow across v1 rollout and restores 256 live rows post-ACK", func() {
@@ -3451,6 +3458,188 @@ var _ = ginkgo.Describe("PR-1 Private Access & Reserved Port Validation (envtest
 		gomega.Expect(cfgApplied.Status).To(gomega.Equal(metav1.ConditionFalse))
 		gomega.Expect(cfgApplied.Reason).To(gomega.Equal("ConfigurationError"))
 	})
+
+	ginkgo.It("Finding 4D-4: Case B deferral accounts for pre-partition takeBase port allocation", func() {
+		var baseHashPort int32
+		var tpvbHost, tpvbPD string
+		ctx := setupCaseB256WithHosts(map[int]string{126: "tpvb.example.com"}, func(ns string, splitHosts []string, protOnlyHost, wildHost, appDigest string, pubHashFor, appHashFor func(string) string) ([]v1alpha1.CloudflareTunnelHostnameStatus, []v1alpha1.CloudflareProtectionDomainStatus) {
+			tpvbHost = splitHosts[len(splitHosts)-1]
+			tpvbPD = pubHashFor(tpvbHost)
+			baseSum := sha256.Sum256([]byte("web\x00web"))
+			baseHashPort = 18080 + int32(binary.BigEndian.Uint32(baseSum[:4])%40000)
+
+			// Leave s125 & tpvb unapplied; pending checkpoint holds tpvbPD on baseHashPort (21348).
+			// Deferring tpvb would let Pass 2 translateListeners takeBase("web") claim 21348 and shift tpvb to 21349.
+			seedHostnames := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0, 256)
+			for idx, h := range splitHosts {
+				if idx < len(splitHosts)-2 {
+					pubPD := pubHashFor(h)
+					if idx == 0 {
+						pubPD = "web-public"
+					}
+					seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+						Hostname: h, ProtectionDomain: pubPD, Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1,
+					})
+				}
+				seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+					Hostname: h, ProtectionDomain: appHashFor(h), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest,
+				})
+			}
+			seedHostnames = append(seedHostnames,
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: protOnlyHost, ProtectionDomain: appHashFor(protOnlyHost), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: wildHost, ProtectionDomain: appHashFor(wildHost), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+			)
+			return seedHostnames, []v1alpha1.CloudflareProtectionDomainStatus{
+				{Name: "web-public", EnvoyPort: 18080},
+				{Name: tpvbPD, EnvoyPort: baseHashPort},
+			}
+		})
+		f := ctx.f
+		tunnel := ctx.tunnel
+
+		for pass := 1; pass <= 2; pass++ {
+			_, err := f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+			hasLegacy, s000Health, _ := ctx.inspectHostOn(18080, "s000.example.com")
+			gomega.Expect(hasLegacy).To(gomega.BeTrue())
+			gomega.Expect(s000Health).To(gomega.BeTrue())
+
+			tpvbEnvoyPort, ok := ctx.findEnvoyPort(tpvbHost)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			gomega.Expect(tpvbEnvoyPort).To(gomega.Equal(baseHashPort), fmt.Sprintf("pass %d must keep tpvb on %d instead of losing it to takeBase", pass, baseHashPort))
+
+			gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+			recordedPort, ok := ctx.listenerPDPort(&tunnel, tpvbPD)
+			gomega.Expect(ok).To(gomega.BeTrue(), fmt.Sprintf("pass %d must keep %s recorded in Status.Listeners so takeBase cannot steal %d", pass, tpvbPD, baseHashPort))
+			gomega.Expect(recordedPort).To(gomega.Equal(baseHashPort))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.ContainElement(v1alpha1.CloudflareProtectionDomainStatus{
+				Name: "web-public", EnvoyPort: 18080,
+			}))
+		}
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "pre-partition takeBase collision must emit exactly 1 remote PUT across Pass 1 & 2")
+
+		f.prober.version = 2
+		_, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).NotTo(gomega.ContainElement(gomega.HaveField("Name", "web-public")))
+	})
+
+	ginkgo.It("Finding 4D-5: deficit=2 backtracking skips non-greedy tail blocker and defers reconstructible pair", func() {
+		webHash := sha256.Sum256([]byte("web"))
+		disambigLegacyPD := "web-public-" + hex.EncodeToString(webHash[:4])
+		var tb9yHost, tclbHost, tcqxHost string
+		var tb9yPD, tclbPD, tcqxPD string
+		var tcqxHashPort int32
+
+		ctx := setupCaseB256WithHosts(map[int]string{
+			124: "tb9y.example.com",
+			125: "tclb.example.com",
+			126: "tcqx.example.com",
+		}, func(ns string, splitHosts []string, protOnlyHost, wildHost, appDigest string, pubHashFor, appHashFor func(string) string) ([]v1alpha1.CloudflareTunnelHostnameStatus, []v1alpha1.CloudflareProtectionDomainStatus) {
+			tb9yHost = splitHosts[124]
+			tclbHost = splitHosts[125]
+			tcqxHost = splitHosts[126]
+			tb9yPD = pubHashFor(tb9yHost)
+			tclbPD = pubHashFor(tclbHost)
+			tcqxPD = pubHashFor(tcqxHost)
+			tcqxSum := sha256.Sum256([]byte("web\x00" + tcqxPD))
+			tcqxHashPort = 18080 + int32(binary.BigEndian.Uint32(tcqxSum[:4])%40000)
+
+			// Seed two legacy shadows (s000 -> web-public:18080, s001 -> disambigLegacyPD:18081),
+			// pin all 253 other live domains in Status.Hostnames (255 rows <= 256 MaxItems) so ONLY
+			// (tb9y, tclb, tcqx) are unapplied candidates, and seed tcqx at tcqxHashPort in Status.Listeners.
+			seedHostnames := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0, 256)
+			for idx, h := range splitHosts {
+				if idx < 124 {
+					switch idx {
+					case 0:
+						seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+							Hostname: h, ProtectionDomain: "web-public", Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1,
+						})
+					case 1:
+						seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+							Hostname: h, ProtectionDomain: disambigLegacyPD, Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1,
+						})
+					}
+					seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+						Hostname: h, ProtectionDomain: pubHashFor(h), Guard: v1alpha1.HostnameGuardUnprotected, AppliedVersion: 1,
+					})
+				}
+				seedHostnames = append(seedHostnames, v1alpha1.CloudflareTunnelHostnameStatus{
+					Hostname: h, ProtectionDomain: appHashFor(h), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest,
+				})
+			}
+			seedHostnames = append(seedHostnames,
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: protOnlyHost, ProtectionDomain: appHashFor(protOnlyHost), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+				v1alpha1.CloudflareTunnelHostnameStatus{Hostname: wildHost, ProtectionDomain: appHashFor(wildHost), AccessApplication: ns + "/app-caseb", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1, AccessBinding: appDigest},
+			)
+			return seedHostnames, []v1alpha1.CloudflareProtectionDomainStatus{
+				{Name: "web-public", EnvoyPort: 18080},
+				{Name: disambigLegacyPD, EnvoyPort: 18081},
+				{Name: tcqxPD, EnvoyPort: tcqxHashPort},
+			}
+		})
+		f := ctx.f
+		tunnel := ctx.tunnel
+
+		for pass := 1; pass <= 2; pass++ {
+			_, err := f.reconciler.Reconcile(f.ctx, f.request)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+
+			hasL1, hasH1, _ := ctx.inspectHostOn(18080, "s000.example.com")
+			gomega.Expect(hasL1).To(gomega.BeTrue())
+			gomega.Expect(hasH1).To(gomega.BeTrue())
+			hasL2, hasH2, _ := ctx.inspectHostOn(18081, "s001.example.com")
+			gomega.Expect(hasL2).To(gomega.BeTrue())
+			gomega.Expect(hasH2).To(gomega.BeTrue())
+
+			pTb9y, ok1 := ctx.findEnvoyPort(tb9yHost)
+			pTclb, ok2 := ctx.findEnvoyPort(tclbHost)
+			pTcqx, ok3 := ctx.findEnvoyPort(tcqxHost)
+			gomega.Expect(ok1 && ok2 && ok3).To(gomega.BeTrue())
+			gomega.Expect(pTcqx).To(gomega.Equal(tcqxHashPort))
+			gomega.Expect(pTb9y).To(gomega.Equal(tcqxHashPort + 1))
+			gomega.Expect(pTclb).To(gomega.Equal(tcqxHashPort + 2))
+
+			gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.ContainElement(v1alpha1.CloudflareProtectionDomainStatus{
+				Name: "web-public", EnvoyPort: 18080,
+			}))
+			gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.ContainElement(v1alpha1.CloudflareProtectionDomainStatus{
+				Name: disambigLegacyPD, EnvoyPort: 18081,
+			}))
+			recordedTcqx, hasTcqx := ctx.listenerPDPort(&tunnel, tcqxPD)
+			gomega.Expect(hasTcqx).To(gomega.BeTrue(), fmt.Sprintf("pass %d must retain %s on %d instead of greedy tail deferral", pass, tcqxPD, tcqxHashPort))
+			gomega.Expect(recordedTcqx).To(gomega.Equal(tcqxHashPort))
+			_, hasTb9y := ctx.listenerPDPort(&tunnel, tb9yPD)
+			_, hasTclb := ctx.listenerPDPort(&tunnel, tclbPD)
+			gomega.Expect(hasTb9y).To(gomega.BeFalse())
+			gomega.Expect(hasTclb).To(gomega.BeFalse())
+		}
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1), "deficit=2 backtracking must emit exactly 1 remote PUT across Pass 1 & 2")
+
+		f.prober.version = 2
+		_, err := f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.snapshots.ACK(f.gatewayKey.String())).To(gomega.Succeed())
+		_, err = f.reconciler.Reconcile(f.ctx, f.request)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(f.remote.updates).To(gomega.Equal(1))
+		gomega.Expect(f.direct.Get(f.ctx, f.tunnelKey, &tunnel)).To(gomega.Succeed())
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).To(gomega.HaveLen(256))
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).NotTo(gomega.ContainElement(gomega.HaveField("Name", "web-public")))
+		gomega.Expect(tunnel.Status.Listeners[0].ProtectionDomains).NotTo(gomega.ContainElement(gomega.HaveField("Name", disambigLegacyPD)))
+	})
 })
 
 // QA-1-REG-5 (controller): Mixed PodIP + Loopback and All-PodIP active Private
@@ -3549,12 +3738,78 @@ func TestValidateDesiredTunnelStatusLimitsShadowRecoverability(t *testing.T) {
 	if err := validateDesiredTunnelStatusLimits(gwOK, nil); err != nil {
 		t.Fatalf("255 protected + 1 reconstructible unprotected + 1 shadow must validate, got: %v", err)
 	}
-	statusOK := tunnelListenerStatus("web", ir.ExposurePublic, "", gwOK.Domains)
+	statusOK := desiredTunnelListeners(gwOK, nil)[0]
 	if len(statusOK.ProtectionDomains) != maxTunnelListenerProtectionDomains {
 		t.Fatalf("ProtectionDomains len = %d, want %d", len(statusOK.ProtectionDomains), maxTunnelListenerProtectionDomains)
 	}
 	if last := statusOK.ProtectionDomains[len(statusOK.ProtectionDomains)-1]; last.Name != "web-public" || last.EnvoyPort != 18080 {
 		t.Fatalf("last retained PD = %#v, want web-public:18080", last)
+	}
+
+	// Pre-partition takeBase port conflict: unprotected carve-out holding PublicDomainHashPort("web", "web")
+	// cannot be deferred because Pass 2 translateListeners takeBase("web") would steal that port.
+	gwBaseConflict := makeCaseB(255, 1, true, true)
+	baseConflictPort := gatewayapi.PublicDomainHashPort("web", "web")
+	gwBaseConflict.Domains[255].EnvoyPort = baseConflictPort
+	if err := validateDesiredTunnelStatusLimits(gwBaseConflict, nil); err == nil || !strings.Contains(err.Error(), "cannot retain legacy shadow domain") {
+		t.Fatalf("expected unrecoverable shadow error on takeBase conflict, got: %v", err)
+	}
+
+	// Sibling-listener port reservation: sibling listener "api" holds web-public-000's hash port,
+	// forcing web-public-000 onto hash+1; gateway-wide replay keeps "api" in projected and validates cleanly.
+	gwSibling := makeCaseB(255, 1, true, true)
+	siblingHoldPort := gatewayapi.PublicDomainHashPort("web", "web-public-000")
+	gwSibling.Listeners = append(gwSibling.Listeners, ir.Listener{Name: "api", Exposure: ir.ExposurePublic})
+	gwSibling.Domains = append(gwSibling.Domains, ir.ProtectionDomain{
+		Name:         "api",
+		ListenerName: "api",
+		Exposure:     ir.ExposurePublic,
+		EnvoyPort:    siblingHoldPort,
+	})
+	gwSibling.Domains[255].EnvoyPort = siblingHoldPort + 1
+	if err := validateDesiredTunnelStatusLimits(gwSibling, nil); err != nil {
+		t.Fatalf("sibling-listener reservation should allow deferring web-public-000 at hash+1, got: %v", err)
+	}
+	siblingListeners := desiredTunnelListeners(gwSibling, nil)
+	if len(siblingListeners) != 2 || len(siblingListeners[0].ProtectionDomains) != maxTunnelListenerProtectionDomains {
+		t.Fatalf("unexpected sibling listener statuses: %#v", siblingListeners)
+	}
+
+	// deficit=2 backtracking over 3 hash-colliding candidates (A: H+1, B: H+2, C: H):
+	// tail-first greedy would drop C:H and fail on A/B; backtracking keeps C:H and defers (A, B).
+	pubPDForHost := func(h string) string {
+		sum := sha256.Sum256([]byte("public\x00" + h))
+		return "web-public-" + hex.EncodeToString(sum[:4])
+	}
+	pdA := pubPDForHost("tb9y.example.com")
+	pdB := pubPDForHost("tclb.example.com")
+	pdC := pubPDForHost("tcqx.example.com")
+	hPort := gatewayapi.PublicDomainHashPort("web", pdC)
+	gwBacktrack := makeCaseB(253, 0, true, true)
+	gwBacktrack.Domains = append(gwBacktrack.Domains,
+		ir.ProtectionDomain{Name: pdA, ListenerName: "web", Exposure: ir.ExposurePublic, EnvoyPort: hPort + 1},
+		ir.ProtectionDomain{Name: pdB, ListenerName: "web", Exposure: ir.ExposurePublic, EnvoyPort: hPort + 2},
+		ir.ProtectionDomain{Name: pdC, ListenerName: "web", Exposure: ir.ExposurePublic, EnvoyPort: hPort},
+		ir.ProtectionDomain{Name: "web-public-4b5e57f6", ListenerName: "web", Exposure: ir.ExposurePublic, EnvoyPort: 18081, ShadowOnly: true},
+	)
+	if err := validateDesiredTunnelStatusLimits(gwBacktrack, nil); err != nil {
+		t.Fatalf("deficit=2 backtracking should find (pdA, pdB), got: %v", err)
+	}
+	backtrackStatus := desiredTunnelListeners(gwBacktrack, nil)[0]
+	if len(backtrackStatus.ProtectionDomains) != maxTunnelListenerProtectionDomains {
+		t.Fatalf("backtrack ProtectionDomains len = %d, want %d", len(backtrackStatus.ProtectionDomains), maxTunnelListenerProtectionDomains)
+	}
+	sawC := false
+	for _, pd := range backtrackStatus.ProtectionDomains {
+		if pd.Name == pdC && pd.EnvoyPort == hPort {
+			sawC = true
+		}
+		if pd.Name == pdA || pd.Name == pdB {
+			t.Fatalf("expected %s to be deferred while keeping %s", pd.Name, pdC)
+		}
+	}
+	if !sawC {
+		t.Fatalf("expected %s:%d to remain retained", pdC, hPort)
 	}
 
 	// Applied carve-out in tunnel.Status.Hostnames cannot be deferred.

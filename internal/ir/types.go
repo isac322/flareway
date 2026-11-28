@@ -66,6 +66,24 @@ type Gateway struct {
 	Domains                   []ProtectionDomain   `json:"domains,omitempty"`
 	Clusters                  []Cluster            `json:"clusters,omitempty"`
 	Secrets                   []TLSSecret          `json:"secrets,omitempty"`
+	PublicPortSpec            *PublicPortSpec      `json:"-"`
+}
+
+// PublicPortSpec captures listener spec order and hold reservations needed to
+// replay public Envoy port allocation without changing serialized IR or xDS output.
+type PublicPortSpec struct {
+	SpecListeners         []PublicPortListenerSpec `json:"-"`
+	HoldReservedPorts     []int32                  `json:"-"`
+	HasPersistedListeners bool                     `json:"-"`
+}
+
+// PublicPortListenerSpec captures one Gateway listener spec entry in declaration order.
+type PublicPortListenerSpec struct {
+	Name        string `json:"-"`
+	Exposure    string `json:"-"`
+	Wildcard    bool   `json:"-"`
+	ExactPublic bool   `json:"-"`
+	Port        int32  `json:"-"`
 }
 
 // Cloudflare identifies the remotely managed tunnel used by a production
