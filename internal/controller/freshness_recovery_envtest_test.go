@@ -9702,3 +9702,492 @@ func TestServiceTokenLostCreateResponseJournalDeleteEnvtest(t *testing.T) {
 		}
 	})
 }
+
+type journalFaultClient struct {
+	client.Client
+	failNextJournalDelete atomic.Bool
+	failJournalUpdate     atomic.Bool
+	credSecretGetCount    atomic.Int32
+	credSecretName        string
+}
+
+func (c *journalFaultClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok && c.credSecretName != "" && key.Name == c.credSecretName {
+		c.credSecretGetCount.Add(1)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *journalFaultClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if s, ok := obj.(*corev1.Secret); ok && strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && c.failJournalUpdate.Load() {
+		return apierrors.NewServiceUnavailable("injected 503 on journalSecret update")
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c *journalFaultClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if s, ok := obj.(*corev1.Secret); ok && strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && c.failNextJournalDelete.CompareAndSwap(true, false) {
+		return apierrors.NewServiceUnavailable("injected 503 on journalSecret delete")
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+type deleteResponseLossAPI struct {
+	*serviceTokenFakeAPI
+	dropNextDeleteResponse atomic.Bool
+}
+
+func (a *deleteResponseLossAPI) DeleteServiceToken(ctx context.Context, scope flarecloudflare.AccessScope, id string) error {
+	err := a.serviceTokenFakeAPI.DeleteServiceToken(ctx, scope, id)
+	if err == nil && a.dropNextDeleteResponse.CompareAndSwap(true, false) {
+		return fmt.Errorf("injected delete response loss after commit")
+	}
+	return err
+}
+
+// Regression test (Finding 1, P2): cleanupPendingServiceTokenJournal MUST
+// persist recovered issuedID/retiringID onto the journal Secret BEFORE calling
+// DeleteServiceToken, so a lost Delete response or transient 503 on
+// deleteServiceTokenJournalSecret recovers via GetServiceToken 404 on retry
+// (with 1 total Delete), and a journal persistence failure aborts BEFORE any
+// remote DeleteServiceToken call.
+func TestServiceTokenJournalRecoveredIDPersistedBeforeDeleteEnvtest(t *testing.T) {
+	setup := func(t *testing.T, suffix string) (client.Client, *journalFaultClient, *ServiceTokenReconciler, *deleteResponseLossAPI, *v1alpha1.ServiceToken, types.NamespacedName, string) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+
+		ns := "tenant-st-recid-" + suffix
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatal(err)
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "acct-st-recid-" + suffix},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:         []string{"*"},
+					Zones:             []string{"*"},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+		markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "z1.example.com"}})
+
+		innerAPI := &serviceTokenFakeAPI{
+			now:                    time.Now,
+			tokens:                 make(map[string]flarecloudflare.ServiceToken),
+			secrets:                make(map[string]string),
+			commitThenFailCreateAt: 1,
+		}
+		api := &deleteResponseLossAPI{serviceTokenFakeAPI: innerAPI}
+		faultClient := &journalFaultClient{Client: direct}
+		reconciler := &ServiceTokenReconciler{
+			Client:    faultClient,
+			APIReader: direct,
+			Scheme:    mgr.GetScheme(),
+			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) {
+				return api, nil
+			},
+			Freshness:   freshness.DefaultPolicy(),
+			Invalidator: freshness.NewLatch(),
+		}
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "recovered-id test account ready", func() (bool, error) {
+			var cur v1alpha1.CloudflareAccount
+			if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+		})
+
+		st := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-recid"},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+				Zone:             "z1.example.com",
+				Name:             "st-recid",
+				Enabled:          true,
+				Duration:         "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		if err := direct.Create(ctx, st); err != nil {
+			t.Fatal(err)
+		}
+		stKey := client.ObjectKeyFromObject(st)
+
+		var sawErr bool
+		for i := 0; i < 4; i++ {
+			if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+				sawErr = true
+				break
+			}
+		}
+		if !sawErr {
+			t.Fatal("expected commitThenFailCreateAt error")
+		}
+		var current v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &current); err != nil {
+			t.Fatal(err)
+		}
+		if current.Status.TokenID != "" || len(api.tokens) != 1 {
+			t.Fatalf("expected empty TokenID and 1 committed remote token, status=%+v tokens=%v", current.Status, api.tokens)
+		}
+		return direct, faultClient, reconciler, api, &current, stKey, ns
+	}
+
+	t.Run("dispatched_issuedID_empty_journal_delete_503_recovers_on_retry", func(t *testing.T) {
+		ctx := context.Background()
+		direct, faultClient, reconciler, api, current, stKey, ns := setup(t, "del503")
+		faultClient.failNextJournalDelete.Store(true)
+
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected first delete reconcile to fail on injected 503 during journalSecret delete")
+		}
+		if api.deletes != 1 || len(api.tokens) != 0 {
+			t.Fatalf("expected 1 remote delete and 0 remote tokens after first pass, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained after 503: %v", err)
+		}
+		if string(j.Data[serviceTokenJournalKeyIssuedID]) == "" {
+			t.Fatal("expected recovered issuedID persisted to journal Secret before remote DeleteServiceToken")
+		}
+
+		// Retry reconcile: List sees 0 tokens, GetServiceToken returns 404 for persisted issuedID, deletes journal & finalizers.
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+			t.Fatalf("retry delete reconcile failed: %v", err)
+		}
+		if api.deletes != 1 {
+			t.Fatalf("expected 1 total remote DeleteServiceToken across retry, got %d (calls=%v)", api.deletes, api.calls)
+		}
+		if !slices.Contains(api.calls, "get:"+string(j.Data[serviceTokenJournalKeyIssuedID])) {
+			t.Fatalf("expected GetServiceToken 404 verification on retry, calls=%v", api.calls)
+		}
+		var gone v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &gone); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected ServiceToken deleted on retry, got err=%v finalizers=%v", err, gone.Finalizers)
+		}
+	})
+
+	t.Run("dispatched_issuedID_empty_delete_response_loss_recovers_on_retry", func(t *testing.T) {
+		ctx := context.Background()
+		direct, _, reconciler, api, current, stKey, ns := setup(t, "delresp")
+		api.dropNextDeleteResponse.Store(true)
+
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected first delete reconcile to fail on injected delete response loss")
+		}
+		if api.deletes != 1 || len(api.tokens) != 0 {
+			t.Fatalf("expected committed delete and 0 remote tokens, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained: %v", err)
+		}
+		if string(j.Data[serviceTokenJournalKeyIssuedID]) == "" {
+			t.Fatal("expected recovered issuedID persisted to journal Secret before DeleteServiceToken")
+		}
+
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+			t.Fatalf("retry after delete response loss failed: %v", err)
+		}
+		if api.deletes != 1 {
+			t.Fatalf("expected 1 total DeleteServiceToken across retry, got %d", api.deletes)
+		}
+		var gone v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &gone); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected ServiceToken deleted on retry, got err=%v", err)
+		}
+	})
+
+	t.Run("retiring_retiringID_empty_journal_delete_503_recovers_on_retry", func(t *testing.T) {
+		ctx := context.Background()
+		direct, faultClient, reconciler, api, current, stKey, ns := setup(t, "ret503")
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &j); err != nil {
+			t.Fatal(err)
+		}
+		attemptName := string(j.Data[serviceTokenJournalKeyAttemptName])
+		j.Data[serviceTokenJournalKeyPhase] = []byte(serviceTokenJournalPhaseRetiring)
+		j.Data[serviceTokenJournalKeyIssuedID] = nil
+		j.Data[serviceTokenJournalKeyRetiringID] = nil
+		j.Data[serviceTokenJournalKeyRetiringName] = []byte(attemptName)
+		j.Data[serviceTokenJournalKeyAttemptName] = []byte(attemptName + "-next")
+		if err := direct.Update(ctx, &j); err != nil {
+			t.Fatal(err)
+		}
+
+		faultClient.failNextJournalDelete.Store(true)
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected first retiring delete reconcile to fail on injected 503")
+		}
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &j); err != nil {
+			t.Fatal(err)
+		}
+		if string(j.Data[serviceTokenJournalKeyRetiringID]) == "" {
+			t.Fatal("expected recovered retiringID persisted to journal Secret before DeleteServiceToken")
+		}
+
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+			t.Fatalf("retry retiring delete reconcile failed: %v", err)
+		}
+		if api.deletes != 1 || len(api.tokens) != 0 {
+			t.Fatalf("expected 1 delete and 0 remote tokens, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
+		var gone v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &gone); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected ServiceToken deleted on retry, got err=%v", err)
+		}
+	})
+
+	t.Run("journal_persist_failure_aborts_before_remote_delete", func(t *testing.T) {
+		ctx := context.Background()
+		direct, faultClient, reconciler, api, current, stKey, ns := setup(t, "persistfail")
+		faultClient.failJournalUpdate.Store(true)
+
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected delete reconcile to fail closed when journal persistence fails")
+		}
+		if api.deletes != 0 || len(api.tokens) != 1 {
+			t.Fatalf("expected 0 DeleteServiceToken calls when journal persist fails, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
+		var blocked v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if cond := serviceTokenCondition(blocked.Status.Conditions, "CleanupBlocked"); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("expected CleanupBlocked=True, got %+v", blocked.Status.Conditions)
+		}
+		if !slices.Contains(blocked.Finalizers, v1alpha1.ServiceTokenFinalizer) ||
+			!slices.Contains(blocked.Finalizers, serviceTokenAttemptFinalizer) {
+			t.Fatalf("expected both finalizers retained, got %v", blocked.Finalizers)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained: %v", err)
+		}
+	})
+}
+
+// Regression test (Finding 2, P2): when journal.accountUID mismatches the live
+// CloudflareAccount (same name), BOTH pending-journal and checkpointed-status
+// teardown MUST reject before reading the credentials Secret or calling the
+// client factory (0 Secret reads, 0 factory calls, 0 provider API calls).
+func TestServiceTokenMismatchedJournalAccountUIDBlocksBeforeSecretOrFactoryEnvtest(t *testing.T) {
+	runPath := func(t *testing.T, suffix string, checkpointedStatus bool) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+
+		ns := "tenant-st-acctuid-" + suffix
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatal(err)
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "acct-st-uid-" + suffix},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:         []string{"*"},
+					Zones:             []string{"*"},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+		markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "z1.example.com"}})
+
+		api := &serviceTokenFakeAPI{now: time.Now, tokens: make(map[string]flarecloudflare.ServiceToken), secrets: make(map[string]string)}
+		if !checkpointedStatus {
+			api.commitThenFailCreateAt = 1
+		}
+		var factoryCalls atomic.Int32
+		readerSpy := &journalFaultClient{Client: direct, credSecretName: "api-tok"}
+		reconciler := &ServiceTokenReconciler{
+			Client:    readerSpy,
+			APIReader: readerSpy,
+			Scheme:    mgr.GetScheme(),
+			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) {
+				factoryCalls.Add(1)
+				return api, nil
+			},
+			Freshness:   freshness.DefaultPolicy(),
+			Invalidator: freshness.NewLatch(),
+		}
+		apiReaderHook := &failingStatusClient{Client: readerSpy}
+		reconciler.APIReader = apiReaderHook
+
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "acctuid test account ready", func() (bool, error) {
+			var cur v1alpha1.CloudflareAccount
+			if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+		})
+
+		st := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-acctuid"},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+				Zone:             "z1.example.com",
+				Name:             "st-acctuid",
+				Enabled:          true,
+				Duration:         "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		if err := direct.Create(ctx, st); err != nil {
+			t.Fatal(err)
+		}
+		stKey := client.ObjectKeyFromObject(st)
+
+		if checkpointedStatus {
+			var bumped atomic.Bool
+			var bumpErr error
+			apiReaderHook.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+				if _, ok := obj.(*v1alpha1.ServiceToken); !ok || key != stKey || bumped.Load() {
+					return
+				}
+				var latest v1alpha1.ServiceToken
+				if err := direct.Get(ctx, stKey, &latest); err != nil || latest.Status.TokenID != "" {
+					return
+				}
+				var secrets corev1.SecretList
+				if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+					return
+				}
+				hasCreds, hasJournal := false, false
+				for i := range secrets.Items {
+					if secrets.Items[i].Name == "st-creds-v1" && len(secrets.Items[i].Data) > 0 {
+						hasCreds = true
+					}
+					if strings.HasPrefix(secrets.Items[i].Name, serviceTokenJournalPrefix) && len(secrets.Items[i].Data[serviceTokenJournalKeyIssuedID]) > 0 {
+						hasJournal = true
+					}
+				}
+				if !hasCreds || !hasJournal || bumped.Swap(true) {
+					return
+				}
+				latest.Spec.SecretRef = corev1.LocalObjectReference{Name: "st-creds-v2"}
+				bumpErr = direct.Update(ctx, &latest)
+			}
+			for i := 0; i < 4; i++ {
+				if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+					t.Fatalf("checkpoint pass %d: %v", i, err)
+				}
+				if bumped.Load() {
+					break
+				}
+			}
+			if bumpErr != nil || !bumped.Load() {
+				t.Fatalf("expected secretRef bump: bumped=%v err=%v", bumped.Load(), bumpErr)
+			}
+		} else {
+			var sawErr bool
+			for i := 0; i < 4; i++ {
+				if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+					sawErr = true
+					break
+				}
+			}
+			if !sawErr {
+				t.Fatal("expected commitThenFailCreateAt error")
+			}
+		}
+
+		var current v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &current); err != nil {
+			t.Fatal(err)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(&current)}, &j); err != nil {
+			t.Fatal(err)
+		}
+		j.Data[serviceTokenJournalKeyAccountUID] = []byte("wrong-account-uid")
+		if err := direct.Update(ctx, &j); err != nil {
+			t.Fatal(err)
+		}
+
+		secretReadsBefore := readerSpy.credSecretGetCount.Load()
+		factoryCallsBefore := factoryCalls.Load()
+		providerCallsBefore := len(api.calls)
+
+		if err := direct.Delete(ctx, &current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected CleanupBlocked when journal.accountUID mismatches live CloudflareAccount")
+		}
+
+		if got := readerSpy.credSecretGetCount.Load() - secretReadsBefore; got != 0 {
+			t.Fatalf("expected 0 credential Secret reads before journal accountUID validation, got %d", got)
+		}
+		if got := factoryCalls.Load() - factoryCallsBefore; got != 0 {
+			t.Fatalf("expected 0 factory invocations before journal accountUID validation, got %d", got)
+		}
+		if got := len(api.calls) - providerCallsBefore; got != 0 {
+			t.Fatalf("expected 0 provider API calls before journal accountUID validation, got %d (%v)", got, api.calls[providerCallsBefore:])
+		}
+		if len(api.tokens) != 1 {
+			t.Fatalf("expected remote token retained, tokens=%v", api.tokens)
+		}
+		var blocked v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if cond := serviceTokenCondition(blocked.Status.Conditions, "CleanupBlocked"); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("expected CleanupBlocked=True, got %+v", blocked.Status.Conditions)
+		}
+		if !slices.Contains(blocked.Finalizers, v1alpha1.ServiceTokenFinalizer) ||
+			!slices.Contains(blocked.Finalizers, serviceTokenAttemptFinalizer) {
+			t.Fatalf("expected both finalizers retained, got %v", blocked.Finalizers)
+		}
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(&current)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained: %v", err)
+		}
+	}
+
+	t.Run("pending_journal_path", func(t *testing.T) {
+		runPath(t, "pending", false)
+	})
+	t.Run("checkpointed_status_path", func(t *testing.T) {
+		runPath(t, "checkpointed", true)
+	})
+}

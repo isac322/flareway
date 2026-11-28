@@ -676,7 +676,7 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 				skipJournalCleanup = journal.matchesCheckpointedToken(object, deletedAccount, deletedScope, clusterID)
 			}
 			if !skipJournalCleanup {
-				if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {
+				if err := r.cleanupPendingServiceTokenJournal(ctx, object, journalSecret, journal); err != nil {
 					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 				}
 			}

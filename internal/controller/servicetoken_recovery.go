@@ -979,15 +979,18 @@ func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object 
 // cleanupPendingServiceTokenJournal removes remote tokens recorded by a
 // pending journal during teardown. It uses the journaled account and scope
 // binding so pending cleanup works even when status.tokenId is empty.
-func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journal *serviceTokenJournal) error {
+func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal) error {
 	switch journal.phase {
 	case serviceTokenJournalPhasePrepared, serviceTokenJournalPhaseDispatched, serviceTokenJournalPhaseRetiring:
 	default:
 		return fmt.Errorf("unsupported service token journal phase %q during teardown", journal.phase)
 	}
-	api, account, err := accessClientForAccount(ctx, r.apiReader(), object.Namespace, journal.accountName, authzRequestForJournal(journal), r.NewCloudflareClient)
-	if err != nil {
-		return err
+	if journal.accountName == "" {
+		return errors.New("service token journal account name is empty")
+	}
+	account := new(v1alpha1.CloudflareAccount)
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Name: journal.accountName}, account); err != nil {
+		return fmt.Errorf("get CloudflareAccount %q: %w", journal.accountName, err)
 	}
 	clusterID, err := r.authoritativeClusterID(ctx)
 	if err != nil {
@@ -995,6 +998,10 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 	}
 	if !journal.matchesIdentity(object, account, clusterID) {
 		return errors.New("service token journal identity does not match the live object or authoritative cluster")
+	}
+	api, err := accessClientForResolvedAccount(ctx, r.apiReader(), account, object.Namespace, authzRequestForJournal(journal), r.NewCloudflareClient)
+	if err != nil {
+		return err
 	}
 	scope := flarecloudflare.AccessScope{ZoneID: journal.zoneID}
 	tokens, err := api.ListServiceTokens(ctx, scope)
@@ -1026,14 +1033,29 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 			return errors.New("retiring service token journal has no retiring ID or exact remote candidate")
 		}
 	}
-	if journal.issuedID != "" {
-		if match, ok := matches[journal.attemptName]; ok && match.ID != journal.issuedID {
+	var recoveredIssuedID, recoveredRetiringID string
+	if match, ok := matches[journal.attemptName]; ok {
+		if match.ID == "" {
+			return fmt.Errorf("matched remote service token %q omitted ID", journal.attemptName)
+		}
+		if journal.issuedID != "" && match.ID != journal.issuedID {
 			return fmt.Errorf("remote service token %q ID %q disagrees with journaled issued ID %q", journal.attemptName, match.ID, journal.issuedID)
 		}
+		if journal.issuedID == "" {
+			recoveredIssuedID = match.ID
+		}
 	}
-	if journal.retiringID != "" {
-		if match, ok := matches[journal.retiringName]; ok && match.ID != journal.retiringID {
-			return fmt.Errorf("remote service token %q ID %q disagrees with journaled retiring ID %q", journal.retiringName, match.ID, journal.retiringID)
+	if journal.retiringName != "" {
+		if match, ok := matches[journal.retiringName]; ok {
+			if match.ID == "" {
+				return fmt.Errorf("matched remote service token %q omitted ID", journal.retiringName)
+			}
+			if journal.retiringID != "" && match.ID != journal.retiringID {
+				return fmt.Errorf("remote service token %q ID %q disagrees with journaled retiring ID %q", journal.retiringName, match.ID, journal.retiringID)
+			}
+			if journal.retiringID == "" {
+				recoveredRetiringID = match.ID
+			}
 		}
 	}
 	committedID, err := r.committedServiceTokenCredential(ctx, object)
@@ -1048,20 +1070,21 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 		}
 		committedClientID = string(secret.Data[v1alpha1.ServiceTokenClientIDKey])
 	}
-	ids := map[string]bool{}
-	if journal.issuedID != "" {
-		ids[journal.issuedID] = true
-	}
-	if journal.retiringID != "" {
-		ids[journal.retiringID] = true
-	}
-	for name, match := range matches {
-		if match.ID == "" {
-			return fmt.Errorf("matched remote service token %q omitted ID", name)
+	seenIDs := map[string]bool{}
+	idList := make([]string, 0, 4)
+	addID := func(id string) {
+		if id != "" && !seenIDs[id] {
+			seenIDs[id] = true
+			idList = append(idList, id)
 		}
-		ids[match.ID] = true
 	}
-	for id := range ids {
+	addID(journal.issuedID)
+	addID(journal.retiringID)
+	addID(recoveredIssuedID)
+	addID(recoveredRetiringID)
+
+	deleteIDs := make([]string, 0, len(idList))
+	for _, id := range idList {
 		remote, getErr := api.GetServiceToken(ctx, scope, id)
 		if flarecloudflare.IsNotFound(getErr) {
 			continue
@@ -1076,6 +1099,23 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 		if !allowed {
 			return fmt.Errorf("remote service token %q has unexpected name %q during journal cleanup", id, remote.Name)
 		}
+		deleteIDs = append(deleteIDs, id)
+	}
+	if recoveredIssuedID != "" || recoveredRetiringID != "" {
+		if journalSecret == nil {
+			return errors.New("service token journal Secret is missing before recording recovered token ID")
+		}
+		if recoveredIssuedID != "" {
+			journal.issuedID = recoveredIssuedID
+		}
+		if recoveredRetiringID != "" {
+			journal.retiringID = recoveredRetiringID
+		}
+		if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
+			return fmt.Errorf("persist recovered service token ID to journal: %w", err)
+		}
+	}
+	for _, id := range deleteIDs {
 		if err := ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, id)); err != nil {
 			return err
 		}
