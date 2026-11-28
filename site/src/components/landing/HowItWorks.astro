@@ -86,23 +86,31 @@ const f = copy.figure;
 				<path class="d-thin" d="M404 378 H382" marker-end="url(#dg-ah)"></path>
 				<text class="d-m" x="456" y="428" text-anchor="middle">{f.xds}</text>
 
-				<rect class="d-pod" x="28" y="322" width="360" height="148" rx="12"></rect>
+				<rect class="d-pod" x="28" y="322" width="360" height="170" rx="12"></rect>
 				<text class="d-m" x="372" y="342" text-anchor="end">{f.podLabel}</text>
 				<rect class="d-box-ink" x="44" y="354" width="136" height="50" rx="9"></rect>
 				<text class="d-mi" x="112" y="384" text-anchor="middle">{f.cloudflared}</text>
 				<rect class="d-box-ink" x="228" y="354" width="136" height="50" rx="9"></rect>
 				<text class="d-mi" x="296" y="384" text-anchor="middle">{f.envoy}</text>
 				<path class="d-arrow" d="M180 379 H222" marker-end="url(#dg-ah)"></path>
-				<text class="d-m" x="204" y="422" text-anchor="middle">{f.loopback}</text>
-				<text class="d-s" x="44" y="456">{f.coredns}</text>
+				<text class="d-m" x="44" y="422" style="font-size: 11px;">
+					{f.loopback.split(' · ').map((line, index) => (
+						<tspan x="44" dy={index === 0 ? '0' : '15'}>{line}</tspan>
+					))}
+				</text>
+				<text class="d-s" x="44" y="460" style="font-size: 11.5px;">
+					{f.coredns.split(' · ').map((line, index) => (
+						<tspan x="44" dy={index === 0 ? '0' : '15'}>{line}</tspan>
+					))}
+				</text>
 
-				<path class="d-arrow" d="M296 404 V494" marker-end="url(#dg-ah)"></path>
-				<rect class="d-box" x="228" y="500" width="136" height="44" rx="9"></rect>
-				<text class="d-t d-t-sm" x="296" y="527" text-anchor="middle">{f.service}</text>
-				<path class="d-arrow" d="M364 522 H398" marker-end="url(#dg-ah)"></path>
-				<rect class="d-box" x="404" y="500" width="104" height="44" rx="9"></rect>
-				<text class="d-t d-t-sm" x="456" y="527" text-anchor="middle">{f.pods}</text>
-				<text class="d-s" x="286" y="490" text-anchor="end">{f.routed}</text>
+				<path class="d-arrow" d="M296 404 V516" marker-end="url(#dg-ah)"></path>
+				<rect class="d-box" x="228" y="522" width="136" height="44" rx="9"></rect>
+				<text class="d-t d-t-sm" x="296" y="549" text-anchor="middle">{f.service}</text>
+				<path class="d-arrow" d="M364 544 H398" marker-end="url(#dg-ah)"></path>
+				<rect class="d-box" x="404" y="522" width="104" height="44" rx="9"></rect>
+				<text class="d-t d-t-sm" x="456" y="549" text-anchor="middle">{f.pods}</text>
+				<text class="d-s" x="286" y="512" text-anchor="end">{f.routed}</text>
 
 				<path class="d-tunnel" d="M112 354 V330 Q112 316 126 316 H246 Q260 316 260 302 V214"></path>
 				<path class="d-tunnel-core" d="M112 350 V330 Q112 316 126 316 H246 Q260 316 260 302 V218"></path>
@@ -119,7 +127,7 @@ const f = copy.figure;
 							begin="2.4s"
 							repeatCount="indefinite"
 							calcMode="linear"
-							path="M132 76 V196 H250 V316 H126 Q112 316 112 330 V379 H296 V522 H456"></animateMotion>
+							path="M132 76 V196 H250 V316 H126 Q112 316 112 330 V379 H296 V544 H456"></animateMotion>
 					</circle>
 					<circle class="d-dot" r="4.5" opacity="0">
 						<set attributeName="opacity" to="1" begin="4.1s"></set>
@@ -128,7 +136,7 @@ const f = copy.figure;
 							begin="4.1s"
 							repeatCount="indefinite"
 							calcMode="linear"
-							path="M388 76 V196 H270 V316 H126 Q112 316 112 330 V379 H296 V522 H456"></animateMotion>
+							path="M388 76 V196 H270 V316 H126 Q112 316 112 330 V379 H296 V544 H456"></animateMotion>
 					</circle>
 				</g>
 			</svg>

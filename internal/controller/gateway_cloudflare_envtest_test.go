@@ -809,12 +809,14 @@ var _ = ginkgo.Describe("Gateway Cloudflare mode", func() {
 		gomega.Expect(remote.locks).To(gomega.Equal(0))
 		gomega.Expect(factoryCalls).To(gomega.Equal(0))
 
-		var observedSecondDataplane appsv1.Deployment
-		gomega.Expect(testClient.Get(testContext, types.NamespacedName{
-			Namespace: namespaceName, Name: "flareway-gw-" + second.Name,
-		}, &observedSecondDataplane)).To(gomega.Succeed())
-		gomega.Expect(observedSecondDataplane.Spec.Replicas).NotTo(gomega.BeNil())
-		gomega.Expect(*observedSecondDataplane.Spec.Replicas).To(gomega.Equal(int32(0)))
+		gomega.Eventually(func(g gomega.Gomega) {
+			var observedSecondDataplane appsv1.Deployment
+			g.Expect(testClient.Get(testContext, types.NamespacedName{
+				Namespace: namespaceName, Name: "flareway-gw-" + second.Name,
+			}, &observedSecondDataplane)).To(gomega.Succeed())
+			g.Expect(observedSecondDataplane.Spec.Replicas).NotTo(gomega.BeNil())
+			g.Expect(*observedSecondDataplane.Spec.Replicas).To(gomega.Equal(int32(0)))
+		}).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(gomega.Succeed())
 
 		var preserved v1alpha1.CloudflareTunnel
 		gomega.Expect(testClient.Get(testContext, client.ObjectKeyFromObject(tunnel), &preserved)).To(gomega.Succeed())

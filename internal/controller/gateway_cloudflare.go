@@ -19,14 +19,18 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -198,15 +202,43 @@ func accessBindingDigest(domain ir.ProtectionDomain) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+func tunnelRecordedPrivateBindings(tunnel *v1alpha1.CloudflareTunnel) map[string]string {
+	if tunnel == nil {
+		return nil
+	}
+	bindings := make(map[string]string, len(tunnel.Status.Listeners))
+	for _, listener := range tunnel.Status.Listeners {
+		if listener.Exposure == v1alpha1.ExposurePrivate && listener.Binding != "" {
+			bindings[string(listener.Name)] = string(listener.Binding)
+		}
+	}
+	return bindings
+}
+
+func irListenerBindKey(conformanceMode bool, listener ir.Listener) string {
+	port := listener.EnvoyPort
+	if listener.Exposure == ir.ExposurePrivate && listener.Port > 0 {
+		port = listener.Port
+	}
+	address := "127.0.0.1"
+	if conformanceMode || (listener.Exposure == ir.ExposurePrivate && listener.Binding == ir.ListenerBindingPodIP) {
+		address = "0.0.0.0"
+	}
+	return net.JoinHostPort(address, strconv.Itoa(int(port)))
+}
+
 func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel, applications []v1alpha1.AccessApplication) {
 	if gateway == nil || tunnel == nil {
 		return
 	}
 	tombstones := gatewayapi.AccessRevocationTombstones(tunnel, applications, gateway.Domains)
 	existingListeners := make(map[string]struct{}, len(gateway.Listeners))
+	occupiedSockets := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
 		existingListeners[listener.Name] = struct{}{}
+		occupiedSockets[irListenerBindKey(gateway.ConformanceMode, listener)] = struct{}{}
 	}
+	recordedBindings := tunnelRecordedPrivateBindings(tunnel)
 	retainedListeners := make(map[string]ir.Listener)
 	domains := make([]ir.ProtectionDomain, 0, len(tombstones))
 	for _, tombstone := range tombstones {
@@ -219,21 +251,41 @@ func retainAccessRevocationDomains(gateway *ir.Gateway, tunnel *v1alpha1.Cloudfl
 			})
 		}
 		listenerName := string(dataPlane.Listener)
-		if _, found := existingListeners[listenerName]; !found {
-			exposure := ir.ExposurePublic
-			for _, listener := range tunnel.Spec.Listeners {
-				if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
-					exposure = ir.ExposurePrivate
-					break
-				}
+		exposure := ir.ExposurePublic
+		for _, listener := range tunnel.Spec.Listeners {
+			if string(listener.Name) == listenerName && listener.Exposure == v1alpha1.ExposurePrivate {
+				exposure = ir.ExposurePrivate
+				break
 			}
-			retainedListeners[listenerName] = ir.Listener{
-				Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
-				Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
+		}
+		if _, found := existingListeners[listenerName]; !found {
+			// Skip synthesizing an Envoy listener when a retained Private
+			// tombstone records an invalid or reserved dataplane pod port, or
+			// when its socket bind key is already occupied (for example by a
+			// healthy TLS sibling sharing the same port): keeping GuardBlocked
+			// preserves revocation proof while translator.Build skips the
+			// unreferenced domain and keeps healthy siblings publishing.
+			if exposure != ir.ExposurePrivate || (dataPlane.EnvoyPort > 0 && !dataplane.IsReservedPodPort(dataPlane.EnvoyPort)) {
+				retained := ir.Listener{
+					Name: listenerName, Hostname: tombstone.Hostnames[0], EnvoyPort: dataPlane.EnvoyPort,
+					Protocol: string(gatewayv1.HTTPProtocolType), Exposure: exposure,
+				}
+				if exposure == ir.ExposurePrivate {
+					retained.Port = dataPlane.EnvoyPort
+					retained.Binding = recordedBindings[listenerName]
+					if retained.Binding == "" {
+						retained.Binding = ir.ListenerBindingLoopback
+					}
+				}
+				bindKey := irListenerBindKey(gateway.ConformanceMode, retained)
+				if _, occupied := occupiedSockets[bindKey]; !occupied {
+					retainedListeners[listenerName] = retained
+					occupiedSockets[bindKey] = struct{}{}
+				}
 			}
 		}
 		domains = append(domains, ir.ProtectionDomain{
-			Name: dataPlane.ProtectionDomain, ListenerName: listenerName, EnvoyPort: dataPlane.EnvoyPort,
+			Name: dataPlane.ProtectionDomain, ListenerName: listenerName, Exposure: exposure, EnvoyPort: dataPlane.EnvoyPort,
 			Protected: true, AccessApplication: tombstone.Application, Guard: ir.GuardBlocked, BlockReason: ir.BlockReasonRevocation, VirtualHosts: virtualHosts,
 		})
 	}
@@ -696,6 +748,9 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	if err != nil {
 		return cloudflareConfigResult{}, &cloudflaredConfigCompileError{err: err}
 	}
+	if err := validateDesiredTunnelStatusLimits(gateway, tunnel); err != nil {
+		return cloudflareConfigResult{}, &cloudflaredConfigCompileError{err: err}
+	}
 	// Desired-hash gate (D11): evaluated outside the tunnel lock and before
 	// the Cloudflare client is built. An open gate skips client creation,
 	// GetTunnel, and the lock entirely; the result is reconstructed from the
@@ -818,7 +873,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 		checkpoint.Remote = result.remoteVersion
 		checkpoint.CreatedAt = result.remoteCreatedAt
 		checkpoint.AppliedAt = result.appliedAt
-		if err := r.patchTunnelGatewayData(ctx, gateway, tunnel, checkpoint, tunnel.Status.Hostnames, desiredTunnelListeners(gateway)); err != nil {
+		if err := r.patchTunnelGatewayData(ctx, gateway, tunnel, checkpoint, tunnel.Status.Hostnames, desiredTunnelListeners(gateway, tunnel)); err != nil {
 			return cloudflareConfigResult{}, fmt.Errorf("checkpoint Cloudflare Tunnel configuration version: %w", err)
 		}
 	}
@@ -1047,6 +1102,9 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 	result := make([]v1alpha1.CloudflareTunnelHostnameStatus, 0)
 	teardown := gateway.Cloudflare != nil && gateway.Cloudflare.Teardown
 	for _, domain := range gateway.Domains {
+		if domain.ShadowOnly {
+			continue
+		}
 		for _, host := range domain.VirtualHosts {
 			if host.Hostname == "" || host.Hostname == "*" {
 				continue
@@ -1077,42 +1135,361 @@ func desiredTunnelHostnames(gateway *ir.Gateway, appliedVersion int64) []v1alpha
 	return result
 }
 
-func desiredTunnelListeners(gateway *ir.Gateway) []v1alpha1.CloudflareTunnelListenerStatus {
-	result := make([]v1alpha1.CloudflareTunnelListenerStatus, 0, len(gateway.Listeners))
+type preparedTunnelListenerStatus struct {
+	status          v1alpha1.CloudflareTunnelListenerStatus
+	liveList        []v1alpha1.CloudflareProtectionDomainStatus
+	requiredShadows []v1alpha1.CloudflareProtectionDomainStatus
+}
+
+const deferSubsetBudget = 65536
+
+func desiredTunnelListeners(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []v1alpha1.CloudflareTunnelListenerStatus {
+	var appliedDomains map[string]struct{}
+	if tunnel != nil && len(tunnel.Status.Hostnames) > 0 {
+		appliedDomains = make(map[string]struct{}, len(tunnel.Status.Hostnames))
+		for _, hs := range tunnel.Status.Hostnames {
+			if hs.ProtectionDomain != "" {
+				appliedDomains[hs.ProtectionDomain] = struct{}{}
+			}
+		}
+	}
+
+	prepared := make([]preparedTunnelListenerStatus, 0, len(gateway.Listeners))
+	recordedListeners := make(map[string]struct{}, len(gateway.Listeners))
 	for _, listener := range gateway.Listeners {
-		status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(listener.Name), Exposure: v1alpha1.Exposure(listener.Exposure)}
-		if listener.Exposure == ir.ExposurePrivate {
-			status.Binding = v1alpha1.ListenerBindingLoopback
-			if listener.Binding == ir.ListenerBindingPodIP {
-				status.Binding = v1alpha1.ListenerBindingPodIP
+		recordedListeners[listener.Name] = struct{}{}
+		prepared = append(prepared, prepareTunnelListenerStatus(listener.Name, listener.Exposure, listener.Binding, gateway.Domains))
+	}
+	recordedBindings := tunnelRecordedPrivateBindings(tunnel)
+	// Preserve listener exposure and binding metadata for retained GuardBlocked
+	// tombstones whose Envoy listener was omitted from gateway.Listeners so xDS
+	// never binds an invalid, reserved, or socket-colliding listener. Access
+	// revocation acknowledgment at an unchanged remote version reads
+	// listener.Exposure through listener.ProtectionDomains.
+	var retainedNames []string
+	retainedExposure := make(map[string]string)
+	for _, domain := range gateway.Domains {
+		if domain.ListenerName == "" {
+			continue
+		}
+		if _, recorded := recordedListeners[domain.ListenerName]; recorded {
+			continue
+		}
+		if _, seen := retainedExposure[domain.ListenerName]; !seen {
+			retainedNames = append(retainedNames, domain.ListenerName)
+			exposure := domain.Exposure
+			if exposure == "" {
+				exposure = ir.ExposurePublic
+			}
+			retainedExposure[domain.ListenerName] = exposure
+		} else if domain.Exposure == ir.ExposurePrivate {
+			retainedExposure[domain.ListenerName] = ir.ExposurePrivate
+		}
+	}
+	sort.Strings(retainedNames)
+	for _, name := range retainedNames {
+		exposure := retainedExposure[name]
+		binding := ""
+		if exposure == ir.ExposurePrivate {
+			binding = recordedBindings[name]
+			if binding == "" {
+				binding = ir.ListenerBindingLoopback
 			}
 		}
-		// One ir.ProtectionDomain is produced per virtual host. Fragments that
-		// share a name are one Envoy route table on one port: hosts with no
-		// Access claim reuse the listener's base domain, and private Access
-		// hosts share the listener port. translator.Build rejects a name that
-		// maps to more than one route table, so the fragments are identical
-		// here, and each public Access host carries its own name and port.
-		//
-		// ProtectionDomains is +listMapKey=name, so emitting fragments
-		// one-for-one makes the whole status object unpatchable: server-side
-		// apply rejects it with "duplicate entries for key [name=...]" and the
-		// Gateway reconcile fails before any route status is written. Report
-		// each distinct protection domain once instead.
-		seen := make(map[string]struct{}, len(gateway.Domains))
-		for _, domain := range gateway.Domains {
-			if domain.ListenerName != listener.Name {
-				continue
+		prepared = append(prepared, prepareTunnelListenerStatus(name, exposure, binding, gateway.Domains))
+	}
+	// Preserve recorded Private exposure and binding for listeners temporarily
+	// omitted from gateway.Listeners without an Access tombstone (for example,
+	// rejected on a reserved port) as long as CloudflareTunnel.Spec.Listeners
+	// still configures them as Private, so recovery keeps PodIP intact while
+	// listeners removed from Spec.Listeners clear cleanly.
+	if tunnel != nil {
+		specPrivate := make(map[string]struct{}, len(tunnel.Spec.Listeners))
+		for _, listener := range tunnel.Spec.Listeners {
+			if listener.Exposure == v1alpha1.ExposurePrivate {
+				specPrivate[string(listener.Name)] = struct{}{}
 			}
-			if _, duplicate := seen[domain.Name]; duplicate {
-				continue
-			}
-			seen[domain.Name] = struct{}{}
-			status.ProtectionDomains = append(status.ProtectionDomains, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
 		}
-		result = append(result, status)
+		var preservedNames []string
+		seenPreserved := make(map[string]struct{})
+		for _, ls := range tunnel.Status.Listeners {
+			if ls.Exposure != v1alpha1.ExposurePrivate {
+				continue
+			}
+			name := string(ls.Name)
+			if _, recorded := recordedListeners[name]; recorded {
+				continue
+			}
+			if _, retained := retainedExposure[name]; retained {
+				continue
+			}
+			if _, configured := specPrivate[name]; !configured {
+				continue
+			}
+			if _, dup := seenPreserved[name]; dup {
+				continue
+			}
+			seenPreserved[name] = struct{}{}
+			preservedNames = append(preservedNames, name)
+		}
+		sort.Strings(preservedNames)
+		for _, name := range preservedNames {
+			prepared = append(prepared, prepareTunnelListenerStatus(name, ir.ExposurePrivate, recordedBindings[name], gateway.Domains))
+		}
+	}
+
+	result := make([]v1alpha1.CloudflareTunnelListenerStatus, len(prepared))
+	for i := range prepared {
+		result[i] = prepared[i].status
+		result[i].ProtectionDomains = buildListenerProtectionDomains(prepared[i].liveList, prepared[i].requiredShadows, nil, maxTunnelListenerProtectionDomains)
+	}
+
+	for li := range prepared {
+		item := prepared[li]
+		if len(item.liveList) > maxTunnelListenerProtectionDomains || len(item.liveList)+len(item.requiredShadows) <= maxTunnelListenerProtectionDomains {
+			continue
+		}
+		deficit := len(item.liveList) + len(item.requiredShadows) - maxTunnelListenerProtectionDomains
+		listenerName := string(item.status.Name)
+		deferred := selectDeferrableProtectionDomains(gateway, result, li, listenerName, item.liveList, item.requiredShadows, deficit, appliedDomains)
+		if deferred != nil {
+			result[li].ProtectionDomains = buildListenerProtectionDomains(item.liveList, item.requiredShadows, deferred, maxTunnelListenerProtectionDomains)
+		}
 	}
 	return result
+}
+
+func selectDeferrableProtectionDomains(
+	gateway *ir.Gateway,
+	baseline []v1alpha1.CloudflareTunnelListenerStatus,
+	listenerIdx int,
+	listenerName string,
+	liveList []v1alpha1.CloudflareProtectionDomainStatus,
+	requiredShadows []v1alpha1.CloudflareProtectionDomainStatus,
+	deficit int,
+	appliedDomains map[string]struct{},
+) map[int]bool {
+	trial := make([]v1alpha1.CloudflareTunnelListenerStatus, len(baseline))
+	copy(trial, baseline)
+	trialWithOmitted := func(omitted map[int]bool) []v1alpha1.CloudflareTunnelListenerStatus {
+		trial[listenerIdx].ProtectionDomains = buildListenerProtectionDomains(liveList, requiredShadows, omitted, len(liveList)+len(requiredShadows))
+		return trial
+	}
+
+	// Pre-filter individually valid candidates in tail-to-head order so deficit == 1
+	// keeps tail preference, then prune by downward-closed gateway-wide replay.
+	valid := make([]int, 0, len(liveList))
+	single := make(map[int]bool, 1)
+	for i := len(liveList) - 1; i >= 0; i-- {
+		pd := liveList[i]
+		if pd.Protected || pd.Name == listenerName {
+			continue
+		}
+		if _, applied := appliedDomains[pd.Name]; applied {
+			continue
+		}
+		single[i] = true
+		if gatewayapi.CanReconstructPublicPorts(gateway, trialWithOmitted(single)) {
+			valid = append(valid, i)
+		}
+		delete(single, i)
+	}
+	if len(valid) < deficit {
+		return nil
+	}
+
+	chosen := make(map[int]bool, deficit)
+	steps := 0
+	var search func(start int) bool
+	search = func(start int) bool {
+		if len(chosen) == deficit {
+			return true
+		}
+		need := deficit - len(chosen)
+		for k := start; k <= len(valid)-need; k++ {
+			steps++
+			if steps > deferSubsetBudget {
+				return false
+			}
+			idx := valid[k]
+			chosen[idx] = true
+			if gatewayapi.CanReconstructPublicPorts(gateway, trialWithOmitted(chosen)) {
+				if search(k + 1) {
+					return true
+				}
+			}
+			delete(chosen, idx)
+			if steps > deferSubsetBudget {
+				return false
+			}
+		}
+		return false
+	}
+	if search(0) {
+		return chosen
+	}
+	return nil
+}
+
+func buildListenerProtectionDomains(
+	liveList []v1alpha1.CloudflareProtectionDomainStatus,
+	requiredShadows []v1alpha1.CloudflareProtectionDomainStatus,
+	deferred map[int]bool,
+	capItems int,
+) []v1alpha1.CloudflareProtectionDomainStatus {
+	out := make([]v1alpha1.CloudflareProtectionDomainStatus, 0, min(len(liveList)+len(requiredShadows), capItems))
+	for i, pd := range liveList {
+		if deferred[i] {
+			continue
+		}
+		out = append(out, pd)
+	}
+	for _, pd := range requiredShadows {
+		if len(out) >= capItems {
+			break
+		}
+		out = append(out, pd)
+	}
+	return out
+}
+
+const (
+	maxTunnelStatusListeners           = 64
+	maxTunnelListenerProtectionDomains = 256
+	maxTunnelStatusHostnames           = 256
+)
+
+func validateDesiredGatewayCloudflareConfig(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) error {
+	if _, _, err := cloudflaredconfig.Compile(gateway); err != nil {
+		return &cloudflaredConfigCompileError{err: err}
+	}
+	if err := validateDesiredTunnelStatusLimits(gateway, tunnel); err != nil {
+		return &cloudflaredConfigCompileError{err: err}
+	}
+	return nil
+}
+
+func validateDesiredTunnelStatusLimits(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) error {
+	if gateway == nil {
+		return nil
+	}
+	listeners := desiredTunnelListeners(gateway, tunnel)
+	if len(listeners) > maxTunnelStatusListeners {
+		return fmt.Errorf("desired CloudflareTunnel status.listeners count %d exceeds maximum %d", len(listeners), maxTunnelStatusListeners)
+	}
+	liveByListener := make(map[string]map[string]struct{}, len(listeners))
+	for _, domain := range gateway.Domains {
+		if domain.ShadowOnly {
+			continue
+		}
+		seen := liveByListener[domain.ListenerName]
+		if seen == nil {
+			seen = make(map[string]struct{})
+			liveByListener[domain.ListenerName] = seen
+		}
+		seen[domain.Name] = struct{}{}
+		if len(seen) > maxTunnelListenerProtectionDomains {
+			return fmt.Errorf("desired CloudflareTunnel listener %q live protectionDomains count %d exceeds maximum %d", domain.ListenerName, len(seen), maxTunnelListenerProtectionDomains)
+		}
+	}
+	listenerByName := make(map[string]v1alpha1.CloudflareTunnelListenerStatus, len(listeners))
+	for _, listener := range listeners {
+		if len(listener.ProtectionDomains) > maxTunnelListenerProtectionDomains {
+			return fmt.Errorf("desired CloudflareTunnel listener %q protectionDomains count %d exceeds maximum %d", listener.Name, len(listener.ProtectionDomains), maxTunnelListenerProtectionDomains)
+		}
+		listenerByName[string(listener.Name)] = listener
+	}
+	for _, domain := range gateway.Domains {
+		if !domain.ShadowOnly {
+			continue
+		}
+		listener, ok := listenerByName[domain.ListenerName]
+		if !ok {
+			return fmt.Errorf("desired CloudflareTunnel listener %q missing for legacy shadow domain %q (port %d)", domain.ListenerName, domain.Name, domain.EnvoyPort)
+		}
+		recoverable := false
+		for _, pd := range listener.ProtectionDomains {
+			if pd.EnvoyPort == domain.EnvoyPort && (pd.Name == domain.Name || pd.Name == domain.ListenerName) {
+				recoverable = true
+				break
+			}
+		}
+		if !recoverable {
+			return fmt.Errorf("desired CloudflareTunnel listener %q cannot retain legacy shadow domain %q (port %d) within %d protectionDomains limit", domain.ListenerName, domain.Name, domain.EnvoyPort, maxTunnelListenerProtectionDomains)
+		}
+	}
+	if hostnames := desiredTunnelHostnames(gateway, 1); len(hostnames) > maxTunnelStatusHostnames {
+		return fmt.Errorf("desired CloudflareTunnel status.hostnames count %d exceeds maximum %d", len(hostnames), maxTunnelStatusHostnames)
+	}
+	return nil
+}
+
+func tunnelListenerStatus(name, exposure, binding string, domains []ir.ProtectionDomain) v1alpha1.CloudflareTunnelListenerStatus {
+	prepared := prepareTunnelListenerStatus(name, exposure, binding, domains)
+	status := prepared.status
+	status.ProtectionDomains = buildListenerProtectionDomains(prepared.liveList, prepared.requiredShadows, nil, maxTunnelListenerProtectionDomains)
+	return status
+}
+
+func prepareTunnelListenerStatus(name, exposure, binding string, domains []ir.ProtectionDomain) preparedTunnelListenerStatus {
+	status := v1alpha1.CloudflareTunnelListenerStatus{Name: gatewayv1.SectionName(name), Exposure: v1alpha1.Exposure(exposure)}
+	if exposure == ir.ExposurePrivate {
+		status.Binding = v1alpha1.ListenerBindingLoopback
+		if binding == ir.ListenerBindingPodIP {
+			status.Binding = v1alpha1.ListenerBindingPodIP
+		}
+	}
+	// One ir.ProtectionDomain is produced per virtual host. Fragments that
+	// share a name are one Envoy route table on one port: hosts with no
+	// Access claim reuse the listener's base domain, and private Access
+	// hosts share the listener port. translator.Build rejects a name that
+	// maps to more than one route table, so the fragments are identical
+	// here, and each public Access host carries its own name and port.
+	//
+	// ProtectionDomains is +listMapKey=name, so emitting fragments
+	// one-for-one makes the whole status object unpatchable: server-side
+	// apply rejects it with "duplicate entries for key [name=...]" and the
+	// Gateway reconcile fails before any route status is written. Report
+	// each distinct protection domain once instead.
+	//
+	// Pass 1 collects distinct live (!ShadowOnly) domains and records basePort
+	// when the listener's literal base domain is present. Pass 2 collects
+	// distinct ShadowOnly domains that cannot piggyback on basePort (Case B).
+	seen := make(map[string]struct{}, len(domains))
+	var liveList []v1alpha1.CloudflareProtectionDomainStatus
+	var basePort int32
+	for _, domain := range domains {
+		if domain.ListenerName != name || domain.ShadowOnly {
+			continue
+		}
+		if _, duplicate := seen[domain.Name]; duplicate {
+			continue
+		}
+		seen[domain.Name] = struct{}{}
+		if domain.Name == name && domain.EnvoyPort > 0 {
+			basePort = domain.EnvoyPort
+		}
+		liveList = append(liveList, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+	}
+	var requiredShadows []v1alpha1.CloudflareProtectionDomainStatus
+	for _, domain := range domains {
+		if domain.ListenerName != name || !domain.ShadowOnly {
+			continue
+		}
+		if basePort > 0 && domain.EnvoyPort == basePort {
+			continue
+		}
+		if _, duplicate := seen[domain.Name]; duplicate {
+			continue
+		}
+		seen[domain.Name] = struct{}{}
+		requiredShadows = append(requiredShadows, v1alpha1.CloudflareProtectionDomainStatus{Name: domain.Name, EnvoyPort: domain.EnvoyPort, Protected: domain.Protected})
+	}
+	return preparedTunnelListenerStatus{
+		status:          status,
+		liveList:        liveList,
+		requiredShadows: requiredShadows,
+	}
 }
 
 func tunnelGatewayAddresses(gateway *ir.Gateway, tunnel *v1alpha1.CloudflareTunnel) []gatewayv1.GatewayStatusAddress {
@@ -1364,6 +1741,9 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		if err := validate(&live); err != nil {
 			return err
 		}
+		if tunnelGatewayDataUnchanged(&live, statusMap, config, hostnames, listeners) {
+			return nil
+		}
 		apply := &unstructured.Unstructured{Object: map[string]any{"status": statusMap}}
 		apply.SetAPIVersion(v1alpha1.GroupVersion.String())
 		apply.SetKind("CloudflareTunnel")
@@ -1380,6 +1760,214 @@ func (r *GatewayReconciler) patchTunnelGatewayData(
 		lastErr = err
 	}
 	return fmt.Errorf("apply Gateway-owned CloudflareTunnel %s status: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
+}
+
+func tunnelGatewayDataUnchanged(
+	live *v1alpha1.CloudflareTunnel,
+	statusMap map[string]any,
+	config v1alpha1.CloudflareTunnelConfigVersion,
+	hostnames []v1alpha1.CloudflareTunnelHostnameStatus,
+	listeners []v1alpha1.CloudflareTunnelListenerStatus,
+) bool {
+	if live == nil {
+		return false
+	}
+	if !tunnelConfigVersionEqual(live.Status.ConfigVersion, config) ||
+		!apiequality.Semantic.DeepEqual(live.Status.Hostnames, hostnames) ||
+		!apiequality.Semantic.DeepEqual(live.Status.Listeners, listeners) {
+		return false
+	}
+	return gatewayDataOwnershipPresent(live, statusMap)
+}
+
+func tunnelConfigVersionEqual(left, right v1alpha1.CloudflareTunnelConfigVersion) bool {
+	return left.Desired == right.Desired &&
+		left.DesiredHash == right.DesiredHash &&
+		left.Applied == right.Applied &&
+		left.Remote == right.Remote &&
+		tunnelTimeEqual(left.AppliedAt, right.AppliedAt) &&
+		tunnelTimeEqual(left.CreatedAt, right.CreatedAt)
+}
+
+func tunnelTimeEqual(left, right *metav1.Time) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Time.Truncate(time.Second).Equal(right.Truncate(time.Second))
+}
+
+func gatewayDataOwnershipPresent(live *v1alpha1.CloudflareTunnel, statusMap map[string]any) bool {
+	if live == nil || statusMap == nil {
+		return false
+	}
+	covered := false
+	for _, entry := range live.ManagedFields {
+		// Only status Apply entries matter: SSA Apply cannot shed fields held in
+		// a separate Status().Update entry and cannot derive data ownership from
+		// Update; ADR 0004 allows a lingering Update co-owner once shared
+		// condition ownership is established.
+		if entry.Manager != gatewayFieldManager || entry.Subresource != "status" || entry.Operation != metav1.ManagedFieldsOperationApply || entry.FieldsV1 == nil {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(entry.FieldsV1.GetRawBytes(), &fields); err != nil {
+			continue
+		}
+		statusFields, _ := fields["f:status"].(map[string]any)
+		if statusFields == nil {
+			continue
+		}
+		if _, hasConditions := statusFields["f:conditions"]; hasConditions {
+			return false
+		}
+		if fieldsV1CoversStatusMap(statusFields, statusMap) {
+			covered = true
+		}
+	}
+	return covered
+}
+
+func fieldsV1CoversStatusMap(statusFields, statusMap map[string]any) bool {
+	for key, val := range statusMap {
+		switch key {
+		case "configVersion":
+			cfgMap, ok := val.(map[string]any)
+			if !ok {
+				return false
+			}
+			rawCfg, exists := statusFields["f:configVersion"]
+			if !exists {
+				return false
+			}
+			if len(cfgMap) == 0 {
+				continue
+			}
+			ownedCfg, ok := rawCfg.(map[string]any)
+			if !ok {
+				return false
+			}
+			for leafKey := range cfgMap {
+				if _, leafOwned := ownedCfg["f:"+leafKey]; !leafOwned {
+					return false
+				}
+			}
+		case "hostnames":
+			items, ok := val.([]any)
+			if !ok {
+				return false
+			}
+			if len(items) == 0 {
+				continue
+			}
+			ownedList, ok := statusFields["f:hostnames"].(map[string]any)
+			if !ok {
+				return false
+			}
+			if !fieldsV1CoversMapList(ownedList, items, []string{"hostname", "protectionDomain", "accessApplication"}, nil) {
+				return false
+			}
+		case "listeners":
+			items, ok := val.([]any)
+			if !ok {
+				return false
+			}
+			if len(items) == 0 {
+				continue
+			}
+			ownedList, ok := statusFields["f:listeners"].(map[string]any)
+			if !ok {
+				return false
+			}
+			if !fieldsV1CoversMapList(ownedList, items, []string{"name"}, map[string][]string{"protectionDomains": {"name"}}) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+type fieldsV1ListEntry struct {
+	keys   map[string]any
+	fields map[string]any
+}
+
+func fieldsV1CoversMapList(ownedList map[string]any, items []any, keyFields []string, nestedLists map[string][]string) bool {
+	entries := make([]fieldsV1ListEntry, 0, len(ownedList))
+	for rawKey, rawVal := range ownedList {
+		if !strings.HasPrefix(rawKey, "k:") {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(rawKey, "k:")), &parsed); err != nil {
+			continue
+		}
+		valMap, _ := rawVal.(map[string]any)
+		entries = append(entries, fieldsV1ListEntry{keys: parsed, fields: valMap})
+	}
+	for _, rawItem := range items {
+		elem, ok := rawItem.(map[string]any)
+		if !ok {
+			return false
+		}
+		var matched *fieldsV1ListEntry
+		for index := range entries {
+			if mapKeysMatch(entries[index].keys, elem, keyFields) {
+				matched = &entries[index]
+				break
+			}
+		}
+		if matched == nil || matched.fields == nil {
+			return false
+		}
+		for fieldName, fieldVal := range elem {
+			if nestedKeys, isNested := nestedLists[fieldName]; isNested {
+				nestedItems, ok := fieldVal.([]any)
+				if !ok {
+					return false
+				}
+				rawNested, exists := matched.fields["f:"+fieldName]
+				if !exists {
+					return false
+				}
+				if len(nestedItems) == 0 {
+					continue
+				}
+				ownedNested, ok := rawNested.(map[string]any)
+				if !ok {
+					return false
+				}
+				if !fieldsV1CoversMapList(ownedNested, nestedItems, nestedKeys, nil) {
+					return false
+				}
+				continue
+			}
+			if _, exists := matched.fields["f:"+fieldName]; !exists {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func mapKeysMatch(parsed, elem map[string]any, keyFields []string) bool {
+	if len(parsed) != len(keyFields) {
+		return false
+	}
+	for _, kf := range keyFields {
+		parsedVal, pOk := parsed[kf]
+		elemVal, eOk := elem[kf]
+		if !pOk || !eOk {
+			return false
+		}
+		pStr, pStrOk := parsedVal.(string)
+		eStr, eStrOk := elemVal.(string)
+		if !pStrOk || !eStrOk || pStr != eStr {
+			return false
+		}
+	}
+	return true
 }
 
 // gatewayTunnelCondition stamps an authored condition with the caller's clock.

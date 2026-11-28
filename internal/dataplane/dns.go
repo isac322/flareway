@@ -37,8 +37,8 @@ func PrivateDNSConfigMapName(gw *ir.Gateway) string {
 // BuildPrivateDNSConfigMap renders pod-local DNS for private listener
 // hostnames. It returns nil when the Gateway has no private listener.
 func BuildPrivateDNSConfigMap(gw *ir.Gateway) *corev1.ConfigMap {
-	hostnames, podIP := privateDNSHostnames(gw)
-	if len(hostnames) == 0 {
+	entries := privateDNSHostnames(gw)
+	if len(entries) == 0 {
 		return nil
 	}
 	return &corev1.ConfigMap{
@@ -50,13 +50,17 @@ func BuildPrivateDNSConfigMap(gw *ir.Gateway) *corev1.ConfigMap {
 			Annotations:     map[string]string{ManagedByLabelKey: managedByValue(gw)},
 			OwnerReferences: gatewayOwnerReferences(gw),
 		},
-		Data: map[string]string{"Corefile": renderPrivateCorefile(hostnames, podIP)},
+		Data: map[string]string{"Corefile": renderPrivateCorefile(entries)},
 	}
 }
 
-func privateDNSHostnames(gw *ir.Gateway) ([]string, bool) {
-	seen := make(map[string]struct{})
-	podIP := false
+type privateDNSEntry struct {
+	hostname string
+	podIP    bool
+}
+
+func privateDNSHostnames(gw *ir.Gateway) []privateDNSEntry {
+	byHost := make(map[string]bool)
 	for _, listener := range gw.Listeners {
 		if listener.Exposure != ir.ExposurePrivate || listener.Hostname == "" {
 			continue
@@ -65,48 +69,78 @@ func privateDNSHostnames(gw *ir.Gateway) ([]string, bool) {
 		if hostname == "" {
 			continue
 		}
-		seen[hostname] = struct{}{}
-		podIP = podIP || listener.Binding == ir.ListenerBindingPodIP
+		podIP := listener.Binding == ir.ListenerBindingPodIP
+		if existing, seen := byHost[hostname]; seen {
+			// When mixed bindings share the exact same hostname, prefer loopback.
+			byHost[hostname] = existing && podIP
+			continue
+		}
+		byHost[hostname] = podIP
 	}
-	hostnames := make([]string, 0, len(seen))
-	for hostname := range seen {
-		hostnames = append(hostnames, hostname)
+	entries := make([]privateDNSEntry, 0, len(byHost))
+	for hostname, podIP := range byHost {
+		entries = append(entries, privateDNSEntry{hostname: hostname, podIP: podIP})
 	}
-	slices.Sort(hostnames)
-	return hostnames, podIP
+	slices.SortFunc(entries, func(left, right privateDNSEntry) int {
+		return strings.Compare(left.hostname, right.hostname)
+	})
+	return entries
 }
 
-func renderPrivateCorefile(hostnames []string, podIP bool) string {
-	answerAddress := "127.0.0.1"
+func privateDNSAnswerAddress(podIP bool) string {
 	if podIP {
-		answerAddress = "{$POD_IP}"
+		return "{$POD_IP}"
 	}
+	return "127.0.0.1"
+}
 
-	exact := make([]string, 0, len(hostnames))
-	wildcards := make([]string, 0, len(hostnames))
-	for _, hostname := range hostnames {
-		if strings.HasPrefix(hostname, "*.") {
-			wildcards = append(wildcards, strings.TrimPrefix(hostname, "*."))
+func escapeCoreDNSRegex(host string) string {
+	return strings.ReplaceAll(regexp.QuoteMeta(host), `\.`, "[.]")
+}
+
+func writePrivateDNSTemplate(builder *strings.Builder, pattern, addr string) {
+	builder.WriteString("    template IN A {\n")
+	fmt.Fprintf(builder, "        match %q\n", pattern)
+	fmt.Fprintf(builder, "        answer \"{{ .Name }} 30 IN A %s\"\n", addr)
+	builder.WriteString("        fallthrough\n    }\n")
+}
+
+func writePrivateDNSEmptyNonATemplate(builder *strings.Builder, pattern string) {
+	builder.WriteString("    template IN ANY {\n")
+	fmt.Fprintf(builder, "        match %q\n", pattern)
+	builder.WriteString("        rcode NOERROR\n")
+	builder.WriteString("        fallthrough\n    }\n")
+}
+
+func renderPrivateCorefile(entries []privateDNSEntry) string {
+	exact := make([]privateDNSEntry, 0, len(entries))
+	wildcards := make([]privateDNSEntry, 0, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.hostname, "*.") {
+			wildcards = append(wildcards, entry)
 		} else {
-			exact = append(exact, hostname)
+			exact = append(exact, entry)
 		}
 	}
 
 	var builder strings.Builder
 	builder.WriteString(".:53 {\n    bind 127.0.0.1\n")
-	for _, suffix := range wildcards {
-		pattern := "^[^.]+[.]" + strings.ReplaceAll(regexp.QuoteMeta(suffix), `\.`, "[.]") + "[.]?$"
-		builder.WriteString("    template IN A {\n")
-		fmt.Fprintf(&builder, "        match %q\n", pattern)
-		fmt.Fprintf(&builder, "        answer \"{{ .Name }} 30 IN A %s\"\n", answerAddress)
-		builder.WriteString("        fallthrough\n    }\n")
+	// CoreDNS executes template plugins before hosts in plugin.cfg order.
+	// Render exact hostnames as template blocks ahead of wildcards so an exact
+	// hostname always takes precedence over an overlapping wildcard binding:
+	// template IN A handles literal A queries (and QTYPE=ANY meta-queries per
+	// RFC 8482 §4.1), while template IN ANY returns authoritative empty NOERROR
+	// for specific non-A query types (AAAA, HTTPS/TYPE65, etc.) so exact
+	// IPv4-only Private hostnames do not fall through upstream.
+	for _, entry := range exact {
+		pattern := "^" + escapeCoreDNSRegex(entry.hostname) + "[.]?$"
+		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
+		writePrivateDNSEmptyNonATemplate(&builder, pattern)
 	}
-	if len(exact) > 0 {
-		builder.WriteString("    hosts {\n")
-		for _, hostname := range exact {
-			fmt.Fprintf(&builder, "        %s %s\n", answerAddress, hostname)
-		}
-		builder.WriteString("        ttl 30\n        no_reverse\n        fallthrough\n    }\n")
+	for _, entry := range wildcards {
+		suffix := strings.TrimPrefix(entry.hostname, "*.")
+		pattern := "^[^.]+[.]" + escapeCoreDNSRegex(suffix) + "[.]?$"
+		writePrivateDNSTemplate(&builder, pattern, privateDNSAnswerAddress(entry.podIP))
 	}
 	builder.WriteString("    forward . /etc/resolv.conf\n    reload 5s 2s\n    errors\n}\n")
 	return builder.String()

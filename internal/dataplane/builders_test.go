@@ -190,7 +190,7 @@ func TestBuildPrivateDNSDataplaneIsPodLocal(t *testing.T) {
 	corefile := configMap.Data["Corefile"]
 	for _, want := range []string{
 		"bind 127.0.0.1",
-		"127.0.0.1 admin.internal.example",
+		`match "^admin[.]internal[.]example[.]?$"`,
 		`match "^[^.]+[.]apps[.]internal[.]example[.]?$"`,
 		`answer "{{ .Name }} 30 IN A 127.0.0.1"`,
 		"forward . /etc/resolv.conf",
@@ -234,7 +234,7 @@ func TestBuildPrivateDNSPodIPFallbackRequiresRecordedBinding(t *testing.T) {
 		Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP,
 	}}
 	configMap := BuildPrivateDNSConfigMap(gw)
-	if configMap == nil || !strings.Contains(configMap.Data["Corefile"], "{$POD_IP} admin.internal.example") {
+	if configMap == nil || !strings.Contains(configMap.Data["Corefile"], "match \"^admin[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A {$POD_IP}\"") {
 		t.Fatalf("PodIP fallback Corefile = %#v", configMap)
 	}
 	gw.Listeners[0].Binding = ir.ListenerBindingLoopback
@@ -242,6 +242,115 @@ func TestBuildPrivateDNSPodIPFallbackRequiresRecordedBinding(t *testing.T) {
 	if strings.Contains(configMap.Data["Corefile"], "{$POD_IP}") {
 		t.Fatal("PodIP fallback activated without the recorded PodIP binding")
 	}
+}
+
+// QA-1D-1: Mixed PodIP and Loopback Private listeners must answer with their
+// own address ({$POD_IP} vs 127.0.0.1) per hostname, and prefer 127.0.0.1 when
+// both bindings share the exact same hostname.
+func TestBuildPrivateDNSMixedBindingsPerHostname(t *testing.T) {
+	t.Run("mixed exact and wildcard listeners keep per-hostname binding", func(t *testing.T) {
+		gw := testGateway(false)
+		gw.Listeners = []ir.Listener{
+			{Name: "podip-exact", Hostname: "pod.internal.example", Port: 443, EnvoyPort: 443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+			{Name: "loop-exact", Hostname: "loop.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+			{Name: "podip-wild", Hostname: "*.pod.internal.example", Port: 443, EnvoyPort: 443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+			{Name: "loop-wild", Hostname: "*.loop.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+		}
+		configMap := BuildPrivateDNSConfigMap(gw)
+		if configMap == nil {
+			t.Fatal("private DNS ConfigMap was not built")
+		}
+		corefile := configMap.Data["Corefile"]
+		for _, want := range []string{
+			"match \"^pod[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A {$POD_IP}\"",
+			"match \"^loop[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A 127.0.0.1\"",
+			"match \"^[^.]+[.]pod[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A {$POD_IP}\"",
+			"match \"^[^.]+[.]loop[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A 127.0.0.1\"",
+		} {
+			if !strings.Contains(corefile, want) {
+				t.Errorf("Corefile missing %q:\n%s", want, corefile)
+			}
+		}
+		for _, unwanted := range []string{
+			"match \"^pod[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A 127.0.0.1\"",
+			"match \"^loop[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A {$POD_IP}\"",
+		} {
+			if strings.Contains(corefile, unwanted) {
+				t.Errorf("Corefile unexpectedly contains %q:\n%s", unwanted, corefile)
+			}
+		}
+	})
+
+	t.Run("mixed bindings on exact same hostname prefer 127.0.0.1", func(t *testing.T) {
+		for _, order := range [][]string{
+			{ir.ListenerBindingPodIP, ir.ListenerBindingLoopback},
+			{ir.ListenerBindingLoopback, ir.ListenerBindingPodIP},
+		} {
+			gw := testGateway(false)
+			gw.Listeners = []ir.Listener{
+				{Name: "first", Hostname: "shared.internal.example", Port: 443, EnvoyPort: 443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: order[0]},
+				{Name: "second", Hostname: "shared.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: order[1]},
+			}
+			configMap := BuildPrivateDNSConfigMap(gw)
+			if configMap == nil {
+				t.Fatal("private DNS ConfigMap was not built")
+			}
+			corefile := configMap.Data["Corefile"]
+			if !strings.Contains(corefile, "match \"^shared[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A 127.0.0.1\"") || strings.Contains(corefile, "A {$POD_IP}") {
+				t.Fatalf("order %v did not prefer 127.0.0.1 for mixed same-hostname listeners:\n%s", order, corefile)
+			}
+		}
+	})
+
+	t.Run("exact hostnames precede overlapping wildcards in Corefile directive order", func(t *testing.T) {
+		gw := testGateway(false)
+		gw.Listeners = []ir.Listener{
+			{Name: "wild-podip", Hostname: "*.internal.example", Port: 9443, EnvoyPort: 9443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+			{Name: "exact-loopback", Hostname: "api.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+		}
+		corefile := BuildPrivateDNSConfigMap(gw).Data["Corefile"]
+		exactIdx := strings.Index(corefile, `match "^api[.]internal[.]example[.]?$"`)
+		wildIdx := strings.Index(corefile, `match "^[^.]+[.]internal[.]example[.]?$"`)
+		if exactIdx < 0 || wildIdx < 0 || exactIdx > wildIdx {
+			t.Fatalf("exact hostname rule must appear in template block before overlapping wildcard rule (exactIdx=%d wildIdx=%d):\n%s", exactIdx, wildIdx, corefile)
+		}
+		if strings.Contains(corefile, "\n    hosts {") {
+			t.Fatalf("Corefile must not place exact hosts in hosts{} where CoreDNS template{} shadows them:\n%s", corefile)
+		}
+	})
+}
+
+// QA-1-REG-4 (dataplane): Homogeneous All-Loopback and All-PodIP Corefiles remain unchanged.
+func TestBuildPrivateDNSHomogeneousBindingsRegression(t *testing.T) {
+	t.Run("all loopback", func(t *testing.T) {
+		gw := testGateway(false)
+		gw.Listeners = []ir.Listener{
+			{Name: "a", Hostname: "a.internal.example", Port: 443, EnvoyPort: 443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+			{Name: "b", Hostname: "*.b.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingLoopback},
+		}
+		corefile := BuildPrivateDNSConfigMap(gw).Data["Corefile"]
+		if strings.Contains(corefile, "{$POD_IP}") {
+			t.Fatalf("all-loopback Corefile unexpectedly used {$POD_IP}:\n%s", corefile)
+		}
+		if !strings.Contains(corefile, "match \"^a[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A 127.0.0.1\"") {
+			t.Fatalf("all-loopback Corefile missing exact 127.0.0.1:\n%s", corefile)
+		}
+	})
+
+	t.Run("all PodIP", func(t *testing.T) {
+		gw := testGateway(false)
+		gw.Listeners = []ir.Listener{
+			{Name: "a", Hostname: "a.internal.example", Port: 443, EnvoyPort: 443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+			{Name: "b", Hostname: "*.b.internal.example", Port: 8443, EnvoyPort: 8443, Protocol: "HTTPS", Exposure: ir.ExposurePrivate, Binding: ir.ListenerBindingPodIP},
+		}
+		corefile := BuildPrivateDNSConfigMap(gw).Data["Corefile"]
+		if strings.Contains(corefile, "A 127.0.0.1\"") || !strings.Contains(corefile, "match \"^a[.]internal[.]example[.]?$\"\n        answer \"{{ .Name }} 30 IN A {$POD_IP}\"") {
+			t.Fatalf("all-PodIP Corefile did not answer {$POD_IP} for exact host:\n%s", corefile)
+		}
+		if !strings.Contains(corefile, `answer "{{ .Name }} 30 IN A {$POD_IP}"`) {
+			t.Fatalf("all-PodIP Corefile did not answer {$POD_IP} for wildcard host:\n%s", corefile)
+		}
+	})
 }
 
 func TestBuildServiceMapsListenerPorts(t *testing.T) {

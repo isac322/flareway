@@ -68,10 +68,10 @@ const (
 	// deletion whether a remote object may exist even if status never recorded
 	// it; without either, deletion has nothing remote to clean up.
 	accessApplicationRemoteAttemptAnnotation = "flareway.bhyoo.com/access-remote-attempt"
-	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
-	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
-	accessApplicationPrivateTunnelsKey    = "tunnels"
-	accessApplicationAUDReadyKey          = "ready"
+	accessRevocationPublisherUnavailable     = "RevocationPublisherUnavailable"
+	accessApplicationPrivateTunnelsLabel     = "flareway.bhyoo.com/private-tunnels-for"
+	accessApplicationPrivateTunnelsKey       = "tunnels"
+	accessApplicationAUDReadyKey             = "ready"
 
 	accessApplicationConditionAccepted       = "Accepted"
 	accessApplicationConditionProgrammed     = "Programmed"
@@ -1738,8 +1738,25 @@ func revocationRolloutSettled(status v1alpha1.CloudflareTunnelHostnameStatus, tu
 	if previouslyAcknowledged {
 		return true
 	}
-	return status.AppliedVersion == tunnel.Status.ConfigVersion.Applied &&
-		tunnel.Status.ConfigVersion.Desired == tunnel.Status.ConfigVersion.Applied
+	if status.AppliedVersion != tunnel.Status.ConfigVersion.Applied {
+		return false
+	}
+	if tunnel.Status.ConfigVersion.Desired == tunnel.Status.ConfigVersion.Applied {
+		return true
+	}
+	return protectionDomainExposure(tunnel, status.ProtectionDomain) == v1alpha1.ExposurePrivate &&
+		revocationDrainedGatewayInvalid(tunnel)
+}
+
+func revocationDrainedGatewayInvalid(tunnel *v1alpha1.CloudflareTunnel) bool {
+	if tunnel == nil {
+		return false
+	}
+	cond := meta.FindStatusCondition(tunnel.Status.Conditions, v1alpha1.CloudflareTunnelConditionConfigApplied)
+	return cond != nil &&
+		cond.Status == metav1.ConditionFalse &&
+		cond.Reason == "GatewayInvalid" &&
+		cond.ObservedGeneration == tunnel.Generation
 }
 
 func revocationClaimAbsentFromConvergedTunnel(

@@ -48,11 +48,14 @@ Gateway names its tunnel through the standard `infrastructure.parametersRef`,
 with no annotations.
 
 - `cloudflared` dials out to Cloudflare's edge over QUIC or HTTP/2 and forwards
-  each hostname to Envoy over loopback. It carries transport only.
+  public hostnames to Envoy over loopback. It carries transport only.
 - Envoy runs the `HTTPRoute` rules that the controller streams to it over xDS
-  (Delta ADS).
+  (Delta ADS), receiving public hostnames over loopback and terminating TLS for
+  private HTTPS listeners on their recorded binding (`127.0.0.1` by default, or
+  the Pod IP when Pod IP fallback is active).
 - For a Gateway with private listeners, a CoreDNS sidecar answers private
-  hostnames with `127.0.0.1`, so WARP traffic also passes through Envoy.
+  hostnames with `127.0.0.1` by default (or the Pod IP for a listener using Pod
+  IP fallback), so WARP traffic also passes through Envoy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture/layers-dark.svg">

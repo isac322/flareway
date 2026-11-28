@@ -82,7 +82,8 @@ description (keep it ≤ 155 characters, plain prose, not a list or image).
     loopback Envoy port.
   - Envoy — L7 routing streamed over xDS (Delta ADS).
   - CoreDNS sidecar (private listeners only) — resolves private hostnames to
-    `127.0.0.1` so WARP traffic flows through Envoy.
+    `127.0.0.1` by default (or the Pod IP for a listener using Pod IP fallback)
+    so WARP traffic flows through Envoy.
 - Public listeners get proxied CNAMEs to the tunnel hostname with an
   ownership comment; private listeners terminate TLS at Envoy and are reached
   over Cloudflare private network routes.

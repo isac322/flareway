@@ -45,6 +45,22 @@ const (
 	StandardGatewayLabelKey = "gateway.networking.k8s.io/gateway-name"
 )
 
+// ReservedPodPorts returns the pod ports used by dataplane components
+// (CoreDNS, cloudflared metrics, xDS client/server, Envoy admin and health).
+func ReservedPodPorts() []int32 {
+	return []int32{PrivateDNSPort, CloudflaredMetricsPort, XDSPort, EnvoyAdminPort, EnvoyHealthPort}
+}
+
+// IsReservedPodPort reports whether port is reserved by dataplane pod components.
+func IsReservedPodPort(port int32) bool {
+	switch port {
+	case PrivateDNSPort, CloudflaredMetricsPort, XDSPort, EnvoyAdminPort, EnvoyHealthPort:
+		return true
+	default:
+		return false
+	}
+}
+
 // ResourceName returns the common name for a Gateway's dataplane resources.
 func ResourceName(gw *ir.Gateway) string {
 	return dnsLabelName("flareway-gw-", gw.Key.Name, "")

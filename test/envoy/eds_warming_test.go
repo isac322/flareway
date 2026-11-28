@@ -19,6 +19,7 @@ limitations under the License.
 package envoy_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -388,12 +389,15 @@ func resolveDockerHostGatewayIP(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx,
+	cmd := exec.CommandContext(ctx,
 		"docker", "run", "--rm", "--add-host", "host.docker.internal:host-gateway",
 		envoyImage, "getent", "hosts", "host.docker.internal",
-	).CombinedOutput()
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("resolve host.docker.internal IP: %v\n%s", err, out)
+		t.Fatalf("resolve host.docker.internal IP: %v\n%s", err, stderr.String())
 	}
 	fields := strings.Fields(string(out))
 	if len(fields) == 0 || net.ParseIP(fields[0]) == nil {

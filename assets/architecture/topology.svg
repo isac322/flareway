@@ -56,7 +56,8 @@
   <text x="725" y="331" font-size="16" font-weight="700" fill="#172B4D" text-anchor="middle">cloudflared</text>
 
   <line x1="640" y1="360" x2="640" y2="414" stroke="#172B4D" stroke-width="2" marker-end="url(#aN)"/>
-  <text x="654" y="392" font-size="14" fill="#172B4D">loopback</text>
+  <text x="654" y="384" font-size="13" fill="#172B4D">public: loopback</text>
+  <text x="654" y="402" font-size="13" fill="#52627A">private: 127.0.0.1 / Pod IP</text>
 
   <rect x="525" y="420" width="250" height="115" rx="8" fill="#FFFFFF" stroke="#172B4D" stroke-width="1.5"/>
   <text x="650" y="483" font-size="15" font-weight="700" fill="#172B4D" text-anchor="middle">Envoy</text>

@@ -32,6 +32,7 @@ import (
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
 	"github.com/isac322/flareway/internal/authz"
+	"github.com/isac322/flareway/internal/dataplane"
 
 	"github.com/isac322/flareway/internal/gatewayapi/status"
 	"github.com/isac322/flareway/internal/ir"
@@ -156,7 +157,13 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 		}
 	}
 
-	publicPorts := newPublicEnvoyPorts(in, holds.reservedPorts(), conformanceMode)
+	out.PublicPortSpec = buildPublicPortSpec(in, holds.reservedPorts())
+	var persistedListeners []v1alpha1.CloudflareTunnelListenerStatus
+	if in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt == nil {
+		persistedListeners = in.CloudflareTunnel.Status.Listeners
+	}
+	publicPorts := newPublicEnvoyPortsFromProjected(out.PublicPortSpec, conformanceMode, persistedListeners)
+	publicPorts.allocs = &out.PublicPortSpec.Allocations
 	listeners, gatewayReason, gatewayMessage := translateListeners(in, out, publicPorts)
 	topLevelReason, topLevelMessage, globalInvalid := ValidateTopLevelGateway(in.Gateway)
 	if globalInvalid {
@@ -189,7 +196,7 @@ func translate(in Inputs, holds *accessRevocationHolds) (*ir.Gateway, Statuses) 
 	}
 
 	compileHTTPRoutes(in, out, listeners, &outStatuses, now)
-	applyAccessApplications(in, out, &outStatuses, now, holds, publicPorts)
+	applyAccessApplications(in, out, listeners, &outStatuses, now, holds, publicPorts)
 	populateBackendTLSPolicyStatuses(in, out, &outStatuses, now)
 	out.Clusters = buildClusters(in, out)
 	finalizeIR(out)
@@ -436,6 +443,10 @@ func validateListener(in Inputs, translated *listenerTranslation, conformance bo
 			((listener.Protocol == gatewayv1.HTTPProtocolType && listener.Port != 80) ||
 				(listener.Protocol == gatewayv1.HTTPSProtocolType && listener.Port != 443)) {
 			invalidateListener(translated, gatewayv1.ListenerReasonPortUnavailable, "public HTTP and HTTPS listeners require ports 80 and 443")
+			return
+		}
+		if translated.exposure == v1alpha1.ExposurePrivate && dataplane.IsReservedPodPort(int32(listener.Port)) {
+			invalidateListener(translated, gatewayv1.ListenerReasonPortUnavailable, fmt.Sprintf("private listener port %d is reserved for dataplane pod components", listener.Port))
 			return
 		}
 	}

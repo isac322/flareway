@@ -61,10 +61,11 @@ Traffic follows one of two paths:
   private hostname and receives a synthetic IP. The edge resolves the hostname
   through the tunnel's virtual DNS service. `cloudflared` forwards that query
   to the Pod-local CoreDNS sidecar (`TUNNEL_DNS_RESOLVER_ADDRS=127.0.0.1:53`,
-  `internal/dataplane/deployment.go:240`), which answers `127.0.0.1`.
-  The edge then sends the L4 flow to `127.0.0.1:<listener port>`,
-  `cloudflared` dials it, and Envoy terminates TLS on the port the Gateway
-  listener declares and applies the same compiled routes.
+  `internal/dataplane/deployment.go`), which answers `127.0.0.1` by default (or
+  the Pod IP per listener using Pod IP fallback, D13). The edge then sends the
+  L4 flow to that answered IP and the listener port, `cloudflared` dials it,
+  and Envoy terminates TLS on the port the Gateway listener declares and applies
+  the same compiled routes.
 
 In Cloudflare mode, Envoy listeners bind to `127.0.0.1` only, and a
 Gateway with private listeners also runs a CoreDNS sidecar bound to
@@ -114,8 +115,11 @@ through conditions.
 
 **D4. Two Access application kinds.** `AccessApplication` is a GEP-713 Direct
 policy (label `gateway.networking.k8s.io/policy: Direct`). It targets a
-`Gateway` or `HTTPRoute`, optionally narrowed by `sectionName` and
-`pathScope`, and compiles the target into Cloudflare destinations. It can also
+`Gateway` or `HTTPRoute`—on Public listeners optionally narrowed by
+`sectionName` (on routes) and `pathScope`, while Private listeners enforce
+whole-hostname L4 semantics and reject `pathScope`, per-rule route splits, and
+duplicate `AccessApplication` claims on the same hostname with `Invalid`—and
+compiles the target into Cloudflare destinations. It can also
 carry typed private, MCP, and Worker destinations. Its types are `SelfHosted`,
 `SSH`, `VNC`, `RDP`, `MCP`, and `ProxyEndpoint`.
 `AccessStandaloneApplication` manages applications that do not attach to a
@@ -141,19 +145,29 @@ anyone who reaches the origin by another path bypasses Access. Blocking until
 the AUD exists closes the window between creating a route and creating its
 Access application.
 
-**D6. Separate protection domains per hostname region.** Each protected region
-of a hostname gets its own `cloudflared` ingress rule and its own Envoy
-listener. By default these listeners bind to loopback. Public and protected
-paths may share a hostname only when the public carve-out `Q` is disjoint from
-the protected region `P`, or when `P` contains `Q`. In the second case
-Flareway creates a more specific child "bypass" Access application for each
-carve-out, and the carve-out must be listed in the grant's
-`unprotectedHostnames` (`internal/gatewayapi/access.go:580`). Other overlaps are
-rejected. When a later `HTTPRoute` would break an established proof, its
-offending rule is dropped and reported as `PartiallyInvalid`. Rationale:
-Cloudflare Access matches by hostname and path at the edge, and a single Envoy
-listener cannot tell which Access decision a request passed. Separate listeners
-make the edge decision visible to the origin.
+**D6. Separate protection domains per hostname region.** On Public listeners,
+each protected region of a hostname gets its own `cloudflared` ingress rule and
+its own Envoy loopback listener (`-public` and `-blocked` carve-out or fallback
+domains also receive distinct loopback ports rather than sharing the base
+wildcard port; while newly compiled `cloudflared` ingress always targets the
+dedicated carve-out port, in-place upgrades from `v0.5.0` wildcard Public
+listeners temporarily keep authorized carve-out routes reachable on the legacy
+shared Envoy socket until active connectors acknowledge the new ingress
+version, after which the legacy route is removed and blocked). Public and protected paths may share a hostname only when the
+public carve-out `Q` is disjoint from the protected region `P`, or when `P`
+contains `Q`. In the second case Flareway creates a more specific child
+"bypass" Access application for each carve-out, and the carve-out must be listed
+in the grant's `unprotectedHostnames` for the listener's exposure. Other
+overlaps are rejected. When a later `HTTPRoute` would break an established
+proof, its offending rule is dropped, reported as `PartiallyInvalid` on the
+affected parent attachment, and fully dropped routes are excluded from that
+listener's `AttachedRoutes`. Private listeners share one TLS filter chain on
+the listener port, enforce whole-hostname Access protection (rejecting
+same-host path splits as `Invalid`), and apply `cf-access-*` mutation stripping
+to unprotected routes using Private exposure authorization. Rationale:
+Cloudflare Access matches by hostname and path at the edge on Public listeners,
+and separate listeners make the edge decision visible to the origin; Private
+listeners have L4 host+port Access semantics over WARP and share one SNI chain.
 
 **D7. DNS is a property of the tunnel.** There is no DNS CRD. For every
 listener hostname, Flareway maintains a proxied CNAME to
@@ -241,18 +255,28 @@ unverified.
 
 **D13. Private hostnames resolve through a Pod-local DNS sidecar.** A
 Gateway with at least one private listener runs a CoreDNS sidecar in its
-data-plane Pod, bound to `127.0.0.1:53`. It answers private listener
-hostnames (exact and single-label wildcard) with `127.0.0.1` and
-forwards everything else to the Pod's resolver
-(`internal/dataplane/dns.go:79-113`). If the edge does not accept a loopback
-answer, a private listener can fall back to Pod IP binding. The sidecar then
-answers with the Pod IP, Envoy binds the listener on `0.0.0.0`, a
-NetworkPolicy restricts access, and the tunnel reports
-`PrivateListenerDegraded=True` with reason `PodIPFallback`
-(`internal/controller/gateway_private.go:394-406`). Rationale: `cloudflared`
-dials the IP the edge sends and resolves hostnames through its DNS resolver
-setting. `hostAliases` is invisible to that path, and changing cluster DNS
-would affect every workload.
+data-plane Pod, bound to `127.0.0.1:53`. It resolves private listener
+hostnames (exact and single-label wildcard) using per-listener binding lookup—selecting
+`127.0.0.1` by default and `{$POD_IP}` for any listener whose recorded
+`CloudflareTunnel.status.listeners[*].binding` is `PodIP`
+(`internal/gatewayapi/translate.go`)—and forwards everything else to the Pod's
+resolver (`internal/dataplane/dns.go`). Exact hostnames are ordered before
+wildcard rules in CoreDNS (returning `127.0.0.1` or `{$POD_IP}` for `A` and
+for `ANY` meta-queries per RFC 8482 §4.1, and authoritative empty `NOERROR` for
+specific non-`A` query types such as `AAAA` and `HTTPS` so exact IPv4-only
+hostnames do not fall through upstream) so an exact hostname always takes
+precedence over an overlapping wildcard regardless of binding, and if both
+bindings share the same exact hostname, `127.0.0.1` wins. When a listener carries a recorded `PodIP`
+binding, CoreDNS answers its hostname with `{$POD_IP}`, Envoy binds that
+listener on `0.0.0.0`, a NetworkPolicy restricts access, and the tunnel reports
+`PrivateListenerDegraded=True` with reason `PodIPFallback` while any active
+listener uses `PodIP` (`internal/controller/gateway_private.go`). There is no
+automatic detection of edge loopback rejection (`CloudflareTunnel` status
+reflects the binding read during translation), and live Cloudflare edge and
+WARP validation of loopback answers remains outside local test runs
+([Limits](../concepts/limits.md)). Rationale: `cloudflared` dials the IP the
+edge sends and resolves hostnames through its DNS resolver setting. `hostAliases`
+is invisible to that path, and changing cluster DNS would affect every workload.
 
 **D14. Conformance mode relaxes the Cloudflare constraints.** With
 `conformanceMode: true`, listeners may use any hostname and port, HTTPS

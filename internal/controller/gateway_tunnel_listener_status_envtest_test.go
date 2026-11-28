@@ -61,7 +61,7 @@ var _ = ginkgo.Describe("Gateway-owned CloudflareTunnel listener status", func()
 			testContext, compiled, observed,
 			v1alpha1.CloudflareTunnelConfigVersion{Desired: 1, DesiredHash: "hash"},
 			observed.Status.Hostnames,
-			desiredTunnelListeners(compiled),
+			desiredTunnelListeners(compiled, observed),
 		)).To(gomega.Succeed())
 
 		persisted := fixture.live()

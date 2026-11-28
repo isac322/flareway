@@ -258,9 +258,13 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 				if target.SectionName != nil && string(*target.SectionName) != domain.ListenerName {
 					continue
 				}
+				private := isPrivateListener(gateway, domain.ListenerName)
 				for _, virtualHost := range domain.VirtualHosts {
 					if virtualHost.Hostname == "" || isWildcardHostname(virtualHost.Hostname) {
 						continue
+					}
+					if private && scoped {
+						return accessFailure("Invalid", "pathScope is not supported on Private listeners")
 					}
 					matched = true
 					if err := appendAccessDestination(&result, seenDestination, in, gateway, domain.ListenerName, virtualHost.Hostname, region); err != nil {
@@ -280,6 +284,7 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		case group == gatewayGroup && kind == "HTTPRoute":
 			matched := false
 			for _, domain := range gateway.Domains {
+				private := isPrivateListener(gateway, domain.ListenerName)
 				for _, virtualHost := range domain.VirtualHosts {
 					for _, route := range virtualHost.Routes {
 						if route.Source.Namespace != application.Namespace || route.Source.Name != string(target.Name) {
@@ -288,23 +293,34 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 						if target.SectionName != nil && route.Source.RuleName != string(*target.SectionName) {
 							continue
 						}
-						matched = true
-						region, err := accessRegionForRoute(route)
-						if err != nil {
-							return accessFailure("Invalid", err.Error())
+						if private && scoped {
+							return accessFailure("Invalid", "pathScope is not supported on Private listeners")
 						}
+						if private && target.SectionName != nil {
+							return accessFailure("Invalid", "per-rule HTTPRoute targetRefs are not supported on Private listeners")
+						}
+						matched = true
+						region := accessRegion{kind: accessRegionPrefix, path: "/"}
+						wholeHost := private
 						specificity := 20
 						if target.SectionName != nil {
 							specificity = 25
 						}
-						if scoped {
-							region = pathScope
-							specificity += 5
+						if !private {
+							var routeErr error
+							region, routeErr = accessRegionForRoute(route)
+							if routeErr != nil {
+								return accessFailure("Invalid", routeErr.Error())
+							}
+							if scoped {
+								region = pathScope
+								specificity += 5
+							}
 						}
 						if err := appendAccessDestination(&result, seenDestination, in, gateway, domain.ListenerName, virtualHost.Hostname, region); err != nil {
 							return accessFailure("TargetNotFound", err.Error())
 						}
-						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: region, shadow: scoped, specificity: specificity})
+						appendAccessClaim(&result, seenClaim, accessClaim{listener: domain.ListenerName, hostname: virtualHost.Hostname, routeName: route.Name, region: region, wholeHost: wholeHost, shadow: scoped && !private, specificity: specificity})
 					}
 				}
 			}
@@ -314,6 +330,9 @@ func compileAccessApplicationAgainstIR(in Inputs, gateway *ir.Gateway, applicati
 		default:
 			return accessFailure("Invalid", fmt.Sprintf("unsupported targetRef %s/%s", group, kind))
 		}
+	}
+	if err := validatePrivateHostClaimCoverage(gateway, result.claims); err != nil {
+		return accessFailure("Invalid", err.Error())
 	}
 
 	declared := CompileDeclaredAccessDestinations(in, application)
@@ -461,7 +480,7 @@ func CompileDeclaredAccessDestinations(in Inputs, application *v1alpha1.AccessAp
 	return result
 }
 
-func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds, publicPorts *publicEnvoyPorts) {
+func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listenerTranslation, statuses *Statuses, now metav1.Time, holds *accessRevocationHolds, publicPorts *publicEnvoyPorts) {
 	statuses.AccessApplications = make(map[types.NamespacedName]AccessApplicationCompilation)
 	if gateway == nil || gateway.ConformanceMode || len(in.AccessApplications) == 0 {
 		markPublicDomainsForHeaderStripping(gateway)
@@ -486,7 +505,14 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 		if compiled.Accepted {
 			for _, claim := range compiled.claims {
 				for _, existing := range acceptedClaims[claim.hostname] {
-					if existing.specificity == claim.specificity && accessRegionsOverlap(existing.region, claim.region) {
+					if isPrivateListener(gateway, claim.listener) {
+						if existing.listener == claim.listener {
+							compiled = rejectedAccessCompilation(compiled, "Invalid", fmt.Sprintf("another AccessApplication already protects Private hostname %s on listener %s", claim.hostname, claim.listener))
+							break
+						}
+						continue
+					}
+					if !isPrivateListener(gateway, existing.listener) && existing.specificity == claim.specificity && accessRegionsOverlap(existing.region, claim.region) {
 						compiled = rejectedAccessCompilation(compiled, "Conflicted", fmt.Sprintf("another equally specific AccessApplication already protects an overlapping path on %s", claim.hostname))
 						break
 					}
@@ -512,12 +538,15 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 	if publicPorts == nil {
 		publicPorts = newPublicEnvoyPorts(in, holds.reservedPorts(), gateway.ConformanceMode)
 	}
-	dropped := make(map[types.NamespacedName][]string)
-	remaining := make(map[types.NamespacedName]int)
+	dropped := make(map[routeListenerKey][]string)
+	remaining := make(map[routeListenerKey]int)
 	for _, domain := range original {
 		for _, virtualHost := range domain.VirtualHosts {
 			for _, route := range virtualHost.Routes {
-				remaining[types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name}]++
+				remaining[routeListenerKey{
+					route:    types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name},
+					listener: domain.ListenerName,
+				}]++
 			}
 		}
 	}
@@ -527,14 +556,75 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, statuses *Statuses,
 			partitionAccessVirtualHost(in, gateway, statuses, domain, virtualHost, publicPorts, dropped, remaining)
 		}
 	}
+	filterCollidingShadowDomains(gateway)
 	disambiguateDerivedDomainNames(gateway, statuses)
 	// Names are settled first so holding a host never renames another domain.
 	holds.apply(gateway)
-	applyAccessRouteDrops(statuses, in, dropped, remaining, now)
+	applyAccessRouteDrops(statuses, in, listeners, dropped, remaining, now)
 	for key, compiled := range statuses.AccessApplications {
 		sortAccessCompilation(&compiled)
 		statuses.AccessApplications[key] = compiled
 	}
+	if gateway.PublicPortSpec != nil && len(gateway.PublicPortSpec.Allocations) > 0 {
+		privateListeners := make(map[string]bool, len(gateway.Listeners))
+		for _, listener := range gateway.Listeners {
+			if listener.Exposure == ir.ExposurePrivate {
+				privateListeners[listener.Name] = true
+			}
+		}
+		type survivedKey struct {
+			listener string
+			name     string
+			port     int32
+		}
+		survived := make(map[survivedKey]struct{}, len(gateway.Domains))
+		for _, domain := range gateway.Domains {
+			if domain.ShadowOnly || domain.Exposure == ir.ExposurePrivate || privateListeners[domain.ListenerName] {
+				continue
+			}
+			survived[survivedKey{listener: domain.ListenerName, name: domain.Name, port: domain.EnvoyPort}] = struct{}{}
+		}
+		for i := range gateway.PublicPortSpec.Allocations {
+			alloc := &gateway.PublicPortSpec.Allocations[i]
+			if _, ok := survived[survivedKey{listener: alloc.ListenerName, name: alloc.DomainName, port: alloc.WantPort}]; ok {
+				alloc.MustMatch = true
+				continue
+			}
+			disambig := alloc.DomainName + "-" + disambiguateListenerHash(alloc.ListenerName)
+			if _, ok := survived[survivedKey{listener: alloc.ListenerName, name: disambig, port: alloc.WantPort}]; ok {
+				alloc.MustMatch = true
+			}
+		}
+	}
+}
+
+// filterCollidingShadowDomains drops any ShadowOnly upgrade domain whose
+// EnvoyPort collides with a non-shadow domain that cannot share the same Envoy
+// route group (different listener, Protected, non-Unprotected, or
+// !StripAccessHeaders), preventing bindCollisionError in translator.Build.
+func filterCollidingShadowDomains(gateway *ir.Gateway) {
+	kept := gateway.Domains[:0]
+	for _, shadow := range gateway.Domains {
+		if !shadow.ShadowOnly {
+			kept = append(kept, shadow)
+			continue
+		}
+		collides := false
+		for _, other := range gateway.Domains {
+			if other.ShadowOnly || other.EnvoyPort != shadow.EnvoyPort {
+				continue
+			}
+			if other.ListenerName != shadow.ListenerName || other.Protected || other.Guard != ir.GuardUnprotected || !other.StripAccessHeaders {
+				collides = true
+				break
+			}
+		}
+		if !collides {
+			kept = append(kept, shadow)
+		}
+	}
+	clear(gateway.Domains[len(kept):])
+	gateway.Domains = kept
 }
 
 // disambiguateDerivedDomainNames keeps protection domain names unique across
@@ -580,7 +670,12 @@ func disambiguateDerivedDomainNames(gateway *ir.Gateway, statuses *Statuses) {
 	}
 }
 
-func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, publicPorts *publicEnvoyPorts, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int) {
+type routeListenerKey struct {
+	route    types.NamespacedName
+	listener string
+}
+
+func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Statuses, base ir.ProtectionDomain, host ir.VirtualHost, publicPorts *publicEnvoyPorts, dropped map[routeListenerKey][]string, remaining map[routeListenerKey]int) {
 	claimed := make(map[string][]ir.Route)
 	public := make([]ir.Route, 0, len(host.Routes))
 	wholeHost := make(map[string]bool)
@@ -639,6 +734,14 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 
 	if len(claimed) == 0 && len(wholeHost) == 0 {
 		base.StripAccessHeaders = base.Guard == ir.GuardUnprotected
+		if base.StripAccessHeaders {
+			sanitizedHost := host
+			sanitizedHost.Routes = slices.Clone(host.Routes)
+			for routeIndex := range sanitizedHost.Routes {
+				sanitizedHost.Routes[routeIndex] = sanitizeUnprotectedRoute(sanitizedHost.Routes[routeIndex])
+			}
+			host = sanitizedHost
+		}
 		base.VirtualHosts = []ir.VirtualHost{host}
 		gateway.Domains = append(gateway.Domains, base)
 		return
@@ -650,8 +753,12 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			protectedRegions[owner] = appendUniqueAccessRegion(protectedRegions[owner], region)
 		}
 	}
+	exposure := v1alpha1.ExposurePublic
+	if isPrivateListener(gateway, base.ListenerName) {
+		exposure = v1alpha1.ExposurePrivate
+	}
 	publicAllowed := authz.Evaluate(in.CloudflareAccount, namespaceByName(in.Namespaces, gateway.Key.Namespace), authz.Request{
-		Hostname: host.Hostname, Exposure: v1alpha1.ExposurePublic, Unprotected: true,
+		Hostname: host.Hostname, Exposure: exposure, Unprotected: true,
 	}).Allowed
 	keptPublic := make([]ir.Route, 0, len(public))
 	publicIngress := make([]ir.PathMatch, 0, len(public))
@@ -696,7 +803,10 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 			}
 		}
 		if message != "" {
-			key := types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name}
+			key := routeListenerKey{
+				route:    types.NamespacedName{Namespace: route.Source.Namespace, Name: route.Source.Name},
+				listener: base.ListenerName,
+			}
 			dropped[key] = append(dropped[key], routeRuleLabel(route)+" "+message)
 			remaining[key]--
 			continue
@@ -707,7 +817,7 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 
 	if len(keptPublic) > 0 {
 		publicDomain := base
-		publicDomain.Name = base.Name + "-public"
+		assignDerivedDomainPort(gateway, publicPorts, &publicDomain, base.ListenerName, "public", host.Hostname)
 		publicDomain.Protected = false
 		publicDomain.Access = nil
 		publicDomain.AccessApplication = ""
@@ -716,9 +826,27 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 		publicDomain.IngressPaths = publicIngress
 		publicDomain.VirtualHosts = []ir.VirtualHost{{Name: host.Name + "-public", Hostname: host.Hostname, Routes: keptPublic}}
 		gateway.Domains = append(gateway.Domains, publicDomain)
+
+		listener := listenerByName(gateway.Listeners, base.ListenerName)
+		if !gateway.ConformanceMode && listener != nil && listener.Exposure == ir.ExposurePublic && isWildcardHostname(listener.Hostname) {
+			if legacyPD, legacyPort, ok := publicPorts.legacyCarveOut(in, base.ListenerName, host.Hostname); ok && legacyPort != publicDomain.EnvoyPort {
+				gateway.Domains = append(gateway.Domains, ir.ProtectionDomain{
+					Name:               legacyPD,
+					ListenerName:       base.ListenerName,
+					Exposure:           ir.ExposurePublic,
+					EnvoyPort:          legacyPort,
+					Protected:          false,
+					AccessApplication:  "",
+					Guard:              ir.GuardUnprotected,
+					StripAccessHeaders: true,
+					ShadowOnly:         true,
+					VirtualHosts:       []ir.VirtualHost{{Name: host.Name + "-public-legacy", Hostname: host.Hostname, Routes: keptPublic}},
+				})
+			}
+		}
 	} else if !publicAllowed && !accessRegionsCoverWholeHost(protectedRegions) {
 		blocked := base
-		blocked.Name = base.Name + "-blocked"
+		assignDerivedDomainPort(gateway, publicPorts, &blocked, base.ListenerName, "blocked", host.Hostname)
 		blocked.Protected = false
 		blocked.Access = nil
 		blocked.Guard = ir.GuardBlocked
@@ -808,6 +936,82 @@ func partitionAccessVirtualHost(in Inputs, gateway *ir.Gateway, statuses *Status
 func accessHostSuffix(owner, hostname string) string {
 	sum := sha256.Sum256([]byte(owner + "\x00" + strings.ToLower(hostname)))
 	return hex.EncodeToString(sum[:4])
+}
+
+func isPrivateListener(gateway *ir.Gateway, listenerName string) bool {
+	if gateway == nil {
+		return false
+	}
+	listener := listenerByName(gateway.Listeners, listenerName)
+	return listener != nil && listener.Exposure == ir.ExposurePrivate
+}
+
+func assignDerivedDomainPort(gateway *ir.Gateway, publicPorts *publicEnvoyPorts, domain *ir.ProtectionDomain, listenerName, kind, hostname string) {
+	domain.Name += "-" + kind
+	listener := listenerByName(gateway.Listeners, listenerName)
+	if listener != nil && listener.Exposure == ir.ExposurePrivate {
+		domain.EnvoyPort = listener.Port
+		return
+	}
+	if listener != nil && isWildcardHostname(listener.Hostname) {
+		domain.Name += "-" + accessHostSuffix(kind, hostname)
+		domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
+		return
+	}
+	if kind == "public" && listener != nil && listener.Hostname != "" {
+		// Exact Public listeners host a single hostname whose base domain is not
+		// emitted once split by AccessApplication, so a newly created "-public"
+		// carve-out preserves the base port already allocated on base.EnvoyPort.
+		domain.EnvoyPort = publicPorts.takeExactPublicCarveOut(listenerName, domain.Name, domain.EnvoyPort)
+		return
+	}
+	domain.EnvoyPort = publicPorts.takeDomain(listenerName, domain.Name)
+}
+
+func validatePrivateHostClaimCoverage(gateway *ir.Gateway, claims []accessClaim) error {
+	if gateway == nil || len(claims) == 0 {
+		return nil
+	}
+	type hostKey struct {
+		listener string
+		hostname string
+	}
+	claimedByHost := make(map[hostKey]map[string]struct{})
+	for _, claim := range claims {
+		if !isPrivateListener(gateway, claim.listener) {
+			continue
+		}
+		key := hostKey{listener: claim.listener, hostname: strings.ToLower(strings.TrimSuffix(claim.hostname, "."))}
+		routes := claimedByHost[key]
+		if routes == nil {
+			routes = make(map[string]struct{})
+			claimedByHost[key] = routes
+		}
+		if claim.routeName != "" {
+			routes[claim.routeName] = struct{}{}
+		}
+	}
+	if len(claimedByHost) == 0 {
+		return nil
+	}
+	for _, domain := range gateway.Domains {
+		if !isPrivateListener(gateway, domain.ListenerName) {
+			continue
+		}
+		for _, virtualHost := range domain.VirtualHosts {
+			normalized := strings.ToLower(strings.TrimSuffix(virtualHost.Hostname, "."))
+			claimedRoutes, claimed := claimedByHost[hostKey{listener: domain.ListenerName, hostname: normalized}]
+			if !claimed {
+				continue
+			}
+			for _, route := range virtualHost.Routes {
+				if _, ok := claimedRoutes[route.Name]; !ok {
+					return fmt.Errorf("AccessApplication must cover all routes for Private hostname %s on listener %s", virtualHost.Hostname, domain.ListenerName)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func accessApplicationReady(in Inputs, applicationKey types.NamespacedName) bool {
@@ -917,31 +1121,74 @@ func markPublicDomainsForHeaderStripping(gateway *ir.Gateway) {
 	}
 }
 
-func applyAccessRouteDrops(statuses *Statuses, in Inputs, dropped map[types.NamespacedName][]string, remaining map[types.NamespacedName]int, now metav1.Time) {
-	for key, messages := range dropped {
+func applyAccessRouteDrops(statuses *Statuses, in Inputs, listeners []*listenerTranslation, dropped map[routeListenerKey][]string, remaining map[routeListenerKey]int, now metav1.Time) {
+	droppedByRoute := make(map[types.NamespacedName]map[string][]string)
+	listenersByName := make(map[string]*listenerTranslation, len(listeners))
+	for _, listener := range listeners {
+		listenersByName[string(listener.spec.Name)] = listener
+	}
+	for rlKey, messages := range dropped {
+		byListener := droppedByRoute[rlKey.route]
+		if byListener == nil {
+			byListener = make(map[string][]string)
+			droppedByRoute[rlKey.route] = byListener
+		}
+		byListener[rlKey.listener] = append(byListener[rlKey.listener], messages...)
+		if remaining[rlKey] <= 0 {
+			if listener := listenersByName[rlKey.listener]; listener != nil {
+				delete(listener.attachedRoutes, rlKey.route)
+			}
+		}
+	}
+
+	for key, listenerMessages := range droppedByRoute {
 		routeStatus, exists := statuses.HTTPRoutes[key]
 		if !exists {
 			continue
 		}
-		generation := int64(0)
+		var route *gatewayv1.HTTPRoute
 		for index := range in.HTTPRoutes {
 			if in.HTTPRoutes[index].Namespace == key.Namespace && in.HTTPRoutes[index].Name == key.Name {
-				generation = in.HTTPRoutes[index].Generation
+				route = &in.HTTPRoutes[index]
 				break
 			}
+		}
+		generation := int64(0)
+		if route != nil {
+			generation = route.Generation
 		}
 		for index := range routeStatus.Parents {
 			parent := &routeStatus.Parents[index]
 			if parent.ControllerName != ControllerName {
 				continue
 			}
-			if remaining[key] <= 0 {
+			var parentMessages []string
+			allDropped := false
+			if route != nil {
+				matched, _ := matchingListeners(in, route, parent.ParentRef, listeners)
+				if len(matched) > 0 {
+					allDropped = true
+					for _, listener := range matched {
+						lname := string(listener.spec.Name)
+						if msgs := listenerMessages[lname]; len(msgs) > 0 {
+							parentMessages = append(parentMessages, msgs...)
+						}
+						if remaining[routeListenerKey{route: key, listener: lname}] > 0 {
+							allDropped = false
+						}
+					}
+				}
+			}
+			if len(parentMessages) == 0 {
+				continue
+			}
+			if allDropped {
 				parent.Conditions = gatewaystatus.SetCondition(parent.Conditions, now, gatewaystatus.NewCondition(
 					string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonUnsupportedValue), "all Route rules were dropped", generation, now,
 				))
 			}
 			parent.Conditions = gatewaystatus.SetCondition(parent.Conditions, now, gatewaystatus.NewCondition(
-				string(gatewayv1.RouteConditionPartiallyInvalid), metav1.ConditionTrue, string(gatewayv1.RouteReasonUnsupportedValue), "Dropped Rule: "+strings.Join(uniqueStrings(messages), "; "), generation, now,
+				string(gatewayv1.RouteConditionPartiallyInvalid), metav1.ConditionTrue, string(gatewayv1.RouteReasonUnsupportedValue), "Dropped Rule: "+strings.Join(uniqueStrings(parentMessages), "; "), generation, now,
 			))
 		}
 		statuses.HTTPRoutes[key] = routeStatus

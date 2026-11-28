@@ -110,6 +110,9 @@ func filterNonAccessHeaders(headers []*corev3.HeaderValueOption) []*corev3.Heade
 }
 
 func isAccessIdentityHeader(name string) bool {
+	if strings.HasPrefix(strings.ToLower(name), "cf-access-") {
+		return true
+	}
 	for _, header := range accessIdentityHeaders {
 		if strings.EqualFold(name, header) {
 			return true

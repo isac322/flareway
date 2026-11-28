@@ -66,6 +66,48 @@ type Gateway struct {
 	Domains                   []ProtectionDomain   `json:"domains,omitempty"`
 	Clusters                  []Cluster            `json:"clusters,omitempty"`
 	Secrets                   []TLSSecret          `json:"secrets,omitempty"`
+	PublicPortSpec            *PublicPortSpec      `json:"-"`
+}
+
+// PublicPortSpec captures listener spec order, hold reservations, and the raw
+// pre-disambiguation allocation journal needed to replay public Envoy port
+// allocation without changing serialized IR or xDS output.
+type PublicPortSpec struct {
+	SpecListeners         []PublicPortListenerSpec `json:"-"`
+	HoldReservedPorts     []int32                  `json:"-"`
+	HasPersistedListeners bool                     `json:"-"`
+	Allocations           []PublicPortAllocation   `json:"-"`
+}
+
+// PublicPortAllocOp identifies one step in public Envoy port allocation during
+// Gateway translation.
+type PublicPortAllocOp string
+
+// PublicPortAllocOp values classify the allocator steps recorded in PublicPortSpec.Allocations.
+const (
+	PublicPortAllocBase                PublicPortAllocOp = "base"
+	PublicPortAllocDomain              PublicPortAllocOp = "domain"
+	PublicPortAllocExactPublicCarveOut PublicPortAllocOp = "exact-carve-out"
+)
+
+// PublicPortAllocation records one port allocation call with its raw
+// pre-disambiguation domain name so status deferral replay reproduces the
+// exact allocator sequence.
+type PublicPortAllocation struct {
+	Op           PublicPortAllocOp `json:"-"`
+	ListenerName string            `json:"-"`
+	DomainName   string            `json:"-"`
+	WantPort     int32             `json:"-"`
+	MustMatch    bool              `json:"-"`
+}
+
+// PublicPortListenerSpec captures one Gateway listener spec entry in declaration order.
+type PublicPortListenerSpec struct {
+	Name        string `json:"-"`
+	Exposure    string `json:"-"`
+	Wildcard    bool   `json:"-"`
+	ExactPublic bool   `json:"-"`
+	Port        int32  `json:"-"`
 }
 
 // Cloudflare identifies the remotely managed tunnel used by a production
@@ -219,18 +261,23 @@ type TLSRef struct {
 type ProtectionDomain struct {
 	Name              string       `json:"name"`
 	ListenerName      string       `json:"listenerName"`
+	Exposure          string       `json:"exposure,omitempty"`
 	EnvoyPort         int32        `json:"envoyPort"`
 	Protected         bool         `json:"protected"`
 	OriginJWTDisabled bool         `json:"originJWTDisabled,omitempty"`
 	Access            *AccessGuard `json:"access,omitempty"`
 	AccessApplication string       `json:"accessApplication,omitempty"`
 	// AccessBinding retains the desired binding digest while its guard is blocked.
-	AccessBinding      string        `json:"accessBinding,omitempty"`
-	Guard              string        `json:"guard,omitempty"`
-	BlockReason        string        `json:"blockReason,omitempty"`
-	StripAccessHeaders bool          `json:"stripAccessHeaders,omitempty"`
-	IngressPaths       []PathMatch   `json:"ingressPaths,omitempty"`
-	VirtualHosts       []VirtualHost `json:"virtualHosts,omitempty"`
+	AccessBinding      string `json:"accessBinding,omitempty"`
+	Guard              string `json:"guard,omitempty"`
+	BlockReason        string `json:"blockReason,omitempty"`
+	StripAccessHeaders bool   `json:"stripAccessHeaders,omitempty"`
+	// ShadowOnly marks an upgrade-transition Envoy protection domain preserved
+	// temporarily on a legacy port until cloudflared connectors acknowledge the
+	// replacement dedicated port; omitted from cloudflared ingress and status.hostnames.
+	ShadowOnly   bool          `json:"shadowOnly,omitempty"`
+	IngressPaths []PathMatch   `json:"ingressPaths,omitempty"`
+	VirtualHosts []VirtualHost `json:"virtualHosts,omitempty"`
 }
 
 // AccessGuard describes Cloudflare Access JWT enforcement for a domain.

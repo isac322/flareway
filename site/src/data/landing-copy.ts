@@ -223,10 +223,10 @@ export const landingCopy: LandingCopy = {
 	how: {
 		heading: 'One Gateway, one tunnel, one data plane.',
 		ledeHtml:
-			'Traffic enters only through <code>cloudflared</code>, which dials out over QUIC/HTTP2. Envoy takes decrypted requests over loopback and applies the routes the controller streams to it over xDS.',
+			'Traffic enters only through <code>cloudflared</code>, which dials out over QUIC/HTTP2. Envoy receives public hostnames from <code>cloudflared</code> over loopback, terminates private HTTPS directly on its recorded binding, and applies the routes the controller streams to it over xDS.',
 		figure: {
 			title: 'How traffic reaches the cluster',
-			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. The outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands requests to Envoy over loopback; the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
+			desc: 'Browsers and WARP devices reach the Cloudflare edge. Inbound paths into the cluster are blocked at a sealed boundary. The outbound tunnel, opened by cloudflared inside the data-plane pod, crosses the boundary. cloudflared hands public hostnames to Envoy over loopback, while private WARP HTTPS reaches Envoy over its recorded binding (loopback or Pod IP); the Flareway controller streams routes to Envoy over xDS. Envoy forwards to Services and Pods.',
 			browsers: 'Browsers',
 			browsersSub: 'public hostnames',
 			warp: 'WARP devices',
@@ -244,8 +244,8 @@ export const landingCopy: LandingCopy = {
 			podLabel: 'data-plane pod',
 			cloudflared: 'cloudflared',
 			envoy: 'Envoy',
-			loopback: 'loopback',
-			coredns: '+ CoreDNS sidecar for private listeners',
+			loopback: 'public: loopback (cloudflared) · private: 127.0.0.1 / Pod IP',
+			coredns: '+ CoreDNS answers private names · 127.0.0.1 / Pod IP',
 			controllerName: 'flareway',
 			controllerSub: 'controller',
 			xds: 'xDS · Delta ADS',
@@ -320,7 +320,7 @@ export const landingCopy: LandingCopy = {
 		warp: {
 			heading: 'Private services over WARP, same Gateway',
 			bodyHtml:
-				'Set a listener’s exposure to <code>Private</code>, and WARP devices reach the Service through the same <code>Gateway</code>, <code>HTTPRoute</code>, and <code>AccessApplication</code>. Envoy terminates TLS with a certificate Secret you supply; a CoreDNS sidecar answers private hostnames with 127.0.0.1 so the traffic passes through Envoy.',
+				'Set a listener’s exposure to <code>Private</code>, and WARP devices reach the Service through the same <code>Gateway</code>, <code>HTTPRoute</code>, and <code>AccessApplication</code>. Envoy terminates TLS with a certificate Secret you supply; a CoreDNS sidecar answers private hostnames with 127.0.0.1 by default (or the Pod IP per listener using Pod IP fallback) so the traffic passes through Envoy.',
 			kinds: ['VirtualNetwork', 'NetworkRoute', 'HostnameRoute', 'WARPConnector'],
 			kindsNoteHtml: 'for WARP reachability and k8s-to-VPC site-to-site links',
 			more: { label: 'Private services over WARP', href: '/docs/get-started/private-services-over-warp/' },

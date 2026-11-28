@@ -100,15 +100,15 @@
     <!-- channel tail resumes inside the pod: starts at cloudflared top, 6px clear of the pod border -->
     <rect x="782" y="551" width="56" height="39" fill="#FBE0C8" stroke="#E77B35" stroke-width="2.5"/>
 
-    <!-- loopback: cloudflared -> Envoy -->
+    <!-- public forwarding: cloudflared -> Envoy (private HTTPS reaches Envoy directly on its recorded binding) -->
     <path d="M810,590 C810,566 1040,566 1040,590" fill="none" stroke="#172B4D" stroke-width="2" marker-end="url(#mReq)"/>
-    <text x="925" y="560" font-size="14" text-anchor="middle" fill="#52627A">loopback</text>
+    <text x="850" y="562" font-size="13" text-anchor="start" fill="#52627A">public: loopback · private: 127.0.0.1 / Pod IP</text>
 
     <!-- CoreDNS sidecar sits inside the pod, alongside the other containers -->
     <rect x="270" y="590" width="200" height="85" rx="8" fill="#F7F9FC" stroke="#52627A" stroke-width="1.2" stroke-dasharray="4 3"/>
     <text x="370" y="620" font-size="14" font-weight="600" text-anchor="middle" fill="#172B4D">CoreDNS (private only)</text>
     <text x="370" y="642" font-size="14" text-anchor="middle" fill="#52627A">private names</text>
-    <text x="370" y="662" font-size="14" text-anchor="middle" fill="#52627A">→ 127.0.0.1</text>
+    <text x="370" y="662" font-size="14" text-anchor="middle" fill="#52627A">→ 127.0.0.1 / Pod IP</text>
     <line x1="470" y1="632" x2="700" y2="632" stroke="#52627A" stroke-width="1.5" stroke-dasharray="2 3"/>
 
     <rect x="710" y="590" width="200" height="85" rx="8" fill="#F7F9FC" stroke="#172B4D" stroke-width="1.2"/>

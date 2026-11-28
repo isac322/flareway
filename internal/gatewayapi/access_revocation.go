@@ -29,6 +29,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
+	"github.com/isac322/flareway/internal/dataplane"
 	"github.com/isac322/flareway/internal/ir"
 )
 
@@ -374,6 +375,19 @@ const (
 	publicHashRange int32 = 40000
 )
 
+// PublicPortRange returns the inclusive Envoy port range allocated to public
+// ProtectionDomains.
+func PublicPortRange() (minPort, maxPort int32) {
+	return publicPortMin, publicPortMax
+}
+
+// PublicDomainHashPort returns the deterministic initial hash port probed by
+// public Envoy port allocation for (listenerName, domainName).
+func PublicDomainHashPort(listenerName, domainName string) int32 {
+	sum := sha256.Sum256([]byte(listenerName + "\x00" + domainName))
+	return publicPortMin + int32(binary.BigEndian.Uint32(sum[:4])%uint32(publicHashRange))
+}
+
 // publicEnvoyPorts hands out loopback Envoy ports for public listeners and
 // public Access domains. Persisted (listener, domain) bindings from
 // CloudflareTunnel.Status.Listeners keep their recorded ports across
@@ -386,76 +400,350 @@ type publicEnvoyPorts struct {
 	preClaimed            map[int32]struct{}
 	stickyDomain          map[string]int32
 	stickyBase            map[string]int32
+	stickyBaseFallback    map[string]int32
+	legacyCarveOutPort    map[string]int32
 	hasPersistedListeners bool
+	allocs                *[]ir.PublicPortAllocation
+}
+
+func (ports *publicEnvoyPorts) record(op ir.PublicPortAllocOp, listenerName, domainName string, port int32, mustMatch bool) {
+	if ports == nil || ports.allocs == nil {
+		return
+	}
+	*ports.allocs = append(*ports.allocs, ir.PublicPortAllocation{
+		Op:           op,
+		ListenerName: listenerName,
+		DomainName:   domainName,
+		WantPort:     port,
+		MustMatch:    mustMatch,
+	})
+}
+
+func buildPublicPortSpec(in Inputs, reserved map[int32]struct{}) *ir.PublicPortSpec {
+	spec := &ir.PublicPortSpec{}
+	if len(reserved) > 0 {
+		spec.HoldReservedPorts = make([]int32, 0, len(reserved))
+		for port := range reserved {
+			spec.HoldReservedPorts = append(spec.HoldReservedPorts, port)
+		}
+		slices.Sort(spec.HoldReservedPorts)
+	}
+	if in.Gateway != nil && len(in.Gateway.Spec.Listeners) > 0 {
+		spec.SpecListeners = make([]ir.PublicPortListenerSpec, 0, len(in.Gateway.Spec.Listeners))
+		for _, listener := range in.Gateway.Spec.Listeners {
+			exposure := string(listenerExposure(in.CloudflareTunnel, listener.Name))
+			wildcard := listener.Hostname != nil && *listener.Hostname != "" && isWildcardHostname(string(*listener.Hostname))
+			exactPublic := exposure != ir.ExposurePrivate && !wildcard && listener.Hostname != nil && *listener.Hostname != ""
+			spec.SpecListeners = append(spec.SpecListeners, ir.PublicPortListenerSpec{
+				Name:        string(listener.Name),
+				Exposure:    exposure,
+				Wildcard:    wildcard,
+				ExactPublic: exactPublic,
+				Port:        int32(listener.Port),
+			})
+		}
+	}
+	if in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt == nil && len(in.CloudflareTunnel.Status.Listeners) > 0 {
+		spec.HasPersistedListeners = true
+	}
+	return spec
 }
 
 func newPublicEnvoyPorts(in Inputs, reserved map[int32]struct{}, conformance bool) *publicEnvoyPorts {
+	spec := buildPublicPortSpec(in, reserved)
+	var persisted []v1alpha1.CloudflareTunnelListenerStatus
+	if in.CloudflareTunnel != nil && in.CloudflareTunnel.Status.DeletedAt == nil {
+		persisted = in.CloudflareTunnel.Status.Listeners
+	}
+	return newPublicEnvoyPortsFromProjected(spec, conformance, persisted)
+}
+
+func newPublicEnvoyPortsFromProjected(spec *ir.PublicPortSpec, conformance bool, projected []v1alpha1.CloudflareTunnelListenerStatus) *publicEnvoyPorts {
+	holdCount := 0
+	if spec != nil {
+		holdCount = len(spec.HoldReservedPorts)
+	}
 	ports := &publicEnvoyPorts{
-		next:         publicPortMin,
-		reserved:     make(map[int32]struct{}, len(reserved)+4),
-		used:         make(map[int32]struct{}),
-		preClaimed:   make(map[int32]struct{}),
-		stickyDomain: make(map[string]int32),
-		stickyBase:   make(map[string]int32),
+		next:               publicPortMin,
+		reserved:           make(map[int32]struct{}, holdCount+4),
+		used:               make(map[int32]struct{}),
+		preClaimed:         make(map[int32]struct{}),
+		stickyDomain:       make(map[string]int32),
+		stickyBase:         make(map[string]int32),
+		stickyBaseFallback: make(map[string]int32),
+		legacyCarveOutPort: make(map[string]int32),
 	}
-	for port := range reserved {
-		ports.reserved[port] = struct{}{}
+	if spec != nil {
+		for _, port := range spec.HoldReservedPorts {
+			ports.reserved[port] = struct{}{}
+		}
 	}
-	for _, internalPort := range []int32{18000, 19000, 19001} {
+	for _, internalPort := range dataplane.ReservedPodPorts() {
 		ports.reserved[internalPort] = struct{}{}
 	}
-	if conformance || in.Gateway == nil {
+	if conformance || spec == nil {
 		return ports
 	}
-	livePublic := make(map[string]struct{}, len(in.Gateway.Spec.Listeners))
-	for _, listener := range in.Gateway.Spec.Listeners {
-		exposure := listenerExposure(in.CloudflareTunnel, listener.Name)
-		if exposure == v1alpha1.ExposurePrivate {
-			if port := int32(listener.Port); port > 0 && port <= publicPortMax {
-				ports.reserved[port] = struct{}{}
+	livePublic := make(map[string]struct{}, len(spec.SpecListeners))
+	liveExactPublic := make(map[string]struct{}, len(spec.SpecListeners))
+	liveWildcardPublic := make(map[string]struct{}, len(spec.SpecListeners))
+	for _, listener := range spec.SpecListeners {
+		if listener.Exposure == ir.ExposurePrivate {
+			if listener.Port > 0 && listener.Port <= publicPortMax {
+				ports.reserved[listener.Port] = struct{}{}
 			}
 			continue
 		}
-		livePublic[string(listener.Name)] = struct{}{}
+		livePublic[listener.Name] = struct{}{}
+		if listener.Wildcard {
+			liveWildcardPublic[listener.Name] = struct{}{}
+		} else if listener.ExactPublic {
+			liveExactPublic[listener.Name] = struct{}{}
+		}
 	}
-	if in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.DeletedAt != nil || len(in.CloudflareTunnel.Status.Listeners) == 0 {
+	if !spec.HasPersistedListeners || len(projected) == 0 {
 		return ports
 	}
 	ports.hasPersistedListeners = true
-	for _, ls := range in.CloudflareTunnel.Status.Listeners {
-		if ls.Exposure == v1alpha1.ExposurePrivate {
-			continue
-		}
-		listenerName := string(ls.Name)
-		if _, live := livePublic[listenerName]; !live {
-			continue
-		}
-		suffix := "-" + disambiguateListenerHash(listenerName)
-		for _, pd := range ls.ProtectionDomains {
-			port := pd.EnvoyPort
-			if port < publicPortMin || port > publicPortMax {
+	// Pass 1 claims literal base entries (pd.Name == listenerName) ahead of any
+	// derived/non-base entries so legacy status listing e.g. "web-public" before
+	// "web" on the same port never starves stickyBase["web"].
+	for _, wantBase := range []bool{true, false} {
+		for _, ls := range projected {
+			if ls.Exposure == v1alpha1.ExposurePrivate {
 				continue
 			}
-			if _, blocked := ports.reserved[port]; blocked {
+			listenerName := string(ls.Name)
+			if _, live := livePublic[listenerName]; !live {
 				continue
 			}
-			if _, claimed := ports.preClaimed[port]; claimed {
-				continue
-			}
-			ports.preClaimed[port] = struct{}{}
-			ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
-			if pd.Name == listenerName ||
-				pd.Name == listenerName+"-public" ||
-				pd.Name == listenerName+"-blocked" ||
-				pd.Name == listenerName+"-public"+suffix ||
-				pd.Name == listenerName+"-blocked"+suffix {
-				if _, exists := ports.stickyBase[listenerName]; !exists {
-					ports.stickyBase[listenerName] = port
+			for _, pd := range ls.ProtectionDomains {
+				isBase := pd.Name == listenerName
+				if isBase != wantBase {
+					continue
+				}
+				port := pd.EnvoyPort
+				if port < publicPortMin || port > publicPortMax {
+					continue
+				}
+				if _, blocked := ports.reserved[port]; blocked {
+					continue
+				}
+				if !isBase {
+					if _, wildcard := liveWildcardPublic[listenerName]; wildcard &&
+						(pd.Name == listenerName+"-public" || pd.Name == listenerName+"-public-"+disambiguateListenerHash(listenerName)) {
+						if _, claimed := ports.preClaimed[port]; !claimed || ports.stickyBase[listenerName] == port {
+							if _, exists := ports.legacyCarveOutPort[listenerName+"\x00"+pd.Name]; !exists {
+								ports.legacyCarveOutPort[listenerName+"\x00"+pd.Name] = port
+							}
+						}
+					}
+				}
+				if _, claimed := ports.preClaimed[port]; claimed {
+					continue
+				}
+				ports.preClaimed[port] = struct{}{}
+				ports.stickyDomain[listenerName+"\x00"+pd.Name] = port
+				if isBase {
+					if _, exists := ports.stickyBase[listenerName]; !exists {
+						ports.stickyBase[listenerName] = port
+					}
+				} else if _, exact := liveExactPublic[listenerName]; exact &&
+					(pd.Name == listenerName+"-public" || pd.Name == listenerName+"-public-"+disambiguateListenerHash(listenerName)) {
+					// Record the -public carve-out port as a fallback for exact Public
+					// listeners so removing the last AccessApplication restores the base
+					// domain onto its previously served Envoy port without shifting.
+					if _, exists := ports.stickyBaseFallback[listenerName]; !exists {
+						ports.stickyBaseFallback[listenerName] = port
+					}
 				}
 			}
 		}
 	}
 	return ports
+}
+
+func fallbackPublicPortSpec(gateway *ir.Gateway) *ir.PublicPortSpec {
+	spec := &ir.PublicPortSpec{
+		SpecListeners:         make([]ir.PublicPortListenerSpec, 0, len(gateway.Listeners)),
+		HasPersistedListeners: true,
+	}
+	for _, l := range gateway.Listeners {
+		wildcard := isWildcardHostname(l.Hostname)
+		exactPublic := l.Exposure != ir.ExposurePrivate && !wildcard && l.Hostname != ""
+		port := l.Port
+		if port == 0 && l.Exposure == ir.ExposurePrivate {
+			port = l.EnvoyPort
+		}
+		spec.SpecListeners = append(spec.SpecListeners, ir.PublicPortListenerSpec{
+			Name:        l.Name,
+			Exposure:    l.Exposure,
+			Wildcard:    wildcard,
+			ExactPublic: exactPublic,
+			Port:        port,
+		})
+	}
+	var holds []int32
+	for _, d := range gateway.Domains {
+		if d.BlockReason == ir.BlockReasonRevocation && d.EnvoyPort > 0 {
+			holds = append(holds, d.EnvoyPort)
+		}
+	}
+	if len(holds) > 0 {
+		slices.Sort(holds)
+		spec.HoldReservedPorts = slices.Compact(holds)
+	}
+	return spec
+}
+
+// CanReconstructPublicPorts reports whether re-translating gateway against
+// projected CloudflareTunnel.Status.Listeners reproduces the exact EnvoyPort
+// for every live (!ShadowOnly) Public ProtectionDomain without shifting ports.
+func CanReconstructPublicPorts(gateway *ir.Gateway, projected []v1alpha1.CloudflareTunnelListenerStatus) bool {
+	if gateway == nil || gateway.ConformanceMode || len(gateway.Domains) == 0 {
+		return true
+	}
+	spec := gateway.PublicPortSpec
+	if spec == nil {
+		spec = fallbackPublicPortSpec(gateway)
+	}
+	ports := newPublicEnvoyPortsFromProjected(spec, gateway.ConformanceMode, projected)
+
+	if len(spec.Allocations) > 0 {
+		basePorts := make(map[string]int32, len(spec.SpecListeners))
+		for _, alloc := range spec.Allocations {
+			var got int32
+			switch alloc.Op {
+			case ir.PublicPortAllocBase:
+				got = ports.takeBase(alloc.ListenerName)
+				basePorts[alloc.ListenerName] = got
+			case ir.PublicPortAllocExactPublicCarveOut:
+				got = ports.takeExactPublicCarveOut(alloc.ListenerName, alloc.DomainName, basePorts[alloc.ListenerName])
+			case ir.PublicPortAllocDomain:
+				got = ports.takeDomain(alloc.ListenerName, alloc.DomainName)
+			default:
+				return false
+			}
+			if alloc.MustMatch && got != alloc.WantPort {
+				return false
+			}
+		}
+		return true
+	}
+
+	holdReserved := make(map[int32]struct{}, len(spec.HoldReservedPorts))
+	for _, p := range spec.HoldReservedPorts {
+		holdReserved[p] = struct{}{}
+	}
+	basePorts := make(map[string]int32, len(spec.SpecListeners))
+	exactPublic := make(map[string]bool, len(spec.SpecListeners))
+	privateListeners := make(map[string]bool, len(spec.SpecListeners))
+	for _, l := range spec.SpecListeners {
+		if l.Exposure == ir.ExposurePrivate {
+			privateListeners[l.Name] = true
+			continue
+		}
+		exactPublic[l.Name] = l.ExactPublic
+		basePorts[l.Name] = ports.takeBase(l.Name)
+	}
+	for _, l := range gateway.Listeners {
+		if l.Exposure == ir.ExposurePrivate {
+			privateListeners[l.Name] = true
+		}
+	}
+
+	type domainKey struct {
+		listener string
+		name     string
+	}
+	seen := make(map[domainKey]struct{}, len(gateway.Domains))
+	for _, d := range gateway.Domains {
+		if d.ShadowOnly || d.Exposure == ir.ExposurePrivate || privateListeners[d.ListenerName] {
+			continue
+		}
+		key := domainKey{listener: d.ListenerName, name: d.Name}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, held := holdReserved[d.EnvoyPort]; d.BlockReason == ir.BlockReasonRevocation && held {
+			continue
+		}
+		if d.Name == d.ListenerName {
+			allocated, ok := basePorts[d.ListenerName]
+			if !ok || allocated != d.EnvoyPort {
+				return false
+			}
+			continue
+		}
+		if exactPublic[d.ListenerName] &&
+			(d.Name == d.ListenerName+"-public" || d.Name == d.ListenerName+"-public-"+disambiguateListenerHash(d.ListenerName)) {
+			if port, ok := ports.claimStickyDomain(d.ListenerName, d.Name); ok {
+				if port != d.EnvoyPort {
+					return false
+				}
+				continue
+			}
+			if basePort := basePorts[d.ListenerName]; basePort > 0 {
+				if basePort != d.EnvoyPort {
+					return false
+				}
+				continue
+			}
+			if ports.takeFresh(d.ListenerName, d.Name) != d.EnvoyPort {
+				return false
+			}
+			continue
+		}
+		if ports.takeDomain(d.ListenerName, d.Name) != d.EnvoyPort {
+			return false
+		}
+	}
+	return true
+}
+
+func (ports *publicEnvoyPorts) legacyCarveOut(in Inputs, listenerName, hostname string) (string, int32, bool) {
+	if ports == nil || in.CloudflareTunnel == nil || in.CloudflareTunnel.Status.DeletedAt != nil {
+		return "", 0, false
+	}
+	plainPD := listenerName + "-public"
+	disambigPD := plainPD + "-" + disambiguateListenerHash(listenerName)
+	matchedPD := ""
+	for _, hs := range in.CloudflareTunnel.Status.Hostnames {
+		if !strings.EqualFold(hs.Hostname, hostname) || hs.AccessApplication != "" || hs.Guard != v1alpha1.HostnameGuardUnprotected {
+			continue
+		}
+		if hs.ProtectionDomain == plainPD || hs.ProtectionDomain == disambigPD {
+			matchedPD = hs.ProtectionDomain
+			break
+		}
+	}
+	if matchedPD == "" {
+		return "", 0, false
+	}
+	var port int32
+	for _, key := range []string{
+		listenerName + "\x00" + matchedPD,
+		listenerName + "\x00" + plainPD,
+		listenerName + "\x00" + disambigPD,
+	} {
+		if p, ok := ports.legacyCarveOutPort[key]; ok {
+			port = p
+			break
+		}
+	}
+	if port == 0 {
+		if p, ok := ports.stickyBase[listenerName]; ok {
+			port = p
+		}
+	}
+	if port < publicPortMin || port > publicPortMax {
+		return "", 0, false
+	}
+	if _, blocked := ports.reserved[port]; blocked {
+		return "", 0, false
+	}
+	return matchedPD, port, true
 }
 
 func disambiguateListenerHash(listenerName string) string {
@@ -474,30 +762,71 @@ func (ports *publicEnvoyPorts) isBlocked(port int32) bool {
 	return pc
 }
 
+func (ports *publicEnvoyPorts) claimUnused(port int32) bool {
+	if _, r := ports.reserved[port]; r {
+		return false
+	}
+	if _, u := ports.used[port]; u {
+		return false
+	}
+	ports.used[port] = struct{}{}
+	return true
+}
+
 func (ports *publicEnvoyPorts) takeBase(listenerName string) int32 {
-	if port, ok := ports.stickyBase[listenerName]; ok {
-		if _, r := ports.reserved[port]; !r {
-			if _, u := ports.used[port]; !u {
-				ports.used[port] = struct{}{}
-				return port
-			}
+	var port int32
+	switch {
+	case ports.hasStickyBase(listenerName):
+		port = ports.stickyBase[listenerName]
+	case ports.hasStickyBaseFallback(listenerName):
+		port = ports.stickyBaseFallback[listenerName]
+	default:
+		port = ports.takeFresh(listenerName, listenerName)
+	}
+	ports.record(ir.PublicPortAllocBase, listenerName, listenerName, port, false)
+	return port
+}
+
+func (ports *publicEnvoyPorts) hasStickyBase(listenerName string) bool {
+	port, ok := ports.stickyBase[listenerName]
+	return ok && ports.claimUnused(port)
+}
+
+func (ports *publicEnvoyPorts) hasStickyBaseFallback(listenerName string) bool {
+	port, ok := ports.stickyBaseFallback[listenerName]
+	return ok && ports.claimUnused(port)
+}
+
+func (ports *publicEnvoyPorts) claimStickyDomain(listenerName, domainName string) (int32, bool) {
+	for _, candidate := range []string{domainName, domainName + "-" + disambiguateListenerHash(listenerName)} {
+		if port, ok := ports.stickyDomain[listenerName+"\x00"+candidate]; ok && ports.claimUnused(port) {
+			return port, true
 		}
 	}
-	return ports.takeFresh(listenerName, listenerName)
+	return 0, false
+}
+
+func (ports *publicEnvoyPorts) takeExactPublicCarveOut(listenerName, domainName string, fallbackBasePort int32) int32 {
+	var port int32
+	switch sticky, ok := ports.claimStickyDomain(listenerName, domainName); {
+	case ok:
+		port = sticky
+	case fallbackBasePort > 0:
+		port = fallbackBasePort
+	default:
+		port = ports.takeFresh(listenerName, domainName)
+	}
+	ports.record(ir.PublicPortAllocExactPublicCarveOut, listenerName, domainName, port, false)
+	return port
 }
 
 func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32 {
-	for _, candidate := range []string{domainName, domainName + "-" + disambiguateListenerHash(listenerName)} {
-		if port, ok := ports.stickyDomain[listenerName+"\x00"+candidate]; ok {
-			if _, r := ports.reserved[port]; !r {
-				if _, u := ports.used[port]; !u {
-					ports.used[port] = struct{}{}
-					return port
-				}
-			}
-		}
+	port, ok := ports.claimStickyDomain(listenerName, domainName)
+	if !ok {
+		port = ports.takeFresh(listenerName, domainName)
 	}
-	return ports.takeFresh(listenerName, domainName)
+	ports.record(ir.PublicPortAllocDomain, listenerName, domainName, port, false)
+	return port
 }
 
 func (ports *publicEnvoyPorts) takeFresh(listenerName, domainName string) int32 {
@@ -511,8 +840,7 @@ func (ports *publicEnvoyPorts) takeFresh(listenerName, domainName string) int32 
 			}
 		}
 	}
-	sum := sha256.Sum256([]byte(listenerName + "\x00" + domainName))
-	offset := int32(binary.BigEndian.Uint32(sum[:4]) % uint32(publicHashRange))
+	offset := PublicDomainHashPort(listenerName, domainName) - publicPortMin
 	span := publicPortMax - publicPortMin + 1
 	for i := int32(0); i < span; i++ {
 		port := publicPortMin + ((offset + i) % span)
