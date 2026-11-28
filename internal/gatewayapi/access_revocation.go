@@ -816,7 +816,7 @@ func (ports *publicEnvoyPorts) takeExactPublicCarveOut(listenerName, domainName 
 	default:
 		port = ports.takeFresh(listenerName, domainName)
 	}
-	ports.record(ir.PublicPortAllocExactPublicCarveOut, listenerName, domainName, port, true)
+	ports.record(ir.PublicPortAllocExactPublicCarveOut, listenerName, domainName, port, false)
 	return port
 }
 
@@ -825,7 +825,7 @@ func (ports *publicEnvoyPorts) takeDomain(listenerName, domainName string) int32
 	if !ok {
 		port = ports.takeFresh(listenerName, domainName)
 	}
-	ports.record(ir.PublicPortAllocDomain, listenerName, domainName, port, true)
+	ports.record(ir.PublicPortAllocDomain, listenerName, domainName, port, false)
 	return port
 }
 

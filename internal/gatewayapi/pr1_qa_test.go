@@ -1335,3 +1335,121 @@ func TestCanReconstructPublicPortsUsesRawNameBeforeDisambiguation(t *testing.T) 
 		t.Fatalf("PublicPortSpec altered translator.Build snapshot")
 	}
 }
+
+func TestCanReconstructPublicPortsIgnoresHeldRemovedCarveOut(t *testing.T) {
+	in := accessInputs(true)
+	in.CloudflareAccount.Spec.Grants[0].Hostnames = []string{"*.example.com"}
+	in.CloudflareAccount.Spec.Grants[0].UnprotectedHostnames = []string{"*.example.com"}
+	in.Gateway.Spec.Listeners = []gatewayv1.Listener{
+		{Name: "web", Hostname: new(gatewayv1.Hostname("*.example.com")), Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+	}
+	in.HTTPRoutes = []gatewayv1.HTTPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-s010", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(1, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"s010.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					namedRouteRule("admin", "/admin", "backend"),
+					namedRouteRule("health", "/health", "backend"),
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-other", Namespace: "default", Generation: 1, CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway"}}},
+				Hostnames:       []gatewayv1.Hostname{"other.example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					namedRouteRule("admin", "/admin", "backend"),
+					namedRouteRule("health", "/health", "backend"),
+				},
+			},
+		},
+	}
+	appLive := accessApplication("app-live", "HTTPRoute", "route-s010", "admin")
+	appLive.Spec.TargetRefs = append(appLive.Spec.TargetRefs, gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+		LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Group: gatewayv1.GroupName, Kind: "HTTPRoute", Name: "route-other"},
+		SectionName:                new(gatewayv1.SectionName("admin")),
+	})
+	now := metav1.Now()
+	appRevoked := accessApplication("app-revoked", "HTTPRoute", "route-s010", "admin")
+	appRevoked.DeletionTimestamp = &now
+	appRevoked.Finalizers = []string{v1alpha1.AccessApplicationFinalizer}
+	appRevoked.Status.DataPlanes = []v1alpha1.AccessApplicationDataPlaneStatus{{
+		Tunnel: "gateway", Listener: "web", ProtectionDomain: "web-access-default-app-revoked", EnvoyPort: 19081,
+	}}
+	appRevoked.Status.Destinations = []v1alpha1.AccessApplicationDestinationStatus{{
+		Type: v1alpha1.AccessApplicationDestinationPublic, Hostname: "s010.example.com",
+	}}
+	in.AccessApplications = []v1alpha1.AccessApplication{appLive, appRevoked}
+	in.AUDSecrets = map[types.NamespacedName]AUDSecret{{Namespace: "default", Name: "app-live"}: {AUD: "aud-live", ApplicationID: "id-live", Ready: true}}
+
+	heldPDName := "web-public-" + accessHostSuffix("public", "s010.example.com")
+	otherPDName := "web-public-" + accessHostSuffix("public", "other.example.com")
+	in.CloudflareTunnel.Status.Hostnames = []v1alpha1.CloudflareTunnelHostnameStatus{{
+		Hostname: "s010.example.com", ProtectionDomain: "web-access-default-app-revoked", AccessApplication: "default/app-revoked", Guard: v1alpha1.HostnameGuardForwarding, AppliedVersion: 1,
+	}}
+	in.CloudflareTunnel.Status.Listeners = []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name:     "web",
+		Exposure: v1alpha1.ExposurePublic,
+		ProtectionDomains: []v1alpha1.CloudflareProtectionDomainStatus{
+			{Name: heldPDName, EnvoyPort: 19080},
+			{Name: "web-access-default-app-revoked", EnvoyPort: 19081, Protected: true},
+		},
+	}}
+
+	gw, _ := Translate(in)
+	for _, d := range gw.Domains {
+		if d.Name == heldPDName {
+			t.Fatalf("expected holds.apply to remove %q from gw.Domains", heldPDName)
+		}
+	}
+	sawHeldAlloc := false
+	for _, alloc := range gw.PublicPortSpec.Allocations {
+		if alloc.DomainName == heldPDName {
+			sawHeldAlloc = true
+			if alloc.MustMatch {
+				t.Fatalf("expected removed carve-out %q allocation to have MustMatch=false, got true", heldPDName)
+			}
+		}
+	}
+	if !sawHeldAlloc {
+		t.Fatalf("expected allocation journal entry for removed carve-out %q", heldPDName)
+	}
+
+	buildProjected := func(omit string) []v1alpha1.CloudflareTunnelListenerStatus {
+		var pds []v1alpha1.CloudflareProtectionDomainStatus
+		for _, d := range gw.Domains {
+			if d.ListenerName == "web" && d.Name != omit {
+				pds = append(pds, v1alpha1.CloudflareProtectionDomainStatus{Name: d.Name, EnvoyPort: d.EnvoyPort, Protected: d.Protected})
+			}
+		}
+		return []v1alpha1.CloudflareTunnelListenerStatus{{
+			Name: "web", Exposure: v1alpha1.ExposurePublic, ProtectionDomains: pds,
+		}}
+	}
+
+	if !CanReconstructPublicPorts(gw, buildProjected("")) {
+		t.Fatalf("expected CanReconstructPublicPorts to succeed when held-removed %q is absent from projected status", heldPDName)
+	}
+
+	// If heldPDName collided with otherPDName's hash port in Status.Listeners, omitting otherPDName
+	// alongside heldPDName shifts surviving otherPDName and must fail CanReconstructPublicPorts.
+	otherHashPort := PublicDomainHashPort("web", otherPDName)
+	inCollide := in
+	inCollide.CloudflareTunnel = in.CloudflareTunnel.DeepCopy()
+	inCollide.CloudflareTunnel.Status.Listeners[0].ProtectionDomains[0].EnvoyPort = otherHashPort
+	gwCollide, _ := Translate(inCollide)
+	var pdsCollide []v1alpha1.CloudflareProtectionDomainStatus
+	for _, d := range gwCollide.Domains {
+		if d.ListenerName == "web" && d.Name != otherPDName {
+			pdsCollide = append(pdsCollide, v1alpha1.CloudflareProtectionDomainStatus{Name: d.Name, EnvoyPort: d.EnvoyPort, Protected: d.Protected})
+		}
+	}
+	if CanReconstructPublicPorts(gwCollide, []v1alpha1.CloudflareTunnelListenerStatus{{
+		Name: "web", Exposure: v1alpha1.ExposurePublic, ProtectionDomains: pdsCollide,
+	}}) {
+		t.Fatalf("expected CanReconstructPublicPorts to reject when absent held %q shifts surviving %q", heldPDName, otherPDName)
+	}
+}

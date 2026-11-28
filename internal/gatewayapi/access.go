@@ -566,18 +566,33 @@ func applyAccessApplications(in Inputs, gateway *ir.Gateway, listeners []*listen
 		statuses.AccessApplications[key] = compiled
 	}
 	if gateway.PublicPortSpec != nil && len(gateway.PublicPortSpec.Allocations) > 0 {
-		liveBaseListeners := make(map[string]struct{}, len(gateway.Listeners))
-		for _, domain := range gateway.Domains {
-			if !domain.ShadowOnly && domain.Name == domain.ListenerName {
-				liveBaseListeners[domain.ListenerName] = struct{}{}
+		privateListeners := make(map[string]bool, len(gateway.Listeners))
+		for _, listener := range gateway.Listeners {
+			if listener.Exposure == ir.ExposurePrivate {
+				privateListeners[listener.Name] = true
 			}
+		}
+		type survivedKey struct {
+			listener string
+			name     string
+			port     int32
+		}
+		survived := make(map[survivedKey]struct{}, len(gateway.Domains))
+		for _, domain := range gateway.Domains {
+			if domain.ShadowOnly || domain.Exposure == ir.ExposurePrivate || privateListeners[domain.ListenerName] {
+				continue
+			}
+			survived[survivedKey{listener: domain.ListenerName, name: domain.Name, port: domain.EnvoyPort}] = struct{}{}
 		}
 		for i := range gateway.PublicPortSpec.Allocations {
 			alloc := &gateway.PublicPortSpec.Allocations[i]
-			if alloc.Op == ir.PublicPortAllocBase {
-				if _, liveBase := liveBaseListeners[alloc.ListenerName]; liveBase {
-					alloc.MustMatch = true
-				}
+			if _, ok := survived[survivedKey{listener: alloc.ListenerName, name: alloc.DomainName, port: alloc.WantPort}]; ok {
+				alloc.MustMatch = true
+				continue
+			}
+			disambig := alloc.DomainName + "-" + disambiguateListenerHash(alloc.ListenerName)
+			if _, ok := survived[survivedKey{listener: alloc.ListenerName, name: disambig, port: alloc.WantPort}]; ok {
+				alloc.MustMatch = true
 			}
 		}
 	}
