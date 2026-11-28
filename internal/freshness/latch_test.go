@@ -434,3 +434,84 @@ func TestLatchRemoveIfUntouchedPreservesUnseenPostBeginUIDGuard(t *testing.T) {
 		t.Fatalf("activeGuards not empty after EndLifetime: len=%d", len(latch.activeGuards))
 	}
 }
+
+func TestLatchRemoveForUIDAtEpoch(t *testing.T) {
+	latch := NewLatch()
+	key := types.NamespacedName{Namespace: "tenant", Name: "edge"}
+	const uid1 = types.UID("uid-1")
+	const uid2 = types.UID("uid-2")
+
+	var nilLatch *Latch
+	if epoch, ok := nilLatch.ForgetAndInvalidateIfUnretiredWithEpoch(LifetimeToken{}, "demoted"); ok || epoch != 0 {
+		t.Fatalf("nil ForgetAndInvalidateIfUnretiredWithEpoch = (%d, %v), want (0, false)", epoch, ok)
+	}
+	if nilLatch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, uid1, 1) {
+		t.Fatal("nil RemoveForUIDAtEpoch returned true")
+	}
+
+	tokUID1 := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	defer latch.EndLifetime(tokUID1)
+	epoch1, ok := latch.ForgetAndInvalidateIfUnretiredWithEpoch(tokUID1, "demoted")
+	if !ok || epoch1 == 0 {
+		t.Fatalf("ForgetAndInvalidateIfUnretiredWithEpoch = (%d, %v), want non-zero true", epoch1, ok)
+	}
+
+	// Seed uid2 so we verify uid1 removal never affects uid2.
+	tokUID2 := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2)
+	defer latch.EndLifetime(tokUID2)
+	epoch2, ok := latch.ForgetAndInvalidateIfUnretiredWithEpoch(tokUID2, "uid2-demoted")
+	if !ok || epoch2 <= epoch1 {
+		t.Fatalf("UID2 ForgetAndInvalidateIfUnretiredWithEpoch = (%d, %v), want > %d true", epoch2, ok, epoch1)
+	}
+
+	// Mismatched / zero / stale epoch returns false and preserves state.
+	if latch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, uid1, 0) {
+		t.Fatal("RemoveForUIDAtEpoch accepted zero epoch")
+	}
+	if latch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, "", epoch1) {
+		t.Fatal("RemoveForUIDAtEpoch accepted empty UID")
+	}
+	if latch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, uid1, epoch1+1) {
+		t.Fatal("RemoveForUIDAtEpoch succeeded with mismatched epoch")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) || latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid1) != epoch1 {
+		t.Fatal("failed RemoveForUIDAtEpoch altered uid1 state")
+	}
+
+	// Advance uid1 to a newer epoch and confirm stale epoch1 no longer removes it.
+	latch.InvalidateForUID("CloudflareTunnelConfig", key, uid1, "newer-drift")
+	newerEpoch1 := latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid1)
+	if latch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, uid1, epoch1) {
+		t.Fatal("RemoveForUIDAtEpoch removed uid1 using stale epoch")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) || latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid1) != newerEpoch1 {
+		t.Fatal("stale RemoveForUIDAtEpoch disturbed newer uid1 epoch")
+	}
+
+	// Exact epoch deletes uid1 state and retires active uid1 guards while leaving uid2 untouched.
+	tokUID1Sibling := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid1)
+	defer latch.EndLifetime(tokUID1Sibling)
+	if !latch.RemoveForUIDAtEpoch("CloudflareTunnelConfig", key, uid1, newerEpoch1) {
+		t.Fatal("RemoveForUIDAtEpoch failed on exact epoch")
+	}
+	if latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid1) || latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid1) != 0 {
+		t.Fatal("RemoveForUIDAtEpoch did not purge uid1 state")
+	}
+	if latch.ForgetAndInvalidateIfUnretired(tokUID1Sibling, "late") {
+		t.Fatal("RemoveForUIDAtEpoch did not retire active uid1 guard")
+	}
+	if !latch.IsInvalidatedForUID("CloudflareTunnelConfig", key, uid2) || latch.InvalidationEpochForUID("CloudflareTunnelConfig", key, uid2) != epoch2 {
+		t.Fatal("RemoveForUIDAtEpoch disturbed uid2 state")
+	}
+	tokUID2Check := latch.BeginLifetimeForUID("CloudflareTunnelConfig", key, uid2)
+	if !latch.ForgetAndInvalidateIfUnretired(tokUID2Check, "uid2-still-live") {
+		t.Fatal("RemoveForUIDAtEpoch retired uid2 guard")
+	}
+	latch.EndLifetime(tokUID2Check)
+	latch.EndLifetime(tokUID1)
+	latch.EndLifetime(tokUID1Sibling)
+	latch.EndLifetime(tokUID2)
+	if len(latch.activeGuards) != 0 {
+		t.Fatalf("activeGuards not empty after EndLifetime: len=%d", len(latch.activeGuards))
+	}
+}

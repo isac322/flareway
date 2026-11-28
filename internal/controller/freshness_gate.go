@@ -268,7 +268,20 @@ func forgetGateForLiveTunnelUID(
 	if live.UID != expectedUID {
 		return
 	}
-	latch.ForgetAndInvalidateIfUnretired(tok, "demoted")
+	writtenEpoch, applied := latch.ForgetAndInvalidateIfUnretiredWithEpoch(tok, "demoted")
+	if !applied {
+		return
+	}
+	var recheck v1alpha1.CloudflareTunnel
+	recheckErr := reader.Get(ctx, tok.Key(), &recheck)
+	if apierrors.IsNotFound(recheckErr) {
+		latch.RemoveForUIDAtEpoch(tok.Kind(), tok.Key(), expectedUID, writtenEpoch)
+		_, _ = retireTunnelIfConfirmedAbsent(ctx, reader, latch, tok.Key(), recheckErr)
+		return
+	}
+	if recheckErr == nil && recheck.UID != expectedUID {
+		latch.RemoveForUIDAtEpoch(tok.Kind(), tok.Key(), expectedUID, writtenEpoch)
+	}
 }
 
 // statusConverged reports whether the object's live status is converged on the

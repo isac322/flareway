@@ -74,6 +74,11 @@ type LifetimeToken struct {
 	knownUIDs map[types.UID]struct{}
 }
 
+// Kind returns the resource kind guarded by this LifetimeToken.
+func (t LifetimeToken) Kind() string {
+	return t.kind
+}
+
 // Key returns the NamespacedName guarded by this LifetimeToken.
 func (t LifetimeToken) Key() types.NamespacedName {
 	return t.key
@@ -552,13 +557,19 @@ func (l *Latch) PruneOtherUIDsIfUntouched(tok PruneToken, liveUID types.UID) boo
 
 // ForgetAndInvalidateIfUnretired atomically forgets verified/baseline state and
 // marks the token's exact key (including its UID when UID-scoped) invalidated
-// only if tok is still active and has not been retired. Sibling guards on the
-// same key and any active name-scoped guards (when UID-scoped) are marked
-// touched so concurrent absence checks or prunes do not drop this update.
-// Reports whether the update applied.
+// only if tok is still active and has not been retired. Reports whether the
+// update applied.
 func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string) bool {
+	_, ok := l.ForgetAndInvalidateIfUnretiredWithEpoch(tok, reason)
+	return ok
+}
+
+// ForgetAndInvalidateIfUnretiredWithEpoch behaves like
+// ForgetAndInvalidateIfUnretired and also returns the newly written invalidation
+// epoch on success (or 0, false when tok is inactive or retired).
+func (l *Latch) ForgetAndInvalidateIfUnretiredWithEpoch(tok LifetimeToken, reason string) (uint64, bool) {
 	if l == nil || tok.id == 0 {
-		return false
+		return 0, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -566,7 +577,7 @@ func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string)
 	guards := l.activeGuards[k]
 	st, ok := guards[tok.id]
 	if !ok || st.retired {
-		return false
+		return 0, false
 	}
 	if l.epochs == nil {
 		l.epochs = make(map[latchKey]uint64)
@@ -575,7 +586,8 @@ func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string)
 		l.reasons = make(map[latchKey]string)
 	}
 	l.nextEpoch++
-	l.epochs[k] = l.nextEpoch
+	epoch := l.nextEpoch
+	l.epochs[k] = epoch
 	l.reasons[k] = reason
 	delete(l.verified, k)
 	delete(l.baselines, k)
@@ -591,14 +603,37 @@ func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string)
 			other.touched = true
 		}
 	}
+	return epoch, true
+}
+
+// RemoveForUIDAtEpoch drops all records and retires active guards exclusively
+// for (kind, key, uid) iff its stored epoch still equals expectedEpoch. A newer
+// epoch or any other UID (including empty uid) is never touched.
+func (l *Latch) RemoveForUIDAtEpoch(kind string, key types.NamespacedName, uid types.UID, expectedEpoch uint64) bool {
+	if l == nil || uid == "" || expectedEpoch == 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid}
+	if l.epochs[k] != expectedEpoch {
+		return false
+	}
+	l.purgeMatchingLocked(kind, key.Namespace, key.Name, func(u types.UID) bool {
+		return u == uid
+	}, func(latchKey, uint64) bool {
+		return true
+	})
 	return true
 }
 
 // RemoveIfUntouched drops records only if tok is still active and untouched.
 // For name-scoped tokens (uid == ""), it deletes all name- and UID-scoped
-// entries for (kind, key) and retires every other guard across all UID variants.
-// For UID-scoped tokens, it deletes only tok's UID entry and retires sibling
-// guards on that UID. Reports whether removal applied.
+// entries for (kind, key), retires name-scoped sibling guards, and retires
+// UID-scoped guards that either pre-date BeginLifetime (gid < tok.id) or
+// belong to tok.knownUIDs, while preserving unseen post-BeginLifetime
+// replacement-UID guards. For UID-scoped tokens, it deletes only tok's UID
+// entry and retires sibling guards on that UID. Reports whether removal applied.
 func (l *Latch) RemoveIfUntouched(tok LifetimeToken) bool {
 	if l == nil || tok.id == 0 {
 		return false

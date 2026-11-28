@@ -4467,6 +4467,7 @@ type failingStatusClient struct {
 	staleGateway        *gatewayv1.Gateway
 	onStatusPatch       func(obj client.Object)
 	onAfterStatusApply  func(err error)
+	onBeforeTunnelGet   func(key client.ObjectKey)
 	onAfterTunnelGet    func(key client.ObjectKey, tunnel *v1alpha1.CloudflareTunnel, err error)
 	onList              func(list client.ObjectList)
 }
@@ -4490,6 +4491,9 @@ func (c *failingStatusClient) Get(ctx context.Context, key client.ObjectKey, obj
 		if c.staleTunnel != nil && client.ObjectKeyFromObject(c.staleTunnel) == key {
 			*target = *c.staleTunnel.DeepCopy()
 			return nil
+		}
+		if c.onBeforeTunnelGet != nil {
+			c.onBeforeTunnelGet(key)
 		}
 	case *v1alpha1.AccessApplication:
 		if c.staleApp != nil && client.ObjectKeyFromObject(c.staleApp) == key {
@@ -7586,4 +7590,197 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 	if decision.Open {
 		t.Fatalf("expected UID2 config gate to stay closed after transient demote failure, got %+v", decision.Gate)
 	}
+}
+
+// Regression test: live UID1 with empty latch -> Tunnel Reconcile gets cached
+// NotFound (registers BeginLifetime tok, pauses BEFORE uncached Get) ->
+// Gateway demoteTunnelConfigApplied registers BeginLifetimeForUID(UID1) (gid > tok.id),
+// hits transient Apply failure, reads live UID1 inside forgetGateForLiveTunnelUID,
+// and pauses BEFORE ForgetAndInvalidateIfUnretired -> UID1 is deleted -> Tunnel's
+// uncached Get sees NotFound and runs RemoveIfUntouched -> Gateway resumes:
+// (1) when UID1 stays absent, post-write recheck clears UID1 at writtenEpoch so
+//     neither CloudflareTunnelConfig(UID1) nor CloudflareTunnel has a stale latch;
+// (2) when replacement UID2 exists with an active/invalidated demotion guard,
+//     post-write recheck cleans UID1 ONLY and preserves UID2's state & guard.
+func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.T) {
+	runVariant := func(t *testing.T, suffix string, recreateUID2 bool) {
+		t.Helper()
+		f := setupDemoteEnvtest(t, suffix)
+		ctx := context.Background()
+		tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+		uid1 := f.tunnel.UID
+
+		// Start with empty latch on live UID1.
+		f.latch.Remove(configFreshnessKind, tunnelKey)
+		f.latch.Remove("CloudflareTunnel", tunnelKey)
+
+		// 1. Tunnel Reconcile with cached NotFound registers BeginLifetime and
+		// pauses BEFORE its uncached Get hits etcd.
+		tunnelBeforeGet := make(chan struct{})
+		releaseTunnelGet := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-releaseTunnelGet:
+			default:
+				close(releaseTunnelGet)
+			}
+		})
+		var tunnelGetPaused atomic.Bool
+		tunnelAPIReader := &failingStatusClient{
+			Client: f.direct,
+			onBeforeTunnelGet: func(key client.ObjectKey) {
+				if key == tunnelKey && !tunnelGetPaused.Swap(true) {
+					close(tunnelBeforeGet)
+					<-releaseTunnelGet
+				}
+			},
+		}
+		staleClient := &failingStatusClient{Client: f.direct, staleNotFoundTunnel: &tunnelKey}
+		tunnelReconciler := &CloudflareTunnelReconciler{
+			Client:              staleClient,
+			APIReader:           tunnelAPIReader,
+			Scheme:              f.tunnelReconciler.Scheme,
+			NewCloudflareClient: f.tunnelReconciler.NewCloudflareClient,
+			Freshness:           f.tunnelReconciler.Freshness,
+			Invalidator:         f.latch,
+		}
+		tunnelDone := make(chan error, 1)
+		go func() {
+			_, err := tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+			tunnelDone <- err
+		}()
+		<-tunnelBeforeGet
+
+		// 2. Gateway demoteTunnelConfigApplied registers BeginLifetimeForUID(UID1)
+		// (gid > tok.id), hits transient Apply error, reads live UID1 in
+		// forgetGateForLiveTunnelUID, and pauses BEFORE ForgetAndInvalidateIfUnretired.
+		var applyFailed atomic.Bool
+		f.statusClient.failStatusKind = "CloudflareTunnel"
+		f.statusClient.failStatusWrite.Store(true)
+		f.statusClient.onAfterStatusApply = func(err error) {
+			if err != nil {
+				applyFailed.Store(true)
+			}
+		}
+		gwReadUID1 := make(chan struct{})
+		releaseGWAfterGet := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-releaseGWAfterGet:
+			default:
+				close(releaseGWAfterGet)
+			}
+		})
+		var gwPaused atomic.Bool
+		f.faultReader.onAfterTunnelGet = func(key client.ObjectKey, got *v1alpha1.CloudflareTunnel, err error) {
+			if key == tunnelKey && err == nil && got.UID == uid1 && applyFailed.Load() && !gwPaused.Swap(true) {
+				close(gwReadUID1)
+				<-releaseGWAfterGet
+			}
+		}
+		gwDone := make(chan error, 1)
+		go func() {
+			gwDone <- f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &f.tunnel, time.Now(), "Applying", "applying")
+		}()
+		<-gwReadUID1
+
+		// 3. Delete UID1 cleanly from etcd.
+		var cur v1alpha1.CloudflareTunnel
+		if err := f.direct.Get(ctx, tunnelKey, &cur); err != nil {
+			t.Fatal(err)
+		}
+		cur.Finalizers = nil
+		if err := f.direct.Update(ctx, &cur); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.direct.Delete(ctx, &cur); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+		if f.tunnel.Status.ConnectorTokenSecretRef != nil {
+			if err := f.direct.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Namespace: tunnelKey.Namespace,
+				Name:      f.tunnel.Status.ConnectorTokenSecretRef.Name,
+			}}); err != nil && !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+		}
+		waitUntilTrue(t, 10*time.Second, "UID1 deleted in race window", func() (bool, error) {
+			var check v1alpha1.CloudflareTunnel
+			return apierrors.IsNotFound(f.direct.Get(ctx, tunnelKey, &check)), nil
+		})
+
+		// 4. Release Tunnel Reconcile: reads NotFound, runs RemoveIfUntouched(tok).
+		close(releaseTunnelGet)
+		if err := <-tunnelDone; err != nil {
+			t.Fatalf("tunnel Reconcile after NotFound: %v", err)
+		}
+
+		var uid2UID types.UID
+		var uid2Epoch uint64
+		var uid2Guard freshness.LifetimeToken
+		if recreateUID2 {
+			uid2Spec := f.tunnel.Spec.DeepCopy()
+			uid2Spec.Tunnel.Name = "uid2-remote-late-dead"
+			uid2 := &v1alpha1.CloudflareTunnel{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:       tunnelKey.Namespace,
+					Name:            tunnelKey.Name,
+					OwnerReferences: append([]metav1.OwnerReference(nil), f.tunnel.OwnerReferences...),
+				},
+				Spec: *uid2Spec,
+			}
+			if err := f.direct.Create(ctx, uid2); err != nil {
+				t.Fatal(err)
+			}
+			uid2UID = uid2.UID
+			f.latch.InvalidateForUID(configFreshnessKind, tunnelKey, uid2UID, "replacement-drift")
+			uid2Epoch = f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2UID)
+			uid2Guard = f.latch.BeginLifetimeForUID(configFreshnessKind, tunnelKey, uid2UID)
+			defer f.latch.EndLifetime(uid2Guard)
+		}
+
+		// 5. Resume Gateway demoteTunnelConfigApplied (runs ForgetAndInvalidateIfUnretired
+		// with stale UID1 read, then rechecks live API server).
+		close(releaseGWAfterGet)
+		if err := <-gwDone; err == nil {
+			t.Fatal("expected transient Apply error from demoteTunnelConfigApplied")
+		}
+
+		if f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid1) || f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid1) != 0 {
+			t.Fatalf("deleted UID1 left stale config latch: invalidated=%v epoch=%d",
+				f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid1),
+				f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid1))
+		}
+		if f.latch.IsInvalidated(configFreshnessKind, tunnelKey) {
+			t.Fatal("deleted UID1 left name-scoped CloudflareTunnelConfig invalidation")
+		}
+		if f.latch.IsInvalidated("CloudflareTunnel", tunnelKey) {
+			t.Fatal("deleted UID1 left CloudflareTunnel invalidation")
+		}
+
+		if recreateUID2 {
+			if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2UID) || f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2UID) != uid2Epoch {
+				t.Fatalf("late UID1 cleanup disturbed UID2 state: invalidated=%v epoch=%d want=%d",
+					f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2UID),
+					f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2UID),
+					uid2Epoch)
+			}
+			if !f.latch.ForgetAndInvalidateIfUnretired(uid2Guard, "uid2-demoted") {
+				t.Fatal("late UID1 cleanup retired in-flight UID2 guard")
+			}
+			f.latch.EndLifetime(uid2Guard)
+		} else {
+			var check v1alpha1.CloudflareTunnel
+			if err := f.direct.Get(ctx, tunnelKey, &check); !apierrors.IsNotFound(err) {
+				t.Fatalf("expected fresh API Get NotFound for deleted UID1, got %v", err)
+			}
+		}
+	}
+
+	t.Run("deleted_UID1_leaves_clean_absent_latch", func(t *testing.T) {
+		runVariant(t, "late-dead-del", false)
+	})
+	t.Run("replaced_UID2_cleans_UID1_and_preserves_UID2", func(t *testing.T) {
+		runVariant(t, "late-dead-uid2", true)
+	})
 }
