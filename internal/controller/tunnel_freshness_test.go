@@ -646,7 +646,7 @@ func TestGatewayPreGateDemotionsForgetOwnConfigGateButProtectForeignOwner(t *tes
 	tunnel := &v1alpha1.CloudflareTunnel{
 		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "apps", UID: "tunnel-uid", Generation: 1},
 		Spec: v1alpha1.CloudflareTunnelSpec{
-			AccountRef: corev1.LocalObjectReference{Name: "account"},
+			AccountRef:       corev1.LocalObjectReference{Name: "account"},
 			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
 			Configuration: v1alpha1.CloudflareTunnelConfiguration{
 				Mode: v1alpha1.CloudflareTunnelConfigurationModeGateway,

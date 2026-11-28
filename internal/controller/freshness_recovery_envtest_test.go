@@ -7648,9 +7648,12 @@ func TestAbsenceCheckPreservesInFlightReplacementDemotionGuardEnvtest(t *testing
 // and pauses BEFORE ForgetAndInvalidateIfUnretired -> UID1 is deleted -> Tunnel's
 // uncached Get sees NotFound and runs RemoveIfUntouched -> Gateway resumes:
 // (1) when UID1 stays absent, post-write recheck clears UID1 at writtenEpoch so
-//     neither CloudflareTunnelConfig(UID1) nor CloudflareTunnel has a stale latch;
+//
+//	neither CloudflareTunnelConfig(UID1) nor CloudflareTunnel has a stale latch;
+//
 // (2) when replacement UID2 exists with an active/invalidated demotion guard,
-//     post-write recheck cleans UID1 ONLY and preserves UID2's state & guard.
+//
+//	post-write recheck cleans UID1 ONLY and preserves UID2's state & guard.
 func TestDelayedAbsenceReadAndLateDeadUIDDoesNotRecreateLatchEnvtest(t *testing.T) {
 	runVariant := func(t *testing.T, suffix string, recreateUID2 bool, earlyExitBeforeGW bool) {
 		t.Helper()
@@ -9033,14 +9036,26 @@ func TestServiceTokenConvergeZoneAndSecretRefEditImmediateDeleteEnvtest(t *testi
 		}
 
 		accessFake := newFakeAccessResourceCloudflare()
+		otherFake := newFakeAccessResourceCloudflare()
+		apisByAccountID := map[string]*fakeAccessResourceCloudflare{
+			account.Spec.AccountID: accessFake,
+		}
+		if otherAccount != nil {
+			apisByAccountID[otherAccount.Spec.AccountID] = otherFake
+		}
 		apiReader := &failingStatusClient{Client: direct}
 		reconciler := &ServiceTokenReconciler{
-			Client:              direct,
-			APIReader:           apiReader,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: accessFake.Client,
-			Freshness:           freshness.DefaultPolicy(),
-			Invalidator:         freshness.NewLatch(),
+			Client:    direct,
+			APIReader: apiReader,
+			Scheme:    mgr.GetScheme(),
+			NewCloudflareClient: func(token, accountID string) (flarecloudflare.AccessAPI, error) {
+				if api, ok := apisByAccountID[accountID]; ok {
+					return api.Client(token, accountID)
+				}
+				return nil, fmt.Errorf("unexpected accountID %q", accountID)
+			},
+			Freshness:   freshness.DefaultPolicy(),
+			Invalidator: freshness.NewLatch(),
 		}
 		startManagerAndWait(t, mgr)
 		waitUntilTrue(t, 10*time.Second, "ServiceToken zone account accepted", func() (bool, error) {
@@ -9183,6 +9198,12 @@ func TestServiceTokenConvergeZoneAndSecretRefEditImmediateDeleteEnvtest(t *testi
 			if !origStillExists || remainingTokens != 1 {
 				t.Fatalf("expected original remote token in %q to be retained on fail-closed teardown, origStillExists=%v remaining=%d", wantZoneID, origStillExists, remainingTokens)
 			}
+			otherFake.mu.Lock()
+			otherCalls := otherFake.clientCalls
+			otherFake.mu.Unlock()
+			if otherCalls != 0 {
+				t.Fatalf("expected 0 provider calls on mismatched otherAccount, got %d", otherCalls)
+			}
 			if !journalPresent {
 				t.Fatal("expected journal Secret to be retained on fail-closed teardown")
 			}
@@ -9234,5 +9255,450 @@ func TestServiceTokenConvergeZoneAndSecretRefEditImmediateDeleteEnvtest(t *testi
 	})
 	t.Run("mismatched_accountRef_fails_closed", func(t *testing.T) {
 		runCase(t, "bad-acct", "z1.example.com", "z1", "z1.example.com", false, false, true)
+	})
+}
+
+type staleAccountGetClient struct {
+	client.Client
+	accountKey   client.ObjectKey
+	staleAccount *v1alpha1.CloudflareAccount
+}
+
+func (c *staleAccountGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if acct, ok := obj.(*v1alpha1.CloudflareAccount); ok && key == c.accountKey && c.staleAccount != nil {
+		*acct = *c.staleAccount.DeepCopy()
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// Regression test (Finding 1, P1): reconcileDelete MUST read and authorize the
+// CloudflareAccount against APIReader rather than a lagging watch-cached Client,
+// so revoking a zone grant before Delete fails closed with CleanupBlocked,
+// builds 0 provider clients, makes 0 provider calls, and retains the z1 token,
+// journal Secret, and both finalizers.
+func TestServiceTokenDeleteAuthorizesAgainstAPIReaderAccountNotStaleCacheEnvtest(t *testing.T) {
+	_, mgr, direct, _ := startPR2EnvtestManager(t)
+	ctx := context.Background()
+
+	const ns = "tenant-st-stale-cache"
+	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	allZones := []v1alpha1.CloudflareVerifiedZone{
+		{ID: "z1", Name: "z1.example.com"},
+		{ID: "z2", Name: "z2.example.com"},
+	}
+	account := &v1alpha1.CloudflareAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "acct-st-stale-cache"},
+		Spec: v1alpha1.CloudflareAccountSpec{
+			AccountID:   "0123456789abcdef0123456789abcdef",
+			Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+			Grants: []v1alpha1.CloudflareAccountGrant{{
+				NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+				Hostnames:         []string{"*"},
+				Zones:             []string{"*"},
+				Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+				PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+			}},
+		},
+	}
+	if err := direct.Create(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	markAccountReady(ctx, t, direct, account, allZones)
+	acctKey := client.ObjectKeyFromObject(account)
+
+	accessFake := newFakeAccessResourceCloudflare()
+	apiReader := &failingStatusClient{Client: direct}
+	var buildClients atomic.Int32
+	reconciler := &ServiceTokenReconciler{
+		Client:    direct,
+		APIReader: apiReader,
+		Scheme:    mgr.GetScheme(),
+		NewCloudflareClient: func(token, accountID string) (flarecloudflare.AccessAPI, error) {
+			buildClients.Add(1)
+			return accessFake.Client(token, accountID)
+		},
+		Freshness:   freshness.DefaultPolicy(),
+		Invalidator: freshness.NewLatch(),
+	}
+	startManagerAndWait(t, mgr)
+	waitUntilTrue(t, 10*time.Second, "stale-cache test account ready", func() (bool, error) {
+		var cur v1alpha1.CloudflareAccount
+		if err := direct.Get(ctx, acctKey, &cur); err != nil {
+			return false, nil
+		}
+		return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+	})
+
+	st := &v1alpha1.ServiceToken{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-stale-cache"},
+		Spec: v1alpha1.ServiceTokenSpec{
+			AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+			Zone:             "z1.example.com",
+			Name:             "st-stale-cache",
+			Enabled:          true,
+			Duration:         "8760h",
+			SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+			ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+			DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+		},
+	}
+	if err := direct.Create(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	stKey := client.ObjectKeyFromObject(st)
+
+	var bumped atomic.Bool
+	var bumpErr error
+	apiReader.onBeforeGet = func(key client.ObjectKey, obj client.Object) {
+		if _, ok := obj.(*v1alpha1.ServiceToken); !ok || key != stKey || bumped.Load() {
+			return
+		}
+		var latest v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &latest); err != nil || latest.Status.TokenID != "" {
+			return
+		}
+		var secrets corev1.SecretList
+		if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+			return
+		}
+		hasCommittedCreds, hasJournal := false, false
+		for i := range secrets.Items {
+			s := &secrets.Items[i]
+			if s.Name == "st-creds-v1" && len(s.Data) > 0 {
+				hasCommittedCreds = true
+			}
+			if strings.HasPrefix(s.Name, serviceTokenJournalPrefix) && len(s.Data[serviceTokenJournalKeyIssuedID]) > 0 {
+				hasJournal = true
+			}
+		}
+		if !hasCommittedCreds || !hasJournal || bumped.Swap(true) {
+			return
+		}
+		latest.Spec.SecretRef = corev1.LocalObjectReference{Name: "st-creds-v2"}
+		bumpErr = direct.Update(ctx, &latest)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+			t.Fatalf("converge pass %d: %v", i, err)
+		}
+		if bumped.Load() {
+			break
+		}
+	}
+	if bumpErr != nil || !bumped.Load() {
+		t.Fatalf("expected secretRef bump: bumped=%v err=%v", bumped.Load(), bumpErr)
+	}
+
+	var afterBump v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if afterBump.Status.TokenID == "" || afterBump.Status.ZoneID != "z1" || !afterBump.Status.OwnershipVerified {
+		t.Fatalf("unexpected checkpoint status: %+v", afterBump.Status)
+	}
+
+	// Capture stale granted CloudflareAccount BEFORE revoking z1 in the real API server.
+	var staleAcct v1alpha1.CloudflareAccount
+	if err := direct.Get(ctx, acctKey, &staleAcct); err != nil {
+		t.Fatal(err)
+	}
+	revokedAcct := staleAcct.DeepCopy()
+	revokedAcct.Spec.Grants[0].Zones = []string{"z2.example.com"}
+	if err := direct.Update(ctx, revokedAcct); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject lagging Client cache shim returning staleAcct (z1 allowed) while
+	// APIReader (direct) sees revokedAcct (z2 only).
+	reconciler.Client = &staleAccountGetClient{
+		Client:       direct,
+		accountKey:   acctKey,
+		staleAccount: staleAcct.DeepCopy(),
+	}
+	buildsBefore := buildClients.Load()
+	accessFake.mu.Lock()
+	clientCallsBefore := accessFake.clientCalls
+	accessFake.mu.Unlock()
+
+	if err := direct.Delete(ctx, &afterBump); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+		t.Fatal("expected Delete with revoked grant in APIReader to fail closed despite stale Client cache")
+	}
+	if buildClients.Load() != buildsBefore {
+		t.Fatalf("expected 0 provider clients built after grant revocation, got %d", buildClients.Load()-buildsBefore)
+	}
+	accessFake.mu.Lock()
+	clientCallsDelta := accessFake.clientCalls - clientCallsBefore
+	_, z1StillExists := accessFake.tokens[fakeServiceTokenKey(flarecloudflare.AccessScope{ZoneID: "z1"}, afterBump.Status.TokenID)]
+	accessFake.mu.Unlock()
+	if clientCallsDelta != 0 || !z1StillExists {
+		t.Fatalf("expected 0 provider calls and z1 token retained, calls=%d z1StillExists=%v", clientCallsDelta, z1StillExists)
+	}
+	var blocked v1alpha1.ServiceToken
+	if err := direct.Get(ctx, stKey, &blocked); err != nil {
+		t.Fatalf("expected blocked ServiceToken to remain: %v", err)
+	}
+	if cond := serviceTokenCondition(blocked.Status.Conditions, "CleanupBlocked"); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected CleanupBlocked=True, got %+v", blocked.Status.Conditions)
+	}
+	if !slices.Contains(blocked.Finalizers, v1alpha1.ServiceTokenFinalizer) ||
+		!slices.Contains(blocked.Finalizers, serviceTokenAttemptFinalizer) {
+		t.Fatalf("expected both finalizers retained, got %v", blocked.Finalizers)
+	}
+	var secrets corev1.SecretList
+	if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+		t.Fatal(err)
+	}
+	journalRetained := false
+	for i := range secrets.Items {
+		if strings.HasPrefix(secrets.Items[i].Name, serviceTokenJournalPrefix) {
+			journalRetained = true
+			break
+		}
+	}
+	if !journalRetained {
+		t.Fatal("expected journal Secret to be retained on fail-closed delete")
+	}
+}
+
+// Regression test (Finding 2, P1): when a dispatched journal has issuedID == ""
+// (committed create with lost response) and Status.TokenID == "",
+// cleanupPendingServiceTokenJournal MUST verify and delete the uniquely matched
+// remote candidate instead of returning nil and leaking an enabled token, while
+// failing closed on 0 matches, duplicate matches, issuedID mismatch, or unknown phase.
+func TestServiceTokenLostCreateResponseJournalDeleteEnvtest(t *testing.T) {
+	setupLostCreateEnv := func(t *testing.T, suffix string) (client.Client, *ServiceTokenReconciler, *serviceTokenFakeAPI, *v1alpha1.ServiceToken, types.NamespacedName, string) {
+		t.Helper()
+		_, mgr, direct, _ := startPR2EnvtestManager(t)
+		ctx := context.Background()
+
+		ns := "tenant-st-lost-create-" + suffix
+		if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{"tenant": "true"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "api-tok"}, Data: map[string][]byte{"token": []byte("tok")}}); err != nil {
+			t.Fatal(err)
+		}
+		account := &v1alpha1.CloudflareAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "acct-st-lost-" + suffix},
+			Spec: v1alpha1.CloudflareAccountSpec{
+				AccountID:   "0123456789abcdef0123456789abcdef",
+				Credentials: v1alpha1.CloudflareAccountCredentials{APITokenSecretRef: v1alpha1.NamespacedSecretKeyReference{Namespace: ns, Name: "api-tok", Key: "token"}},
+				Grants: []v1alpha1.CloudflareAccountGrant{{
+					NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"tenant": "true"}},
+					Hostnames:         []string{"*"},
+					Zones:             []string{"*"},
+					Exposures:         []v1alpha1.Exposure{v1alpha1.ExposurePublic},
+					PlatformObjects:   v1alpha1.GrantPermissionAllowed,
+				}},
+			},
+		}
+		if err := direct.Create(ctx, account); err != nil {
+			t.Fatal(err)
+		}
+		markAccountReady(ctx, t, direct, account, []v1alpha1.CloudflareVerifiedZone{{ID: "z1", Name: "z1.example.com"}})
+
+		api := &serviceTokenFakeAPI{
+			now:                    time.Now,
+			tokens:                 make(map[string]flarecloudflare.ServiceToken),
+			secrets:                make(map[string]string),
+			commitThenFailCreateAt: 1,
+		}
+		reconciler := &ServiceTokenReconciler{
+			Client:    direct,
+			APIReader: direct,
+			Scheme:    mgr.GetScheme(),
+			NewCloudflareClient: func(string, string) (flarecloudflare.AccessAPI, error) {
+				return api, nil
+			},
+			Freshness:   freshness.DefaultPolicy(),
+			Invalidator: freshness.NewLatch(),
+		}
+		startManagerAndWait(t, mgr)
+		waitUntilTrue(t, 10*time.Second, "lost-create test account ready", func() (bool, error) {
+			var cur v1alpha1.CloudflareAccount
+			if err := direct.Get(ctx, client.ObjectKeyFromObject(account), &cur); err != nil {
+				return false, nil
+			}
+			return assertConditionTrueForCurrentGen(cur.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted, cur.Generation), nil
+		})
+
+		st := &v1alpha1.ServiceToken{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "st-lost-create"},
+			Spec: v1alpha1.ServiceTokenSpec{
+				AccountRef:       corev1.LocalObjectReference{Name: account.Name},
+				Zone:             "z1.example.com",
+				Name:             "st-lost-create",
+				Enabled:          true,
+				Duration:         "8760h",
+				SecretRef:        corev1.LocalObjectReference{Name: "st-creds-v1"},
+				ManagementPolicy: v1alpha1.ManagementPolicyManaged,
+				DeletionPolicy:   v1alpha1.DeletionPolicyDelete,
+			},
+		}
+		if err := direct.Create(ctx, st); err != nil {
+			t.Fatal(err)
+		}
+		stKey := client.ObjectKeyFromObject(st)
+
+		// Pass 1 adds ServiceToken finalizer; Pass 2 adds attempt finalizer; Pass 3 hits commitThenFailCreateAt.
+		var sawLostCreateErr bool
+		for i := 0; i < 4; i++ {
+			if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+				sawLostCreateErr = true
+				break
+			}
+		}
+		if !sawLostCreateErr {
+			t.Fatal("expected commitThenFailCreateAt error during ServiceToken create")
+		}
+		var current v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &current); err != nil {
+			t.Fatal(err)
+		}
+		if current.Status.TokenID != "" || len(api.tokens) != 1 {
+			t.Fatalf("expected empty TokenID and 1 committed remote token, status=%+v tokens=%v", current.Status, api.tokens)
+		}
+		return direct, reconciler, api, &current, stKey, ns
+	}
+
+	t.Run("dispatched_issuedID_empty_unique_match_deletes_remote_and_cleans_journal", func(t *testing.T) {
+		ctx := context.Background()
+		direct, reconciler, api, current, stKey, ns := setupLostCreateEnv(t, "unique")
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err != nil {
+			t.Fatalf("delete after lost create response failed: %v", err)
+		}
+		if len(api.tokens) != 0 {
+			t.Fatalf("leaked enabled remote token after lost-create delete: tokens=%v calls=%v", api.tokens, api.calls)
+		}
+		if api.deletes != 1 {
+			t.Fatalf("expected 1 DeleteServiceToken call, got %d (calls=%v)", api.deletes, api.calls)
+		}
+		var secrets corev1.SecretList
+		if err := direct.List(ctx, &secrets, client.InNamespace(ns)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range secrets.Items {
+			if strings.HasPrefix(secrets.Items[i].Name, serviceTokenJournalPrefix) {
+				t.Fatalf("journal Secret %q leaked after lost-create delete", secrets.Items[i].Name)
+			}
+		}
+		var gone v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &gone); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected ServiceToken deleted, got err=%v conditions=%+v finalizers=%v", err, gone.Status.Conditions, gone.Finalizers)
+		}
+	})
+
+	t.Run("dispatched_issuedID_empty_zero_matches_fails_closed", func(t *testing.T) {
+		ctx := context.Background()
+		direct, reconciler, api, current, stKey, ns := setupLostCreateEnv(t, "zero")
+		api.tokens = map[string]flarecloudflare.ServiceToken{}
+
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected CleanupBlocked when dispatched journal has issuedID==\"\" and 0 matches")
+		}
+		if api.deletes != 0 {
+			t.Fatalf("expected 0 DeleteServiceToken calls, got %d", api.deletes)
+		}
+		var blocked v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if cond := serviceTokenCondition(blocked.Status.Conditions, "CleanupBlocked"); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("expected CleanupBlocked=True, got %+v", blocked.Status.Conditions)
+		}
+		if !slices.Contains(blocked.Finalizers, v1alpha1.ServiceTokenFinalizer) ||
+			!slices.Contains(blocked.Finalizers, serviceTokenAttemptFinalizer) {
+			t.Fatalf("expected both finalizers retained, got %v", blocked.Finalizers)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(&blocked)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained: %v", err)
+		}
+	})
+
+	t.Run("dispatched_issuedID_empty_duplicate_matches_fails_closed", func(t *testing.T) {
+		ctx := context.Background()
+		direct, reconciler, api, current, stKey, ns := setupLostCreateEnv(t, "dup")
+		for _, tok := range api.tokens {
+			dup := tok
+			dup.ID = "token-dup"
+			api.tokens[parityServiceTokenKey(flarecloudflare.AccessScope{ZoneID: "z1"}, dup.ID)] = dup
+			break
+		}
+
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected CleanupBlocked on duplicate attemptName matches")
+		}
+		if api.deletes != 0 || len(api.tokens) != 2 {
+			t.Fatalf("expected 0 deletes and 2 retained tokens, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
+		var blocked v1alpha1.ServiceToken
+		if err := direct.Get(ctx, stKey, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if cond := serviceTokenCondition(blocked.Status.Conditions, "CleanupBlocked"); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("expected CleanupBlocked=True, got %+v", blocked.Status.Conditions)
+		}
+		var j corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(&blocked)}, &j); err != nil {
+			t.Fatalf("expected journal Secret retained: %v", err)
+		}
+	})
+
+	t.Run("dispatched_issuedID_mismatch_and_unknown_phase_fail_closed", func(t *testing.T) {
+		ctx := context.Background()
+		direct, reconciler, api, current, stKey, ns := setupLostCreateEnv(t, "bad-id-phase")
+		var journalSecret corev1.Secret
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &journalSecret); err != nil {
+			t.Fatal(err)
+		}
+		journalSecret.Data[serviceTokenJournalKeyIssuedID] = []byte("different-token-id")
+		if err := direct.Update(ctx, &journalSecret); err != nil {
+			t.Fatal(err)
+		}
+		if err := direct.Delete(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected CleanupBlocked when journal.issuedID != matched candidate ID")
+		}
+		if api.deletes != 0 {
+			t.Fatalf("expected 0 deletes on issuedID mismatch, got %d", api.deletes)
+		}
+
+		// Also reject unsupported synthetic phase (e.g. "created").
+		if err := direct.Get(ctx, types.NamespacedName{Namespace: ns, Name: serviceTokenJournalName(current)}, &journalSecret); err != nil {
+			t.Fatal(err)
+		}
+		journalSecret.Data[serviceTokenJournalKeyPhase] = []byte("created")
+		journalSecret.Data[serviceTokenJournalKeyIssuedID] = nil
+		if err := direct.Update(ctx, &journalSecret); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: stKey}); err == nil {
+			t.Fatal("expected CleanupBlocked on unsupported journal phase")
+		}
+		if api.deletes != 0 || len(api.tokens) != 1 {
+			t.Fatalf("expected 0 deletes and 1 retained token on unsupported phase, deletes=%d tokens=%v", api.deletes, api.tokens)
+		}
 	})
 }

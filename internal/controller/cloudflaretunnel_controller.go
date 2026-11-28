@@ -51,8 +51,8 @@ import (
 	"github.com/isac322/flareway/internal/authz"
 	flarecloudflare "github.com/isac322/flareway/internal/cloudflare"
 	cloudflaredconfig "github.com/isac322/flareway/internal/cloudflared"
-	"github.com/isac322/flareway/internal/freshness"
 	"github.com/isac322/flareway/internal/dataplane"
+	"github.com/isac322/flareway/internal/freshness"
 	gatewaystatus "github.com/isac322/flareway/internal/gatewayapi/status"
 	"github.com/isac322/flareway/internal/ir"
 )
@@ -2859,7 +2859,7 @@ func withoutRemoteVerdicts(authored []metav1.Condition) []metav1.Condition {
 // convergence evidence that must be durable before the condition becomes
 // visible. Demotions and non-input conditions are never withheld.
 var tunnelReadyInputConditions = map[string]struct{}{
-	v1alpha1.CloudflareTunnelConditionTunnelReady:  {},
+	v1alpha1.CloudflareTunnelConditionTunnelReady:   {},
 	v1alpha1.CloudflareTunnelConditionConfigApplied: {},
 	v1alpha1.CloudflareTunnelConditionDNSReady:      {},
 }

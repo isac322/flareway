@@ -980,7 +980,12 @@ func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object 
 // pending journal during teardown. It uses the journaled account and scope
 // binding so pending cleanup works even when status.tokenId is empty.
 func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journal *serviceTokenJournal) error {
-	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, journal.accountName, authzRequestForJournal(journal), r.NewCloudflareClient)
+	switch journal.phase {
+	case serviceTokenJournalPhasePrepared, serviceTokenJournalPhaseDispatched, serviceTokenJournalPhaseRetiring:
+	default:
+		return fmt.Errorf("unsupported service token journal phase %q during teardown", journal.phase)
+	}
+	api, account, err := accessClientForAccount(ctx, r.apiReader(), object.Namespace, journal.accountName, authzRequestForJournal(journal), r.NewCloudflareClient)
 	if err != nil {
 		return err
 	}
@@ -1011,8 +1016,25 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 			matches[remote.Name] = remote
 		}
 	}
-	if journal.phase == serviceTokenJournalPhaseDispatched && journal.issuedID == "" && len(matches) == 0 {
-		return errors.New("dispatched service token journal has no issued ID or exact remote candidate")
+	if journal.phase == serviceTokenJournalPhaseDispatched && journal.issuedID == "" {
+		if _, ok := matches[journal.attemptName]; !ok {
+			return errors.New("dispatched service token journal has no issued ID or exact remote candidate")
+		}
+	}
+	if journal.phase == serviceTokenJournalPhaseRetiring && journal.retiringName != "" && journal.retiringID == "" {
+		if _, ok := matches[journal.retiringName]; !ok {
+			return errors.New("retiring service token journal has no retiring ID or exact remote candidate")
+		}
+	}
+	if journal.issuedID != "" {
+		if match, ok := matches[journal.attemptName]; ok && match.ID != journal.issuedID {
+			return fmt.Errorf("remote service token %q ID %q disagrees with journaled issued ID %q", journal.attemptName, match.ID, journal.issuedID)
+		}
+	}
+	if journal.retiringID != "" {
+		if match, ok := matches[journal.retiringName]; ok && match.ID != journal.retiringID {
+			return fmt.Errorf("remote service token %q ID %q disagrees with journaled retiring ID %q", journal.retiringName, match.ID, journal.retiringID)
+		}
 	}
 	committedID, err := r.committedServiceTokenCredential(ctx, object)
 	if err != nil {
@@ -1032,6 +1054,12 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 	}
 	if journal.retiringID != "" {
 		ids[journal.retiringID] = true
+	}
+	for name, match := range matches {
+		if match.ID == "" {
+			return fmt.Errorf("matched remote service token %q omitted ID", name)
+		}
+		ids[match.ID] = true
 	}
 	for id := range ids {
 		remote, getErr := api.GetServiceToken(ctx, scope, id)
@@ -1058,7 +1086,7 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 // cleanupUntrackedServiceTokenAttempts refuses to mutate any remote token when
 // a lost journal leaves either an attempt-prefix or canonical legacy collision.
 func (r *ServiceTokenReconciler) cleanupUntrackedServiceTokenAttempts(ctx context.Context, object *v1alpha1.ServiceToken) error {
-	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
+	api, account, err := accessClientForAccount(ctx, r.apiReader(), object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
 		return err
 	}

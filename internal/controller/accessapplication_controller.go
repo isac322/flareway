@@ -70,10 +70,10 @@ const (
 	// deletion whether a remote object may exist even if status never recorded
 	// it; without either, deletion has nothing remote to clean up.
 	accessApplicationRemoteAttemptAnnotation = "flareway.bhyoo.com/access-remote-attempt"
-	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
-	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
-	accessApplicationPrivateTunnelsKey    = "tunnels"
-	accessApplicationAUDReadyKey          = "ready"
+	accessRevocationPublisherUnavailable     = "RevocationPublisherUnavailable"
+	accessApplicationPrivateTunnelsLabel     = "flareway.bhyoo.com/private-tunnels-for"
+	accessApplicationPrivateTunnelsKey       = "tunnels"
+	accessApplicationAUDReadyKey             = "ready"
 
 	accessApplicationConditionAccepted       = "Accepted"
 	accessApplicationConditionProgrammed     = "Programmed"

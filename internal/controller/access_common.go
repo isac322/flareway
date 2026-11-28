@@ -54,7 +54,7 @@ func AccessClientFromFactory(factory flarecloudflare.ClientFactory) NewAccessClo
 
 func accessClientForAccount(
 	ctx context.Context,
-	kube client.Client,
+	reader client.Reader,
 	namespaceName string,
 	accountName string,
 	operation authz.Request,
@@ -70,26 +70,53 @@ func accessClientForAccount(
 		return nil, nil, errors.New("cloudflare Access client factory is required")
 	}
 	account := new(v1alpha1.CloudflareAccount)
-	if err := kube.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
 		return nil, nil, fmt.Errorf("get CloudflareAccount %q: %w", accountName, err)
+	}
+	api, err := accessClientForResolvedAccount(ctx, reader, account, namespaceName, operation, factory)
+	if err != nil {
+		return nil, nil, err
+	}
+	return api, account, nil
+}
+
+func accessClientForResolvedAccount(
+	ctx context.Context,
+	reader client.Reader,
+	account *v1alpha1.CloudflareAccount,
+	namespaceName string,
+	operation authz.Request,
+	factory NewAccessCloudflareClient,
+) (flarecloudflare.AccessAPI, error) {
+	if account == nil {
+		return nil, errors.New("CloudflareAccount is required")
+	}
+	if reader == nil {
+		return nil, errors.New("kubernetes reader is required")
+	}
+	if namespaceName == "" {
+		return nil, errors.New("request namespace is required")
+	}
+	if factory == nil {
+		return nil, errors.New("cloudflare Access client factory is required")
 	}
 	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
 		!metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return nil, nil, fmt.Errorf("the CloudflareAccount %q is not ready", accountName)
+		return nil, fmt.Errorf("the CloudflareAccount %q is not ready", account.Name)
 	}
 	namespace := new(corev1.Namespace)
-	if err := kube.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
-		return nil, nil, fmt.Errorf("get request Namespace %q: %w", namespaceName, err)
+	if err := reader.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
+		return nil, fmt.Errorf("get request Namespace %q: %w", namespaceName, err)
 	}
 	decision := authz.Evaluate(account, namespace, operation)
 	if !decision.Allowed {
-		return nil, nil, privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
+		return nil, privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
 	}
 
 	ref := account.Spec.Credentials.APITokenSecretRef
 	secret := new(corev1.Secret)
-	if err := kube.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
-		return nil, nil, fmt.Errorf("get Cloudflare API token Secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+		return nil, fmt.Errorf("get Cloudflare API token Secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 	key := ref.Key
 	if key == "" {
@@ -97,13 +124,13 @@ func accessClientForAccount(
 	}
 	token := secret.Data[key]
 	if len(token) == 0 {
-		return nil, nil, fmt.Errorf("cloudflare API token Secret %s/%s has no non-empty %q key", ref.Namespace, ref.Name, key)
+		return nil, fmt.Errorf("cloudflare API token Secret %s/%s has no non-empty %q key", ref.Namespace, ref.Name, key)
 	}
 	api, err := factory(string(token), account.Spec.AccountID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return api, account, nil
+	return api, nil
 }
 
 func metaConditionTrue(conditions []metav1.Condition, conditionType string) bool {
