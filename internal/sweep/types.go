@@ -29,7 +29,8 @@ import (
 
 // Invalidator is the path the sweep uses to close an object's desired-hash
 // gate when drift is found (00-architecture.md §5 contract). The latch is the
-// source of truth: even when the Events() wakeup is lost, the gate stays
+// invalidation target and default metric kind). The latch is the
+// source of truth: even when the EventsFor wakeup is lost, the gate stays
 // closed until the owning controller reconciles and clears it.
 type Invalidator interface {
 	Invalidate(kind string, key types.NamespacedName, reason string)
@@ -137,7 +138,7 @@ type localRef struct {
 }
 
 // kindGVK maps invalidation target kinds to their API identity for the
-// GenericEvent objects emitted on Events().
+// GenericEvent objects emitted on EventsFor.
 var kindGVK = map[string]schema.GroupVersionKind{
 	"AccessApplication":           v1alpha1.GroupVersion.WithKind("AccessApplication"),
 	"AccessStandaloneApplication": v1alpha1.GroupVersion.WithKind("AccessStandaloneApplication"),

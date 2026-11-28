@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/netip"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -135,6 +136,8 @@ type GatewayReconciler struct {
 	// Programmed drops when a dataplane stream closes. When nil no raw source
 	// is registered in SetupWithManager.
 	XDSEvents <-chan event.GenericEvent
+
+	onSweepEnqueue func([]reconcile.Request)
 }
 
 func (r *GatewayReconciler) operatorNamespace() string {
@@ -388,6 +391,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.forgetTunnelConfigGateIfWriter(ctx, &gateway, tunnel)
 		if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, req.NamespacedName); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -410,7 +414,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return ctrl.Result{RequeueAfter: programmedRequeue}, nil
 	}
-	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
+	// Admission-only patch: patchGatewayAdmissionStatus strips programming fields
+	// on a copy so a stale reconcile-start snapshot can never republish
+	// Programmed or Addresses over a newer write, while keeping statuses.Gateway
+	// intact for downstream programming and rejection paths.
+	if err := r.patchGatewayAdmissionStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -475,6 +483,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var cloudflareResult cloudflareConfigResult
 	if !compiled.ConformanceMode {
 		cloudflareResult, err = r.reconcileCloudflaredConfiguration(ctx, compiled, tunnel, account)
+		defer r.Invalidator.EndLifetime(cloudflareResult.verifiedTok)
 		if err != nil {
 			var compileErr *cloudflaredConfigCompileError
 			if errors.As(err, &compileErr) {
@@ -552,6 +561,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	pending := false
+	tunnelConfigCommitted := false
 	requeueDelay := programmedRequeue
 	if compiled.ConformanceMode {
 		addresses, addressReady, addressMessage, err := r.serviceAddresses(ctx, compiled)
@@ -719,6 +729,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					// onto another owner's or another generation's object.
 					return ctrl.Result{}, err
 				}
+			} else {
+				tunnelConfigCommitted = true
 			}
 		} else {
 			// Demotion commits before the data apply.
@@ -729,8 +741,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		observability.Default.SetConfigVersions(req.String(), config.Desired, config.Applied)
 	}
 
-	if err := r.patchGatewayStatus(ctx, req.NamespacedName, statuses.Gateway); err != nil {
+	programmedCurrentGen, err := r.patchGatewayStatusChecked(ctx, req.NamespacedName, gateway.UID, gateway.Generation, statuses.Gateway)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if tunnelConfigCommitted && !pending && programmedCurrentGen {
+		r.confirmTunnelConfigGate(cloudflareResult)
 	}
 	if compiled.ConformanceMode {
 		observability.Default.SetConfigVersions(req.String(), 0, 0)
@@ -745,7 +761,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if pending {
 		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
-	return ctrl.Result{RequeueAfter: cloudflareResult.requeue}, nil
+	requeue := cloudflareResult.requeue
+	if !compiled.ConformanceMode && cloudflareResult.appliedAt != nil {
+		requeue = convergedRequeue(r.Freshness, freshness.GradeTraffic, gatewayZeroFreshnessRequeue)
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 func (r *GatewayReconciler) rejectDirectTunnelAttachment(
@@ -826,7 +846,11 @@ func (r *GatewayReconciler) rejectGatewayAdmission(
 		Message:            programmedMessage,
 		LastTransitionTime: now,
 	})
-	return r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gateway), desired)
+	if err := r.patchGatewayStatus(ctx, client.ObjectKeyFromObject(gateway), desired); err != nil {
+		return err
+	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
+	return nil
 }
 
 // invalidGatewayClassConfigError marks a GatewayClass parametersRef that can
@@ -1449,6 +1473,7 @@ func (r *GatewayReconciler) reportCloudflareUnprogrammed(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return err
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 	if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, key); err != nil {
 		return err
 	}
@@ -1546,6 +1571,7 @@ func (r *GatewayReconciler) handleGatewayCompileFailure(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return errors.Join(buildErr, err)
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 	if err := r.patchHTTPRouteStatuses(ctx, routes, statuses.HTTPRoutes, key); err != nil {
 		return errors.Join(buildErr, err)
 	}
@@ -1592,7 +1618,7 @@ func (r *GatewayReconciler) reportDataplaneRejection(
 		marked.reason,
 	)
 
-	before := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	before := meta.FindStatusCondition(gateway.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	if before != nil {
 		before = before.DeepCopy()
 	}
@@ -1623,6 +1649,7 @@ func (r *GatewayReconciler) reportDataplaneRejection(
 	if err := r.patchGatewayStatus(ctx, key, statuses.Gateway); err != nil {
 		return errors.Join(rejection, err)
 	}
+	r.forgetTunnelConfigGateIfWriter(ctx, gateway, nil)
 
 	after := meta.FindStatusCondition(statuses.Gateway.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	changed := before == nil || after == nil ||
@@ -1715,12 +1742,11 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 		gateway.Generation,
 		now,
 		map[string]struct{}{
-			string(gatewayv1.GatewayConditionAccepted):   {},
-			string(gatewayv1.GatewayConditionProgrammed): {},
+			string(gatewayv1.GatewayConditionAccepted): {},
 		},
-		string(gatewayv1.GatewayConditionProgrammed),
-		string(gatewayv1.GatewayReasonPending),
-		"Reconciling Gateway configuration",
+		"",
+		"",
+		"",
 	)
 	for index := range status.Listeners {
 		listener := &status.Listeners[index]
@@ -1732,11 +1758,10 @@ func (r *GatewayReconciler) prepareGatewayStatus(status *gatewayv1.GatewayStatus
 				string(gatewayv1.ListenerConditionAccepted):     {},
 				string(gatewayv1.ListenerConditionResolvedRefs): {},
 				string(gatewayv1.ListenerConditionConflicted):   {},
-				string(gatewayv1.ListenerConditionProgrammed):   {},
 			},
-			string(gatewayv1.ListenerConditionProgrammed),
-			string(gatewayv1.ListenerReasonPending),
-			"Reconciling listener configuration",
+			"",
+			"",
+			"",
 		)
 	}
 }
@@ -1756,7 +1781,7 @@ func prepareConditions(
 		if _, ok := owned[condition.Type]; !ok {
 			continue
 		}
-		if condition.Type == programmedType {
+		if programmedType != "" && condition.Type == programmedType {
 			programmedFound = true
 			if condition.ObservedGeneration != generation && condition.Status == metav1.ConditionTrue {
 				condition.Status = metav1.ConditionUnknown
@@ -1767,7 +1792,7 @@ func prepareConditions(
 		}
 		condition.ObservedGeneration = generation
 	}
-	if !programmedFound {
+	if programmedType != "" && !programmedFound {
 		result = append(result, metav1.Condition{
 			Type:               programmedType,
 			Status:             metav1.ConditionUnknown,
@@ -1780,32 +1805,93 @@ func prepareConditions(
 	return result
 }
 
+// patchGatewayAdmissionStatus strips programming fields from a copy of
+// desired before calling patchGatewayStatus so an admission-only update never
+// republishes stale Programmed, listener Programmed, or Addresses while
+// leaving the caller's status intact for downstream programming updates.
+func (r *GatewayReconciler) patchGatewayAdmissionStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
+	admission := *desired.DeepCopy()
+	admission.Addresses = nil
+	meta.RemoveStatusCondition(&admission.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	for index := range admission.Listeners {
+		meta.RemoveStatusCondition(&admission.Listeners[index].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	}
+	return r.patchGatewayStatus(ctx, key, admission)
+}
+
 func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.NamespacedName, desired gatewayv1.GatewayStatus) error {
+	_, err := r.patchGatewayStatusChecked(ctx, key, "", 0, desired)
+	return err
+}
+
+func (r *GatewayReconciler) patchGatewayStatusChecked(ctx context.Context, key types.NamespacedName, expectedUID types.UID, expectedGen int64, desired gatewayv1.GatewayStatus) (bool, error) {
 	deleted := false
+	stale := false
+	var liveGen int64
 	var patched gatewayv1.GatewayStatus
+	now := metav1.Now()
+	if r.Now != nil {
+		now = metav1.NewTime(r.Now())
+	}
+	admissionOnly := meta.FindStatusCondition(desired.Conditions, string(gatewayv1.GatewayConditionProgrammed)) == nil
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current gatewayv1.Gateway
-		if err := r.Get(ctx, key, &current); err != nil {
+		if err := r.directReader().Get(ctx, key, &current); err != nil {
 			if apierrors.IsNotFound(err) {
 				deleted = true
 				return nil
 			}
 			return err
 		}
+		if !admissionOnly && ((expectedUID != "" && current.UID != expectedUID) || (expectedGen > 0 && current.Generation != expectedGen)) {
+			stale = true
+			return nil
+		}
+		liveGen = current.Generation
 
 		ownedGatewayConditions := map[string]struct{}{
 			string(gatewayv1.GatewayConditionAccepted):   {},
 			string(gatewayv1.GatewayConditionProgrammed): {},
 		}
+		if admissionOnly {
+			delete(ownedGatewayConditions, string(gatewayv1.GatewayConditionProgrammed))
+		}
 		merged := desired
+		if admissionOnly {
+			merged.Addresses = slices.Clone(current.Status.Addresses)
+		}
+		var prevProg *metav1.Condition
+		if !admissionOnly {
+			prevProg = meta.FindStatusCondition(current.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		}
 		merged.Conditions = make([]metav1.Condition, 0, len(current.Status.Conditions)+len(desired.Conditions))
 		for _, condition := range desired.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				if !admissionOnly && condition.Type == string(gatewayv1.GatewayConditionProgrammed) {
+					condition.LastTransitionTime = monotonicProgrammedTransitionTime(condition, prevProg, now)
+				}
 				merged.Conditions = append(merged.Conditions, condition)
 			}
 		}
+		if admissionOnly {
+			if prev := meta.FindStatusCondition(current.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed)); prev != nil {
+				merged.Conditions = append(merged.Conditions, *prev.DeepCopy())
+			}
+			merged.Conditions = prepareConditions(
+				merged.Conditions,
+				current.Generation,
+				now,
+				map[string]struct{}{string(gatewayv1.GatewayConditionProgrammed): {}},
+				string(gatewayv1.GatewayConditionProgrammed),
+				string(gatewayv1.GatewayReasonPending),
+				"Reconciling Gateway configuration",
+			)
+		}
 		for _, condition := range current.Status.Conditions {
 			if _, owned := ownedGatewayConditions[condition.Type]; owned {
+				continue
+			}
+			if admissionOnly && condition.Type == string(gatewayv1.GatewayConditionProgrammed) {
 				continue
 			}
 			merged.Conditions = append(merged.Conditions, condition)
@@ -1817,26 +1903,58 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 				string(gatewayv1.ListenerConditionConflicted):   {},
 				string(gatewayv1.ListenerConditionProgrammed):   {},
 			}
+			if admissionOnly {
+				delete(ownedListenerConditions, string(gatewayv1.ListenerConditionProgrammed))
+			}
 			merged.Listeners = make([]gatewayv1.ListenerStatus, len(desired.Listeners))
 			for i := range desired.Listeners {
 				merged.Listeners[i] = desired.Listeners[i]
+				var currentListener *gatewayv1.ListenerStatus
+				for j := range current.Status.Listeners {
+					if current.Status.Listeners[j].Name == merged.Listeners[i].Name {
+						currentListener = &current.Status.Listeners[j]
+						break
+					}
+				}
+				var prevListenerProg *metav1.Condition
+				if !admissionOnly && currentListener != nil {
+					prevListenerProg = meta.FindStatusCondition(currentListener.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+				}
 				merged.Listeners[i].Conditions = make([]metav1.Condition, 0, len(desired.Listeners[i].Conditions))
 				for _, condition := range desired.Listeners[i].Conditions {
 					if _, owned := ownedListenerConditions[condition.Type]; owned {
+						if !admissionOnly && condition.Type == string(gatewayv1.ListenerConditionProgrammed) {
+							condition.LastTransitionTime = monotonicProgrammedTransitionTime(condition, prevListenerProg, now)
+						}
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
 				}
-				for j := range current.Status.Listeners {
-					if current.Status.Listeners[j].Name != merged.Listeners[i].Name {
-						continue
+				if currentListener != nil {
+					if admissionOnly {
+						if prev := meta.FindStatusCondition(currentListener.Conditions, string(gatewayv1.ListenerConditionProgrammed)); prev != nil {
+							merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, *prev.DeepCopy())
+						}
 					}
-					for _, condition := range current.Status.Listeners[j].Conditions {
+					for _, condition := range currentListener.Conditions {
 						if _, owned := ownedListenerConditions[condition.Type]; owned {
+							continue
+						}
+						if admissionOnly && condition.Type == string(gatewayv1.ListenerConditionProgrammed) {
 							continue
 						}
 						merged.Listeners[i].Conditions = append(merged.Listeners[i].Conditions, condition)
 					}
-					break
+				}
+				if admissionOnly {
+					merged.Listeners[i].Conditions = prepareConditions(
+						merged.Listeners[i].Conditions,
+						current.Generation,
+						now,
+						map[string]struct{}{string(gatewayv1.ListenerConditionProgrammed): {}},
+						string(gatewayv1.ListenerConditionProgrammed),
+						string(gatewayv1.ListenerReasonPending),
+						"Reconciling listener configuration",
+					)
 				}
 			}
 		}
@@ -1856,15 +1974,37 @@ func (r *GatewayReconciler) patchGatewayStatus(ctx context.Context, key types.Na
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if deleted {
 		observability.Default.DeleteGateway(key.String())
-		return nil
+		return false, nil
+	}
+	if stale {
+		return false, nil
 	}
 	condition := meta.FindStatusCondition(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	observability.Default.SetGatewayProgrammed(key.String(), condition != nil && condition.Status == metav1.ConditionTrue)
-	return nil
+	if admissionOnly {
+		return false, nil
+	}
+	return conditionTrueForGeneration(patched.Conditions, string(gatewayv1.GatewayConditionProgrammed), liveGen), nil
+}
+
+func monotonicProgrammedTransitionTime(desired metav1.Condition, prev *metav1.Condition, now metav1.Time) metav1.Time {
+	if prev == nil {
+		return desired.LastTransitionTime
+	}
+	if prev.Status == desired.Status {
+		return prev.LastTransitionTime
+	}
+	if desired.LastTransitionTime.Before(&prev.LastTransitionTime) {
+		if now.Before(&prev.LastTransitionTime) {
+			return prev.LastTransitionTime
+		}
+		return now
+	}
+	return desired.LastTransitionTime
 }
 
 func (r *GatewayReconciler) patchHTTPRouteStatuses(
@@ -2227,17 +2367,7 @@ func applyObject(ctx context.Context, kube client.Client, scheme *runtime.Scheme
 	return kube.Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), options...)
 }
 
-// SetupWithManager registers the Gateway API and Cloudflare-mode cache watches.
-func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.OperatorNamespace == "" {
-		r.OperatorNamespace = dataplane.DefaultOperatorNamespace
-	}
-	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorder("flareway-gateway")
-	}
-	if r.APIReader == nil {
-		r.APIReader = mgr.GetAPIReader()
-	}
+func (r *GatewayReconciler) registerFieldIndexers(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.HTTPRoute{}, httpRouteParentGatewayIndex, func(object client.Object) []string {
 		return httpRouteParentGatewayKeys(object.(*gatewayv1.HTTPRoute))
 	}); err != nil {
@@ -2263,7 +2393,6 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index GatewayClass parametersRef: %w", err)
 	}
-
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.BackendTLSPolicy{}, backendTLSPolicyTargetServiceIndex, func(object client.Object) []string {
 		return backendTLSPolicyTargetServiceKeys(object.(*gatewayv1.BackendTLSPolicy))
 	}); err != nil {
@@ -2283,6 +2412,23 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return accessApplicationTargetKeys(object.(*v1alpha1.AccessApplication), "HTTPRoute")
 	}); err != nil {
 		return fmt.Errorf("index AccessApplication target HTTPRoutes: %w", err)
+	}
+	return nil
+}
+
+// SetupWithManager registers the Gateway API and Cloudflare-mode cache watches.
+func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.OperatorNamespace == "" {
+		r.OperatorNamespace = dataplane.DefaultOperatorNamespace
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("flareway-gateway")
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	if err := r.registerFieldIndexers(mgr); err != nil {
+		return err
 	}
 
 	blder := ctrl.NewControllerManagedBy(mgr).
@@ -2323,7 +2469,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// wakeup so a drifted object reconciles before its TTL expires (C10).
 		// Events carry the drifted CloudflareTunnel, so they map through the
 		// same tunnel→Gateway lookup as the regular Tunnel watch.
-		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(r.mapTunnelToGateways)))
+		blder = blder.WatchesRawSource(source.Channel(r.SweepEvents, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			reqs := r.mapTunnelToGateways(ctx, object)
+			if r.onSweepEnqueue != nil {
+				r.onSweepEnqueue(reqs)
+			}
+			return reqs
+		})))
 	}
 	if r.XDSEvents != nil {
 		// Events carry PartialObjectMetadata addressed to the Gateway

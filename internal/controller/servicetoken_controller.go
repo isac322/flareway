@@ -205,10 +205,25 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			return r.recoverServiceToken(ctx, object, api, account, scope, input, clusterID, journalSecret, journal)
 		}
 	}
+	secretPresent := true
+	if object.Status.TokenID != "" && !rotationRequested(object) {
+		var destSecret corev1.Secret
+		secretErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.SecretRef.Name}, &destSecret)
+		if apierrors.IsNotFound(secretErr) {
+			// Do not return early before UpdateServiceToken: if the user updates
+			// spec.enabled (e.g. disabling a token whose Secret is missing),
+			// keep the gate closed so the remote update still runs before
+			// SecretMissing is recorded below.
+			secretPresent = false
+		} else if secretErr != nil {
+			return ctrl.Result{}, secretErr
+		}
+	}
 	decision := evaluateGate(r.Freshness, r.Invalidator, freshness.GradeAuthz, gateInput{
 		Kind: "ServiceToken", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.TokenID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready") && secretPresent,
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -223,6 +238,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ServiceToken", request.NamespacedName)
 	if id == "" {
 		recoveredID, recoverErr := r.recoverTokenID(ctx, object)
 		if recoverErr != nil {
@@ -233,7 +249,20 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			if getErr != nil {
 				return ctrl.Result{}, r.finishRemoteError(ctx, object, getErr)
 			}
-			return ctrl.Result{}, r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Recovered", "Recovered service token ownership from its Secret", serviceTokenStatusUpdate{OwnershipVerified: true})
+			applied, patchErr := r.patchStatusChecked(ctx, object, scope, remote, metav1.ConditionTrue, "Recovered", "Recovered service token ownership from its Secret", serviceTokenStatusUpdate{OwnershipVerified: true})
+			if patchErr != nil {
+				return ctrl.Result{}, patchErr
+			}
+			if !applied && remote.ID != "" {
+				persisted, persistErr := r.persistIdentity(ctx, object, scope, remote, serviceTokenStatusUpdate{OwnershipVerified: true})
+				if persistErr != nil {
+					return ctrl.Result{}, persistErr
+				}
+				if persisted {
+					return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+				}
+			}
+			return ctrl.Result{}, nil
 		}
 	}
 
@@ -354,7 +383,6 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 			}
 		}
 	}
-	clearGate(r.Invalidator, "ServiceToken", request.NamespacedName)
 	requeue := r.requeueAfter(remote.ExpiresAt, remote.Duration, previousExpiry)
 	if ttl := r.Freshness.TTL(freshness.GradeAuthz); ttl > 0 && ttl < requeue {
 		requeue = ttl
@@ -366,7 +394,7 @@ func (r *ServiceTokenReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	// (missing Secret, previous-credential expiry) and refreshes on expiry,
 	// none of which the sweep's token listing shows. A sweep confirmation
 	// would defer that work for as long as the sweep stays healthy.
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
@@ -394,6 +422,18 @@ func serviceTokenScope(zoneName string, zones []v1alpha1.CloudflareVerifiedZone)
 		}
 	}
 	return flarecloudflare.AccessScope{}, fmt.Errorf("zone %q was not verified for the referenced CloudflareAccount", zoneName)
+}
+
+func serviceTokenVerifiedZoneName(zoneID string, zones []v1alpha1.CloudflareVerifiedZone) (string, error) {
+	if zoneID == "" {
+		return "", nil
+	}
+	for _, zone := range zones {
+		if zone.ID == zoneID && zone.Name != "" {
+			return zone.Name, nil
+		}
+	}
+	return "", fmt.Errorf("zone ID %q was not verified for the referenced CloudflareAccount", zoneID)
 }
 
 func serviceTokenMatchesInput(remote flarecloudflare.ServiceToken, input flarecloudflare.ServiceTokenInput) bool {
@@ -591,25 +631,54 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 		attemptMarked = false
 	}
 	if object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly && object.Spec.DeletionPolicy == v1alpha1.DeletionPolicyDelete {
+		var deletedAccount *v1alpha1.CloudflareAccount
+		var deletedScope flarecloudflare.AccessScope
 		if object.Status.TokenID != "" && object.Status.OwnershipVerified {
-			api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
+			if object.Spec.AccountRef.Name == "" {
+				return r.patchCleanupBlocked(ctx, object, "Invalid", errors.New("accountRef.name is required"))
+			}
+			account := new(v1alpha1.CloudflareAccount)
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Name: object.Spec.AccountRef.Name}, account); err != nil {
+				return r.patchCleanupBlocked(ctx, object, "RemoteError", fmt.Errorf("get CloudflareAccount %q: %w", object.Spec.AccountRef.Name, err))
+			}
+			if journal != nil && journal.crUID == string(object.UID) &&
+				(journal.accountName != object.Spec.AccountRef.Name ||
+					journal.accountUID != string(account.UID) ||
+					journal.accountID != account.Spec.AccountID) {
+				return r.patchCleanupBlocked(ctx, object, "Invalid", errors.New("service token journal account binding does not match the live CloudflareAccount"))
+			}
+			deleteZoneName := ""
+			if object.Status.ZoneID != "" {
+				var zoneErr error
+				deleteZoneName, zoneErr = serviceTokenVerifiedZoneName(object.Status.ZoneID, account.Status.Verified.Zones)
+				if zoneErr != nil {
+					return r.patchCleanupBlocked(ctx, object, "Invalid", zoneErr)
+				}
+			}
+			api, err := accessClientForResolvedAccount(ctx, r.apiReader(), account, object.Namespace, authz.Request{Zone: deleteZoneName, PlatformObject: true}, r.NewCloudflareClient)
 			if err != nil {
 				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
-			scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
-			if scopeErr != nil {
-				if object.Status.ZoneID == "" {
-					return r.patchCleanupBlocked(ctx, object, "Invalid", scopeErr)
-				}
-				scope.ZoneID = object.Status.ZoneID
-			}
+			scope := flarecloudflare.AccessScope{ZoneID: object.Status.ZoneID}
 			if err = ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, object.Status.TokenID)); err != nil {
 				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
 			}
+			deletedAccount = account
+			deletedScope = scope
 		}
 		if journal != nil {
-			if err := r.cleanupPendingServiceTokenJournal(ctx, object, journal); err != nil {
-				return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+			skipJournalCleanup := false
+			if deletedAccount != nil {
+				clusterID, clusterErr := r.authoritativeClusterID(ctx)
+				if clusterErr != nil {
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", clusterErr)
+				}
+				skipJournalCleanup = journal.matchesCheckpointedToken(object, deletedAccount, deletedScope, clusterID)
+			}
+			if !skipJournalCleanup {
+				if err := r.cleanupPendingServiceTokenJournal(ctx, object, journalSecret, journal); err != nil {
+					return r.patchCleanupBlocked(ctx, object, "RemoteError", err)
+				}
 			}
 		} else if object.Status.TokenID == "" && attemptMarked {
 			if err := r.cleanupUntrackedServiceTokenAttempts(ctx, object); err != nil {
@@ -628,34 +697,82 @@ func (r *ServiceTokenReconciler) reconcileDelete(ctx context.Context, object *v1
 	return r.Patch(ctx, object, base)
 }
 
-func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) error {
-	base := client.MergeFrom(object.DeepCopy())
-	if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
-		object.Status.TokenID = remote.ID
-		object.Status.ClientID = remote.ClientID
-		object.Status.ZoneID = scope.ZoneID
-		object.Status.OwnershipVerified = update.OwnershipVerified
-		object.Status.ObservedName = remote.Name
-		object.Status.ObservedDuration = remote.Duration
-		object.Status.ObservedEnabled = remote.Enabled
-		if !remote.ExpiresAt.IsZero() {
-			stamp := metav1.NewTime(remote.ExpiresAt)
-			object.Status.ExpiresAt = &stamp
+func applyServiceTokenIdentityFields(live *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, update serviceTokenStatusUpdate) {
+	live.Status.TokenID = remote.ID
+	live.Status.ClientID = remote.ClientID
+	live.Status.ZoneID = scope.ZoneID
+	live.Status.OwnershipVerified = update.OwnershipVerified
+	live.Status.ObservedName = remote.Name
+	live.Status.ObservedDuration = remote.Duration
+	live.Status.ObservedEnabled = remote.Enabled
+	if !remote.ExpiresAt.IsZero() {
+		stamp := metav1.NewTime(remote.ExpiresAt)
+		live.Status.ExpiresAt = &stamp
+	}
+}
+
+func (r *ServiceTokenReconciler) persistIdentity(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, update serviceTokenStatusUpdate) (bool, error) {
+	observedOwned := update.OwnershipVerified && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if remote.ID == "" || !observedOwned {
+		return false, nil
+	}
+	persisted, err := persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
+		if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+			live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+			live.Spec.Zone != object.Spec.Zone {
+			return errSkipStatusPatch
 		}
+		applyServiceTokenIdentityFields(live, scope, remote, update)
+		if update.RotatedAt != nil {
+			live.Status.RotatedAt = update.RotatedAt
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	if update.RotatedAt != nil {
-		object.Status.RotatedAt = update.RotatedAt
+	if persisted {
+		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
 	}
-	if update.ObserveRotationRequest && object.Spec.Rotation.RequestedAt != nil {
-		object.Status.ObservedRotationRequest = object.Spec.Rotation.RequestedAt.DeepCopy()
+	return persisted, nil
+}
+
+func (r *ServiceTokenReconciler) patchStatusChecked(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) (bool, error) {
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ServiceToken", client.ObjectKeyFromObject(object))
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if err := r.Status().Patch(ctx, object, base); err != nil {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ServiceToken) error {
+		if remote.ID != "" && (status == metav1.ConditionTrue || update.OwnershipVerified) {
+			applyServiceTokenIdentityFields(live, scope, remote, update)
+		}
+		if update.RotatedAt != nil {
+			live.Status.RotatedAt = update.RotatedAt
+		}
+		if update.ObserveRotationRequest && live.Spec.Rotation.RequestedAt != nil {
+			live.Status.ObservedRotationRequest = live.Spec.Rotation.RequestedAt.DeepCopy()
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if applied && (status == metav1.ConditionTrue || remote.ID != "") {
+		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
+	}
+	return applied, nil
+}
+
+func (r *ServiceTokenReconciler) patchStatus(ctx context.Context, object *v1alpha1.ServiceToken, scope flarecloudflare.AccessScope, remote flarecloudflare.ServiceToken, status metav1.ConditionStatus, reason, message string, update serviceTokenStatusUpdate) error {
+	applied, err := r.patchStatusChecked(ctx, object, scope, remote, status, reason, message, update)
+	if err != nil {
 		return err
 	}
-	if status == metav1.ConditionTrue || remote.ID != "" {
-		r.clearServiceTokenCreateBackoff(client.ObjectKeyFromObject(object))
+	observedOwned := update.OwnershipVerified && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote.ID != "" && observedOwned {
+		_, err = r.persistIdentity(ctx, object, scope, remote, update)
+		return err
 	}
 	return nil
 }

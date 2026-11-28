@@ -45,6 +45,7 @@ import (
 // VirtualNetworkReconciler manages Cloudflare Zero Trust virtual networks.
 type VirtualNetworkReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	Now                 func() time.Time
@@ -116,11 +117,13 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 		Kind: "VirtualNetwork", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.VirtualNetworkID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
-		Spec: object.Spec,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady),
+		Spec:      object.Spec,
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("VirtualNetwork", request.NamespacedName)
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -144,10 +147,9 @@ func (r *VirtualNetworkReconciler) Reconcile(ctx context.Context, request ctrl.R
 			privateCommentOwnedBy(vnet.Comment, input.Comment) &&
 			!virtualNetworkNeedsUpdate(input, vnet)
 	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "VirtualNetwork", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, nil
 }
 
@@ -379,21 +381,44 @@ func (r *VirtualNetworkReconciler) finishRemoteError(ctx context.Context, object
 }
 
 func (r *VirtualNetworkReconciler) patchStatus(ctx context.Context, object *v1alpha1.VirtualNetwork, remote flarecloudflare.VirtualNetwork, owned bool, status metav1.ConditionStatus, reason, message string) error {
-	base := client.MergeFrom(object.DeepCopy())
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "VirtualNetwork", client.ObjectKeyFromObject(object))
+	}
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
-	if persistIdentity {
-		object.Status.VirtualNetworkID = remote.ID
-		object.Status.Name = remote.Name
-		object.Status.IsDefault = remote.IsDefault
-		object.Status.Comment = remote.Comment
-		object.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
-		object.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
-		object.Status.OwnershipVerified = owned
+	setIdentity := func(live *v1alpha1.VirtualNetwork) {
+		live.Status.VirtualNetworkID = remote.ID
+		live.Status.Name = remote.Name
+		live.Status.IsDefault = remote.IsDefault
+		live.Status.Comment = remote.Comment
+		live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+		live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.VirtualNetwork) error {
+		if persistIdentity {
+			setIdentity(live)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = privateConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	observedOwned := owned && effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.VirtualNetwork) error {
+			if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			setIdentity(live)
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func virtualNetworkFromStatus(object *v1alpha1.VirtualNetwork) flarecloudflare.VirtualNetwork {
@@ -421,6 +446,9 @@ func (r *VirtualNetworkReconciler) now() time.Time {
 
 // SetupWithManager registers the VirtualNetwork controller and dependency watches.
 func (r *VirtualNetworkReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.VirtualNetwork{}, virtualNetworkAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.VirtualNetwork).Spec.AccountRef.Name}
 	}); err != nil {

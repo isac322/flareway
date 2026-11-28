@@ -78,7 +78,7 @@ type SweeperOptions struct {
 	SweepRateLimit float64
 	// SweepRateBurst is the limiter burst.
 	SweepRateBurst int
-	// EventBufferSize bounds Events(); default 256.
+	// EventBufferSize bounds each subscriber channel returned by EventsFor; default 256.
 	EventBufferSize int
 	// AccountSyncInterval overrides the 30s account re-list period (tests).
 	AccountSyncInterval time.Duration
@@ -105,8 +105,10 @@ type Sweeper struct {
 	rateBurst         int
 	accountSync       time.Duration
 	targets           []TargetDescriptor
+	eventBufferSize   int
 
-	events chan event.GenericEvent
+	subMu       sync.RWMutex
+	subscribers map[string][]chan event.GenericEvent
 
 	mu       sync.Mutex
 	accounts map[string]*AccountSweeper
@@ -152,21 +154,54 @@ func NewSweeper(opts SweeperOptions) *Sweeper {
 		rateBurst:         opts.SweepRateBurst,
 		accountSync:       opts.AccountSyncInterval,
 		targets:           opts.Targets,
-		events:            make(chan event.GenericEvent, opts.EventBufferSize),
+		eventBufferSize:   opts.EventBufferSize,
+		subscribers:       make(map[string][]chan event.GenericEvent),
 		accounts:          make(map[string]*AccountSweeper),
 	}
 }
 
-// Events returns the stream of GenericEvents for objects whose drift was
-// confirmed. Controllers subscribe with
-// WatchesRawSource(source.Channel(sweeper.Events(), &handler.EnqueueRequestForObject{})).
+// EventsFor returns a per-subscriber stream of GenericEvents for objects of
+// targetKind whose drift was confirmed. Each call allocates an independent
+// buffered channel so multiple controllers watching the same target kind (for
+// example CloudflareTunnelReconciler and GatewayReconciler) never compete for
+// events, and a slow or full subscriber never blocks other subscribers or kinds.
+// Controllers subscribe with
+// WatchesRawSource(source.Channel(sweeper.EventsFor(kind), ...)).
 //
 // The channel is a fast-wakeup optimization only. Sends never block: a full
 // buffer drops the event and the item is re-emitted on the next pass while
 // the Invalidator latch keeps the gate closed. Losing an event can delay a
 // reconcile to the latch/TTL path; it can never lose the invalidation.
-func (s *Sweeper) Events() <-chan event.GenericEvent {
-	return s.events
+func (s *Sweeper) EventsFor(targetKind string) <-chan event.GenericEvent {
+	ch := make(chan event.GenericEvent, s.eventBufferSize)
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	existing := s.subscribers[targetKind]
+	next := make([]chan event.GenericEvent, len(existing)+1)
+	copy(next, existing)
+	next[len(existing)] = ch
+	s.subscribers[targetKind] = next
+	return ch
+}
+
+// emitEvent fans out ev to every subscriber registered for targetKind without
+// blocking.
+func (s *Sweeper) emitEvent(targetKind string, ev event.GenericEvent) {
+	s.subMu.RLock()
+	subs := s.subscribers[targetKind]
+	s.subMu.RUnlock()
+	for _, ch := range subs {
+		select {
+		case ch <- ev:
+		default:
+			key := ""
+			if ev.Object != nil {
+				key = ev.Object.GetNamespace() + "/" + ev.Object.GetName()
+			}
+			s.logger.V(1).Info("sweep event buffer full; deferring wakeup to next pass",
+				"kind", targetKind, "key", key)
+		}
+	}
 }
 
 // Start is invoked by the manager on the elected leader only.
@@ -250,7 +285,7 @@ func (s *Sweeper) ensureAccountSweeper(ctx context.Context, account *v1alpha1.Cl
 		RateLimit:         s.rateLimit,
 		RateBurst:         s.rateBurst,
 		Targets:           s.targets,
-		Events:            s.events,
+		EventSink:         s.emitEvent,
 		Logger:            s.logger.WithValues("account", account.Name),
 	})
 	s.accounts[account.Name] = accountSweeper

@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,6 +49,7 @@ const accessPolicyAccountIndex = accessAccountIndex + ".accessPolicy"
 // AccessPolicyReconciler manages reusable Cloudflare Access policies.
 type AccessPolicyReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -87,18 +87,18 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err != nil {
 		return r.finishAccessPolicyError(ctx, object, privateErrorReason(err), err)
 	}
-	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
+	include, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Include)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	require, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Require)
+	require, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Require)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 	if object.Spec.Require == nil {
 		require = nil
 	}
-	exclude, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Exclude)
+	exclude, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Exclude)
 	if err != nil {
 		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -112,6 +112,9 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	input := accessPolicyInput(object.Spec, name, include, require, exclude)
 
 	if effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+			return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		}
 		if object.Spec.ExternalRef == nil {
 			return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "Invalid", "ObserveOnly AccessPolicy requires externalRef")
 		}
@@ -141,6 +144,7 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		Kind: "AccessPolicy", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.PolicyID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -148,6 +152,10 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessPolicy", request.NamespacedName)
+	if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+		return ctrl.Result{}, r.patchAccessPolicyStatus(ctx, object, nil, object.Status.OwnershipVerified, nil, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	policyID := object.Status.PolicyID
@@ -241,16 +249,19 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := r.patchAccessPolicyStatus(ctx, object, &remote, owned, nil, metav1.ConditionTrue, "Ready", "Access policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sweep's policy listing carries every field AccessPolicyMatchesInput
-	// compares; rule references are resolved before the gate on every pass.
-	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
-		policy, ok := listed.(flarecloudflare.AccessPolicy)
-		return ok && policy.ID == remote.ID && flarecloudflare.AccessPolicyMatchesInput(policy, input)
-	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	// The sweep's policy listing checks only the policy payload itself; when
+	// rules reference un-listed external IDs, skip parent-only content
+	// confirmation so bounded TTL re-verification detects deleted dependencies.
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if !hasExternalAccessRules(object.Spec.Include, object.Spec.Require, object.Spec.Exclude) {
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			policy, ok := listed.(flarecloudflare.AccessPolicy)
+			return ok && policy.ID == remote.ID && flarecloudflare.AccessPolicyMatchesInput(policy, input)
+		}, remote))
+	}
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessPolicy", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
@@ -523,7 +534,9 @@ func (r *AccessPolicyReconciler) reconcileDelete(ctx context.Context, object *v1
 	return r.Patch(ctx, object, base)
 }
 func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, object *v1alpha1.AccessPolicy, remote *flarecloudflare.AccessPolicy, owned bool, wouldApply *v1alpha1.AccessPolicyObservedState, status metav1.ConditionStatus, reason, message string) error {
-	generation := object.Generation
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessPolicy", client.ObjectKeyFromObject(object))
+	}
 	persistIdentity := remote != nil && remote.ID != "" && (status == metav1.ConditionTrue || owned || object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly)
 	if status == metav1.ConditionTrue && remote != nil && remote.ID == "" {
 		return fmt.Errorf("remote Access policy response omitted ID")
@@ -536,57 +549,33 @@ func (r *AccessPolicyReconciler) patchAccessPolicyStatus(ctx context.Context, ob
 			return err
 		}
 	}
-	if persistIdentity {
-		if err := r.persistAccessPolicyIdentity(ctx, object, remote.ID, owned); err != nil {
-			return err
-		}
-	}
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := new(v1alpha1.AccessPolicy)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
-			return err
-		}
-		if current.Generation != generation {
-			return nil
-		}
-		base := client.MergeFrom(current.DeepCopy())
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
 		if persistIdentity {
-			current.Status.PolicyID = remote.ID
-			current.Status.OwnershipVerified = owned
-			current.Status.Observed = observed
-			current.Status.WouldApply = wouldApply
+			live.Status.PolicyID = remote.ID
+			live.Status.OwnershipVerified = owned
+			live.Status.Observed = observed
+			live.Status.WouldApply = wouldApply
 		}
-		current.Status.AppliedHash = object.Status.AppliedHash
-		current.Status.AppliedAt = object.Status.AppliedAt
-		current.Status.ObservedGeneration = generation
-		current.Status.Conditions = mergeAccessConditions(current.Status.Conditions, r.now(), accessCondition(generation, "Accepted", status, reason, message), accessCondition(generation, "Ready", status, reason, message))
-		if err := r.Status().Patch(ctx, current, base); err != nil {
-			return err
-		}
-		*object = *current
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
 	})
-}
-
-func (r *AccessPolicyReconciler) persistAccessPolicyIdentity(ctx context.Context, object *v1alpha1.AccessPolicy, id string, owned bool) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := new(v1alpha1.AccessPolicy)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
-			return err
-		}
-		if current.Status.PolicyID == id && current.Status.OwnershipVerified == owned {
-			*object = *current
+	if err != nil {
+		return err
+	}
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote != nil && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessPolicy) error {
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			live.Status.PolicyID = remote.ID
+			live.Status.OwnershipVerified = true
 			return nil
-		}
-		base := client.MergeFrom(current.DeepCopy())
-		current.Status.PolicyID = id
-		current.Status.OwnershipVerified = owned
-		if err := r.Status().Patch(ctx, current, base); err != nil {
-			return err
-		}
-		*object = *current
-		return nil
-	})
+		})
+	}
+	return err
 }
 
 func findAccessPolicyByName(ctx context.Context, api flarecloudflare.AccessPolicyAPI, name string) (flarecloudflare.AccessPolicy, bool, error) {
@@ -615,6 +604,9 @@ func (r *AccessPolicyReconciler) now() time.Time {
 
 // SetupWithManager registers the AccessPolicy controller and dependency watches.
 func (r *AccessPolicyReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.AccessPolicy{}, accessPolicyAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.AccessPolicy).Spec.AccountRef.Name}
 	}); err != nil {

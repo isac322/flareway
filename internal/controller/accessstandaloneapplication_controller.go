@@ -54,6 +54,7 @@ const (
 // AccessStandaloneApplicationReconciler manages non-Gateway Cloudflare Access applications.
 type AccessStandaloneApplicationReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -100,16 +101,15 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	if err != nil {
 		return r.finishError(ctx, object, "Invalid", err)
 	}
-	input, err := r.applicationInput(ctx, object, account, api)
+	input, err := r.applicationInput(ctx, object, account, nil)
 	if err != nil {
-		var validation accessValidationError
-		if errors.As(err, &validation) || standaloneApplicationIsValidationError(err) {
-			return r.finishError(ctx, object, accessValidationReason(err), err)
-		}
-		return r.finishRemoteError(ctx, object, err)
+		return r.finishInputError(ctx, object, err)
 	}
 
 	if effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyStandaloneExternalRefs(ctx, object, api); err != nil {
+			return r.finishInputError(ctx, object, err)
+		}
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.ApplicationID == "" {
 			return r.finishError(ctx, object, "Invalid", errors.New("management policy ObserveOnly requires externalRef.applicationId"))
 		}
@@ -136,6 +136,7 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		Kind: "AccessStandaloneApplication", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.ApplicationID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -143,6 +144,10 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessStandaloneApplication", request.NamespacedName)
+	if err := verifyStandaloneExternalRefs(ctx, object, api); err != nil {
+		return r.finishInputError(ctx, object, err)
 	}
 
 	remote, secretRef, err := r.ensureManaged(ctx, api, scope, object, input)
@@ -159,24 +164,20 @@ func (r *AccessStandaloneApplicationReconciler) Reconcile(ctx context.Context, r
 		return ctrl.Result{}, err
 	}
 	stamp := newGateStamp(decision.DesiredHash, r.now())
-	if secretRef == nil {
-		// The sweep's application listing carries every field compared above,
-		// with each attached policy embedded; an attachment to a policy deleted
-		// out of band comes back without its decision and counts as changed.
-		// Referenced policies, identity providers, and custom pages are
-		// resolved before the gate on every pass. An application holding a
-		// one-time SaaS client Secret keeps its own verify, which is what
-		// notices that Secret going missing.
+	if secretRef == nil && !hasStandaloneExternalRefs(object) {
+		// The sweep's application listing checks the application and its
+		// embedded policies, not un-listed external IDP/custom-page/rule refs.
+		// Objects with external dependencies or a one-time SaaS client Secret
+		// keep bounded per-TTL self-verification instead.
 		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
 			application, ok := listed.(flarecloudflare.AccessApplication)
 			return ok && application.ID == remote.ID && accessApplicationPoliciesEmbedded(application) &&
 				flarecloudflare.AccessApplicationMatchesInput(application, input)
 		}, remote))
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessStandaloneApplication", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeAuthz, accessStandaloneApplicationRequeue)}, nil
 }
 
@@ -516,14 +517,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicies(ctx co
 
 func (r *AccessStandaloneApplicationReconciler) resolveStandalonePolicy(ctx context.Context, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, reference v1alpha1.AccessApplicationPolicyReference) (string, error) {
 	if reference.ExternalRef != nil {
-		policy, err := api.GetAccessPolicy(ctx, reference.ExternalRef.PolicyID)
-		if err != nil {
-			if flarecloudflare.IsNotFound(err) {
-				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", reference.ExternalRef.PolicyID, err)}
-			}
-			return "", err
+		if api == nil {
+			return reference.ExternalRef.PolicyID, nil
 		}
-		return policy.ID, nil
+		return verifyExternalAccessPolicy(ctx, api, reference.ExternalRef.PolicyID)
 	}
 	if reference.PolicyRef == nil {
 		return "", accessValidationError{reason: "Invalid", message: "policy reference is empty"}
@@ -565,14 +562,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneIDPs(ctx contex
 
 func (r *AccessStandaloneApplicationReconciler) resolveStandaloneIDP(ctx context.Context, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, reference v1alpha1.AccessIdentityProviderReference) (string, error) {
 	if reference.ExternalID != "" {
-		provider, err := api.GetIdentityProvider(ctx, reference.ExternalID)
-		if err != nil {
-			if flarecloudflare.IsNotFound(err) {
-				return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", reference.ExternalID, err)}
-			}
-			return "", err
+		if api == nil {
+			return reference.ExternalID, nil
 		}
-		return provider.ID, nil
+		return verifyExternalStandaloneIDP(ctx, api, reference.ExternalID)
 	}
 	var provider v1alpha1.IdentityProvider
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: reference.Name}, &provider); err != nil {
@@ -594,11 +587,10 @@ func (r *AccessStandaloneApplicationReconciler) resolveStandaloneCustomPages(ctx
 	result := make([]string, 0, len(references))
 	for _, reference := range references {
 		if reference.ExternalID != "" {
-			if _, err := api.GetAccessCustomPage(ctx, reference.ExternalID); err != nil {
-				if flarecloudflare.IsNotFound(err) {
-					return nil, accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", reference.ExternalID, err)}
+			if api != nil {
+				if err := verifyExternalCustomPage(ctx, api, reference.ExternalID); err != nil {
+					return nil, err
 				}
-				return nil, err
 			}
 			result = append(result, reference.ExternalID)
 			continue
@@ -916,6 +908,148 @@ func (r *AccessStandaloneApplicationReconciler) reconcileDelete(ctx context.Cont
 	return r.Patch(ctx, object, base)
 }
 
+var errFoundExternalRef = errors.New("found external ref")
+
+func hasStandaloneExternalRefs(object *v1alpha1.AccessStandaloneApplication) bool {
+	return walkStandaloneExternalRefs(object,
+		func(string) error { return errFoundExternalRef },
+		func(string) error { return errFoundExternalRef },
+		func(string) error { return errFoundExternalRef },
+		func(include, require, exclude []v1alpha1.AccessRule) error {
+			if hasExternalAccessRules(include, require, exclude) {
+				return errFoundExternalRef
+			}
+			return nil
+		},
+	) != nil
+}
+
+func verifyStandaloneExternalRefs(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, api flarecloudflare.AccessAPI) error {
+	return walkStandaloneExternalRefs(object,
+		func(id string) error {
+			_, err := verifyExternalAccessPolicy(ctx, api, id)
+			return err
+		},
+		func(id string) error {
+			_, err := verifyExternalStandaloneIDP(ctx, api, id)
+			return err
+		},
+		func(id string) error {
+			return verifyExternalCustomPage(ctx, api, id)
+		},
+		func(include, require, exclude []v1alpha1.AccessRule) error {
+			return verifyExternalAccessRules(ctx, api, include, require, exclude)
+		},
+	)
+}
+
+func walkStandaloneExternalRefs(
+	object *v1alpha1.AccessStandaloneApplication,
+	onPolicy func(string) error,
+	onIDP func(string) error,
+	onPage func(string) error,
+	onInfraRules func(include, require, exclude []v1alpha1.AccessRule) error,
+) error {
+	for _, ref := range object.Spec.Policies {
+		if ref.ExternalRef != nil {
+			if err := onPolicy(ref.ExternalRef.PolicyID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ref := range object.Spec.Application.AllowedIDPRefs {
+		if ref.ExternalID != "" {
+			if err := onIDP(ref.ExternalID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, ref := range object.Spec.Application.CustomPageRefs {
+		if ref.ExternalID != "" {
+			if err := onPage(ref.ExternalID); err != nil {
+				return err
+			}
+		}
+	}
+	if scim := object.Spec.Application.SCIMConfig; scim != nil && scim.IDPRef.ExternalID != "" {
+		if err := onIDP(scim.IDPRef.ExternalID); err != nil {
+			return err
+		}
+	}
+	if saas := object.Spec.SaaS; saas != nil {
+		if saas.OIDC != nil {
+			for _, claim := range saas.OIDC.CustomClaims {
+				for _, mapping := range claim.Source.NameByIDP {
+					if mapping.IDPRef.ExternalID != "" {
+						if err := onIDP(mapping.IDPRef.ExternalID); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		if saas.SAML != nil {
+			for _, attr := range saas.SAML.CustomAttributes {
+				for _, mapping := range attr.Source.NameByIDP {
+					if mapping.IDPRef.ExternalID != "" {
+						if err := onIDP(mapping.IDPRef.ExternalID); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+	}
+	if infra := object.Spec.Infrastructure; infra != nil {
+		for _, policy := range infra.Policies {
+			if err := onInfraRules(policy.Include, policy.Require, policy.Exclude); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func verifyExternalAccessPolicy(ctx context.Context, api flarecloudflare.AccessAPI, policyID string) (string, error) {
+	policy, err := api.GetAccessPolicy(ctx, policyID)
+	if err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessPolicy %q was not found: %v", policyID, err)}
+		}
+		return "", err
+	}
+	return policy.ID, nil
+}
+
+func verifyExternalStandaloneIDP(ctx context.Context, api flarecloudflare.AccessAPI, idpID string) (string, error) {
+	provider, err := api.GetIdentityProvider(ctx, idpID)
+	if err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return "", accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external IdentityProvider %q was not found: %v", idpID, err)}
+		}
+		return "", err
+	}
+	return provider.ID, nil
+}
+
+func verifyExternalCustomPage(ctx context.Context, api flarecloudflare.AccessAPI, pageID string) error {
+	if _, err := api.GetAccessCustomPage(ctx, pageID); err != nil {
+		if flarecloudflare.IsNotFound(err) {
+			return accessValidationError{reason: "TargetNotFound", message: fmt.Sprintf("external AccessCustomPage %q was not found: %v", pageID, err)}
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *AccessStandaloneApplicationReconciler) finishInputError(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, err error) (ctrl.Result, error) {
+	var validation accessValidationError
+	if errors.As(err, &validation) || standaloneApplicationIsValidationError(err) {
+		return r.finishError(ctx, object, accessValidationReason(err), err)
+	}
+	return r.finishRemoteError(ctx, object, err)
+}
+
 func (r *AccessStandaloneApplicationReconciler) finishError(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, reason string, err error) (ctrl.Result, error) {
 	var validation accessValidationError
 	terminal := errors.As(err, &validation) || standaloneApplicationIsValidationError(err)
@@ -944,28 +1078,48 @@ func (r *AccessStandaloneApplicationReconciler) finishObserved(ctx context.Conte
 	return ctrl.Result{}, r.patchStatus(ctx, object, remote, scope, owned, standaloneStatusSecretRef(object.Status), metav1.ConditionTrue, ready, reason, message, object.Status.AppliedHash, object.Status.AppliedAt)
 }
 
-func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, appliedHash string, appliedAt *metav1.Time) error {
-	base := client.MergeFrom(object.DeepCopy())
-	object.Status.AppliedHash = appliedHash
-	object.Status.AppliedAt = appliedAt
-	if remote.ID != "" {
-		object.Status.ApplicationID = remote.ID
+func (r *AccessStandaloneApplicationReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, scope flarecloudflare.AccessScope, owned bool, secretRef *corev1.LocalObjectReference, accepted, ready metav1.ConditionStatus, reason, message, _ string, _ *metav1.Time) error {
+	if accepted != metav1.ConditionTrue || ready != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessStandaloneApplication", client.ObjectKeyFromObject(object))
 	}
-	if remote.Name != "" {
-		object.Status.Type = v1alpha1.AccessStandaloneApplicationType(remote.Type)
-		object.Status.Name = remote.Name
-		object.Status.Domain = remote.Domain
-		object.Status.ZoneID = scope.ZoneID
-		object.Status.OwnershipVerified = owned
-		object.Status.Tags = slices.Clone(remote.Tags)
-		object.Status.SaaS, object.Status.Bookmark, object.Status.Infrastructure, object.Status.AppLauncher, object.Status.DashSSO, object.Status.MCPPortal = standaloneVariantStatus(object, remote, secretRef)
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
+		if remote.ID != "" {
+			live.Status.ApplicationID = remote.ID
+		}
+		if remote.Name != "" {
+			live.Status.Type = v1alpha1.AccessStandaloneApplicationType(remote.Type)
+			live.Status.Name = remote.Name
+			live.Status.Domain = remote.Domain
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = owned
+			live.Status.Tags = slices.Clone(remote.Tags)
+			live.Status.SaaS, live.Status.Bookmark, live.Status.Infrastructure, live.Status.AppLauncher, live.Status.DashSSO, live.Status.MCPPortal = standaloneVariantStatus(live, remote, secretRef)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(),
+			accessCondition(live.Generation, "Accepted", accepted, reason, message),
+			accessCondition(live.Generation, "Ready", ready, reason, message),
+		)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(),
-		accessCondition(object.Generation, "Accepted", accepted, reason, message),
-		accessCondition(object.Generation, "Ready", ready, reason, message),
-	)
-	return r.Status().Patch(ctx, object, base)
+	observedOwned := owned && effectiveManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessStandaloneApplication) error {
+			if effectiveManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+				live.Spec.Zone != object.Spec.Zone {
+				return errSkipStatusPatch
+			}
+			live.Status.ApplicationID = remote.ID
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func standaloneVariantStatus(_ *v1alpha1.AccessStandaloneApplication, remote flarecloudflare.AccessApplication, secretRef *corev1.LocalObjectReference) (*v1alpha1.AccessSaaSApplicationStatus, *v1alpha1.AccessBookmarkApplicationStatus, *v1alpha1.AccessInfrastructureApplicationStatus, *v1alpha1.AccessAppLauncherApplicationStatus, *v1alpha1.AccessDashSSOApplicationStatus, *v1alpha1.AccessMCPPortalApplicationStatus) {
@@ -1140,6 +1294,9 @@ func (r *AccessStandaloneApplicationReconciler) now() time.Time {
 
 // SetupWithManager registers dependency indexes and watches.
 func (r *AccessStandaloneApplicationReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.AccessStandaloneApplication{}, accessStandaloneApplicationAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.AccessStandaloneApplication).Spec.AccountRef.Name}

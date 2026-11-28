@@ -28,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -91,15 +90,15 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "Invalid", err.Error())
 	}
-	include, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Include)
+	include, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Include)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	require, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Require)
+	require, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Require)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
-	exclude, err := resolveAccessRules(ctx, r.Client, object.Namespace, account, api, object.Spec.Exclude)
+	exclude, err := resolveAccessRulesLocal(ctx, r.Client, object.Namespace, account, object.Spec.Exclude)
 	if err != nil {
 		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
@@ -115,6 +114,9 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		Name: name, Include: include, Require: require, Exclude: exclude, IsDefault: object.Spec.IsDefault,
 	}
 	if object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly {
+		if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+			return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
+		}
 		if object.Spec.ExternalRef == nil || object.Spec.ExternalRef.GroupID == "" {
 			return ctrl.Result{}, r.patchStatus(ctx, object, scope, flarecloudflare.AccessGroup{}, false, metav1.ConditionFalse, "Invalid", "ObserveOnly requires externalRef.groupId")
 		}
@@ -145,6 +147,7 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		Kind: "AccessGroup", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.GroupID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -152,6 +155,10 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
+	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessGroup", request.NamespacedName)
+	if err := verifyExternalAccessRules(ctx, api, object.Spec.Include, object.Spec.Require, object.Spec.Exclude); err != nil {
+		return ctrl.Result{}, r.patchStatus(ctx, object, recordedScope, flarecloudflare.AccessGroup{ID: object.Status.GroupID}, object.Status.OwnershipVerified, metav1.ConditionFalse, "RefNotPermitted", err.Error())
 	}
 
 	remote, owned, conflict, ensureErr := r.ensureManaged(ctx, api, scope, object, input)
@@ -171,16 +178,19 @@ func (r *AccessGroupReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if err := r.patchStatus(ctx, object, scope, remote, owned, metav1.ConditionTrue, "Ready", "Access group is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	// The sweep's group listing carries every field accessGroupMatchesInput
-	// compares; rule references are resolved before the gate on every pass.
-	stamp := newGateStamp(decision.DesiredHash, r.now()).withContent(contentBaseline(func(listed any) bool {
-		group, ok := listed.(flarecloudflare.AccessGroup)
-		return ok && group.ID == remote.ID && accessGroupMatchesInput(group, input)
-	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	// The sweep's group listing checks only the group payload itself; when
+	// rules reference un-listed external IDs, skip parent-only content
+	// confirmation so bounded TTL re-verification detects deleted dependencies.
+	stamp := newGateStamp(decision.DesiredHash, r.now())
+	if !hasExternalAccessRules(object.Spec.Include, object.Spec.Require, object.Spec.Exclude) {
+		stamp = stamp.withContent(contentBaseline(func(listed any) bool {
+			group, ok := listed.(flarecloudflare.AccessGroup)
+			return ok && group.ID == remote.ID && accessGroupMatchesInput(group, input)
+		}, remote))
+	}
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "AccessGroup", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 func (r *AccessGroupReconciler) ensureManaged(ctx context.Context, api flarecloudflare.AccessGroupAPI, scope flarecloudflare.AccessScope, object *v1alpha1.AccessGroup, input flarecloudflare.AccessGroupInput) (flarecloudflare.AccessGroup, bool, string, error) {
@@ -363,15 +373,12 @@ func accessGroupObservedState(remote flarecloudflare.AccessGroup) (*v1alpha1.Acc
 }
 
 func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha1.AccessGroup, scope flarecloudflare.AccessScope, remote flarecloudflare.AccessGroup, owned bool, status metav1.ConditionStatus, reason, message string) error {
-	generation := object.Generation
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "AccessGroup", client.ObjectKeyFromObject(object))
+	}
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || object.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly)
 	if status == metav1.ConditionTrue && remote.ID == "" {
 		return fmt.Errorf("remote Access group response omitted ID")
-	}
-	if persistIdentity {
-		if err := r.persistIdentity(ctx, object, scope, remote.ID, owned); err != nil {
-			return err
-		}
 	}
 	var observed *v1alpha1.AccessGroupObservedState
 	if remote.Name != "" {
@@ -381,55 +388,37 @@ func (r *AccessGroupReconciler) patchStatus(ctx context.Context, object *v1alpha
 			return err
 		}
 	}
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := new(v1alpha1.AccessGroup)
-		if err := r.reader().Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
-			return err
-		}
-		if current.Generation != generation {
-			return nil
-		}
-		base := client.MergeFrom(current.DeepCopy())
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessGroup) error {
 		if observed != nil {
-			current.Status.Observed = observed
+			live.Status.Observed = observed
 		}
 		if persistIdentity {
-			current.Status.GroupID = remote.ID
-			current.Status.ZoneID = scope.ZoneID
-			current.Status.OwnershipVerified = owned
+			live.Status.GroupID = remote.ID
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = owned
 		}
-		current.Status.AppliedHash = object.Status.AppliedHash
-		current.Status.AppliedAt = object.Status.AppliedAt
-		current.Status.ObservedGeneration = generation
-		current.Status.Conditions = mergeAccessConditions(current.Status.Conditions, r.now(), accessCondition(generation, "Accepted", status, reason, message), accessCondition(generation, "Ready", status, reason, message))
-		if err := r.Status().Patch(ctx, current, base); err != nil {
-			return err
-		}
-		*object = *current
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
 	})
-}
-
-func (r *AccessGroupReconciler) persistIdentity(ctx context.Context, object *v1alpha1.AccessGroup, scope flarecloudflare.AccessScope, id string, owned bool) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := new(v1alpha1.AccessGroup)
-		if err := r.reader().Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
-			return err
-		}
-		if current.Status.GroupID == id && current.Status.ZoneID == scope.ZoneID && current.Status.OwnershipVerified == owned {
-			*object = *current
+	if err != nil {
+		return err
+	}
+	observedOwned := owned && object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.AccessGroup) error {
+			if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+				live.Spec.Zone != object.Spec.Zone {
+				return errSkipStatusPatch
+			}
+			live.Status.GroupID = remote.ID
+			live.Status.ZoneID = scope.ZoneID
+			live.Status.OwnershipVerified = true
 			return nil
-		}
-		base := client.MergeFrom(current.DeepCopy())
-		current.Status.GroupID = id
-		current.Status.ZoneID = scope.ZoneID
-		current.Status.OwnershipVerified = owned
-		if err := r.Status().Patch(ctx, current, base); err != nil {
-			return err
-		}
-		*object = *current
-		return nil
-	})
+		})
+	}
+	return err
 }
 func (r *AccessGroupReconciler) now() time.Time {
 	if r.Now != nil {

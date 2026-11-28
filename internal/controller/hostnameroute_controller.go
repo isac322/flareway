@@ -47,6 +47,7 @@ import (
 // HostnameRouteReconciler manages Cloudflare private hostname routes.
 type HostnameRouteReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewPrivateNetworkCloudflareClient
 	OperatorNamespace   string
@@ -128,6 +129,7 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		Kind: "HostnameRoute", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RouteID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -136,6 +138,7 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("HostnameRoute", request.NamespacedName)
 	remote, err := r.ensureManaged(ctx, api, object, input)
 	if err != nil {
 		if privateIsValidationError(err) && remote.ID != "" {
@@ -160,10 +163,9 @@ func (r *HostnameRouteReconciler) Reconcile(ctx context.Context, request ctrl.Re
 			validatePrivateTunnelType(input.TunnelType, route.TunnelType, "hostname route", route.ID) == "" &&
 			!hostnameRouteNeedsUpdate(input, route)
 	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "HostnameRoute", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeTraffic)}, nil
 }
 
@@ -570,29 +572,52 @@ func (r *HostnameRouteReconciler) finishRemoteError(ctx context.Context, object 
 }
 
 func (r *HostnameRouteReconciler) patchStatus(ctx context.Context, object *v1alpha1.HostnameRoute, remote flarecloudflare.HostnameRoute, hostname string, owned, applied bool, status metav1.ConditionStatus, reason, message string) error {
-	base := client.MergeFrom(object.DeepCopy())
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "HostnameRoute", client.ObjectKeyFromObject(object))
+	}
 	observeOnly := effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyObserveOnly
 	persistIdentity := remote.ID != "" && (status == metav1.ConditionTrue || owned || observeOnly)
-	if persistIdentity {
-		object.Status.RouteID = remote.ID
-		object.Status.Hostname = remote.Hostname
-		object.Status.TunnelID = remote.TunnelID
-		object.Status.TunnelName = remote.TunnelName
-		object.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
-		object.Status.Comment = remote.Comment
-		object.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
-		object.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
-		object.Status.OwnershipVerified = owned
+	setIdentity := func(live *v1alpha1.HostnameRoute) {
+		live.Status.RouteID = remote.ID
+		live.Status.Hostname = remote.Hostname
+		live.Status.TunnelID = remote.TunnelID
+		live.Status.TunnelName = remote.TunnelName
+		live.Status.TunnelType = privateTunnelRemoteType(remote.TunnelType)
+		live.Status.Comment = remote.Comment
+		live.Status.CreatedAt = privateMetaTime(remote.CreatedAt)
+		live.Status.DeletedAt = privateMetaTimePointer(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
 	}
-	if applied && remote.ID != "" {
-		object.Status.Applied = v1alpha1.HostnameRouteAppliedStatus{
-			Hostname: hostname, TunnelID: remote.TunnelID,
-			TunnelType: privateTunnelRemoteType(remote.TunnelType), ObservedGeneration: object.Generation,
+	patched, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
+		if persistIdentity {
+			setIdentity(live)
 		}
+		if applied && remote.ID != "" {
+			live.Status.Applied = v1alpha1.HostnameRouteAppliedStatus{
+				Hostname: hostname, TunnelID: remote.TunnelID,
+				TunnelType: privateTunnelRemoteType(remote.TunnelType), ObservedGeneration: live.Generation,
+			}
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = privateConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = privateConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	observedOwned := owned && effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !patched && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.HostnameRoute) error {
+			if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			setIdentity(live)
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func hostnameRouteFromStatus(object *v1alpha1.HostnameRoute) flarecloudflare.HostnameRoute {
@@ -622,6 +647,9 @@ func (r *HostnameRouteReconciler) now() time.Time {
 
 // SetupWithManager registers the HostnameRoute controller and dependency watches.
 func (r *HostnameRouteReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if r.OperatorNamespace == "" {
 		r.OperatorNamespace = dataplane.DefaultOperatorNamespace
 	}

@@ -60,6 +60,8 @@ func TestCloudflareModeGatewayRemovesListenerService(t *testing.T) {
 	current := h.getGateway(t, f.gatewayKey)
 	programmed := meta.FindStatusCondition(current.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	if programmed == nil || programmed.Status != metav1.ConditionTrue {
+		h.dumpDiagnostics(t)
+		h.dumpTunnelSequence(t, f, time.Time{})
 		t.Fatalf("Programmed after listener Service removal = %#v, want True", programmed)
 	}
 }

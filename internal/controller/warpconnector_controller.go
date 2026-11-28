@@ -74,6 +74,7 @@ func WARPConnectorClientFromFactory(factory flarecloudflare.ClientFactory) NewWA
 // It has no Gateway, Envoy, cloudflared ingress, or DNS responsibilities.
 type WARPConnectorReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewWARPConnectorCloudflareClient
 	Now                 func() time.Time
@@ -131,12 +132,14 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 			Kind: "WARPConnector", Namespace: object.Namespace, Name: object.Name,
 			UID: object.UID, RemoteID: object.Status.TunnelID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
-			Spec: object.Spec,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, flarewayv1alpha1.WARPConnectorConditionAccepted, flarewayv1alpha1.WARPConnectorConditionReady),
+			Spec:      object.Spec,
 		}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("WARPConnector", request.NamespacedName)
 	remote, owned, err := r.ensureRemote(ctx, api, account, object)
 	if err != nil {
 		return r.finishError(ctx, object, err)
@@ -186,7 +189,6 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishError(ctx, object, err)
 	}
 	clients = boundedWARPConnectorClients(clients)
-	clearGate(r.Invalidator, "WARPConnector", request.NamespacedName)
 	requeue := warpConnectorRequeue
 	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
 		requeue = convergedRequeue(r.Freshness, freshness.GradeIndirect, warpConnectorRequeue)
@@ -194,7 +196,7 @@ func (r *WARPConnectorReconciler) Reconcile(ctx context.Context, request ctrl.Re
 	if err := r.patchReadyStatus(ctx, object, remote, configuration, clients, failover, owned, conflicts, configurationDrift != ""); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
@@ -764,29 +766,9 @@ func (r *WARPConnectorReconciler) patchOrphaned(ctx context.Context, object *fla
 }
 
 func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *flarewayv1alpha1.WARPConnector, remote flarecloudflare.WARPConnector, configuration flarecloudflare.WARPConnectorConfiguration, clients []flarecloudflare.WARPConnectorClient, failover *flarewayv1alpha1.WARPConnectorFailoverStatus, owned bool, conflicts []string, configurationDrift bool) error {
-	base := client.MergeFrom(object.DeepCopy())
-	object.Status.TunnelID = remote.ID
-	object.Status.AccountID = remote.AccountTag
-	object.Status.Name = remote.Name
-	object.Status.TunnelType = warpConnectorTunnelType(remote.TunnelType)
-	object.Status.ConnectorState = warpConnectorState(remote.Status)
-	object.Status.CreatedAt = warpMetaTime(remote.CreatedAt)
-	object.Status.DeletedAt = warpMetaTime(remote.DeletedAt)
-	object.Status.ConnectionsActiveAt = warpMetaTime(remote.ConnsActiveAt)
-	object.Status.ConnectionsInactiveAt = warpMetaTime(remote.ConnsInactiveAt)
-	object.Status.OwnershipVerified = owned
-	object.Status.CreateAttemptName = ""
-	object.Status.CreateAttemptGeneration = 0
-	object.Status.ObservedGeneration = object.Generation
-	if effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
-		object.Status.TokenSecretRef = &corev1.LocalObjectReference{Name: warpConnectorSecretPrefix + object.Name}
-	} else {
-		object.Status.TokenSecretRef = nil
+	if len(conflicts) > 0 {
+		forgetGate(r.Invalidator, "WARPConnector", client.ObjectKeyFromObject(object))
 	}
-	object.Status.Configuration = warpConfigurationStatus(configuration)
-	object.Status.Failover = failover
-	object.Status.Clients = warpClientStatuses(clients)
-
 	configurationStatus := metav1.ConditionTrue
 	configurationReason := "Ready"
 	configurationMessage := "WARP Connector HA configuration is synchronized"
@@ -799,30 +781,74 @@ func (r *WARPConnectorReconciler) patchReadyStatus(ctx context.Context, object *
 			configurationMessage = "Observed WARP Connector HA configuration differs from the desired configuration"
 		}
 	}
-	conditions := []metav1.Condition{
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionAccepted, metav1.ConditionTrue, "Accepted", "WARP Connector is valid and authorized"),
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionTunnelReady, metav1.ConditionTrue, "Ready", fmt.Sprintf("WARP Connector %s exists", remote.ID)),
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionConfigurationReady, configurationStatus, configurationReason, configurationMessage),
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionClientsReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed %d WARP Connector clients", len(clients))),
-		warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked, metav1.ConditionFalse, "NotBlocked", "No cleanup is pending"),
+	setIdentity := func(live *flarewayv1alpha1.WARPConnector) {
+		live.Status.TunnelID = remote.ID
+		live.Status.AccountID = remote.AccountTag
+		live.Status.Name = remote.Name
+		live.Status.TunnelType = warpConnectorTunnelType(remote.TunnelType)
+		live.Status.CreatedAt = warpMetaTime(remote.CreatedAt)
+		live.Status.DeletedAt = warpMetaTime(remote.DeletedAt)
+		live.Status.OwnershipVerified = owned
 	}
-	if len(conflicts) > 0 {
-		message := strings.Join(conflicts, "; ")
-		conditions = append(conditions,
-			warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionConflict, metav1.ConditionTrue, "DriftDetected", message),
-			warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionReady, metav1.ConditionFalse, "DriftDetected", message),
-		)
-	} else {
-		conditions = append(conditions,
-			warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionConflict, metav1.ConditionFalse, "NoConflict", "No ownership or configuration conflict was detected"),
-			warpCondition(object.Generation, flarewayv1alpha1.WARPConnectorConditionReady, metav1.ConditionTrue, "Ready", "WARP Connector is synchronized"),
-		)
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+		setIdentity(live)
+		live.Status.ConnectorState = warpConnectorState(remote.Status)
+		live.Status.ConnectionsActiveAt = warpMetaTime(remote.ConnsActiveAt)
+		live.Status.ConnectionsInactiveAt = warpMetaTime(remote.ConnsInactiveAt)
+		live.Status.CreateAttemptName = ""
+		live.Status.CreateAttemptGeneration = 0
+		live.Status.ObservedGeneration = live.Generation
+		if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged {
+			live.Status.TokenSecretRef = &corev1.LocalObjectReference{Name: warpConnectorSecretPrefix + live.Name}
+		} else {
+			live.Status.TokenSecretRef = nil
+		}
+		live.Status.Configuration = warpConfigurationStatus(configuration)
+		live.Status.Failover = failover
+		live.Status.Clients = warpClientStatuses(clients)
+
+		conditions := []metav1.Condition{
+			warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionAccepted, metav1.ConditionTrue, "Accepted", "WARP Connector is valid and authorized"),
+			warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionTunnelReady, metav1.ConditionTrue, "Ready", fmt.Sprintf("WARP Connector %s exists", remote.ID)),
+			warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionConfigurationReady, configurationStatus, configurationReason, configurationMessage),
+			warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionClientsReady, metav1.ConditionTrue, "Observed", fmt.Sprintf("Observed %d WARP Connector clients", len(clients))),
+			warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionCleanupBlocked, metav1.ConditionFalse, "NotBlocked", "No cleanup is pending"),
+		}
+		if len(conflicts) > 0 {
+			message := strings.Join(conflicts, "; ")
+			conditions = append(conditions,
+				warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionConflict, metav1.ConditionTrue, "DriftDetected", message),
+				warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionReady, metav1.ConditionFalse, "DriftDetected", message),
+			)
+		} else {
+			conditions = append(conditions,
+				warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionConflict, metav1.ConditionFalse, "NoConflict", "No ownership or configuration conflict was detected"),
+				warpCondition(live.Generation, flarewayv1alpha1.WARPConnectorConditionReady, metav1.ConditionTrue, "Ready", "WARP Connector is synchronized"),
+			)
+		}
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), conditions...)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), conditions...)
-	return r.Status().Patch(ctx, object, base)
+	observedOwned := owned && effectivePrivateManagementPolicy(object.Spec.ManagementPolicy) == flarewayv1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *flarewayv1alpha1.WARPConnector) error {
+			if effectivePrivateManagementPolicy(live.Spec.ManagementPolicy) != flarewayv1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			setIdentity(live)
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func (r *WARPConnectorReconciler) finishError(ctx context.Context, object *flarewayv1alpha1.WARPConnector, err error) (ctrl.Result, error) {
+	forgetGate(r.Invalidator, "WARPConnector", client.ObjectKeyFromObject(object))
 	reason := privateErrorReason(err)
 	message := privateErrorMessage(err)
 	base := client.MergeFrom(object.DeepCopy())
@@ -945,6 +971,9 @@ func (r *WARPConnectorReconciler) now() time.Time {
 
 // SetupWithManager registers WARPConnector and its account/token Secret watches.
 func (r *WARPConnectorReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &flarewayv1alpha1.WARPConnector{}, warpConnectorAccountIndex, func(object client.Object) []string {
 		return []string{object.(*flarewayv1alpha1.WARPConnector).Spec.AccountRef.Name}
 	}); err != nil {

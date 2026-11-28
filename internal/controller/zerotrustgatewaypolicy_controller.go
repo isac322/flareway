@@ -118,6 +118,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 		Kind: "ZeroTrustGatewayPolicy", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.RuleID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustGatewayPolicyConditionAccepted, v1alpha1.ZeroTrustGatewayPolicyConditionReady),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -126,11 +127,11 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ZeroTrustGatewayPolicy", request.NamespacedName)
 	remote, err := r.ensureManaged(ctx, api, object, input, ownerDescription)
 	if err != nil {
 		return r.finishRemoteOrValidationError(ctx, object, err)
 	}
-	clearGate(r.Invalidator, "ZeroTrustGatewayPolicy", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, "Ready", "Zero Trust Gateway policy is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -141,7 +142,7 @@ func (r *ZeroTrustGatewayPolicyReconciler) Reconcile(ctx context.Context, reques
 		rule, ok := listed.(flarecloudflare.GatewayRule)
 		return ok && rule.ID == remote.ID && !rule.ReadOnly && gatewayRuleMatchesInput(rule, input)
 	}, remote))
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, stamp); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, stamp, verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeTraffic, globalRequeue)}, nil
@@ -590,19 +591,39 @@ func (r *ZeroTrustGatewayPolicyReconciler) finishRemoteOrValidationError(ctx con
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustGatewayPolicy, remote flarecloudflare.GatewayRule, owned bool, wouldApply *v1alpha1.ZeroTrustGatewayPolicyDesiredState, status metav1.ConditionStatus, reason, message string) error {
-	base := client.MergeFrom(object.DeepCopy())
-	if remote.ID != "" {
-		object.Status.RuleID = remote.ID
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustGatewayPolicy", client.ObjectKeyFromObject(object))
 	}
-	if status == metav1.ConditionTrue {
-		observed := gatewayRuleObserved(remote)
-		object.Status.Observed = &observed
-		object.Status.OwnershipVerified = owned
-		object.Status.WouldApply = wouldApply
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
+		if remote.ID != "" {
+			live.Status.RuleID = remote.ID
+		}
+		if status == metav1.ConditionTrue {
+			observed := gatewayRuleObserved(remote)
+			live.Status.Observed = &observed
+			live.Status.OwnershipVerified = owned
+			live.Status.WouldApply = wouldApply
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	observedOwned := owned && effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && status == metav1.ConditionTrue && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustGatewayPolicy) error {
+			if effectiveGlobalManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			live.Status.RuleID = remote.ID
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func (r *ZeroTrustGatewayPolicyReconciler) now() time.Time {
@@ -614,6 +635,9 @@ func (r *ZeroTrustGatewayPolicyReconciler) now() time.Time {
 
 // SetupWithManager registers the ZeroTrustGatewayPolicy controller and dependency watches.
 func (r *ZeroTrustGatewayPolicyReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ZeroTrustGatewayPolicy{}, gatewayPolicyAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.ZeroTrustGatewayPolicy).Spec.AccountRef.Name}
 	}); err != nil {

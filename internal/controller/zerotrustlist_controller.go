@@ -103,20 +103,21 @@ func (r *ZeroTrustListReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		Kind: "ZeroTrustList", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.ListID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
-		Spec: object.Spec,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustListConditionAccepted, v1alpha1.ZeroTrustListConditionReady),
+		Spec:      object.Spec,
 	}, object.Status.AppliedHash, object.Status.AppliedAt, r.now())
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ZeroTrustList", request.NamespacedName)
 	remote, err := r.ensureManaged(ctx, api, object, desiredItems)
 	if err != nil {
 		return r.finishRemoteOrValidationError(ctx, object, err)
 	}
-	clearGate(r.Invalidator, "ZeroTrustList", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, remote, true, nil, metav1.ConditionTrue, "Ready", "Zero Trust list is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeTraffic, globalRequeue)}, nil
@@ -393,23 +394,43 @@ func (r *ZeroTrustListReconciler) finishRemoteOrValidationError(ctx context.Cont
 }
 
 func (r *ZeroTrustListReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustList, remote flarecloudflare.GatewayList, owned bool, wouldApply *v1alpha1.ZeroTrustListItemsDiff, status metav1.ConditionStatus, reason, message string) error {
-	base := client.MergeFrom(object.DeepCopy())
-	if remote.ID != "" {
-		object.Status.ListID = remote.ID
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustList", client.ObjectKeyFromObject(object))
 	}
-	if status == metav1.ConditionTrue {
-		items := make([]string, len(remote.Items))
-		for i := range remote.Items {
-			items[i] = remote.Items[i].Value
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustList) error {
+		if remote.ID != "" {
+			live.Status.ListID = remote.ID
 		}
-		items = canonicalListItems(items)
-		object.Status.Observed = &v1alpha1.ZeroTrustListObservedState{Name: remote.Name, Type: v1alpha1.ZeroTrustListType(remote.Type), Items: items}
-		object.Status.OwnershipVerified = owned
-		object.Status.WouldApply = wouldApply
+		if status == metav1.ConditionTrue {
+			items := make([]string, len(remote.Items))
+			for i := range remote.Items {
+				items[i] = remote.Items[i].Value
+			}
+			items = canonicalListItems(items)
+			live.Status.Observed = &v1alpha1.ZeroTrustListObservedState{Name: remote.Name, Type: v1alpha1.ZeroTrustListType(remote.Type), Items: items}
+			live.Status.OwnershipVerified = owned
+			live.Status.WouldApply = wouldApply
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	observedOwned := owned && effectiveGlobalManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && remote.ID != "" && status == metav1.ConditionTrue && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustList) error {
+			if effectiveGlobalManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			live.Status.ListID = remote.ID
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 func (r *ZeroTrustListReconciler) now() time.Time {
@@ -421,6 +442,9 @@ func (r *ZeroTrustListReconciler) now() time.Time {
 
 // SetupWithManager registers the ZeroTrustList controller and singleton watches.
 func (r *ZeroTrustListReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ZeroTrustList{}, zeroTrustListAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.ZeroTrustList).Spec.AccountRef.Name}
 	}); err != nil {

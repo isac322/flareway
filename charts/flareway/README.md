@@ -104,14 +104,14 @@ The `reconcile` values map to the manager's drift and freshness flags and are re
 |---|---|---|
 | `reconcile.driftPolicy` | `--drift-policy` | `Overwrite` restores the desired state over an out-of-band change. `Hold` reports the drift and skips the remote write until the spec changes or the remote is repaired. |
 | `reconcile.freshness.authz` | `--freshness-authz` | Duration; applies to `AccessApplication`, `AccessStandaloneApplication`, `AccessPolicy`, `AccessGroup`, `AccessCustomPage`, `AccessInfrastructureTarget`, `ServiceToken`, `IdentityProvider` |
-| `reconcile.freshness.traffic` | `--freshness-traffic` | Duration; applies to `CloudflareTunnel`, DNS records, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute` |
+| `reconcile.freshness.traffic` | `--freshness-traffic` | Duration; applies to `CloudflareTunnel`, `Gateway` tunnel configuration (`CloudflareTunnelConfig`), DNS records, `ZeroTrustGatewayPolicy`, `ZeroTrustList`, `VirtualNetwork`, `NetworkRoute`, `HostnameRoute` |
 | `reconcile.freshness.indirect` | `--freshness-indirect` | Duration; applies to `DeviceProfile`, `DeviceSettings`, `DevicePostureRule`, `DevicePostureIntegration`, `ZeroTrustOrganization`, `WARPConnector` |
 | `reconcile.freshness.display` | `--freshness-display` | Duration; no Flareway kind uses the T4 grade |
 | `reconcile.disableSweep` | `--disable-sweep` | `true` or `false` |
 
-A freshness value is how long a converged object skips Cloudflare reads. The schema accepts a whole number followed by `ms`, `s`, `m`, or `h`, such as `90s` or `30m`. `0s` keeps that grade's gate closed, so its objects read Cloudflare on every pass. The manager exits at startup unless the positive values satisfy `authz` ≤ `traffic` ≤ `indirect`; the schema does not check that ordering.
+A freshness value is how long a converged object skips Cloudflare reads. The schema accepts a whole number followed by `ms`, `s`, `m`, or `h`, such as `90s` or `30m`. `0s` disables that grade's read-skip gate and sweep target loops, so its objects read Cloudflare on every pass (controllers with periodic fallback loops—including `10s` on a programmed `Gateway`—keep polling on those intervals, `ServiceToken` keeps its expiry scheduler, and event-driven kinds recheck on Kubernetes watch events). The manager exits at startup unless the positive values satisfy `authz` ≤ `traffic` ≤ `indirect`; the schema does not check that ordering.
 
-With `reconcile.disableSweep=true`, freshness gates keep working, and out-of-band drift is detected only when an object's TTL expires.
+With `reconcile.disableSweep=true`, positive-TTL freshness gates keep working, and out-of-band drift on positive grades is detected when an object's TTL expires (grade-0 controllers follow their watch or fallback intervals).
 
 ```sh
 helm upgrade flareway oci://ghcr.io/isac322/charts/flareway \

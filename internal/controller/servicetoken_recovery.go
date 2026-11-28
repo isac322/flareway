@@ -301,6 +301,24 @@ func (journal *serviceTokenJournal) matchesIdentity(object *v1alpha1.ServiceToke
 	return journal.matchesSpecIdentity(object, account) && journal.clusterUID == clusterID
 }
 
+// matchesCheckpointedToken reports whether the journal describes the exact
+// remote token already checkpointed and owned on object.Status.TokenID so a
+// teardown after a spec.secretRef.name edit can reap the journal safely once
+// the remote token itself has been deleted.
+func (journal *serviceTokenJournal) matchesCheckpointedToken(object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, deletedScope flarecloudflare.AccessScope, clusterID string) bool {
+	return journal.phase == serviceTokenJournalPhaseDispatched &&
+		journal.crUID == string(object.UID) &&
+		journal.clusterUID == clusterID &&
+		journal.accountName == object.Spec.AccountRef.Name &&
+		journal.accountUID == string(account.UID) &&
+		journal.accountID == account.Spec.AccountID &&
+		journal.zoneID == object.Status.ZoneID &&
+		deletedScope.ZoneID == journal.zoneID &&
+		journal.issuedID != "" &&
+		journal.issuedID == object.Status.TokenID &&
+		journal.retiringID == ""
+}
+
 // createServiceTokenJournal persists a fresh prepared journal. AlreadyExists is
 // returned to the caller so the next pass resumes through the journal path.
 func (r *ServiceTokenReconciler) createServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, account *v1alpha1.CloudflareAccount, scope flarecloudflare.AccessScope, clusterID, nonce string) (*corev1.Secret, *serviceTokenJournal, error) {
@@ -898,8 +916,21 @@ func (r *ServiceTokenReconciler) convergeCapturedServiceToken(ctx context.Contex
 			return ctrl.Result{}, r.finishRemoteError(ctx, object, err)
 		}
 	}
-	if err := r.patchStatus(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true}); err != nil {
+	applied, err := r.patchStatusChecked(ctx, object, scope, remote, metav1.ConditionTrue, "Ready", "Service token is created", serviceTokenStatusUpdate{OwnershipVerified: true, ObserveRotationRequest: true})
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !applied {
+		if remote.ID != "" {
+			persisted, persistErr := r.persistIdentity(ctx, object, scope, remote, serviceTokenStatusUpdate{OwnershipVerified: true})
+			if persistErr != nil {
+				return ctrl.Result{}, persistErr
+			}
+			if persisted {
+				return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+			}
+		}
+		return ctrl.Result{}, nil
 	}
 	if err := r.deleteServiceTokenJournalSecret(ctx, journalSecret); err != nil {
 		return ctrl.Result{}, err
@@ -948,10 +979,18 @@ func (r *ServiceTokenReconciler) createServiceToken(ctx context.Context, object 
 // cleanupPendingServiceTokenJournal removes remote tokens recorded by a
 // pending journal during teardown. It uses the journaled account and scope
 // binding so pending cleanup works even when status.tokenId is empty.
-func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journal *serviceTokenJournal) error {
-	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, journal.accountName, authzRequestForJournal(journal), r.NewCloudflareClient)
-	if err != nil {
-		return err
+func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.Context, object *v1alpha1.ServiceToken, journalSecret *corev1.Secret, journal *serviceTokenJournal) error {
+	switch journal.phase {
+	case serviceTokenJournalPhasePrepared, serviceTokenJournalPhaseDispatched, serviceTokenJournalPhaseRetiring:
+	default:
+		return fmt.Errorf("unsupported service token journal phase %q during teardown", journal.phase)
+	}
+	if journal.accountName == "" {
+		return errors.New("service token journal account name is empty")
+	}
+	account := new(v1alpha1.CloudflareAccount)
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Name: journal.accountName}, account); err != nil {
+		return fmt.Errorf("get CloudflareAccount %q: %w", journal.accountName, err)
 	}
 	clusterID, err := r.authoritativeClusterID(ctx)
 	if err != nil {
@@ -959,6 +998,10 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 	}
 	if !journal.matchesIdentity(object, account, clusterID) {
 		return errors.New("service token journal identity does not match the live object or authoritative cluster")
+	}
+	api, err := accessClientForResolvedAccount(ctx, r.apiReader(), account, object.Namespace, authzRequestForJournal(journal), r.NewCloudflareClient)
+	if err != nil {
+		return err
 	}
 	scope := flarecloudflare.AccessScope{ZoneID: journal.zoneID}
 	tokens, err := api.ListServiceTokens(ctx, scope)
@@ -980,8 +1023,40 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 			matches[remote.Name] = remote
 		}
 	}
-	if journal.phase == serviceTokenJournalPhaseDispatched && journal.issuedID == "" && len(matches) == 0 {
-		return errors.New("dispatched service token journal has no issued ID or exact remote candidate")
+	if journal.phase == serviceTokenJournalPhaseDispatched && journal.issuedID == "" {
+		if _, ok := matches[journal.attemptName]; !ok {
+			return errors.New("dispatched service token journal has no issued ID or exact remote candidate")
+		}
+	}
+	if journal.phase == serviceTokenJournalPhaseRetiring && journal.retiringName != "" && journal.retiringID == "" {
+		if _, ok := matches[journal.retiringName]; !ok {
+			return errors.New("retiring service token journal has no retiring ID or exact remote candidate")
+		}
+	}
+	var recoveredIssuedID, recoveredRetiringID string
+	if match, ok := matches[journal.attemptName]; ok {
+		if match.ID == "" {
+			return fmt.Errorf("matched remote service token %q omitted ID", journal.attemptName)
+		}
+		if journal.issuedID != "" && match.ID != journal.issuedID {
+			return fmt.Errorf("remote service token %q ID %q disagrees with journaled issued ID %q", journal.attemptName, match.ID, journal.issuedID)
+		}
+		if journal.issuedID == "" {
+			recoveredIssuedID = match.ID
+		}
+	}
+	if journal.retiringName != "" {
+		if match, ok := matches[journal.retiringName]; ok {
+			if match.ID == "" {
+				return fmt.Errorf("matched remote service token %q omitted ID", journal.retiringName)
+			}
+			if journal.retiringID != "" && match.ID != journal.retiringID {
+				return fmt.Errorf("remote service token %q ID %q disagrees with journaled retiring ID %q", journal.retiringName, match.ID, journal.retiringID)
+			}
+			if journal.retiringID == "" {
+				recoveredRetiringID = match.ID
+			}
+		}
 	}
 	committedID, err := r.committedServiceTokenCredential(ctx, object)
 	if err != nil {
@@ -995,14 +1070,21 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 		}
 		committedClientID = string(secret.Data[v1alpha1.ServiceTokenClientIDKey])
 	}
-	ids := map[string]bool{}
-	if journal.issuedID != "" {
-		ids[journal.issuedID] = true
+	seenIDs := map[string]bool{}
+	idList := make([]string, 0, 4)
+	addID := func(id string) {
+		if id != "" && !seenIDs[id] {
+			seenIDs[id] = true
+			idList = append(idList, id)
+		}
 	}
-	if journal.retiringID != "" {
-		ids[journal.retiringID] = true
-	}
-	for id := range ids {
+	addID(journal.issuedID)
+	addID(journal.retiringID)
+	addID(recoveredIssuedID)
+	addID(recoveredRetiringID)
+
+	deleteIDs := make([]string, 0, len(idList))
+	for _, id := range idList {
 		remote, getErr := api.GetServiceToken(ctx, scope, id)
 		if flarecloudflare.IsNotFound(getErr) {
 			continue
@@ -1017,6 +1099,23 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 		if !allowed {
 			return fmt.Errorf("remote service token %q has unexpected name %q during journal cleanup", id, remote.Name)
 		}
+		deleteIDs = append(deleteIDs, id)
+	}
+	if recoveredIssuedID != "" || recoveredRetiringID != "" {
+		if journalSecret == nil {
+			return errors.New("service token journal Secret is missing before recording recovered token ID")
+		}
+		if recoveredIssuedID != "" {
+			journal.issuedID = recoveredIssuedID
+		}
+		if recoveredRetiringID != "" {
+			journal.retiringID = recoveredRetiringID
+		}
+		if err := r.persistServiceTokenJournal(ctx, journalSecret, journal); err != nil {
+			return fmt.Errorf("persist recovered service token ID to journal: %w", err)
+		}
+	}
+	for _, id := range deleteIDs {
 		if err := ignoreRemoteNotFound(api.DeleteServiceToken(ctx, scope, id)); err != nil {
 			return err
 		}
@@ -1027,16 +1126,13 @@ func (r *ServiceTokenReconciler) cleanupPendingServiceTokenJournal(ctx context.C
 // cleanupUntrackedServiceTokenAttempts refuses to mutate any remote token when
 // a lost journal leaves either an attempt-prefix or canonical legacy collision.
 func (r *ServiceTokenReconciler) cleanupUntrackedServiceTokenAttempts(ctx context.Context, object *v1alpha1.ServiceToken) error {
-	api, account, err := accessClientForAccount(ctx, r.Client, object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
+	api, account, err := accessClientForAccount(ctx, r.apiReader(), object.Namespace, object.Spec.AccountRef.Name, authz.Request{Zone: object.Spec.Zone, PlatformObject: true}, r.NewCloudflareClient)
 	if err != nil {
 		return err
 	}
 	scope, scopeErr := serviceTokenScope(object.Spec.Zone, account.Status.Verified.Zones)
 	if scopeErr != nil {
-		if object.Status.ZoneID == "" {
-			return scopeErr
-		}
-		scope.ZoneID = object.Status.ZoneID
+		return scopeErr
 	}
 	clusterID, err := r.authoritativeClusterID(ctx)
 	if err != nil {

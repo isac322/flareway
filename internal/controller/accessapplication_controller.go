@@ -27,11 +27,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -68,10 +70,10 @@ const (
 	// deletion whether a remote object may exist even if status never recorded
 	// it; without either, deletion has nothing remote to clean up.
 	accessApplicationRemoteAttemptAnnotation = "flareway.bhyoo.com/access-remote-attempt"
-	accessRevocationPublisherUnavailable  = "RevocationPublisherUnavailable"
-	accessApplicationPrivateTunnelsLabel  = "flareway.bhyoo.com/private-tunnels-for"
-	accessApplicationPrivateTunnelsKey    = "tunnels"
-	accessApplicationAUDReadyKey          = "ready"
+	accessRevocationPublisherUnavailable     = "RevocationPublisherUnavailable"
+	accessApplicationPrivateTunnelsLabel     = "flareway.bhyoo.com/private-tunnels-for"
+	accessApplicationPrivateTunnelsKey       = "tunnels"
+	accessApplicationAUDReadyKey             = "ready"
 
 	accessApplicationConditionAccepted       = "Accepted"
 	accessApplicationConditionProgrammed     = "Programmed"
@@ -279,6 +281,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			Kind: "AccessApplication", Namespace: application.Namespace, Name: application.Name,
 			UID: application.UID, RemoteID: application.Status.ApplicationID,
 			AccountID: resolved.account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(application.Generation, application.Status.ObservedGeneration, application.Status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed),
 			Spec: struct {
 				Spec  any `json:"spec"`
 				Input any `json:"input"`
@@ -298,6 +301,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 			return ctrl.Result{}, err
 		}
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("AccessApplication", client.ObjectKeyFromObject(application))
 	if err := referenceChecks.run(ctx); err != nil {
 		return r.reconcileInvalidation(ctx, application, rejectedFrom(resolved.compilation, accessValidationReason(err), err.Error()))
 	}
@@ -337,13 +341,16 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 		if desiredHash != "" {
 			status.AppliedHash, status.AppliedAt, _ = nextGateStamp(application.Status.AppliedHash, application.Status.AppliedAt, newGateStamp(desiredHash, r.now()))
 		}
-		clearGate(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application))
 	}
-	if err := r.patchStatus(ctx, application, status); err != nil {
+	convergedPersisted, err := r.patchStatusChecked(ctx, application, status)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !programmed {
 		return ctrl.Result{RequeueAfter: accessApplicationRequeue}, nil
+	}
+	if !convergedPersisted {
+		return ctrl.Result{}, nil
 	}
 	stamp := newGateStamp(desiredHash, r.now())
 	// The sweep hands the matcher this application as it was listed, together
@@ -371,7 +378,7 @@ func (r *AccessApplicationReconciler) reconcileActive(ctx context.Context, appli
 				listedCustomPages(listing, pages)
 		})
 	}
-	recordGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), stamp)
+	completeGateVerification(r.Invalidator, "AccessApplication", client.ObjectKeyFromObject(application), verifyEpoch, stamp)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeAuthz)}, nil
 }
 
@@ -2381,18 +2388,58 @@ func rejectedCompilationLoss(message string, loss gatewayapi.AccessTargetLoss) g
 	return gatewayapi.AccessApplicationCompilation{Accepted: false, Reason: "TargetNotFound", Message: message, TargetLoss: loss}
 }
 
+func (r *AccessApplicationReconciler) directReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *AccessApplicationReconciler) patchStatus(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) error {
-	current := &v1alpha1.AccessApplication{}
+	_, err := r.patchStatusChecked(ctx, application, status)
+	return err
+}
+
+func (r *AccessApplicationReconciler) patchStatusChecked(ctx context.Context, application *v1alpha1.AccessApplication, status v1alpha1.AccessApplicationStatus) (bool, error) {
 	key := client.ObjectKeyFromObject(application)
-	if err := r.Get(ctx, key, current); err != nil {
-		return client.IgnoreNotFound(err)
+	targetConverged := statusConverged(application.Generation, status.ObservedGeneration, status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed)
+	if !targetConverged {
+		forgetGate(r.Invalidator, "AccessApplication", key)
 	}
-	before := current.DeepCopy()
-	current.Status = status
-	if err := r.Status().Patch(ctx, current, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("patch AccessApplication status: %w", err)
+	convergedPersisted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &v1alpha1.AccessApplication{}
+		if err := r.directReader().Get(ctx, key, current); err != nil {
+			if apierrors.IsNotFound(err) {
+				convergedPersisted = false
+				return nil
+			}
+			return err
+		}
+		if (application.UID != "" && current.UID != application.UID) || current.Generation != application.Generation {
+			convergedPersisted = false
+			return nil
+		}
+		if apiequality.Semantic.DeepEqual(current.Status, status) {
+			convergedPersisted = targetConverged
+			return nil
+		}
+		before := current.DeepCopy()
+		current.Status = status
+		if err := r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsNotFound(err) {
+				convergedPersisted = false
+				return nil
+			}
+			return fmt.Errorf("patch AccessApplication status: %w", err)
+		}
+		convergedPersisted = targetConverged
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return nil
+	return convergedPersisted, nil
 }
 
 func (r *AccessApplicationReconciler) operatorNamespace() string {
@@ -2409,11 +2456,7 @@ func (r *AccessApplicationReconciler) now() time.Time {
 	return time.Now()
 }
 
-// SetupWithManager registers all indexes and watches that can change Access application compilation or cleanup.
-func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.APIReader == nil {
-		r.APIReader = mgr.GetAPIReader()
-	}
+func (r *AccessApplicationReconciler) registerFieldIndexers(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.AccessApplication{}, accessApplicationTargetIndex, func(object client.Object) []string {
 		return accessApplicationIndexTargetKeys(object.(*v1alpha1.AccessApplication))
 	}); err != nil {
@@ -2431,6 +2474,17 @@ func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Secret{}, accessApplicationHandoffOwnerIndex, accessHandoffOwnerIndexKeys(r.operatorNamespace())); err != nil {
 		return fmt.Errorf("index Access handoff Secret owners: %w", err)
+	}
+	return nil
+}
+
+// SetupWithManager registers all indexes and watches that can change Access application compilation or cleanup.
+func (r *AccessApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	if err := r.registerFieldIndexers(mgr); err != nil {
+		return err
 	}
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.AccessApplication{}, builder.WithPredicates(desiredStateChangedPredicate)).

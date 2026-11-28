@@ -139,6 +139,7 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 			Kind: "DeviceProfile", Namespace: object.Namespace, Name: object.Name,
 			UID: object.UID, RemoteID: profileID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady),
 			Spec: struct {
 				Spec     any `json:"spec"`
 				Input    any `json:"input"`
@@ -152,6 +153,7 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		}
 	}
 
+	verifyEpoch := r.Invalidator.InvalidationEpoch("DeviceProfile", request.NamespacedName)
 	remote, acquired, err := r.resolveRemoteProfile(ctx, api, object, input)
 	if err != nil {
 		return r.finishError(ctx, object, err)
@@ -163,8 +165,21 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		}
 		// Checkpoint ownership only: desired lists become applied status after remote list synchronization.
 		pending := deviceProfileStatus(object, remote.PolicyID, true, lastAppliedDeviceProfile(object), nil, nil, metav1.ConditionFalse, "Pending", message)
-		if err := r.patchStatus(ctx, object, pending); err != nil {
+		applied, err := r.patchStatusChecked(ctx, object, pending)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if !applied {
+			if remote.PolicyID != "" {
+				persisted, persistErr := r.persistIdentity(ctx, object, pending.ProfileID, pending.OwnershipVerified)
+				if persistErr != nil {
+					return ctrl.Result{}, persistErr
+				}
+				if persisted {
+					return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+				}
+			}
+			return ctrl.Result{}, nil
 		}
 		object.Status = pending
 	}
@@ -202,17 +217,12 @@ func (r *DeviceProfileReconciler) Reconcile(ctx context.Context, request ctrl.Re
 		return r.finishRemoteError(ctx, object, err)
 	}
 	status := deviceProfileStatus(object, profileID, true, desired, nil, nil, metav1.ConditionTrue, "Ready", "Device profile fields and whole lists are synchronized")
-	verifiedAt := time.Now()
-	if decision.DesiredHash != "" {
-		// appliedAt moves only with appliedHash; an unchanged re-verify is
-		// recorded in the latch once status is persisted.
-		status.AppliedHash, status.AppliedAt, _ = nextGateStamp(object.Status.AppliedHash, object.Status.AppliedAt, newGateStamp(decision.DesiredHash, verifiedAt))
-	}
-	clearGate(r.Invalidator, "DeviceProfile", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, status); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.Invalidator.MarkVerified("DeviceProfile", request.NamespacedName, decision.DesiredHash, verifiedAt)
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, time.Now()), verifyEpoch); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
@@ -1201,15 +1211,47 @@ func deviceProfileStatus(object *v1alpha1.DeviceProfile, profileID string, owner
 	}
 }
 
-func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alpha1.DeviceProfile, status v1alpha1.DeviceProfileStatus) error {
-	current := new(v1alpha1.DeviceProfile)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
-		return client.IgnoreNotFound(err)
+func (r *DeviceProfileReconciler) persistIdentity(ctx context.Context, object *v1alpha1.DeviceProfile, profileID string, ownershipVerified bool) (bool, error) {
+	if profileID == "" || !ownershipVerified || effectiveDeviceProfileManagementPolicy(object.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged {
+		return false, nil
 	}
-	before := current.DeepCopy()
-	current.Status = status
-	if err := r.Status().Patch(ctx, current, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("patch DeviceProfile status: %w", err)
+	return persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DeviceProfile) error {
+		if effectiveDeviceProfileManagementPolicy(live.Spec.ManagementPolicy) != v1alpha1.ManagementPolicyManaged ||
+			live.Spec.AccountRef.Name != object.Spec.AccountRef.Name ||
+			live.Spec.Profile.Kind != object.Spec.Profile.Kind {
+			return errSkipStatusPatch
+		}
+		live.Status.ProfileID = profileID
+		live.Status.OwnershipVerified = true
+		return nil
+	})
+}
+
+func (r *DeviceProfileReconciler) patchStatusChecked(ctx context.Context, object *v1alpha1.DeviceProfile, status v1alpha1.DeviceProfileStatus) (bool, error) {
+	key := client.ObjectKeyFromObject(object)
+	if !statusConverged(object.Generation, status.ObservedGeneration, status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady) {
+		forgetGate(r.Invalidator, "DeviceProfile", key)
+	}
+	return patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DeviceProfile) error {
+		next := status
+		next.AppliedHash = live.Status.AppliedHash
+		next.AppliedAt = live.Status.AppliedAt
+		next.ObservedGeneration = live.Generation
+		next.Conditions = statusutil.MergeConditions(live.Status.Conditions, metav1.Now(), status.Conditions...)
+		live.Status = next
+		return nil
+	})
+}
+
+func (r *DeviceProfileReconciler) patchStatus(ctx context.Context, object *v1alpha1.DeviceProfile, status v1alpha1.DeviceProfileStatus) error {
+	applied, err := r.patchStatusChecked(ctx, object, status)
+	if err != nil {
+		return err
+	}
+	observedOwned := status.ProfileID != "" && status.OwnershipVerified && effectiveDeviceProfileManagementPolicy(object.Spec.ManagementPolicy) == v1alpha1.ManagementPolicyManaged
+	if !applied && observedOwned {
+		_, err = r.persistIdentity(ctx, object, status.ProfileID, true)
+		return err
 	}
 	return nil
 }

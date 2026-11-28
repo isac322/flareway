@@ -18,12 +18,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	kubeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/isac322/flareway/api/v1alpha1"
@@ -55,6 +59,12 @@ type gateInput struct {
 	// restored backup in a different cluster cannot inherit a converged gate.
 	AccountID string
 	ClusterID string
+	// Converged reports whether the object's live Kubernetes status currently
+	// reflects a converged state for the current generation (e.g., Ready=True or
+	// Programmed=True with ObservedGeneration == Generation). When false, the
+	// gate closes with DecisionClosedUnconverged so cached TTL or sweep
+	// confirmations never suppress recovery after a transient pre-gate failure.
+	Converged bool
 	// Spec is the spec-derived desired state. Callers pass the object's spec or
 	// the compiled input they are about to send to Cloudflare.
 	Spec any
@@ -114,6 +124,7 @@ func evaluateGate(
 		Spec:      input.Spec,
 	})
 	if err != nil || desired == "" {
+		latch.Forget(input.Kind, types.NamespacedName{Namespace: input.Namespace, Name: input.Name})
 		observability.ObserveGate(input.Kind, gateHashFailureDecision)
 		return gateDecision{}
 	}
@@ -121,19 +132,12 @@ func evaluateGate(
 	return evaluateGateWithHash(
 		policy, latch, grade, input.Kind,
 		types.NamespacedName{Namespace: input.Namespace, Name: input.Name},
-		appliedHash, desired, appliedAt, now,
+		appliedHash, desired, appliedAt, input.Converged, now,
 	)
 }
 
 // evaluateGateWithHash is evaluateGate for callers that already hold an
 // authoritative desired hash and must not recompute one.
-//
-// The Gateway-mode tunnel configuration is the motivating case: its desired
-// state is the compiled cloudflared configuration, and the hash that
-// status.configVersion.desiredHash is compared against is the one
-// cloudflaredconfig.Compile returns. Hashing the spec again here would produce
-// a different value than the one the write path persists, so the gate would
-// never open.
 func evaluateGateWithHash(
 	policy freshness.Policy,
 	latch *freshness.Latch,
@@ -142,58 +146,157 @@ func evaluateGateWithHash(
 	key types.NamespacedName,
 	appliedHash, desiredHash string,
 	appliedAt *metav1.Time,
+	converged bool,
 	now time.Time,
 ) gateDecision {
-	invalidated := latch.IsInvalidated(kind, key)
+	return evaluateGateWithHashForUID(policy, latch, grade, kind, key, "", appliedHash, desiredHash, appliedAt, converged, now)
+}
 
-	// The gate's age is measured from the most recent confirmation of this
-	// exact desired hash: either the persisted appliedAt, or a later re-verify
-	// kept in memory so that an unchanged re-verify need not write status. A
-	// restart loses the in-memory record, which only ever makes the age
-	// larger and the gate more likely to close.
+// evaluateGateWithHashForUID is evaluateGateWithHash scoped optionally to a
+// live object UID so replacements (e.g., deleted/recreated CloudflareTunnel UIDs)
+// never observe or clear each other's freshness latch slots.
+func evaluateGateWithHashForUID(
+	policy freshness.Policy,
+	latch *freshness.Latch,
+	grade freshness.Grade,
+	kind string,
+	key types.NamespacedName,
+	uid types.UID,
+	appliedHash, desiredHash string,
+	appliedAt *metav1.Time,
+	converged bool,
+	now time.Time,
+) gateDecision {
+	if grade == freshness.GradeAlways {
+		return gateDecision{
+			Gate:        freshness.Gate{Decision: freshness.DecisionNotGated},
+			DesiredHash: desiredHash,
+		}
+	}
+	forget := func() {
+		if uid != "" {
+			latch.ForgetForUID(kind, key, uid)
+			return
+		}
+		latch.Forget(kind, key)
+	}
+	if !converged {
+		forget()
+		observability.ObserveGate(kind, string(freshness.DecisionClosedUnconverged))
+		return gateDecision{
+			Gate:        freshness.Gate{Decision: freshness.DecisionClosedUnconverged},
+			DesiredHash: desiredHash,
+		}
+	}
+	var invalidated bool
+	if uid != "" {
+		invalidated = latch.IsInvalidatedForUID(kind, key, uid)
+	} else {
+		invalidated = latch.IsInvalidated(kind, key)
+	}
+
 	var applied time.Time
 	if appliedAt != nil {
 		applied = appliedAt.Time
 	}
-	if verified, ok := latch.VerifiedAt(kind, key, desiredHash); ok && verified.After(applied) {
+	var verified time.Time
+	var ok bool
+	if uid != "" {
+		verified, ok = latch.VerifiedAtForUID(kind, key, uid, desiredHash)
+	} else {
+		verified, ok = latch.VerifiedAt(kind, key, desiredHash)
+	}
+	if ok && verified.After(applied) {
 		applied = verified
 	}
 
 	gate := policy.Evaluate(grade, appliedHash, desiredHash, applied, now, invalidated)
-	// A sweep listing that confirmed the content of this exact desired hash
-	// counts as a verify with a longer window (two grade periods), so that a
-	// healthy sweep keeps the object from reading the remote itself. When
-	// both are valid, the later expiry wins so the object wakes no earlier
-	// than it has to. Invalidation and hash mismatches close it the same way.
-	if confirmed, ok := latch.ConfirmedAt(kind, key, desiredHash); ok {
-		swept := policy.EvaluateSweepConfirmed(grade, appliedHash, desiredHash, confirmed, now, invalidated)
-		if swept.Open && (!gate.Open || swept.Requeue > gate.Requeue) {
-			gate = swept
+	if uid == "" {
+		if confirmed, ok := latch.ConfirmedAt(kind, key, desiredHash); ok {
+			swept := policy.EvaluateSweepConfirmed(grade, appliedHash, desiredHash, confirmed, now, invalidated)
+			if swept.Open && (!gate.Open || swept.Requeue > gate.Requeue) {
+				gate = swept
+			}
 		}
 	}
-	// A closed gate sends this pass to the remote. Until it converges and
-	// records again, nothing verified earlier may re-open the gate: a desired
-	// state that changes and then changes back must not find an old verify
-	// or a sweep confirmation the sweep kept renewing, and skip the pass that
-	// brings status back in line.
 	if !gate.Open && gate.Decision != freshness.DecisionNotGated {
-		latch.Forget(kind, key)
+		forget()
 	}
-	// freshness.Policy.Evaluate already names the first condition that closed
-	// the gate, so the label is never recomputed here and cannot drift from the
-	// judgement it describes. DecisionNotGated means a T0 caller reached this
-	// helper, which is a programming error rather than a gate outcome; leaving
-	// it unobserved keeps the metric to real evaluations.
 	if gate.Decision != freshness.DecisionNotGated {
 		observability.ObserveGate(kind, string(gate.Decision))
 	}
 	return gateDecision{Gate: gate, DesiredHash: desiredHash}
 }
 
-// clearGate drops the invalidation latch for an object whose reconcile has
-// converged, so the next pass is judged on hash and age alone.
-func clearGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
-	latch.Clear(kind, key)
+// forgetGate drops cached verification, sweep confirmation, and sweep baseline
+// state and latches a "demoted" invalidation when a reconcile turns status
+// unconverged (pre-gate failure or remote error), so a temporarily stale
+// informer cache carrying Ready=True cannot reopen the gate before the next pass
+// verifies live. Callers clear the latch via completeGateVerification once
+// status converges.
+func forgetGate(latch *freshness.Latch, kind string, key types.NamespacedName) {
+	latch.Forget(kind, key)
+	latch.Invalidate(kind, key, "demoted")
+}
+
+// forgetGateForLiveTunnelUID forgets cached verification/baseline state and
+// latches a "demoted" invalidation only when the live API server still holds
+// expectedUID for the CloudflareTunnel and tok was not retired concurrently.
+// If the Tunnel is already absent (NotFound), absence is corroborated safely via
+// retireTunnelIfConfirmedAbsent; if the live UID changed, nothing is wiped or
+// recreated so a replacement Tunnel's epoch/invalidation stays intact.
+func forgetGateForLiveTunnelUID(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	tok freshness.LifetimeToken,
+	expectedUID types.UID,
+) {
+	if latch == nil || reader == nil || expectedUID == "" {
+		return
+	}
+	var live v1alpha1.CloudflareTunnel
+	if err := reader.Get(ctx, tok.Key(), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			_, _ = retireTunnelIfConfirmedAbsent(ctx, reader, latch, tok.Key(), err)
+			return
+		}
+		// Transient uncached read failure while live status may be unconverged:
+		// fail closed only if tok was not concurrently retired.
+		latch.ForgetAndInvalidateIfUnretired(tok, "demoted")
+		return
+	}
+	if live.UID != expectedUID {
+		return
+	}
+	writtenEpoch, applied := latch.ForgetAndInvalidateIfUnretiredWithEpoch(tok, "demoted")
+	if !applied {
+		return
+	}
+	var recheck v1alpha1.CloudflareTunnel
+	recheckErr := reader.Get(ctx, tok.Key(), &recheck)
+	if apierrors.IsNotFound(recheckErr) {
+		latch.RemoveForUIDAtEpoch(tok.Kind(), tok.Key(), expectedUID, writtenEpoch)
+		_, _ = retireTunnelIfConfirmedAbsent(ctx, reader, latch, tok.Key(), recheckErr)
+		return
+	}
+	if recheckErr == nil && recheck.UID != expectedUID {
+		latch.RemoveForUIDAtEpoch(tok.Kind(), tok.Key(), expectedUID, writtenEpoch)
+	}
+}
+
+// statusConverged reports whether the object's live status is converged on the
+// current generation with every required condition set to True.
+func statusConverged(generation, observedGeneration int64, conditions []metav1.Condition, required ...string) bool {
+	if observedGeneration != generation {
+		return false
+	}
+	for _, conditionType := range required {
+		if !conditionTrueForGeneration(conditions, conditionType, generation) {
+			return false
+		}
+	}
+	return true
 }
 
 // releaseGoneObject is the NotFound branch of every gated reconciler's
@@ -206,6 +309,67 @@ func releaseGoneObject(latch *freshness.Latch, kind string, key types.Namespaced
 		return nil
 	}
 	return err
+}
+
+// retireTunnelIfConfirmedAbsent corroborates a cached CloudflareTunnel
+// NotFound error against reader (uncached APIReader) before retiring both
+// CloudflareTunnel and CloudflareTunnelConfig latch keys via per-key
+// LifetimeTokens so fresh replacement-UID state added concurrently is never
+// wiped.
+//
+// Returns (true, nil) when uncached reader confirms NotFound, (false, nil)
+// when uncached reader still observes a live tunnel (stale cache lag), or
+// (false, err) when getErr is not NotFound or the uncached lookup fails
+// transiently.
+func retireTunnelIfConfirmedAbsent(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	key types.NamespacedName,
+	getErr error,
+) (bool, error) {
+	if !apierrors.IsNotFound(getErr) {
+		return false, getErr
+	}
+	tokTunnel := latch.BeginLifetime("CloudflareTunnel", key)
+	defer latch.EndLifetime(tokTunnel)
+	tokConfig := latch.BeginLifetime(configFreshnessKind, key)
+	defer latch.EndLifetime(tokConfig)
+	var live v1alpha1.CloudflareTunnel
+	confirmErr := reader.Get(ctx, key, &live)
+	if confirmErr == nil {
+		return false, nil
+	}
+	if !apierrors.IsNotFound(confirmErr) {
+		return false, fmt.Errorf("confirm CloudflareTunnel %s absence: %w", key, confirmErr)
+	}
+	latch.RemoveIfUntouched(tokTunnel)
+	latch.RemoveIfUntouched(tokConfig)
+	return true, nil
+}
+
+// pruneOtherTunnelConfigUIDs reclaims stale UID-scoped CloudflareTunnelConfig
+// latch slots when a Tunnel has been replaced by a newer UID. Fast-paths to
+// zero API reads when no other UID entries exist; otherwise holds a guarded
+// PruneToken across an uncached directReader lookup so a stale cache snapshot
+// or concurrent replacement-UID write never prunes live UID state.
+func pruneOtherTunnelConfigUIDs(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	key types.NamespacedName,
+	observedUID types.UID,
+) {
+	if latch == nil || reader == nil || observedUID == "" || !latch.HasOtherUIDs(configFreshnessKind, key, observedUID) {
+		return
+	}
+	tok := latch.BeginPrune(configFreshnessKind, key)
+	defer latch.EndPrune(tok)
+	var live v1alpha1.CloudflareTunnel
+	if err := reader.Get(ctx, key, &live); err != nil || live.UID == "" {
+		return
+	}
+	latch.PruneOtherUIDsIfUntouched(tok, live.UID)
 }
 
 // gateClusterID resolves the cluster identity used in the gate hash.
@@ -265,14 +429,6 @@ func (stamp gateStamp) withContent(matches freshness.ContentMatcher) gateStamp {
 	return stamp
 }
 
-// recordGateVerification records a converged pass in the latch: the verify
-// time, and the content baseline the sweep confirms against. It runs only
-// after the pass has persisted whatever status it had to.
-func recordGateVerification(latch *freshness.Latch, kind string, key types.NamespacedName, stamp gateStamp) {
-	latch.MarkVerified(kind, key, stamp.Hash, stamp.At.Time)
-	latch.SetBaseline(kind, key, stamp.Hash, stamp.Content)
-}
-
 // contentBaseline returns matches only when the remote object this pass just
 // verified satisfies it. A matcher that rejects the very object the reconciler
 // accepted as converged would make the sweep report drift on every pass, so
@@ -298,109 +454,258 @@ func nextGateStamp(storedHash string, storedAt *metav1.Time, stamp gateStamp) (s
 	return stamp.Hash, &at, true
 }
 
-// persistGateStamp records the converged gate stamp and, when the applied
-// hash changed, writes it as its own status patch.
-//
-// It exists because most status patch helpers capture their merge base from
-// the live object (client.MergeFrom(object.DeepCopy())). A caller that assigns
-// the stamp before calling one of those helpers puts the new values into both
-// the base and the target, so the merge patch carries no change and the stamp
-// is silently dropped. The gate then never opens, the object reads the remote
-// on every pass, and nothing anywhere reports a problem — the build, the
-// linter, and the whole test suite stay green while the saving is zero.
-//
-// Re-reading the stored object and diffing against it makes the write
-// independent of how each controller's own helper builds its base, so the
-// mechanism is identical for every kind instead of correct for some.
-//
-// A re-verify that confirms the already-recorded hash writes nothing: the
-// verify time lives in the latch, so a converged object produces no status
-// writes and no watch events in the steady state.
-func persistGateStamp(
+func directStatusReader(writer kubeclient.Client, reader kubeclient.Reader) kubeclient.Reader {
+	if reader != nil {
+		return reader
+	}
+	return writer
+}
+
+var errSkipStatusPatch = errors.New("skip status patch")
+
+func patchLiveStatusWithDirectReader[T kubeclient.Object](
 	ctx context.Context,
 	writer kubeclient.Client,
-	latch *freshness.Latch,
-	object kubeclient.Object,
-	stamp gateStamp,
-) error {
-	if writer == nil || object == nil || stamp.Hash == "" {
-		return nil
-	}
-	current, ok := object.DeepCopyObject().(kubeclient.Object)
-	if !ok {
-		return nil
-	}
-	if err := writer.Get(ctx, kubeclient.ObjectKeyFromObject(object), current); err != nil {
-		// A deleted object has nothing to stamp; anything else is reported so
-		// the caller does not treat an unstamped pass as converged.
-		return kubeclient.IgnoreNotFound(err)
-	}
-	before, ok := current.DeepCopyObject().(kubeclient.Object)
-	if !ok {
-		return nil
-	}
-	kind, hash, at, ok := gateStampFields(current)
-	if !ok {
-		return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", current)
-	}
-	key := kubeclient.ObjectKeyFromObject(current)
-	nextHash, nextAt, changed := nextGateStamp(*hash, *at, stamp)
-	if changed {
-		*hash, *at = nextHash, nextAt
-		if err := writer.Status().Patch(ctx, current, kubeclient.MergeFrom(before)); err != nil {
-			return fmt.Errorf("persist freshness gate stamp: %w", err)
+	reader kubeclient.Reader,
+	observed T,
+	requireSameGeneration bool,
+	mutate func(live T) error,
+) (bool, error) {
+	key := kubeclient.ObjectKeyFromObject(observed)
+	applied := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live, ok := reflect.New(reflect.TypeOf(observed).Elem()).Interface().(T)
+		if !ok {
+			return fmt.Errorf("allocate live copy for %T", observed)
 		}
+		if err := directStatusReader(writer, reader).Get(ctx, key, live); err != nil {
+			if apierrors.IsNotFound(err) {
+				applied = false
+				return nil
+			}
+			return err
+		}
+		if observed.GetUID() != "" && live.GetUID() != observed.GetUID() {
+			applied = false
+			return nil
+		}
+		if requireSameGeneration && live.GetGeneration() != observed.GetGeneration() {
+			applied = false
+			return nil
+		}
+		before, ok := live.DeepCopyObject().(T)
+		if !ok {
+			return fmt.Errorf("deep-copy live object %T", observed)
+		}
+		if err := mutate(live); err != nil {
+			if errors.Is(err, errSkipStatusPatch) {
+				applied = false
+				return nil
+			}
+			return err
+		}
+		if apiequality.Semantic.DeepEqual(before, live) {
+			applied = true
+			return nil
+		}
+		if err := writer.Status().Patch(ctx, live, kubeclient.MergeFromWithOptions(before, kubeclient.MergeFromWithOptimisticLock{})); err != nil {
+			if apierrors.IsNotFound(err) {
+				applied = false
+				return nil
+			}
+			return fmt.Errorf("patch %T status: %w", observed, err)
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	recordGateVerification(latch, kind, key, stamp)
+	return applied, nil
+}
+
+// patchStatusWithDirectReader reads the live object from reader (uncached
+// APIReader when configured) inside RetryOnConflict, guards UID/Generation
+// identity, applies mutate, and submits an optimistic-locked status merge patch.
+// It returns (false, nil) without clearing latches if the object was deleted
+// or its UID/Generation changed concurrently.
+func patchStatusWithDirectReader[T kubeclient.Object](
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	observed T,
+	mutate func(live T) error,
+) (bool, error) {
+	return patchLiveStatusWithDirectReader(ctx, writer, reader, observed, true, mutate)
+}
+
+// persistIdentityWithDirectReader checkpoints remote resource identity and
+// ownership fields onto the live object even if Spec changed concurrently
+// (live.Generation != observed.Generation), guarding only UID and NotFound.
+// Callers must mutate ONLY identity/ownership fields (never ObservedGeneration,
+// Conditions, AppliedHash, or AppliedAt). Returns (true, nil) when the live
+// object retains or commits the identity, or (false, nil) on UID mismatch /
+// NotFound.
+func persistIdentityWithDirectReader[T kubeclient.Object](
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	observed T,
+	mutate func(live T) error,
+) (bool, error) {
+	return patchLiveStatusWithDirectReader(ctx, writer, reader, observed, false, mutate)
+}
+
+// completeGateVerification atomically releases an invalidation matching
+// expectedEpoch and records verification timestamp and optional sweep baseline.
+func completeGateVerification(latch *freshness.Latch, kind string, key types.NamespacedName, expectedEpoch uint64, stamp gateStamp) bool {
+	return latch.CompleteVerification(kind, key, expectedEpoch, stamp.Hash, stamp.At.Time, stamp.Content)
+}
+
+// persistGateStampChecked re-reads the live object via reader (uncached
+// APIReader), verifies UID, Generation, and converged status conditions on the
+// live object, atomically writes AppliedHash/AppliedAt with optimistic locking
+// if changed, and completes latch verification only when expectedEpoch still
+// matches the latch's current invalidation epoch.
+func persistGateStampChecked(
+	ctx context.Context,
+	writer kubeclient.Client,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	observed kubeclient.Object,
+	stamp gateStamp,
+	expectedEpoch uint64,
+) error {
+	if writer == nil || observed == nil || stamp.Hash == "" {
+		return nil
+	}
+	key := kubeclient.ObjectKeyFromObject(observed)
+	var gateKind string
+	persisted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live, ok := reflect.New(reflect.TypeOf(observed).Elem()).Interface().(kubeclient.Object)
+		if !ok {
+			return fmt.Errorf("allocate live copy for %T", observed)
+		}
+		if err := directStatusReader(writer, reader).Get(ctx, key, live); err != nil {
+			if apierrors.IsNotFound(err) {
+				persisted = false
+				return nil
+			}
+			return err
+		}
+		if (observed.GetUID() != "" && live.GetUID() != observed.GetUID()) || live.GetGeneration() != observed.GetGeneration() {
+			persisted = false
+			return nil
+		}
+		kind, hash, at, converged, ok := gateObjectState(live)
+		if !ok {
+			return fmt.Errorf("persist freshness gate stamp: %T has no gate stamp fields", live)
+		}
+		gateKind = kind
+		if !converged {
+			persisted = false
+			return nil
+		}
+		before, ok := live.DeepCopyObject().(kubeclient.Object)
+		if !ok {
+			return fmt.Errorf("deep-copy live object %T", live)
+		}
+		nextHash, nextAt, changed := nextGateStamp(*hash, *at, stamp)
+		if changed {
+			*hash, *at = nextHash, nextAt
+			if err := writer.Status().Patch(ctx, live, kubeclient.MergeFromWithOptions(before, kubeclient.MergeFromWithOptimisticLock{})); err != nil {
+				if apierrors.IsNotFound(err) {
+					persisted = false
+					return nil
+				}
+				return fmt.Errorf("persist freshness gate stamp: %w", err)
+			}
+		}
+		persisted = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !persisted {
+		return nil
+	}
+	completeGateVerification(latch, gateKind, key, expectedEpoch, stamp)
 	return nil
 }
 
 // gateStampFields returns the gate kind and the status fields holding the
 // stamp of a gated object, and reports whether the kind is one this operator
-// gates. A gated controller whose kind is missing here would otherwise
-// persist nothing and lose its saving silently, so the false result is turned
-// into an error by the caller rather than ignored.
+// gates.
 func gateStampFields(object kubeclient.Object) (string, *string, **metav1.Time, bool) {
+	kind, hash, at, _, ok := gateObjectState(object)
+	return kind, hash, at, ok
+}
+
+// gateObjectState returns the gate kind, stamp field pointers, live status
+// convergence for the object's current generation, and whether the object type
+// is a gated kind.
+func gateObjectState(object kubeclient.Object) (string, *string, **metav1.Time, bool, bool) {
 	switch typed := object.(type) {
 	case *v1alpha1.VirtualNetwork:
-		return "VirtualNetwork", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "VirtualNetwork", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.NetworkRoute:
-		return "NetworkRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "NetworkRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.HostnameRoute:
-		return "HostnameRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "HostnameRoute", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.PrivateNetworkConditionAccepted, v1alpha1.PrivateNetworkConditionReady), true
 	case *v1alpha1.IdentityProvider:
-		return "IdentityProvider", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "IdentityProvider", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessGroup:
-		return "AccessGroup", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessGroup", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessPolicy:
-		return "AccessPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessCustomPage:
-		return "AccessCustomPage", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessCustomPage", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.AccessCustomPageConditionAccepted, v1alpha1.AccessCustomPageConditionReady), true
 	case *v1alpha1.AccessInfrastructureTarget:
-		return "AccessInfrastructureTarget", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessInfrastructureTarget", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessStandaloneApplication:
-		return "AccessStandaloneApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessStandaloneApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.AccessApplication:
-		return "AccessApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "AccessApplication", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, accessApplicationConditionAccepted, accessApplicationConditionProgrammed), true
 	case *v1alpha1.DeviceSettings:
-		return "DeviceSettings", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DeviceSettings", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.DeviceSettingsConditionAccepted, v1alpha1.DeviceSettingsConditionReady), true
 	case *v1alpha1.DeviceProfile:
-		return "DeviceProfile", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DeviceProfile", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.DeviceProfileConditionAccepted, v1alpha1.DeviceProfileConditionReady), true
 	case *v1alpha1.DevicePostureRule:
-		return "DevicePostureRule", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DevicePostureRule", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.DevicePostureIntegration:
-		return "DevicePostureIntegration", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "DevicePostureIntegration", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.ServiceToken:
-		return "ServiceToken", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ServiceToken", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, "Accepted", "Ready"), true
 	case *v1alpha1.WARPConnector:
-		return "WARPConnector", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "WARPConnector", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.WARPConnectorConditionAccepted, v1alpha1.WARPConnectorConditionReady), true
 	case *v1alpha1.ZeroTrustList:
-		return "ZeroTrustList", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustList", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustListConditionAccepted, v1alpha1.ZeroTrustListConditionReady), true
 	case *v1alpha1.ZeroTrustGatewayPolicy:
-		return "ZeroTrustGatewayPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustGatewayPolicy", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustGatewayPolicyConditionAccepted, v1alpha1.ZeroTrustGatewayPolicyConditionReady), true
 	case *v1alpha1.ZeroTrustOrganization:
-		return "ZeroTrustOrganization", &typed.Status.AppliedHash, &typed.Status.AppliedAt, true
+		return "ZeroTrustOrganization", &typed.Status.AppliedHash, &typed.Status.AppliedAt,
+			statusConverged(typed.Generation, typed.Status.ObservedGeneration, typed.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionAccepted, v1alpha1.ZeroTrustOrganizationConditionReady), true
 	default:
-		return "", nil, nil, false
+		return "", nil, nil, false, false
 	}
 }

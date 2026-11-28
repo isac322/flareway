@@ -152,6 +152,10 @@ const (
 	// DecisionClosedInvalidated reports that the sweep invalidated this
 	// object.
 	DecisionClosedInvalidated Decision = "closed_invalidated"
+	// DecisionClosedUnconverged reports that the live Kubernetes status is
+	// not converged on the current generation, so cached TTL or sweep
+	// confirmations cannot suppress a reconciling pass.
+	DecisionClosedUnconverged Decision = "closed_unconverged"
 	// DecisionNotGated reports GradeAlways (T0), which is not a gate
 	// evaluation at all. It is deliberately not a registered metric label;
 	// do not observe it.

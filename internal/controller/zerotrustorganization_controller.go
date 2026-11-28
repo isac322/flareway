@@ -99,7 +99,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
-	input, err := r.resolveOrganizationInput(ctx, object, account, api)
+	input, err := r.resolveOrganizationInput(ctx, object, account, nil)
 	if err != nil {
 		return r.finishError(ctx, object, err)
 	}
@@ -108,7 +108,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		if scope.ZoneID != "" {
 			return r.finishError(ctx, object, privateInvalid("Invalid", "spec.doh is account-scoped and cannot be used with spec.zone"))
 		}
-		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, api, object.Spec.DOH.ServiceTokenRef)
+		serviceTokenID, resolveErr := r.resolveOrganizationServiceTokenID(ctx, object, account, nil, object.Spec.DOH.ServiceTokenRef)
 		if resolveErr != nil {
 			return r.finishError(ctx, object, resolveErr)
 		}
@@ -122,6 +122,7 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 			Kind: "ZeroTrustOrganization", Namespace: object.Namespace, Name: object.Name,
 			UID:       object.UID,
 			AccountID: account.Spec.AccountID, ClusterID: clusterID,
+			Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, v1alpha1.ZeroTrustOrganizationConditionAccepted, v1alpha1.ZeroTrustOrganizationConditionReady),
 			Spec: struct {
 				Spec  any `json:"spec"`
 				Input any `json:"input"`
@@ -132,6 +133,10 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		if decision.Open {
 			return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 		}
+	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("ZeroTrustOrganization", request.NamespacedName)
+	if err := verifyOrganizationExternalRefs(ctx, object, api); err != nil {
+		return r.finishError(ctx, object, err)
 	}
 
 	observed, err := api.GetAccessOrganization(ctx, scope)
@@ -219,11 +224,10 @@ func (r *ZeroTrustOrganizationReconciler) Reconcile(ctx context.Context, request
 		}
 	}
 
-	clearGate(r.Invalidator, "ZeroTrustOrganization", request.NamespacedName)
 	if err := r.patchStatus(ctx, object, observed, observedDOH, nil, observedRevocation, metav1.ConditionTrue, "Ready", "Zero Trust organization is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: convergedRequeue(r.Freshness, freshness.GradeIndirect, globalRequeue)}, nil
@@ -257,10 +261,33 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationInput(ctx context.C
 	return input, nil
 }
 
+func verifyOrganizationExternalRefs(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, api flarecloudflare.OrganizationAPI) error {
+	if object.Spec.CustomPages != nil {
+		if ref := object.Spec.CustomPages.Forbidden; ref != nil && ref.ExternalID != "" {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return fmt.Errorf("resolve forbidden custom page: validate external AccessCustomPage: %w", err)
+			}
+		}
+		if ref := object.Spec.CustomPages.IdentityDenied; ref != nil && ref.ExternalID != "" {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return fmt.Errorf("resolve identity-denied custom page: validate external AccessCustomPage: %w", err)
+			}
+		}
+	}
+	if object.Spec.DOH != nil && object.Spec.DOH.ServiceTokenRef.ExternalID != "" {
+		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, object.Spec.DOH.ServiceTokenRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external ServiceToken: %w", err)
+		}
+	}
+	return nil
+}
+
 func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, account *v1alpha1.CloudflareAccount, api flarecloudflare.OrganizationAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external AccessCustomPage: %w", err)
+		if api != nil {
+			if _, err := api.GetAccessCustomPage(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external AccessCustomPage: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -283,8 +310,10 @@ func (r *ZeroTrustOrganizationReconciler) resolveOrganizationCustomPageID(ctx co
 
 func (r *ZeroTrustOrganizationReconciler) resolveOrganizationServiceTokenID(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, account *v1alpha1.CloudflareAccount, api flarecloudflare.OrganizationAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external ServiceToken: %w", err)
+		if api != nil {
+			if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external ServiceToken: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -658,16 +687,21 @@ func (r *ZeroTrustOrganizationReconciler) finishRemoteError(ctx context.Context,
 }
 
 func (r *ZeroTrustOrganizationReconciler) patchStatus(ctx context.Context, object *v1alpha1.ZeroTrustOrganization, remote flarecloudflare.Organization, doh *flarecloudflare.OrganizationDOHSettings, wouldApply *v1alpha1.ZeroTrustOrganizationValues, observedRevocation *metav1.Time, status metav1.ConditionStatus, reason, message string) error {
-	base := client.MergeFrom(object.DeepCopy())
-	if status == metav1.ConditionTrue {
-		object.Status.AuthDomain = remote.AuthDomain
-		object.Status.Observed = organizationObserved(remote, doh)
-		object.Status.WouldApply = wouldApply
-		object.Status.ObservedUserRevocationRequest = copyOrganizationTime(observedRevocation)
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "ZeroTrustOrganization", client.ObjectKeyFromObject(object))
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = globalConditions(object.Status.Conditions, object.Generation, status, reason, message, r.now())
-	return r.Status().Patch(ctx, object, base)
+	_, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.ZeroTrustOrganization) error {
+		if status == metav1.ConditionTrue {
+			live.Status.AuthDomain = remote.AuthDomain
+			live.Status.Observed = organizationObserved(remote, doh)
+			live.Status.WouldApply = wouldApply
+			live.Status.ObservedUserRevocationRequest = copyOrganizationTime(observedRevocation)
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = globalConditions(live.Status.Conditions, live.Generation, status, reason, message, r.now())
+		return nil
+	})
+	return err
 }
 
 func (r *ZeroTrustOrganizationReconciler) now() time.Time {
@@ -679,6 +713,9 @@ func (r *ZeroTrustOrganizationReconciler) now() time.Time {
 
 // SetupWithManager registers the ZeroTrustOrganization controller and dependency watches.
 func (r *ZeroTrustOrganizationReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	if err := manager.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.ZeroTrustOrganization{}, organizationAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.ZeroTrustOrganization).Spec.AccountRef.Name}
 	}); err != nil {

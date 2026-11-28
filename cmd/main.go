@@ -136,13 +136,13 @@ func main() {
 	flag.DurationVar(&freshnessAuthz, "freshness-authz", 60*time.Second,
 		"Freshness TTL for T1 (Authz) resources: IdentityProvider, ServiceToken, AccessGroup. A converged object skips remote reads until this TTL expires or drift invalidates it.")
 	flag.DurationVar(&freshnessTraffic, "freshness-traffic", 300*time.Second,
-		"Freshness TTL for T2 (Traffic) resources: VirtualNetwork, NetworkRoute, HostnameRoute, ZeroTrustGatewayPolicy, ZeroTrustList.")
+		"Freshness TTL for T2 (Traffic) resources: CloudflareTunnel, Gateway tunnel configuration (CloudflareTunnelConfig), VirtualNetwork, NetworkRoute, HostnameRoute, ZeroTrustGatewayPolicy, ZeroTrustList.")
 	flag.DurationVar(&freshnessIndirect, "freshness-indirect", 1800*time.Second,
 		"Freshness TTL for T3 (Indirect) resources: DeviceProfile, DeviceSettings, DevicePostureRule, DevicePostureIntegration, ZeroTrustOrganization, WARPConnector.")
 	flag.DurationVar(&freshnessDisplay, "freshness-display", 0,
 		"Freshness TTL for T4 (Display) resources. 0 disables periodic display reads.")
 	flag.BoolVar(&disableSweep, "disable-sweep", false,
-		"Disable the periodic drift sweep worker. Out-of-band drift is then detected only by freshness TTL expiry; use this to roll back the sweep if it misbehaves.")
+		"Disable the periodic drift sweep worker. Out-of-band drift then falls back to freshness TTL expiry and watch-driven or controller-specific periodic fallbacks (such as 10s on a converged Gateway); use this to roll back the sweep if it misbehaves.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -181,7 +181,7 @@ func main() {
 	}
 
 	gateLatch := freshness.NewLatch()
-	var sweepEvents <-chan event.GenericEvent
+	var sweeper *sweep.Sweeper
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -275,7 +275,7 @@ func main() {
 	}
 	if controllerGroupsEnabled(controllerGroups) {
 		if !disableSweep {
-			sweeper := newProductionSweeper(controllerGroups, sweep.SweeperOptions{
+			sweeper = newProductionSweeper(controllerGroups, sweep.SweeperOptions{
 				Client:            mgr.GetClient(),
 				APIReader:         mgr.GetAPIReader(),
 				Scheme:            mgr.GetScheme(),
@@ -289,18 +289,11 @@ func main() {
 				setupLog.Error(err, "Failed to register drift sweeper")
 				os.Exit(1)
 			}
-			sweepEvents = sweeper.Events()
-		}
-		if err := (&controller.CloudflareAccountReconciler{
-			Client:     observedClient,
-			Scheme:     mgr.GetScheme(),
-			Cloudflare: cloudflareFactory,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up CloudflareAccount controller")
-			os.Exit(1)
 		}
 	}
 
+	var snapshots controller.SnapshotPublisher
+	var xdsEvents <-chan event.GenericEvent
 	if enableGatewayControllers {
 		bootstrapClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: scheme})
 		if err != nil {
@@ -330,270 +323,27 @@ func main() {
 			setupLog.Error(err, "Failed to register xDS server")
 			os.Exit(1)
 		}
+		snapshots = xdsServer
+		xdsEvents = xdsServer.Events()
+	}
 
-		if err := (&controller.GatewayClassReconciler{
-			Client: observedClient,
-			Scheme: mgr.GetScheme(),
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up GatewayClass controller")
-			os.Exit(1)
-		}
-		if err := (&controller.GatewayReconciler{
-			Client:            observedClient,
-			APIReader:         mgr.GetAPIReader(),
-			Scheme:            mgr.GetScheme(),
-			Snapshots:         xdsServer,
-			OperatorNamespace: dataplane.DefaultOperatorNamespace,
-			CloudflareFactory: cloudflareFactory,
-			Prober:            dataplane.NewHTTPProber(5 * time.Second),
-			DriftPolicy:       driftPolicy,
-			Freshness:         freshnessPolicy,
-			Invalidator:       gateLatch,
-			SweepEvents:       sweepEvents,
-			XDSEvents:         xdsServer.Events(),
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up Gateway controller")
-			os.Exit(1)
-		}
-		if err := (&controller.CloudflareTunnelReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.TunnelClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up CloudflareTunnel controller")
-			os.Exit(1)
-		}
-	}
-	if enablePrivateNetworkControllers {
-		if err := (&controller.VirtualNetworkReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up VirtualNetwork controller")
-			os.Exit(1)
-		}
-		if err := (&controller.NetworkRouteReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up NetworkRoute controller")
-			os.Exit(1)
-		}
-		if err := (&controller.HostnameRouteReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
-			NewCloudflareClient: controller.PrivateNetworkClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up HostnameRoute controller")
-			os.Exit(1)
-		}
-		if err := (&controller.WARPConnectorReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.WARPConnectorClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up WARPConnector controller")
-			os.Exit(1)
-		}
-	}
-	if enableAccessControllers {
-		if err := (&controller.AccessPolicyReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			Recorder:            mgr.GetEventRecorder("access-policy"),
-			DriftPolicy:         driftPolicy,
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessPolicy controller")
-			os.Exit(1)
-		}
-		if err := (&controller.AccessGroupReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessGroup controller")
-			os.Exit(1)
-		}
-		if err := (&controller.IdentityProviderReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up IdentityProvider controller")
-			os.Exit(1)
-		}
-		if err := (&controller.DevicePostureRuleReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up DevicePostureRule controller")
-			os.Exit(1)
-		}
-		if err := (&controller.ServiceTokenReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up ServiceToken controller")
-			os.Exit(1)
-		}
-		if err := (&controller.AccessApplicationReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessApplicationClientFromFactory(cloudflareFactory),
-			OperatorNamespace:   dataplane.DefaultOperatorNamespace,
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessApplication controller")
-			os.Exit(1)
-		}
-		if err := (&controller.AccessStandaloneApplicationReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessStandaloneApplication controller")
-			os.Exit(1)
-		}
-		if err := (&controller.AccessInfrastructureTargetReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessInfrastructureTarget controller")
-			os.Exit(1)
-		}
-		if err := (&controller.AccessCustomPageReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			Recorder:            mgr.GetEventRecorder("access-custom-page"),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up AccessCustomPage controller")
-			os.Exit(1)
-		}
-		if err := (&controller.DevicePostureIntegrationReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.AccessClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up DevicePostureIntegration controller")
-			os.Exit(1)
-		}
-	}
-	if enableDeviceControllers {
-		if err := (&controller.DeviceProfileReconciler{
-			Client:              observedClient,
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.DeviceProfileClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up DeviceProfile controller")
-			os.Exit(1)
-		}
-		if err := (&controller.DeviceSettingsReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.DeviceClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up DeviceSettings controller")
-			os.Exit(1)
-		}
-	}
-	if enableOrganizationControllers {
-		if err := (&controller.ZeroTrustOrganizationReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.OrganizationClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up ZeroTrustOrganization controller")
-			os.Exit(1)
-		}
-		if err := (&controller.ZeroTrustListReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.GatewayClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up ZeroTrustList controller")
-			os.Exit(1)
-		}
-		if err := (&controller.ZeroTrustGatewayPolicyReconciler{
-			Client:              observedClient,
-			APIReader:           mgr.GetAPIReader(),
-			Scheme:              mgr.GetScheme(),
-			NewCloudflareClient: controller.GatewayClientFromFactory(cloudflareFactory),
-			Freshness:           freshnessPolicy,
-			Invalidator:         gateLatch,
-			SweepEvents:         sweepEvents,
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to set up ZeroTrustGatewayPolicy controller")
-			os.Exit(1)
-		}
+	if err := controller.SetupProductionControllers(mgr, controller.ProductionControllerOptions{
+		Groups:            controllerGroups,
+		Client:            observedClient,
+		APIReader:         mgr.GetAPIReader(),
+		CloudflareFactory: cloudflareFactory,
+		AccountFactory:    cloudflareFactory,
+		Snapshots:         snapshots,
+		OperatorNamespace: dataplane.DefaultOperatorNamespace,
+		Prober:            dataplane.NewHTTPProber(5 * time.Second),
+		DriftPolicy:       driftPolicy,
+		Freshness:         freshnessPolicy,
+		Invalidator:       gateLatch,
+		Sweeper:           sweeper,
+		XDSEvents:         xdsEvents,
+	}); err != nil {
+		setupLog.Error(err, "Failed to set up controllers")
+		os.Exit(1)
 	}
 
 	// +kubebuilder:scaffold:builder

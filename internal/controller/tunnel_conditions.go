@@ -107,11 +107,18 @@ type tunnelConditionUpdate struct {
 // Ready=True) pair is repaired atomically while promotion is never folded into
 // a claim.
 func patchTunnelConditions(ctx context.Context, c client.Client, reader client.Reader, update tunnelConditionUpdate) error {
+	_, err := patchTunnelConditionsChecked(ctx, c, reader, update)
+	return err
+}
+
+// patchTunnelConditionsChecked applies the merged tunnel condition document and
+// returns whether Ready=True at the live generation was durably present/applied.
+func patchTunnelConditionsChecked(ctx context.Context, c client.Client, reader client.Reader, update tunnelConditionUpdate) (bool, error) {
 	if c == nil {
-		return errors.New("tunnel conditions update requires a client")
+		return false, errors.New("tunnel conditions update requires a client")
 	}
 	if update.Observed == nil {
-		return errors.New("tunnel conditions update requires an observed CloudflareTunnel")
+		return false, errors.New("tunnel conditions update requires an observed CloudflareTunnel")
 	}
 	if reader == nil {
 		reader = c
@@ -129,35 +136,38 @@ func patchTunnelConditions(ctx context.Context, c client.Client, reader client.R
 			// successful commit: callers that invalidate before remote
 			// mutation must not proceed on a deleted object. Top-level
 			// Reconcile may IgnoreNotFound on its own read.
-			return fmt.Errorf("read live CloudflareTunnel %s for conditions: %w", key, err)
+			return false, fmt.Errorf("read live CloudflareTunnel %s for conditions: %w", key, err)
 		}
 		if err := tunnelConditionIdentityCheck(update.Observed, &live); err != nil {
-			return err
+			return false, err
 		}
 		if update.Validate != nil {
 			if err := update.Validate(&live); err != nil {
-				return err
+				return false, err
 			}
 		}
 		merged := mergeTunnelConditions(&live, update.Conditions, update.ReadyOverride, now)
+		readyLive := conditionTrueForGeneration(merged, v1alpha1.CloudflareTunnelConditionReady, live.Generation)
 		if tunnelConditionsDeepEqual(live.Status.Conditions, merged) && tunnelSharedConditionCoverage(&live, merged) {
-			return nil
+			return readyLive, nil
 		}
 		apply, err := tunnelConditionsApply(&live, merged)
 		if err != nil {
-			return err
+			return false, err
 		}
 		err = c.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(apply), client.FieldOwner(tunnelStatusFieldManager), client.ForceOwnership)
 		if err == nil {
-			return nil
+			return readyLive, nil
 		}
 		if !apierrors.IsConflict(err) {
-			return fmt.Errorf("apply CloudflareTunnel %s conditions: %w", key, err)
+			return false, fmt.Errorf("apply CloudflareTunnel %s conditions: %w", key, err)
 		}
 		lastErr = err
 	}
-	return fmt.Errorf("apply CloudflareTunnel %s conditions: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
+	return false, fmt.Errorf("apply CloudflareTunnel %s conditions: conflict after %d attempts: %w", key, tunnelConditionMaxAttempts, lastErr)
 }
+
+var errTunnelConditionPrecondition = errors.New("tunnel condition precondition failed")
 
 // tunnelConditionIdentityCheck enforces the shared Tier-1 precondition: the
 // live object must still be the same tunnel (UID), the same spec revision
@@ -165,13 +175,13 @@ func patchTunnelConditions(ctx context.Context, c client.Client, reader client.R
 // ownership gates are caller-specific and belong in tunnelConditionUpdate.Validate.
 func tunnelConditionIdentityCheck(observed, live *v1alpha1.CloudflareTunnel) error {
 	if live.UID != observed.UID {
-		return fmt.Errorf("CloudflareTunnel %s/%s UID changed from %s to %s; aborting conditions write", observed.Namespace, observed.Name, observed.UID, live.UID)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s UID changed from %s to %s; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, observed.UID, live.UID)
 	}
 	if live.Generation != observed.Generation {
-		return fmt.Errorf("CloudflareTunnel %s/%s generation changed from %d to %d; aborting conditions write", observed.Namespace, observed.Name, observed.Generation, live.Generation)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s generation changed from %d to %d; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, observed.Generation, live.Generation)
 	}
 	if mode := tunnelConfigurationMode(live); mode != tunnelConfigurationMode(observed) {
-		return fmt.Errorf("CloudflareTunnel %s/%s configuration mode changed to %s; aborting conditions write", observed.Namespace, observed.Name, mode)
+		return fmt.Errorf("%w: CloudflareTunnel %s/%s configuration mode changed to %s; aborting conditions write", errTunnelConditionPrecondition, observed.Namespace, observed.Name, mode)
 	}
 	return nil
 }

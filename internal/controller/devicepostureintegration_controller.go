@@ -56,6 +56,7 @@ var devicePostureIntegrationIntervalPattern = regexp.MustCompile(`^[1-9][0-9]*[m
 // DevicePostureIntegrationReconciler manages Cloudflare posture integrations.
 type DevicePostureIntegrationReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	NewCloudflareClient NewAccessCloudflareClient
 	Now                 func() time.Time
@@ -130,6 +131,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 		Kind: "DevicePostureIntegration", Namespace: object.Namespace, Name: object.Name,
 		UID: object.UID, RemoteID: object.Status.IntegrationID,
 		AccountID: account.Spec.AccountID, ClusterID: clusterID,
+		Converged: statusConverged(object.Generation, object.Status.ObservedGeneration, object.Status.Conditions, "Accepted", "Ready"),
 		Spec: struct {
 			Spec  any `json:"spec"`
 			Input any `json:"input"`
@@ -138,6 +140,7 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 	if decision.Open {
 		return ctrl.Result{RequeueAfter: decision.Requeue}, nil
 	}
+	verifyEpoch := r.Invalidator.InvalidationEpoch("DevicePostureIntegration", request.NamespacedName)
 
 	id := object.Status.IntegrationID
 	var remote flarecloudflare.DevicePostureIntegration
@@ -183,10 +186,9 @@ func (r *DevicePostureIntegrationReconciler) Reconcile(ctx context.Context, requ
 	if err := r.patchStatus(ctx, object, &remote, id, metav1.ConditionTrue, "Ready", "Device posture integration is synchronized"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := persistGateStamp(ctx, r.Client, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now())); err != nil {
+	if err := persistGateStampChecked(ctx, r.Client, r.APIReader, r.Invalidator, object, newGateStamp(decision.DesiredHash, r.now()), verifyEpoch); err != nil {
 		return ctrl.Result{}, err
 	}
-	clearGate(r.Invalidator, "DevicePostureIntegration", request.NamespacedName)
 	return ctrl.Result{RequeueAfter: r.Freshness.TTL(freshness.GradeIndirect)}, nil
 }
 
@@ -350,18 +352,35 @@ func (r *DevicePostureIntegrationReconciler) reconcileDelete(ctx context.Context
 }
 
 func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, object *v1alpha1.DevicePostureIntegration, remote *flarecloudflare.DevicePostureIntegration, id string, status metav1.ConditionStatus, reason, message string) error {
-	baseObject := object.DeepCopy()
-	if remote != nil {
-		object.Status.IntegrationID = id
-		object.Status.OwnershipVerified = object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
-		object.Status.Observed = &v1alpha1.DevicePostureIntegrationObservedState{Name: remote.Name, Type: remote.Type, Interval: remote.Interval, Config: remote.Config}
+	if status != metav1.ConditionTrue {
+		forgetGate(r.Invalidator, "DevicePostureIntegration", client.ObjectKeyFromObject(object))
 	}
-	object.Status.ObservedGeneration = object.Generation
-	object.Status.Conditions = mergeAccessConditions(object.Status.Conditions, r.now(), accessCondition(object.Generation, "Accepted", status, reason, message), accessCondition(object.Generation, "Ready", status, reason, message))
-	if reflect.DeepEqual(baseObject.Status, object.Status) {
+	applied, err := patchStatusWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
+		if remote != nil {
+			live.Status.IntegrationID = id
+			live.Status.OwnershipVerified = live.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+			live.Status.Observed = &v1alpha1.DevicePostureIntegrationObservedState{Name: remote.Name, Type: remote.Type, Interval: remote.Interval, Config: remote.Config}
+		}
+		live.Status.ObservedGeneration = live.Generation
+		live.Status.Conditions = mergeAccessConditions(live.Status.Conditions, r.now(), accessCondition(live.Generation, "Accepted", status, reason, message), accessCondition(live.Generation, "Ready", status, reason, message))
 		return nil
+	})
+	if err != nil {
+		return err
 	}
-	return r.Status().Patch(ctx, object, client.MergeFrom(baseObject))
+	observedOwned := object.Spec.ManagementPolicy != v1alpha1.ManagementPolicyObserveOnly
+	if !applied && remote != nil && id != "" && status == metav1.ConditionTrue && observedOwned {
+		_, err = persistIdentityWithDirectReader(ctx, r.Client, r.APIReader, object, func(live *v1alpha1.DevicePostureIntegration) error {
+			if live.Spec.ManagementPolicy == v1alpha1.ManagementPolicyObserveOnly ||
+				live.Spec.AccountRef.Name != object.Spec.AccountRef.Name {
+				return errSkipStatusPatch
+			}
+			live.Status.IntegrationID = id
+			live.Status.OwnershipVerified = true
+			return nil
+		})
+	}
+	return err
 }
 
 // finishRemoteError records the remote failure before returning it for retry.
@@ -370,6 +389,7 @@ func (r *DevicePostureIntegrationReconciler) patchStatus(ctx context.Context, ob
 // temporary Cloudflare outage. The remote argument stays nil so a failed call
 // never stamps ownership or changes the recorded ID.
 func (r *DevicePostureIntegrationReconciler) finishRemoteError(ctx context.Context, object *v1alpha1.DevicePostureIntegration, err error) (ctrl.Result, error) {
+	forgetGate(r.Invalidator, "DevicePostureIntegration", client.ObjectKeyFromObject(object))
 	reason := "CloudflareError"
 	if flarecloudflare.IsNotFound(err) {
 		reason = "RemoteMissing"
@@ -398,6 +418,9 @@ func (r *DevicePostureIntegrationReconciler) now() time.Time {
 
 // SetupWithManager registers the integration controller and dependency watches.
 func (r *DevicePostureIntegrationReconciler) SetupWithManager(manager ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = manager.GetAPIReader()
+	}
 	indexer := manager.GetFieldIndexer()
 	if err := indexer.IndexField(context.Background(), &v1alpha1.DevicePostureIntegration{}, devicePostureIntegrationAccountIndex, func(object client.Object) []string {
 		return []string{object.(*v1alpha1.DevicePostureIntegration).Spec.AccountRef.Name}

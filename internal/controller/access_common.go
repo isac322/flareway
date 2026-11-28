@@ -54,7 +54,7 @@ func AccessClientFromFactory(factory flarecloudflare.ClientFactory) NewAccessClo
 
 func accessClientForAccount(
 	ctx context.Context,
-	kube client.Client,
+	reader client.Reader,
 	namespaceName string,
 	accountName string,
 	operation authz.Request,
@@ -70,26 +70,53 @@ func accessClientForAccount(
 		return nil, nil, errors.New("cloudflare Access client factory is required")
 	}
 	account := new(v1alpha1.CloudflareAccount)
-	if err := kube.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Name: accountName}, account); err != nil {
 		return nil, nil, fmt.Errorf("get CloudflareAccount %q: %w", accountName, err)
+	}
+	api, err := accessClientForResolvedAccount(ctx, reader, account, namespaceName, operation, factory)
+	if err != nil {
+		return nil, nil, err
+	}
+	return api, account, nil
+}
+
+func accessClientForResolvedAccount(
+	ctx context.Context,
+	reader client.Reader,
+	account *v1alpha1.CloudflareAccount,
+	namespaceName string,
+	operation authz.Request,
+	factory NewAccessCloudflareClient,
+) (flarecloudflare.AccessAPI, error) {
+	if account == nil {
+		return nil, errors.New("CloudflareAccount is required")
+	}
+	if reader == nil {
+		return nil, errors.New("kubernetes reader is required")
+	}
+	if namespaceName == "" {
+		return nil, errors.New("request namespace is required")
+	}
+	if factory == nil {
+		return nil, errors.New("cloudflare Access client factory is required")
 	}
 	if !metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionAccepted) ||
 		!metaConditionTrue(account.Status.Conditions, v1alpha1.CloudflareAccountConditionCredentialsValid) {
-		return nil, nil, fmt.Errorf("the CloudflareAccount %q is not ready", accountName)
+		return nil, fmt.Errorf("the CloudflareAccount %q is not ready", account.Name)
 	}
 	namespace := new(corev1.Namespace)
-	if err := kube.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
-		return nil, nil, fmt.Errorf("get request Namespace %q: %w", namespaceName, err)
+	if err := reader.Get(ctx, types.NamespacedName{Name: namespaceName}, namespace); err != nil {
+		return nil, fmt.Errorf("get request Namespace %q: %w", namespaceName, err)
 	}
 	decision := authz.Evaluate(account, namespace, operation)
 	if !decision.Allowed {
-		return nil, nil, privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
+		return nil, privateInvalid(decision.Reason, "%s: %s", decision.Reason, decision.Message)
 	}
 
 	ref := account.Spec.Credentials.APITokenSecretRef
 	secret := new(corev1.Secret)
-	if err := kube.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
-		return nil, nil, fmt.Errorf("get Cloudflare API token Secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+		return nil, fmt.Errorf("get Cloudflare API token Secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 	key := ref.Key
 	if key == "" {
@@ -97,13 +124,13 @@ func accessClientForAccount(
 	}
 	token := secret.Data[key]
 	if len(token) == 0 {
-		return nil, nil, fmt.Errorf("cloudflare API token Secret %s/%s has no non-empty %q key", ref.Namespace, ref.Name, key)
+		return nil, fmt.Errorf("cloudflare API token Secret %s/%s has no non-empty %q key", ref.Namespace, ref.Name, key)
 	}
 	api, err := factory(string(token), account.Spec.AccountID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return api, account, nil
+	return api, nil
 }
 
 func metaConditionTrue(conditions []metav1.Condition, conditionType string) bool {
@@ -141,6 +168,10 @@ func referenceNamespace(namespace string, ref v1alpha1.AccessObjectReference) st
 	return namespace
 }
 
+func resolveAccessRulesLocal(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, rules []v1alpha1.AccessRule) ([]flarecloudflare.ResolvedAccessRule, error) {
+	return resolveAccessRules(ctx, kube, namespace, account, nil, rules)
+}
+
 func resolveAccessRules(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, rules []v1alpha1.AccessRule) ([]flarecloudflare.ResolvedAccessRule, error) {
 	result := make([]flarecloudflare.ResolvedAccessRule, 0, len(rules))
 	for i := range rules {
@@ -151,6 +182,88 @@ func resolveAccessRules(ctx context.Context, kube client.Client, namespace strin
 		result = append(result, resolved)
 	}
 	return result, nil
+}
+
+func hasExternalAccessRules(ruleSets ...[]v1alpha1.AccessRule) bool {
+	for _, rules := range ruleSets {
+		for i := range rules {
+			if hasExternalAccessRule(rules[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasExternalAccessRule(rule v1alpha1.AccessRule) bool {
+	if rule.Group != nil && rule.Group.GroupRef.ExternalID != "" {
+		return true
+	}
+	if idpRef := accessRuleIDPRef(rule); idpRef != nil && idpRef.ExternalID != "" {
+		return true
+	}
+	if rule.ServiceToken != nil && rule.ServiceToken.TokenRef.ExternalID != "" {
+		return true
+	}
+	return rule.DevicePosture != nil && rule.DevicePosture.RuleRef.ExternalID != ""
+}
+
+func verifyExternalAccessRules(ctx context.Context, api flarecloudflare.AccessAPI, ruleSets ...[]v1alpha1.AccessRule) error {
+	for _, rules := range ruleSets {
+		for i := range rules {
+			if err := verifyExternalAccessRule(ctx, api, rules[i]); err != nil {
+				return fmt.Errorf("resolve Access rule %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+func verifyExternalAccessRule(ctx context.Context, api flarecloudflare.AccessAPI, rule v1alpha1.AccessRule) error {
+	if rule.Group != nil && rule.Group.GroupRef.ExternalID != "" {
+		if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, rule.Group.GroupRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external AccessGroup: %w", err)
+		}
+	}
+	if idpRef := accessRuleIDPRef(rule); idpRef != nil && idpRef.ExternalID != "" {
+		if _, err := api.GetIdentityProvider(ctx, idpRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external IdentityProvider: %w", err)
+		}
+	}
+	if rule.ServiceToken != nil && rule.ServiceToken.TokenRef.ExternalID != "" {
+		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, rule.ServiceToken.TokenRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external ServiceToken: %w", err)
+		}
+	}
+	if rule.DevicePosture != nil && rule.DevicePosture.RuleRef.ExternalID != "" {
+		if _, err := api.GetDevicePostureRule(ctx, rule.DevicePosture.RuleRef.ExternalID); err != nil {
+			return fmt.Errorf("validate external DevicePostureRule: %w", err)
+		}
+	}
+	return nil
+}
+
+func accessRuleIDPRef(rule v1alpha1.AccessRule) *v1alpha1.AccessObjectReference {
+	switch {
+	case rule.AzureAD != nil:
+		return &rule.AzureAD.IdentityProviderRef
+	case rule.GitHubOrganization != nil:
+		return &rule.GitHubOrganization.IdentityProviderRef
+	case rule.GSuite != nil:
+		return &rule.GSuite.IdentityProviderRef
+	case rule.Okta != nil:
+		return &rule.Okta.IdentityProviderRef
+	case rule.SAML != nil:
+		return &rule.SAML.IdentityProviderRef
+	case rule.OIDC != nil:
+		return &rule.OIDC.IdentityProviderRef
+	case rule.LoginMethod != nil:
+		return &rule.LoginMethod.IdentityProviderRef
+	case rule.AuthContext != nil:
+		return &rule.AuthContext.IdentityProviderRef
+	default:
+		return nil
+	}
 }
 
 func resolveAccessRule(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, rule v1alpha1.AccessRule) (flarecloudflare.ResolvedAccessRule, error) {
@@ -277,8 +390,10 @@ func validateAccessReference(_, _, kind, accountName string, deletionTimestamp *
 
 func resolveGroupID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external AccessGroup: %w", err)
+		if api != nil {
+			if _, err := api.GetAccessGroup(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external AccessGroup: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -301,8 +416,10 @@ func resolveGroupID(ctx context.Context, kube client.Client, namespace string, a
 
 func resolveIDPID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetIdentityProvider(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external IdentityProvider: %w", err)
+		if api != nil {
+			if _, err := api.GetIdentityProvider(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external IdentityProvider: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -325,8 +442,10 @@ func resolveIDPID(ctx context.Context, kube client.Client, namespace string, acc
 
 func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external ServiceToken: %w", err)
+		if api != nil {
+			if _, err := api.GetServiceToken(ctx, flarecloudflare.AccessScope{}, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external ServiceToken: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
@@ -349,8 +468,10 @@ func resolveServiceTokenID(ctx context.Context, kube client.Client, namespace st
 
 func resolvePostureID(ctx context.Context, kube client.Client, namespace string, account *v1alpha1.CloudflareAccount, api flarecloudflare.AccessAPI, ref v1alpha1.AccessObjectReference) (string, error) {
 	if ref.ExternalID != "" {
-		if _, err := api.GetDevicePostureRule(ctx, ref.ExternalID); err != nil {
-			return "", fmt.Errorf("validate external DevicePostureRule: %w", err)
+		if api != nil {
+			if _, err := api.GetDevicePostureRule(ctx, ref.ExternalID); err != nil {
+				return "", fmt.Errorf("validate external DevicePostureRule: %w", err)
+			}
 		}
 		return ref.ExternalID, nil
 	}
