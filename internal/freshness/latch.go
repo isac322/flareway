@@ -88,6 +88,17 @@ type guardState struct {
 	touched bool
 }
 
+// PruneToken snapshots candidate stale UID slots and their active guards under
+// an active name-scoped guard so PruneOtherUIDsIfUntouched only deletes stale
+// UIDs if no concurrent update touched the key during an uncached existence read.
+type PruneToken struct {
+	kind            string
+	key             types.NamespacedName
+	id              uint64
+	candidates      map[types.UID]struct{}
+	candidateGuards map[latchKey]map[uint64]struct{}
+}
+
 // verification is the most recent confirmation of one desired hash.
 type verification struct {
 	hash string
@@ -130,15 +141,9 @@ func (l *Latch) markGuardsTouchedLocked(k latchKey) {
 	}
 }
 
-func (l *Latch) beginLifetime(kind string, key types.NamespacedName, uid types.UID) LifetimeToken {
-	if l == nil {
-		return LifetimeToken{kind: kind, key: key, uid: uid}
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+func (l *Latch) registerGuardLocked(k latchKey) uint64 {
 	l.nextGuardID++
 	id := l.nextGuardID
-	k := latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid}
 	if l.activeGuards == nil {
 		l.activeGuards = make(map[latchKey]map[uint64]*guardState)
 	}
@@ -148,6 +153,32 @@ func (l *Latch) beginLifetime(kind string, key types.NamespacedName, uid types.U
 		l.activeGuards[k] = guards
 	}
 	guards[id] = &guardState{}
+	return id
+}
+
+func (l *Latch) endGuard(k latchKey, id uint64) {
+	if l == nil || id == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	guards := l.activeGuards[k]
+	if guards == nil {
+		return
+	}
+	delete(guards, id)
+	if len(guards) == 0 {
+		delete(l.activeGuards, k)
+	}
+}
+
+func (l *Latch) beginLifetime(kind string, key types.NamespacedName, uid types.UID) LifetimeToken {
+	if l == nil {
+		return LifetimeToken{kind: kind, key: key, uid: uid}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	id := l.registerGuardLocked(latchKey{kind: kind, namespace: key.Namespace, name: key.Name, uid: uid})
 	return LifetimeToken{kind: kind, key: key, uid: uid, id: id}
 }
 
@@ -165,20 +196,7 @@ func (l *Latch) BeginLifetimeForUID(kind string, key types.NamespacedName, uid t
 
 // EndLifetime unregisters tok and deletes the per-key guard map when empty.
 func (l *Latch) EndLifetime(tok LifetimeToken) {
-	if l == nil || tok.id == 0 {
-		return
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	k := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name, uid: tok.uid}
-	guards := l.activeGuards[k]
-	if guards == nil {
-		return
-	}
-	delete(guards, tok.id)
-	if len(guards) == 0 {
-		delete(l.activeGuards, k)
-	}
+	l.endGuard(latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name, uid: tok.uid}, tok.id)
 }
 
 func (l *Latch) invalidateKey(k latchKey, reason string) {
@@ -386,67 +404,145 @@ func (l *Latch) ForgetForUID(kind string, key types.NamespacedName, uid types.UI
 	delete(l.confirmed, k)
 }
 
+func mapHasOtherUID[V any](m map[latchKey]V, kind, ns, name string, excludeUID types.UID) bool {
+	for k := range m {
+		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" && k.uid != excludeUID {
+			return true
+		}
+	}
+	return false
+}
+
+func collectCandidateUIDs[V any](m map[latchKey]V, kind, ns, name string, out map[types.UID]struct{}) {
+	for k := range m {
+		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" {
+			out[k.uid] = struct{}{}
+		}
+	}
+}
+
+func deleteMatchingKeys[V any](m map[latchKey]V, kind, ns, name string, shouldDeleteUID func(types.UID) bool) {
+	for k := range m {
+		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
+			delete(m, k)
+		}
+	}
+}
+
 func (l *Latch) purgeMatchingLocked(
 	kind, ns, name string,
 	shouldDeleteUID func(types.UID) bool,
-	skipKey latchKey,
-	skipID uint64,
+	shouldRetireGuard func(latchKey, uint64) bool,
 ) {
-	for k := range l.epochs {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(l.epochs, k)
-		}
-	}
-	for k := range l.reasons {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(l.reasons, k)
-		}
-	}
-	for k := range l.verified {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(l.verified, k)
-		}
-	}
-	for k := range l.baselines {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(l.baselines, k)
-		}
-	}
-	for k := range l.confirmed {
-		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
-			delete(l.confirmed, k)
-		}
-	}
+	deleteMatchingKeys(l.epochs, kind, ns, name, shouldDeleteUID)
+	deleteMatchingKeys(l.reasons, kind, ns, name, shouldDeleteUID)
+	deleteMatchingKeys(l.verified, kind, ns, name, shouldDeleteUID)
+	deleteMatchingKeys(l.baselines, kind, ns, name, shouldDeleteUID)
+	deleteMatchingKeys(l.confirmed, kind, ns, name, shouldDeleteUID)
 	for k, guards := range l.activeGuards {
 		if k.kind == kind && k.namespace == ns && k.name == name && shouldDeleteUID(k.uid) {
 			for id, st := range guards {
-				if k == skipKey && id == skipID {
-					continue
+				if shouldRetireGuard(k, id) {
+					st.retired = true
 				}
-				st.retired = true
 			}
 		}
 	}
 }
 
-// PruneOtherUIDs drops every UID-scoped entry for (kind, key) whose UID differs
-// from liveUID and retires any in-flight guard tokens for those old UIDs.
-// Name-scoped entries (uid == "") are left untouched.
-func (l *Latch) PruneOtherUIDs(kind string, key types.NamespacedName, liveUID types.UID) {
-	if l == nil || liveUID == "" {
-		return
+// HasOtherUIDs reports whether any latch map or active guard holds a UID-scoped
+// entry for (kind, key) with a non-empty UID different from excludeUID.
+func (l *Latch) HasOtherUIDs(kind string, key types.NamespacedName, excludeUID types.UID) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	ns, name := key.Namespace, key.Name
+	return mapHasOtherUID(l.epochs, kind, ns, name, excludeUID) ||
+		mapHasOtherUID(l.reasons, kind, ns, name, excludeUID) ||
+		mapHasOtherUID(l.verified, kind, ns, name, excludeUID) ||
+		mapHasOtherUID(l.baselines, kind, ns, name, excludeUID) ||
+		mapHasOtherUID(l.confirmed, kind, ns, name, excludeUID) ||
+		mapHasOtherUID(l.activeGuards, kind, ns, name, excludeUID)
+}
+
+// BeginPrune registers a name-scoped prune guard for (kind, key) and snapshots
+// existing UID-scoped entries and their active guards. Callers must pair it
+// with defer EndPrune(tok) so idle keys retain zero bytes.
+func (l *Latch) BeginPrune(kind string, key types.NamespacedName) PruneToken {
+	if l == nil {
+		return PruneToken{kind: kind, key: key}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.purgeMatchingLocked(kind, key.Namespace, key.Name, func(u types.UID) bool {
-		return u != "" && u != liveUID
-	}, latchKey{}, 0)
+	ns, name := key.Namespace, key.Name
+	id := l.registerGuardLocked(latchKey{kind: kind, namespace: ns, name: name})
+	candidates := make(map[types.UID]struct{})
+	collectCandidateUIDs(l.epochs, kind, ns, name, candidates)
+	collectCandidateUIDs(l.reasons, kind, ns, name, candidates)
+	collectCandidateUIDs(l.verified, kind, ns, name, candidates)
+	collectCandidateUIDs(l.baselines, kind, ns, name, candidates)
+	collectCandidateUIDs(l.confirmed, kind, ns, name, candidates)
+	collectCandidateUIDs(l.activeGuards, kind, ns, name, candidates)
+	candidateGuards := make(map[latchKey]map[uint64]struct{})
+	for k, guards := range l.activeGuards {
+		if k.kind == kind && k.namespace == ns && k.name == name && k.uid != "" && len(guards) > 0 {
+			ids := make(map[uint64]struct{}, len(guards))
+			for gid := range guards {
+				ids[gid] = struct{}{}
+			}
+			candidateGuards[k] = ids
+		}
+	}
+	return PruneToken{
+		kind:            kind,
+		key:             key,
+		id:              id,
+		candidates:      candidates,
+		candidateGuards: candidateGuards,
+	}
+}
+
+// EndPrune unregisters tok and deletes the per-key guard map when empty.
+func (l *Latch) EndPrune(tok PruneToken) {
+	l.endGuard(latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name}, tok.id)
+}
+
+// PruneOtherUIDsIfUntouched drops snapshotted stale UID-scoped entries
+// (u != "" && u != liveUID && tok.candidates[u]) and retires their snapshotted
+// active guards ONLY if tok is still active and no state update touched the key
+// since BeginPrune. Reports whether pruning applied.
+func (l *Latch) PruneOtherUIDsIfUntouched(tok PruneToken, liveUID types.UID) bool {
+	if l == nil || tok.id == 0 || liveUID == "" {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	nameKey := latchKey{kind: tok.kind, namespace: tok.key.Namespace, name: tok.key.Name}
+	st, ok := l.activeGuards[nameKey][tok.id]
+	if !ok || st.touched {
+		return false
+	}
+	l.purgeMatchingLocked(tok.kind, tok.key.Namespace, tok.key.Name, func(u types.UID) bool {
+		if u == "" || u == liveUID {
+			return false
+		}
+		_, inCandidates := tok.candidates[u]
+		return inCandidates
+	}, func(k latchKey, gid uint64) bool {
+		_, inGuards := tok.candidateGuards[k][gid]
+		return inGuards
+	})
+	return true
 }
 
 // ForgetAndInvalidateIfUnretired atomically forgets verified/baseline state and
 // marks the token's exact key (including its UID when UID-scoped) invalidated
-// only if tok is still active and has not been retired. Reports whether the
-// update applied.
+// only if tok is still active and has not been retired. Sibling guards on the
+// same key and any active name-scoped guards (when UID-scoped) are marked
+// touched so concurrent absence checks or prunes do not drop this update.
+// Reports whether the update applied.
 func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string) bool {
 	if l == nil || tok.id == 0 {
 		return false
@@ -476,6 +572,12 @@ func (l *Latch) ForgetAndInvalidateIfUnretired(tok LifetimeToken, reason string)
 			other.touched = true
 		}
 	}
+	if k.uid != "" {
+		nameKey := latchKey{kind: k.kind, namespace: k.namespace, name: k.name}
+		for _, other := range l.activeGuards[nameKey] {
+			other.touched = true
+		}
+	}
 	return true
 }
 
@@ -496,14 +598,17 @@ func (l *Latch) RemoveIfUntouched(tok LifetimeToken) bool {
 	if !ok || st.touched {
 		return false
 	}
+	notSelf := func(gk latchKey, gid uint64) bool {
+		return gk != k || gid != tok.id
+	}
 	if tok.uid == "" {
 		l.purgeMatchingLocked(tok.kind, tok.key.Namespace, tok.key.Name, func(types.UID) bool {
 			return true
-		}, k, tok.id)
+		}, notSelf)
 	} else {
 		l.purgeMatchingLocked(tok.kind, tok.key.Namespace, tok.key.Name, func(u types.UID) bool {
 			return u == tok.uid
-		}, k, tok.id)
+		}, notSelf)
 	}
 	return true
 }
@@ -519,7 +624,9 @@ func (l *Latch) Remove(kind string, key types.NamespacedName) {
 	defer l.mu.Unlock()
 	l.purgeMatchingLocked(kind, key.Namespace, key.Name, func(types.UID) bool {
 		return true
-	}, latchKey{}, 0)
+	}, func(latchKey, uint64) bool {
+		return true
+	})
 }
 
 func (l *Latch) markVerifiedKey(k latchKey, hash string, at time.Time) {

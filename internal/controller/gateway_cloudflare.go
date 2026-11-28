@@ -732,7 +732,7 @@ func (r *GatewayReconciler) reconcileCloudflaredConfiguration(
 	// remote path below — the lock closure never serves cached state.
 	now := r.gatewayNow()
 	gateKey := client.ObjectKeyFromObject(tunnel)
-	r.Invalidator.PruneOtherUIDs(configFreshnessKind, gateKey, tunnel.UID)
+	pruneOtherTunnelConfigUIDs(ctx, r.directReader(), r.Invalidator, gateKey, tunnel.UID)
 	gate := evaluateGateWithHashForUID(
 		r.Freshness,
 		r.Invalidator,

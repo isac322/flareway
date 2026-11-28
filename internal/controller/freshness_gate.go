@@ -334,6 +334,30 @@ func retireTunnelIfConfirmedAbsent(
 	return true, nil
 }
 
+// pruneOtherTunnelConfigUIDs reclaims stale UID-scoped CloudflareTunnelConfig
+// latch slots when a Tunnel has been replaced by a newer UID. Fast-paths to
+// zero API reads when no other UID entries exist; otherwise holds a guarded
+// PruneToken across an uncached directReader lookup so a stale cache snapshot
+// or concurrent replacement-UID write never prunes live UID state.
+func pruneOtherTunnelConfigUIDs(
+	ctx context.Context,
+	reader kubeclient.Reader,
+	latch *freshness.Latch,
+	key types.NamespacedName,
+	observedUID types.UID,
+) {
+	if latch == nil || reader == nil || observedUID == "" || !latch.HasOtherUIDs(configFreshnessKind, key, observedUID) {
+		return
+	}
+	tok := latch.BeginPrune(configFreshnessKind, key)
+	defer latch.EndPrune(tok)
+	var live v1alpha1.CloudflareTunnel
+	if err := reader.Get(ctx, key, &live); err != nil || live.UID == "" {
+		return
+	}
+	latch.PruneOtherUIDsIfUntouched(tok, live.UID)
+}
+
 // gateClusterID resolves the cluster identity used in the gate hash.
 //
 // Failure is deliberately not fatal. The gate is an optimization, and a

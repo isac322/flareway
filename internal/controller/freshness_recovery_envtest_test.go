@@ -7216,3 +7216,211 @@ func TestDemoteAfterLiveUIDReadDoesNotSeedDirectReplacementEnvtest(t *testing.T)
 		t.Fatal("Direct-mode UID2 reconcile did not prune UID1 config slot via PruneOtherUIDs")
 	}
 }
+
+// Regression test for P2 #1: holding an in-flight retireTunnelIfConfirmedAbsent
+// (with uncached NotFound read) across creating replacement UID2 and running
+// demoteTunnelConfigApplied (transient Status().Apply error calling
+// ForgetAndInvalidateIfUnretired) MUST NOT wipe UID2's demotion when the
+// delayed NotFound resumes RemoveIfUntouched.
+func TestAbsenceCheckDoesNotRetireReplacementDemotionEnvtest(t *testing.T) {
+	f := setupDemoteEnvtest(t, "absence-vs-demote")
+	ctx := context.Background()
+	tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+
+	// Delete UID1 cleanly from etcd.
+	var uid1Obj v1alpha1.CloudflareTunnel
+	if err := f.direct.Get(ctx, tunnelKey, &uid1Obj); err != nil {
+		t.Fatal(err)
+	}
+	uid1Obj.Finalizers = nil
+	if err := f.direct.Update(ctx, &uid1Obj); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.direct.Delete(ctx, &uid1Obj); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	if f.tunnel.Status.ConnectorTokenSecretRef != nil {
+		if err := f.direct.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: tunnelKey.Namespace,
+			Name:      f.tunnel.Status.ConnectorTokenSecretRef.Name,
+		}}); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	waitUntilTrue(t, 10*time.Second, "UID1 deleted", func() (bool, error) {
+		var check v1alpha1.CloudflareTunnel
+		return apierrors.IsNotFound(f.direct.Get(ctx, tunnelKey, &check)), nil
+	})
+
+	// Block retireTunnelIfConfirmedAbsent right after its uncached Get confirms NotFound.
+	gotNotFound := make(chan struct{})
+	releaseNotFound := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseNotFound:
+		default:
+			close(releaseNotFound)
+		}
+	})
+	var blockedOnce atomic.Bool
+	blockingReader := &failingStatusClient{
+		Client: f.direct,
+		onAfterTunnelGet: func(key client.ObjectKey, _ *v1alpha1.CloudflareTunnel, err error) {
+			if key == tunnelKey && apierrors.IsNotFound(err) && !blockedOnce.Swap(true) {
+				close(gotNotFound)
+				<-releaseNotFound
+			}
+		},
+	}
+
+	absentDone := make(chan bool, 1)
+	go func() {
+		retired, err := retireTunnelIfConfirmedAbsent(
+			ctx,
+			blockingReader,
+			f.latch,
+			tunnelKey,
+			apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.Group, Resource: "cloudflaretunnels"}, tunnelKey.Name),
+		)
+		if err != nil {
+			t.Errorf("retireTunnelIfConfirmedAbsent error: %v", err)
+		}
+		absentDone <- retired
+	}()
+	<-gotNotFound
+
+	// While retireTunnelIfConfirmedAbsent holds the delayed NotFound, create
+	// replacement UID2, converge its tunnel verification, and run
+	// demoteTunnelConfigApplied with a transient Status().Apply error so
+	// ForgetAndInvalidateIfUnretired seeds UID2's "demoted" latch.
+	uid2Spec := f.tunnel.Spec.DeepCopy()
+	uid2Spec.Tunnel.Name = "uid2-remote-absence"
+	uid2 := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       tunnelKey.Namespace,
+			Name:            tunnelKey.Name,
+			OwnerReferences: append([]metav1.OwnerReference(nil), f.tunnel.OwnerReferences...),
+		},
+		Spec: *uid2Spec,
+	}
+	if err := f.direct.Create(ctx, uid2); err != nil {
+		close(releaseNotFound)
+		t.Fatal(err)
+	}
+	uid2Obj := convergeUID2WithGateway(ctx, t, f, uid2.UID)
+	f.statusClient.failStatusKind = "CloudflareTunnel"
+	f.statusClient.failStatusWrite.Store(true)
+	err := f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &uid2Obj, time.Now(), "Applying", "applying")
+	if err == nil {
+		close(releaseNotFound)
+		t.Fatal("expected injected Status().Apply error")
+	}
+	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
+		close(releaseNotFound)
+		t.Fatal("expected demoteTunnelConfigApplied to latch UID2 invalidation")
+	}
+	uid2Epoch := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID)
+
+	// Release delayed NotFound -> RemoveIfUntouched MUST NOT wipe UID2's demotion.
+	close(releaseNotFound)
+	<-absentDone
+
+	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
+		t.Fatal("delayed NotFound RemoveIfUntouched wiped UID2 demotion invalidation")
+	}
+	if got := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID); got != uid2Epoch {
+		t.Fatalf("delayed NotFound RemoveIfUntouched altered UID2 epoch: got %d, want %d", got, uid2Epoch)
+	}
+}
+
+// Regression test for P2 #2: invoking CloudflareTunnelReconciler.Reconcile with
+// a stale cached UID1 snapshot while directReader observes live UID2 holding a
+// config invalidation MUST NOT prune UID2's latch entry.
+func TestStaleCachedTunnelReadDoesNotPruneLiveUID2Envtest(t *testing.T) {
+	f := setupDemoteEnvtest(t, "stale-cache-prune")
+	ctx := context.Background()
+	tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+	staleUID1 := f.tunnel.DeepCopy()
+
+	// Replace UID1 with live UID2.
+	cur := f.tunnel.DeepCopy()
+	cur.Finalizers = nil
+	if err := f.direct.Update(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.direct.Delete(ctx, cur); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	if f.tunnel.Status.ConnectorTokenSecretRef != nil {
+		if err := f.direct.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: tunnelKey.Namespace,
+			Name:      f.tunnel.Status.ConnectorTokenSecretRef.Name,
+		}}); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	waitUntilTrue(t, 10*time.Second, "UID1 deleted before UID2 create", func() (bool, error) {
+		var check v1alpha1.CloudflareTunnel
+		return apierrors.IsNotFound(f.direct.Get(ctx, tunnelKey, &check)), nil
+	})
+	uid2Spec := f.tunnel.Spec.DeepCopy()
+	uid2Spec.Tunnel.Name = "uid2-remote-absence"
+	uid2 := &v1alpha1.CloudflareTunnel{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       tunnelKey.Namespace,
+			Name:            tunnelKey.Name,
+			OwnerReferences: append([]metav1.OwnerReference(nil), f.tunnel.OwnerReferences...),
+		},
+		Spec: *uid2Spec,
+	}
+	if err := f.direct.Create(ctx, uid2); err != nil {
+		t.Fatal(err)
+	}
+	uid2Obj := convergeUID2WithGateway(ctx, t, f, uid2.UID)
+
+	// Seed UID2 config invalidation through the Gateway demote path.
+	if err := f.gwReconciler.demoteTunnelConfigApplied(ctx, f.irGW, &uid2Obj, time.Now(), "Applying", "applying"); err != nil {
+		t.Fatalf("demote UID2: %v", err)
+	}
+	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
+		t.Fatal("expected UID2 config invalidation before stale reconcile")
+	}
+	uid2Epoch := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID)
+
+	// Reconcile CloudflareTunnelReconciler using a stale cached Client returning
+	// UID1 while APIReader sees live UID2.
+	staleTunnelReconciler := &CloudflareTunnelReconciler{
+		Client:              &failingStatusClient{Client: f.direct, staleTunnel: staleUID1},
+		APIReader:           f.direct,
+		Scheme:              f.tunnelReconciler.Scheme,
+		NewCloudflareClient: f.tunnelReconciler.NewCloudflareClient,
+		Freshness:           f.tunnelReconciler.Freshness,
+		Invalidator:         f.latch,
+	}
+	_, _ = staleTunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+
+	if !f.latch.IsInvalidatedForUID(configFreshnessKind, tunnelKey, uid2Obj.UID) {
+		t.Fatal("stale cached UID1 reconcile pruned live UID2 invalidation")
+	}
+	if got := f.latch.InvalidationEpochForUID(configFreshnessKind, tunnelKey, uid2Obj.UID); got != uid2Epoch {
+		t.Fatalf("stale cached UID1 reconcile altered live UID2 epoch: got %d, want %d", got, uid2Epoch)
+	}
+}
+
+func convergeUID2WithGateway(ctx context.Context, t *testing.T, f *demoteEnvtestFixture, uid2 types.UID) v1alpha1.CloudflareTunnel {
+	t.Helper()
+	tunnelKey := client.ObjectKeyFromObject(&f.tunnel)
+	var cur v1alpha1.CloudflareTunnel
+	waitUntilTrue(t, 10*time.Second, "UID2 bound to Gateway with OwnershipVerified", func() (bool, error) {
+		if err := f.gwReconciler.Get(ctx, tunnelKey, &cur); err != nil || cur.UID != uid2 {
+			return false, nil
+		}
+		_, _ = f.tunnelReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tunnelKey})
+		_, _ = f.gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: f.irGW.Key})
+		if err := f.direct.Get(ctx, tunnelKey, &cur); err != nil {
+			return false, nil
+		}
+		return cur.UID == uid2 && cur.Status.GatewayUID == f.gw.UID && cur.Status.OwnershipVerified && cur.Status.TunnelID != "" && cur.Status.ConnectorTokenSecretRef != nil, nil
+	})
+	return cur
+}

@@ -147,7 +147,7 @@ func (r *CloudflareTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{RequeueAfter: tunnelRequeue}, nil
 	}
 	if tunnel.UID != "" {
-		r.Invalidator.PruneOtherUIDs(configFreshnessKind, req.NamespacedName, tunnel.UID)
+		pruneOtherTunnelConfigUIDs(ctx, r.directReader(), r.Invalidator, req.NamespacedName, tunnel.UID)
 	}
 
 	if !tunnel.DeletionTimestamp.IsZero() {
